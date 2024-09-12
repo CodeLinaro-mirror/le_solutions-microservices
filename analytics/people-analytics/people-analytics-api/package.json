@@ -1,0 +1,27 @@
+{
+  "name": "api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "",
+    "url": ""
+  },
+  "author": "",
+  "license": "BSD-3-Clause-Clear",
+  "dependencies": {
+    "connect": "^3.7.0",
+    "dotenv": "^16.4.5",
+    "js-yaml": "^4.1.0",
+    "mariadb": "^3.3.1",
+    "mime": "^4.0.3",
+    "node-fetch": "^3.3.2",
+    "oas3-tools": "^2.2.3",
+    "redis": "^4.6.15",
+    "xml-js": "^1.6.11"
+  }
+}

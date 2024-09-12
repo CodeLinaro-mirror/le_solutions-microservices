@@ -1,0 +1,42 @@
+{
+    "type": "object",
+    "title": "Camera Update Redis Payload",
+    "description": "Contains message type (new, update, or removal) and payload information",
+    "properties": {
+        "message_type": {
+            "type": "string",
+            "description": "Payload type. Either new, update, or removal"
+        },
+        "camera_object": {
+            "type": "object",
+            "description": "Camera configuration object",
+            "properties": {
+                "camera_name": {
+                    "type": "string"
+                },
+                "camera_id": {
+                    "type": "string"
+                },
+                "rtsp_url": {
+                    "type": "string"
+                },
+                "camera_location": {
+                    "type": "string"
+                },
+                "camera_fov": {
+                    "type": "number"
+                },
+                "camera_direction": {
+                    "type": "number"
+                }
+            },
+            "required": [
+                "camera_id"
+            ]
+        }
+    },
+    "required": [
+        "message_type",
+        "camera_object"
+    ]
+}

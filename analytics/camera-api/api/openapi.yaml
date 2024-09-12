@@ -1,0 +1,272 @@
+# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+openapi: 3.0.3
+info:
+  title: Camera Configuration API
+  description: |
+    A service that allows clients to manually configure cameras in the system.
+
+    Cameras can be added and deleted, and a list of currently configured cameras can be retrieved.
+
+    As an example a client would:
+    * POST to /config/cameras/add to add a new camera to the system
+    * DELETE to /config/cameras/remove to remove a camera.
+    * GET to /config/cameras to get list of all cameras in the system.
+
+  contact:
+    name: Qualcomm Support Forums
+    url: https://mysupport.qualcomm.com/supportforums/s/
+  license:
+    name: BSD-3-Clause-Clear
+  version: '0.0.1'
+servers:
+  - url: https://{device-address}/camera-config/v1/api
+    description: Server URL
+    variables:
+      device-address:
+        description: IP address (and port) of the host of the Camera Configuration API ingress.
+        default: your.device.ip.here:8080
+x-string-constants:
+  - cameraname: &CAMERANAME_EXAMPLE "OfficeCam1"
+  - cameraid: &CAMERAID_EXAMPLE "ABC123456789XYZ"
+  - rtspurl: &RTSPURL_EXAMPLE "rtsp://admin:passwd@192.168.0.241:554/H.264/ch1/main/av_stream"
+  - cameralocation: &CAMERALOCATION_EXAMPLE "49.2578298,-123.2634732"
+  - camerafov: &CAMERAFOV_EXAMPLE "120"
+  - cameradirection: &CAMERADIRECTION_EXAMPLE "90"
+  
+tags: 
+  - name: camera
+    description: Camera related configuration
+security: []
+paths:
+  /config/cameras/add:
+    post:
+      tags:
+        - camera
+      summary: Manually add a new camera 
+      description: Manually add a new camera by providing RTSP URL and other details.
+      operationId: addCamera
+      requestBody:
+        description:
+          Manually adds a new IP camera to the system with the provided RTSP URL.
+          
+          This camera configuration will added to the existing list of cameras and interested
+          subsystems will be automatically notified of its addition.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Camera'
+            examples:
+              Add new camera:
+                $ref: '#/components/examples/exampleAddCamera'
+      responses:
+        '200':
+          description: New camera configuration was successfully added.
+        '400':
+          description: Error adding camera.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'    
+      x-swagger-router-controller: CameraController
+                
+  /config/cameras/remove:
+    delete:
+      tags:
+        - camera
+      summary: Delete a camera
+      description: Deletes an existing camera by camera ID.
+      operationId: deleteCamera
+      parameters:
+      - name: camera_id
+        in: query          
+        required: true
+        description: Camera ID to delete.
+        schema:
+          type: string
+          example: *CAMERAID_EXAMPLE
+      responses:
+        '200':
+          description: Camera was successfully deleted.
+        '400':
+          description: Error deleting camera.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: CameraController
+
+  /config/cameras:
+    get:
+      tags:
+        - camera
+      summary: Get list of cameras in the system.
+      description: Retrieves a list of cameras in the system.
+      operationId: getCameras
+      responses:
+        '200':
+          description: A list of configured cameras.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cameras'
+        '400':
+          description: Error retreiving list of cameras.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: CameraController
+
+  /config/cameras/update:
+    put:
+      tags:
+        - camera
+      summary: Updates an existing camera
+      description: Update an existing camera by camera ID.
+      operationId: updateCamera
+      requestBody:
+        description:
+          Updates a camera that already exists within the system given a camera ID.
+          
+          This camera configuration will be updated in the existing list of cameras and interested
+          subsystems will be automatically notified of its addition.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCamera'
+            examples:
+              Update camera:
+                $ref: '#/components/examples/exampleUpdateCamera'
+              ILLEGAL!! Update camera No ID:
+                $ref: '#/components/examples/exampleUpdateCameraNoID'
+      responses:
+        '200':
+          description: camera configuration was successfully updated.
+        '400':
+          description: Error updating camera.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: CameraController
+
+components:
+  
+  schemas:
+    
+    Camera:
+      description: Configuration information about an IP camera in the system
+      type: object
+      required:
+        - camera_name
+        - camera_id
+        - rtsp_url
+      properties:
+        camera_name:
+          description: Human readable name for the camera.  
+          type: string
+          example: *CAMERANAME_EXAMPLE
+        camera_id:
+          description: Globally-unique identifier used to identify the camera in the system.
+          type: string
+          example: *CAMERAID_EXAMPLE
+        rtsp_url:
+          description: RTSP stream associated with this camera.
+          type: string
+          example: *RTSPURL_EXAMPLE
+        camera_location:
+          description: Physical location of the installed camera.
+          type: string
+          example: *CAMERALOCATION_EXAMPLE
+        camera_fov:
+          description: Physical field of view angle of the installed camera.
+          type: integer
+          minimum: 0
+          maximum: 360
+          example: *CAMERAFOV_EXAMPLE
+        camera_direction:
+          description: Facing direction of the installed camera. From 0 to 360 degrees. 0 Being the Top and 90 being the right, etc.
+          type: integer
+          minimum: 0
+          maximum: 360
+          example: *CAMERADIRECTION_EXAMPLE
+    
+    Cameras:
+      description: List of Camera objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Camera"
+
+    Error:
+      description: "Error response {TBD: fill out}"
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Detailed reason for error.
+          example: "Invalid user input in parameter..(etc.)"
+
+    UpdateCamera:
+      description: Configuration information about updating an IP camera in the system
+      type: object
+      required:
+        - camera_id
+      properties:
+        camera_name:
+          description: Human readable name for the camera.  
+          type: string
+          example: *CAMERANAME_EXAMPLE
+        camera_id:
+          description: Globally-unique identifier used to identify the camera in the system.
+          type: string
+          example: *CAMERAID_EXAMPLE
+        rtsp_url:
+          description: RTSP stream associated with this camera.
+          type: string
+          example: *RTSPURL_EXAMPLE
+        camera_location:
+          description: Physical location of the installed camera.
+          type: string
+          example: *CAMERALOCATION_EXAMPLE
+        camera_fov:
+          description: Physical field of view angle of the installed camera.
+          type: integer
+          minimum: 0
+          maximum: 360
+          example: *CAMERAFOV_EXAMPLE
+        camera_direction:
+          description: Facing direction of the installed camera. From 0 to 360 degrees. 0 Being the Top and 90 being the right, etc.
+          type: integer
+          minimum: 0
+          maximum: 360
+          example: *CAMERADIRECTION_EXAMPLE
+
+  examples:
+
+    exampleAddCamera:
+      value:
+        camera_name: *CAMERANAME_EXAMPLE
+        camera_id: *CAMERAID_EXAMPLE
+        rtsp_url: *RTSPURL_EXAMPLE
+        camera_location: *CAMERALOCATION_EXAMPLE
+        camera_fov: *CAMERAFOV_EXAMPLE
+        camera_direction: *CAMERADIRECTION_EXAMPLE
+
+    exampleUpdateCamera:
+      value:
+        camera_id: *CAMERAID_EXAMPLE
+        camera_fov: *CAMERAFOV_EXAMPLE
+        camera_direction: *CAMERADIRECTION_EXAMPLE
+
+    exampleUpdateCameraNoID:
+      value:
+        camera_name: *CAMERANAME_EXAMPLE
+        rtsp_url: *RTSPURL_EXAMPLE
+        camera_location: *CAMERALOCATION_EXAMPLE
+        camera_fov: *CAMERAFOV_EXAMPLE
+        camera_direction: *CAMERADIRECTION_EXAMPLE
