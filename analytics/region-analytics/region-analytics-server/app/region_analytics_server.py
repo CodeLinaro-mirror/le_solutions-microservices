@@ -1,5 +1,6 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
+import signal
 from typing import Dict
 import redis.asyncio as redis
 import asyncio
@@ -16,7 +17,7 @@ REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 REDIS_PORT = os.environ.get('REDIS_PORT', 6379)
 ALERT_PERIOD = os.environ.get('ALERT_PERIOD', 1.0)
 ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'RAAlerts')
-REGION_KEY = os.environ.get('TRIGGER_KEY', 'RARegions')
+REGION_KEY = os.environ.get('REGION_KEY', 'RARegions')
 TRIGGER_KEY = os.environ.get('TRIGGER_KEY', 'RATriggers')
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
 CHANNEL_PREIX = os.environ.get('CHANNEL_PREFIX', 'Detection::YoloV8::RZ::')
@@ -25,7 +26,7 @@ TIME_DRIFT_LIMIT_SECS = 3.0 # TODO: pull from environment within loop
 seconds_offsets_by_channel : dict[str, float]= {}
 
 
-# meanings of elements in the ObjectDetection "rectangle" member
+# meanings of elements in the object_detection "rectangle" member
 RECT_IDX_TOP = 0
 RECT_IDX_LEFT = 1
 RECT_IDX_BOTTOM = 2
@@ -76,7 +77,7 @@ async def get_triggers(r):
     triggers = [json.loads(trigger) for trigger in raw_triggers.values()]
     
     # TODO: add occupancy_over, occupancy_under
-    supported_trigger_conditions = ['occupancy_changed']
+    supported_trigger_conditions = ['occupancy_changed', 'occupancy_over', 'occupancy_under']
     triggers = [t for t in triggers if t['trigger_condition'] in supported_trigger_conditions]
     
     # TODO: remove below code when Redis payload has json-decoded inner objects
@@ -159,7 +160,7 @@ def apply_triggers(triggers, regions, messages):
         # get timestamp of last message in epoch time
         last_recv_time, last_message = messages[-1]
         alert_time = convert_msg_timestamp_to_epoch_time(
-            last_message.Parameters.timestamp,
+            last_message.parameters.timestamp,
             recv_time,
             monitor_id
             )
@@ -169,35 +170,40 @@ def apply_triggers(triggers, regions, messages):
         records_by_frame = []
         for _, message in messages[-rh.get_max_lookback():]:
             records = {}
-            frame_objects = message.ObjectDetection
+            if not hasattr(message, 'object_detection'):
+                continue # no people in message
+            frame_objects = message.object_detection
             last_idx = len(frame_objects) - 1
             for idx, person in enumerate(frame_objects):
                 if not person.label.startswith('person'):
                     continue # top-level non-person object
-                id = person.id
+                id = person.tracking_id
                 if not hasattr(person, 'landmarks'):
-                    continue # this person has no feet!
-                if idx == last_idx or frame_objects[idx+1].label != 'feet':
-                    continue # need 'feet' to be the next object
-                
-                feet_bb = frame_objects[idx+1]
+                    continue # this person has no landmarks, so can't find ankles
                 landmarks = person.landmarks
-                landmarks.middle_point = vars(landmarks)['feet-middle-point']
+                foot_coords = {}
+                if hasattr(landmarks, 'left_ankle') and hasattr(landmarks, 'right_ankle'):
+                    # foot_coords (x,y) = midpoint of ankles
+                    foot_coords['x'] = (landmarks.left_ankle.x + landmarks.right_ankle.x) / 2.0
+                    foot_coords['y'] = (landmarks.left_ankle.y + landmarks.right_ankle.y) / 2.0
+                if not foot_coords:
+                    continue # this person had landmarks, but not both a left & right ankle
+
                 rectangle = person.rectangle
                 bounding_box = {
                     'top_left': {
-                        'x': rectangle[RECT_IDX_LEFT],
-                        'y': rectangle[RECT_IDX_TOP]
+                        'x': rectangle.x,
+                        'y': rectangle.y
                     },
                     'bottom_right': {
-                        'x': rectangle[RECT_IDX_RIGHT],
-                        'y': rectangle[RECT_IDX_BOTTOM]
+                        'x': rectangle.x + rectangle.width,
+                        'y': rectangle.y + rectangle.height
                     }
                 }
                 records[id] = {
-                    'id': person.id,
-                    'x': feet_bb.rectangle[0], # instead of incorrect landmark x
-                    'y': feet_bb.rectangle[1],
+                    'id': person.tracking_id,
+                    'x': foot_coords['x'],
+                    'y': foot_coords['y'],
                     'bounding_box': bounding_box,
                 }
             records_by_frame.append(records)
@@ -209,12 +215,34 @@ def apply_triggers(triggers, regions, messages):
         for trigger in [t for t in triggers if t['region_id'] == region_id]:
             trigger_id = trigger['trigger_id']
             last_occupancy = last_trigger_occupancy.get(trigger_id, 0)
-            if last_occupancy != current_occupancy:
+            send_alerts = False
+            trigger_condition = trigger['trigger_condition']
+            match trigger_condition:
+                case 'occupancy_changed':
+                    send_alerts = last_occupancy != current_occupancy
+                case 'occupancy_over':
+                    threshold = get_trigger_param(trigger, 'threshold')
+                    send_alerts = current_occupancy > threshold
+                case 'occupancy_under':
+                    threshold = get_trigger_param(trigger, 'threshold')
+                    send_alerts = current_occupancy < threshold
+                case _:
+                    raise RuntimeError(f'Unexpected trigger_condition \'{trigger_condition}\' in {trigger}')
+
+
+            if send_alerts:
                 alerts.append(make_alert(trigger, region, rh, alert_time))
-            last_trigger_occupancy[trigger_id] = current_occupancy
+                last_trigger_occupancy[trigger_id] = current_occupancy
     
     logger.info(f'Filtered {len(messages)} Detection messages through {len(triggers)} trigger(s), generating {len(alerts)} alert(s)')
     return alerts
+
+def get_trigger_param(trigger, name):
+    for param in trigger['params']:
+        if param['name'] == name:
+            return param['value']
+        
+    raise ValueError(f'{name} not in params for trigger {trigger}')
 
 
 async def check_for_alerts(r : redis.Redis):
@@ -240,7 +268,7 @@ async def check_for_alerts(r : redis.Redis):
         logger.exception(exc)
         logger.error('Database or received messages likely corrupted, will keep trying..')
 
-async def listen_to_channel(r: redis.Redis, group: asyncio.TaskGroup):
+async def register_pubsub_listener(r: redis.Redis):
 
     def detection_message_handler(message):
         # called by the pubsub async runner when a message is received
@@ -258,25 +286,36 @@ async def listen_to_channel(r: redis.Redis, group: asyncio.TaskGroup):
         else:
             logger.debug('No message from get_message')
         if alert_period_has_elapsed(now):
-            nonlocal group
-            group.create_task(check_for_alerts(r))
+            asyncio.ensure_future(check_for_alerts(r))
 
-    # register subscribe pattern handler, add task to run pubsub
+    # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
     channel_pattern = CHANNEL_PREIX + '*'
     await pubsub.psubscribe(**{channel_pattern: detection_message_handler})
-    group.create_task(pubsub.run()) # TODO: how to end gracefully on SIGINT / SIGTERM?
+    return pubsub
 
 
 async def async_main():
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    channel_listener_task = None
+
     try:
         await connect_to_redis(r)
-        async with asyncio.TaskGroup() as group:
-            # TODO: handle SIGTERM gracefully
-            # TODO: handle keyboard interrupt gracefully
-            group.create_task(listen_to_channel(r, group))
 
+        def quit_handler ():
+            if channel_listener_task == None:
+                raise RuntimeError('Got SIGTERM but no task to cancel!')
+            logging.info('Got SIGTERM, cancelling listener task..')
+            channel_listener_task.cancel()
+
+        pubsub = await register_pubsub_listener(r)
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGTERM, quit_handler)
+        channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
+        await channel_listener_task
+
+    except asyncio.CancelledError:
+        logger.info('Got cancelled exception, shutting down..')
     finally:
         logger.info('Closing redis client..')
         await r.aclose()

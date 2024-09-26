@@ -10,7 +10,7 @@ const config = require('./config/config');
 const utils = require('./utils/utils');
 
 var oas3Tools = require('oas3-tools');
-var serverPort = 8081;
+var serverPort = 8080;
 
 // swaggerRouter configuration
 var options = {
@@ -27,6 +27,9 @@ var options = {
         gracefulshutdown();
     }
 })();
+
+// Listen for Camera Updates
+utils.cameraUpdates();
 
 var expressAppConfig = oas3Tools.expressAppConfig(path.join(__dirname, 'api/openapi.yaml'), options);
 var app = expressAppConfig.getApp();

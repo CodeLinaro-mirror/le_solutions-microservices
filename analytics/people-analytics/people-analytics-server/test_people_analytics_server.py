@@ -1,7 +1,7 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-import people_analytics_server as pas
+import app.people_analytics_server as pas
 import json
 import pytest
 
@@ -12,6 +12,9 @@ DEFAULT_TIME_DRIFT_LIMIT = 3.0
 def set_pas_context_to_default():
     pas.TIME_DRIFT_LIMIT_SECS = DEFAULT_TIME_DRIFT_LIMIT
     pas.seconds_offsets_by_channel = {}
+    pas.LOOKBACK_FRAMES=1
+    pas.frame_history_by_channel = {}
+
 
 
 @pytest.fixture
@@ -27,14 +30,20 @@ async def test_get_triggers_returns_fake_trigger(triggers):
 def make_message(type : str):
     MESSAGE_TIMESTAMP = "1234567890" # in nanoseconds; 1.234567890 in seconds
     frame_message = {
-                'ObjectDetection': [
+                'object_detection': [
                     {
-                        # NOTE: later versions of the IMSDK put "person_###" instead of "person"
                         'label': 'person_1',
-                        'rectangle': [0.1, 0.2, 0.3, 0.4] # top, left, bottom, right
+                        'rectangle': {
+                            # Make x0, y0, x1, y1 = 0.1, 0.2, 0.3, 0.4
+                            'x': 0.1,
+                            'y': 0.2,
+                            'width': (0.3 - 0.1),
+                            'height': (0.4 - 0.2)
+                        }
+                        
                     }
                 ],
-                'Parameters': {
+                'parameters': {
                     'timestamp': MESSAGE_TIMESTAMP # source timestamp from monitor in nsec
                 }
             }
@@ -43,25 +52,25 @@ def make_message(type : str):
         pass # all set up above
 
     elif type == 'nobody_and_nothing':
-        frame_message['ObjectDetection'] = []
+        del(frame_message['object_detection']) # no object_detection object in case of no people
 
     elif type == 'only_vest_in_room':
-        frame_message['ObjectDetection'][0]['label'] = 'vest'
+        frame_message['object_detection'][0]['label'] = 'vest'
 
     elif type == 'person_with_vest_in_frame_but_not_worn':
         # create new top-level object which is top level vest only
-        frame_message['ObjectDetection'].append(
+        frame_message['object_detection'].append(
             {
                 'label': 'vest' # top-level vest, e.g. placed on a chair
             }
         )
     
     elif type == 'one_person_with_vest':
-        frame_message['ObjectDetection'][0]['ObjectDetection'] = [{'label': 'vest'}]
+        frame_message['object_detection'][0]['object_detection'] = [{'label': 'vest'}]
     elif type == 'one_person_with_cellphone':
-        frame_message['ObjectDetection'][0]['ObjectDetection'] = [{'label': 'cellphone'}]
+        frame_message['object_detection'][0]['object_detection'] = [{'label': 'cellphone'}]
     elif type == 'one_person_with_vest_with_extra_whitespace':
-        frame_message['ObjectDetection'][0]['ObjectDetection'] = [{'label': '  vest  '}]
+        frame_message['object_detection'][0]['object_detection'] = [{'label': '  vest  '}]
         
     return frame_message
 
@@ -94,10 +103,10 @@ async def test_one_person_no_accessories_generates_one_alert(triggers):
     assert len(causes) == 1, 'Should have one person causing trigger'
     cause = causes[0]
     assert cause['accessories'] == 'vest'
-    assert cause['violator']['top_left']['x'] == 0.2
-    assert cause['violator']['top_left']['y'] == 0.1
-    assert cause['violator']['bottom_right']['x'] == 0.4
-    assert cause['violator']['bottom_right']['y'] == 0.3
+    assert cause['violator']['top_left']['x'] == 0.1
+    assert cause['violator']['top_left']['y'] == 0.2
+    assert cause['violator']['bottom_right']['x'] == 0.3 
+    assert cause['violator']['bottom_right']['y'] == 0.4
 
 
 async def test_one_message_all_accessories_present_generates_no_alerts(triggers):
@@ -129,12 +138,14 @@ async def test_vest_alone_with_no_people_in_room_has_no_alert(triggers):
     alerts =  pas.apply_triggers(triggers, message_list)
     assert len(alerts) == 0, f'Expected no alerts; vest in room but no person'
 
+
 async def test_wrong_accessory_causes_alert(triggers):
     msg = make_message('one_person_with_vest')
-    msg['ObjectDetection'][0]['ObjectDetection'][0]['label'] = 'skateboard' # not a vest
+    msg['object_detection'][0]['object_detection'][0]['label'] = 'skateboard' # not a vest
     message_list = make_message_list([msg])
     alerts =  pas.apply_triggers(triggers, message_list)
     assert len(alerts) == 1, f'Expected alert because no vest, only skateboard'
+
 
 async def test_two_messages_only_looks_at_second_for_alert(triggers):
     message_list = make_message_list([
@@ -144,12 +155,33 @@ async def test_two_messages_only_looks_at_second_for_alert(triggers):
     alerts =  pas.apply_triggers(triggers, message_list)
     assert len(alerts) == 0, f'Expected only last message to be viewed and no alert, alert: {alerts[0]}'
 
-async def test_message_with_no_people_gives_no_alert(triggers):
+async def test_message_with_no_people_gives_no_alert(triggers, caplog):
     message_list = make_message_list([
         make_message('nobody_and_nothing'),
     ])
     alerts =  pas.apply_triggers(triggers, message_list)
     assert len(alerts) == 0, f'Expected no alerts when no objects in view, alert: {alerts[0]}'
+    assert len(caplog.records) == 0, 'Unexpected log message from person-less frame'
+
+
+async def test_can_register_restricted_accessories_from_redis(caplog):
+    class FakeRedis:
+        async def hgetall(self, *args):
+            return {
+                '12345': json.dumps(
+                    {
+                        "monitor_id": "0",
+                        "trigger_id": "0xDEADBEEF",
+                        "trigger_name": "Person with cellphone",
+                        "trigger_condition": "restricted_accessories",
+                        "params": '[{"name":"accessories","value":"cellphone"}]'
+                    }
+                )
+            }    
+    triggers = await pas.get_triggers(FakeRedis())
+    assert len(caplog.records) == 0, 'Expect no errors from restricted_accessories'
+    assert len(triggers) == 1
+    assert triggers[0]['trigger_condition'] == 'restricted_accessories'
 
 
 async def test_trigger_accessory_whitespace_is_stripped():
@@ -251,6 +283,19 @@ async def test_unknown_trigger_condition_fails_correctly(caplog):
     assert 'Ignoring trigger with unsupported condition' in log.getMessage()
     assert 'fake condition' in log.getMessage()
 
+
+def test_no_alerts_if_lookback_buffer_if_room_in_lookback_buffer(triggers):
+    pas.LOOKBACK_FRAMES=5
+    message_list = make_message_list([make_message('one_person_no_accessories')] * 4)
+    alerts =  pas.apply_triggers(triggers, message_list)
+    assert len(alerts) == 0, f'Expected no alerts if only 4 frames of violations: {alerts[0]}'
+
+
+def test_multiple_frames_needed_for_trigger(triggers):
+    pas.LOOKBACK_FRAMES=5
+    message_list = make_message_list([make_message('one_person_no_accessories')] * 5)
+    alerts =  pas.apply_triggers(triggers, message_list)
+    assert len(alerts) == 1, f'Should have one alert with 5 violation frames'
 
 # Time conversion tests
 

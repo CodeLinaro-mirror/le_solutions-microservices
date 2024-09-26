@@ -9,7 +9,7 @@ module.exports.getHealth = async function getHealth (req, res, next, body) {
         // Extremely simple health check for now
         res.status(200).send(`Health Check Passed`);
     } catch (err) {
-        res.status(500).send(`Error updating Job. ${err}`);
+        res.status(501).send(`Server Unhealthy`);
     }
 };
 

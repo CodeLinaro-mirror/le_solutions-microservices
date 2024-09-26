@@ -1,69 +1,46 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
-#!/bin/bash 
 
-docker rmi paapi raapi ras pas redis nginx || true # OK to fail if first run, etc.
+docker rmi paapi raapi cameraapi ras pas redis nginx || true # OK to fail if first run, etc.
 
-if [ $RB2 = 'true' ]; then
-    echo 'building for RB2'
-
-    # PAAPI
-    cd people-analytics-api
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t paapi
-
-    # RAAPI
-    cd ../ra-api
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t raapi
-
-    # NGINX
-    cd ../nginx
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t nginx
-
-    # PA Analytics
-    cd ../people-analytics-server
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t pas
-
-    cd ../region-analytics-server
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t ras
-
-    # Redis
-    cd ../redis
-    docker buildx build --platform=linux/arm64/v8 --load --output type=docker . -t redis
-
-    # Mariadb
-    docker pull --platform=linux/arm64 docker-registry.qualcomm.com/library/mariadb
-
-    cd ../
-    docker save redis nginx docker-registry.qualcomm.com/library/mariadb -o baseImages
-    docker save raapi paapi -o webServerImages
-    docker save ras pas -o analyticsImages
+if [ "$RB2" = "true" ]; then
+    echo "building for RB2"
+    BUILD_CMD="buildx build --platform=linux/arm64/v8 --load --output type=docker"
 else
-    echo 'building local for amd64'
+    echo "building local for amd64"
+    BUILD_CMD="build"
+fi
 
-    # PAAPI
-    cd people-analytics-api
-    docker build . -t paapi
+# PAAPI
+docker $BUILD_CMD -t paapi ../people-analytics/people-analytics-api
 
-    # RAAPI
-    cd ../ra-api
-    docker build . -t raapi
+# RAAPI
+docker $BUILD_CMD -t raapi ../region-analytics/ra-api
 
-    # NGINX
-    cd ../nginx
-    docker build . -t nginx
+# PAS
+docker $BUILD_CMD -t pas ../people-analytics/people-analytics-server
 
-    # PA Analytics
-    cd ../people-analytics-server
-    docker build . -t pas
+# RAS
+docker $BUILD_CMD -t ras ../region-analytics/region-analytics-server
 
-    # Redis
-    cd ../redis
-    docker build . -t redis
+# NGINX
+docker $BUILD_CMD -t nginx ../util/nginx
 
+# Redis
+docker $BUILD_CMD -t redis ../util/redis
+
+# camera api
+docker $BUILD_CMD -t cameraapi ../camera-api
+
+if [ "$RB2" = "true" ]; then
     # Mariadb
-    docker pull docker-registry.qualcomm.com/library/mariadb
+    docker pull --platform=linux/arm64 mariadb
 
-    # Fake Data
-    cd ../fake-object-detect
-    docker build . -t fakedata
+    # Save images to transfer to device
+    docker save redis nginx mariadb -o ../baseImages
+    docker save raapi paapi cameraapi -o ../webServerImages
+    docker save ras pas -o ../analyticsImages
+else
+    # Mariadb
+    docker pull mariadb
 fi

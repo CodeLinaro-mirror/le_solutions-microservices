@@ -52,8 +52,8 @@ class RegionHistory:
         return MAX_LOOKBACK
 
     def add_detections(self, detection_records):
-        # skip processing any records that would just be popped out of history
-        detection_records = detection_records[:MAX_LOOKBACK]
+        # If more than MAX_LOOKBACK new records, look at last MAX_LOOKBACK records
+        detection_records = detection_records[-MAX_LOOKBACK:]
 
         # records are list by frame of dict with k: id (person id), v: record
         for frame in detection_records:
@@ -71,7 +71,6 @@ class RegionHistory:
                     occupants_in_lookback.append(person['id'])
         
         in_region_counts = Counter(occupants_in_lookback) # number of times each person appears in history
-        # print(f'Counts: {counts}')
 
         # if a person is not in the history at all, remove them from occupants
         self._current_occupants &= {*in_region_counts.keys()} # keys: set of ids seen at least once
@@ -91,9 +90,9 @@ class RegionHistory:
             # should be somewhere in history
             for frame in reversed(self._frame_history):
                 if id in frame:
-                    # raise NotImplementedError(frame)
+                    # The alert data per occupant is just the bounding box
                     alert_data.append({
                         'bounding_box': frame[id]['bounding_box']
-                    })
+                        })
                     break
         return alert_data

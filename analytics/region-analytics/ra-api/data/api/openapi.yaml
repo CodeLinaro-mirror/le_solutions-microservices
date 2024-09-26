@@ -43,7 +43,7 @@ tags:
     description: Utility APIs
 security: []
 paths:
-  /health:
+  /healthz:
     get:
       tags:
         - util

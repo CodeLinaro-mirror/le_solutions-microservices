@@ -1,10 +1,26 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
-FROM docker-registry.qualcomm.com/library/python:3.11-alpine
+FROM ubuntu:22.04
 
-COPY requirements.txt .
+# Install Python 3.10, create python group and user.
+RUN apt-get update && \
+    apt-get install -y python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 1234 pythongroup && useradd -u 1234 -g pythongroup python
+
+# Set up venv, set ownership to python user
+RUN python3 -m venv /venv
+ENV PATH=/venv/bin:$PATH
+RUN chown -hR python /venv 
+
+# Install requirements and app as python user
+USER python
+
+WORKDIR /app
+
+COPY --chown=python:python requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY --chown=python:python ./app .
 
 CMD ["python", "people_analytics_server.py"]
