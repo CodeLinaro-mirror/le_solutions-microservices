@@ -8,7 +8,7 @@ qtimlvdetection name=stage_01_postproc threshold=90.0 stabilization=true results
 qtimlvconverter name=stage_02_preproc mode=roi-batch-cumulative \
 qtimlqnn name=stage_02_inference model=/opt/data/libppe_stage2_320x192_act16.so backend=/usr/lib/libQnnHtp.so \
 qtimlvdetection name=stage_02_postproc threshold=51.0 stabilization=true results=10 module=yolov5 labels=/opt/data/yolov5_ppe.labels \
-rtspsrc location=rtsp://admin:qualcomm1@192.168.0.10:554/Streaming/Channels/101 protocols="tcp" ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! queue ! tee name=t_split_1 \
+rtspsrc location=$1 ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
 qtimetamux name=metamux_1 ! queue ! tee name=t_split_2 \

@@ -8,4 +8,4 @@ FROM --platform=arm64 qimsdk:latest
 RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /root/.bashrc
 
 # Add script with mode 777 to /usr/bin
-COPY --chmod=777 ppe.sh /usr/bin
+COPY --chmod=777 qimsdk_ppe.sh /usr/bin
