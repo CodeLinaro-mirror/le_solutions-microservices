@@ -2,7 +2,6 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-
 export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e -v --gst-debug=2 \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimlqnn name=stage_01_inference model=/opt/data/libqnn2.24_PD.so backend=/usr/lib/libQnnHtp.so \

@@ -7,6 +7,7 @@
 # 3. daisy-chain
 # 4. person-detect (restricted-zone)
 # 5. ppe (personal protective equipment)
+# 6. rz (restricted zone with zone overlay)
 
 ARG QIMSDK_IMAGE=qimsdk:latest
 
@@ -21,3 +22,4 @@ COPY --chmod=777 access-control/qimsdk_access_control.sh /usr/bin
 COPY --chmod=777 daisy-chain/qimsdk_daisy_chain.sh /usr/bin
 COPY --chmod=777 person-detect/qimsdk_person_detect.sh /usr/bin
 COPY --chmod=777 ppe/qimsdk_ppe.sh /usr/bin
+COPY --chmod=777 rz/qimsdk_restricted_zone.sh /usr/bin
