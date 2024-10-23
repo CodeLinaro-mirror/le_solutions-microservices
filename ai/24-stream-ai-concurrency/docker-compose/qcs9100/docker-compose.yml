@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 services:
-  qimsdk-microservices:
-    image: qimsdk-microservices
+  qimsdk-docker:
+    image: qimsdk-docker
     container_name: qimsdk_24_stream_ai_concurrency
     hostname: qimsdk_24_stream_ai_concurrency
     user: qimsdk
