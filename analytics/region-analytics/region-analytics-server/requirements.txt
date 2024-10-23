@@ -1,0 +1,4 @@
+# tested with Python 3.11.0rc1
+redis==5.0.8
+async-timeout==4.0.3
+
