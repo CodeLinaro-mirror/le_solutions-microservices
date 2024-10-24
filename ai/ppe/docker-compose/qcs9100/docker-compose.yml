@@ -1,3 +1,6 @@
+# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
 services:
   nginx:
     image: nginx
@@ -61,8 +64,8 @@ services:
     environment:
       - REDIS_HOST=172.17.0.1
     network_mode: "host"
-  qimsdk-microservices:
-    image: qimsdk-microservices
+  qimsdk-docker:
+    image: qimsdk-docker
     container_name: qimsdk_ppe
     hostname: qimsdk_ppe
     user: qimsdk

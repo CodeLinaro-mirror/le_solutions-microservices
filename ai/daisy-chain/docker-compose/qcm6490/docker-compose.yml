@@ -1,6 +1,9 @@
+# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
 services:
-  qimsdk-microservices:
-    image: qimsdk-microservices
+  qimsdk-docker:
+    image: qimsdk-docker
     container_name: qimsdk_daisy_chain
     hostname: qimsdk_daisy_chain
     user: qimsdk
