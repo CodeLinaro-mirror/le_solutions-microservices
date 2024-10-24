@@ -42,7 +42,17 @@ function PAAlertsRedisHook() {
             if (err) {
                 console.error(err);
             } else {
-                await db.insertPAAlert(data);
+                let jsonData = JSON.parse(data);
+
+                let trigger = await db.getPATrigger(jsonData.source_trigger.trigger_id);
+                if (trigger.length == 0 && jsonData.source_trigger.trigger_id == '0xDEADBEEF') {
+                    // No Trigger Sample Alert.
+                    if (process.env.LOG_LEVEL >= 2) {console.debug(`Fake Trigger from PAS has been detected. Ignore`);}
+                }
+                else {
+                    if (process.env.LOG_LEVEL >= 2) {console.debug(`inserting Alert into Database ${data}`);}
+                    await db.insertPAAlert(data);
+                }
             }
         } catch (e) {
             console.error(e.message);

@@ -15,7 +15,7 @@ if [ -z ${RB2+unset} ]; then
 fi
 
 # Run the People Analytics Service; 172.17.0.1 is the default docker bridge IP to the host
-docker run --name pas --net host -e REDIS_HOST=172.17.0.1 -d pas
+docker run --restart always --name pas --net host -e REDIS_HOST=172.17.0.1 -d pas
 
 # Run the People Analytics Web API
-docker run --name paapi --net host -e redisHost=localhost -e mariadbHost=localhost --expose 8080 -d paapi
+docker run --restart always --name paapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8080 -d paapi

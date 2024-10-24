@@ -20,8 +20,10 @@ const config = {
     default_db: process.env.default_db,
     redisHost: process.env.redisHost,
     redisPort: process.env.redisPort,
-    redisPAAlertsChannel: process.env.redisPAAlertsChannel,
-    redisTriggerKey: process.env.PA_TRIGGER_KEY
+    redisRAAlertsChannel: process.env.redisRAAlertsChannel,
+    redisRARegionKey: process.env.RA_REGION_KEY,
+    redisRATriggerKey: process.env.RA_TRIGGER_KEY,
+    redisCameraUpdates: process.env.redisCameraUpdates
 };
 
 module.exports = config;

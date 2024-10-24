@@ -36,17 +36,22 @@ CREATE TABLE IF NOT EXISTS ra_alerts (
         on delete cascade
         on update restrict );
 
+CREATE TABLE IF NOT EXISTS camera_config (
+    camera_name text, camera_id VARCHAR(255) not null unique,
+    rtsp_url text, camera_location text,
+    camera_fov int, camera_direction int);
+
 INSERT IGNORE INTO ra_regions
     (monitor_id, region_id, region_name,
     coordinates) VALUES
     ('0', 'EX_REGION',
-    'Left half of the monitor',
-    '[{"x": 0,"y": 0},{"x": 0.5,"y": 0},{"x": 0.5,"y": 1},{"x": 0, "y":1}]');
+    'Demo Quadrilateral Region',
+    '[{"x":0.20,"y":0.70},{"x":0.45,"y":0.65},{"x":0.55,"y":0.90},{"x":0.25,"y":0.90}]');
 
 INSERT IGNORE INTO ra_triggers
     (region_id, trigger_id, trigger_name,
     trigger_condition) VALUES
-    ('EX_REGION', 'EX_TRIGGER', 'Alert when someone enters or leaves left half of screen',
+    ('EX_REGION', 'EX_TRIGGER', 'Alert when someone enters or leaves Demo Region',
     'occupancy_changed');
 
 INSERT IGNORE INTO ra_alerts

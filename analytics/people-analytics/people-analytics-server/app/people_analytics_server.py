@@ -1,6 +1,8 @@
 # Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
+from collections import deque
+from typing import Dict
 import redis.asyncio as redis
 import asyncio
 import os
@@ -16,15 +18,10 @@ ALERT_PERIOD = os.environ.get('ALERT_PERIOD', 1.0)
 ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'PAAlerts')
 TRIGGER_KEY = os.environ.get('TRIGGER_KEY', 'PATriggers')
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
+LOOKBACK_FRAMES = int(os.environ.get('LOOKBACK_FRAMES', 5))
 
 TIME_DRIFT_LIMIT_SECS = 3.0 # TODO: pull from environment within loop
 seconds_offsets_by_channel : dict[str, float]= {}
-
-# meanings of elements in the ObjectDetection "rectangle" member
-RECT_IDX_TOP = 0
-RECT_IDX_LEFT = 1
-RECT_IDX_BOTTOM = 2
-RECT_IDX_RIGHT = 3
 
 message_list = [] # list of (loop.time(), message)
 logger = logging.getLogger(__file__)
@@ -51,15 +48,15 @@ async def get_triggers(r):
 
     # redis HGETALL returns in format {k : v} where k = trigger_id, v = full trigger in JSON string
     # Convert to list of 
-    triggers = [json.loads(trigger) for trigger in raw_triggers.values()]
+    trigger_objs = [json.loads(trigger) for trigger in raw_triggers.values()]
     supported_trigger_conditions = ['required_accessories', 'restricted_accessories']
 
-    for trigger in triggers:
-        if trigger not in supported_trigger_conditions:
+    triggers = []
+    for trigger in trigger_objs:
+        if trigger['trigger_condition'] not in supported_trigger_conditions:
             logger.warning(f'Ignoring trigger with unsupported condition: "{trigger}"')
-
-    triggers = [t for t in triggers if t['trigger_condition'] in supported_trigger_conditions]
-
+            continue
+        triggers.append(trigger)
     
     if triggers == []:
         logger.info(f'No triggers found at {TRIGGER_KEY}; adding default')
@@ -84,15 +81,30 @@ async def get_triggers(r):
 def convert_msg_timestamp_to_epoch_time(msg_ts, sys_time, channel=None):
     return sys_time # hack to stop drift
 
+frame_history_by_channel : Dict[str, deque] = {}
 
 def apply_triggers(triggers, messages):
     alerts = []
     trigger = None
     message = None # set these for logging in exception handler
     try:
+        # sort messages into frame history by monitor
+        for recv_time, message in messages:
+            channel = message['channel']
+            if channel not in frame_history_by_channel:
+                frame_history_by_channel[channel] = deque(maxlen=LOOKBACK_FRAMES)
+                # TODO: delete stale histories?
+
+            # TODO: optimize by only json-decoding the messages that remain in frame history?
+            msg_obj = json.loads(message['data'], object_hook=lambda d: SimpleNamespace(**d))
+            msg_time = convert_msg_timestamp_to_epoch_time(
+                msg_obj.parameters.timestamp,
+                recv_time,
+                channel)
+            frame_history_by_channel[channel].append( (msg_time, msg_obj) )
+            
         for trigger in triggers:
             id = trigger['monitor_id']
-
             trigger_channel = f'Detection::YoloV8::PPE::{id}'
             trigger_accessories = None
             for param in trigger['params']:
@@ -101,71 +113,88 @@ def apply_triggers(triggers, messages):
                     trigger_accessories = [a.strip() for a in trigger_accessories] # strip all whitespace
                     break
             
-            match trigger['trigger_condition']:
+            # Set "accessory_violations" function depending on the trigger type
+            trigger_condition = trigger['trigger_condition']
+            match trigger_condition:
                 case 'required_accessories':
                     def accessory_violations(detected_accessories):
                         return sorted(set(trigger_accessories) - set(detected_accessories))
                 case 'restricted_accessories':
                     def accessory_violations(detected_accessories):
                         return sorted(set(trigger_accessories) & set(detected_accessories))
-                # No "none" case needed, as only supported triggers are in this list
+                case _:
+                    raise RuntimeError(f'Unexpected trigger condition \'{trigger_condition}\' in trigger {trigger}')
 
-            # TODO: smooth the messages? For now, only look at last message
-            for recv_time, message in [messages[-1]]:
-                # note: first element is the loop timestamp when subscriber got message,
-                # message also contains a timestamp from the source
-                if message['channel'] == trigger_channel:
-                    # this is the last message matching this channel
-                    msg_obj = json.loads(message['data'], object_hook=lambda d: SimpleNamespace(**d))
+            # look for violators in the history buffer
+            recent_frames = frame_history_by_channel[trigger_channel]
 
-                    msg_time = convert_msg_timestamp_to_epoch_time(
-                        msg_obj.Parameters.timestamp,
-                        recv_time,
-                        trigger_channel)
+            # If not enough history in buffer (beginning of stream), no alert
+            if len(recent_frames) < LOOKBACK_FRAMES:
+                continue
 
-                    causes = []
+            # Find violators in each frame
+            def get_violators_in_frame(frame):
+                if not hasattr(frame, 'object_detection'):
+                    return [] # no people = no violators
 
-                    for person in msg_obj.ObjectDetection:
-                        # skip non-person to-level objects
-                        if person.label != 'person' and not person.label.startswith('person'):
-                            continue
+                violators = []
+                for top_object in frame.object_detection:
+                    # If the top-level object is not a person, go to next one
+                    if not top_object.label.startswith('person'):
+                        continue
 
-                        # check for sub-objects aka accessories; if element missing, set it to empty list
-                        sub_objects = person.ObjectDetection if hasattr(person, 'ObjectDetection') else []
+                    # Top object is in fact a person; check for sub-object(s), i.e., accessories
+                    person = top_object
+                    sub_objects = person.object_detection if hasattr(person, 'object_detection') else []
 
-                        # extract labels -- these are the accessories
-                        accessories = [so.label for so in sub_objects]                    
+                    # extract labels -- these are the accessories if any
+                    accessories = [so.label for so in sub_objects]                    
 
-                        # check if all required accessoried are present
-                        violations = accessory_violations(accessories)
-                        if not violations:
-                            continue
+                    # check for any accessory violations
+                    violations = accessory_violations(accessories)
+                    if not violations:
+                        continue # this person is in compliance, check the next person
 
-                        # some required accessories not there
-                        causes.append({
-                            'accessories': ', '.join(violations),
-                            'violator': {
-                                'top_left': {
-                                    'x': person.rectangle[RECT_IDX_LEFT],
-                                    'y': person.rectangle[RECT_IDX_TOP]
-                                },
-                                'bottom_right': {
-                                    'x': person.rectangle[RECT_IDX_RIGHT],
-                                    'y': person.rectangle[RECT_IDX_BOTTOM]
-                                }                                
-                            }
-                        })
-                    
-                    if causes == []:
-                        continue # no alerts triggered
+                    # This person violated the accessory policy; log their rectangle & the violations
+                    violators.append( (person.rectangle, violations) )
+                return violators 
+            
+            violators_by_frame = [get_violators_in_frame(frame) for _, frame in recent_frames] 
 
-                    alerts.append(
-                        {
-                            'source_trigger': trigger,
-                            'time': msg_time,
-                            'causes': causes
-                        }
-                    )
+            # Don't trigger an alert unless all frames in history have a violator
+            if not all(violators_by_frame):
+                continue # at least one frame without violators, continue to next trigger
+
+            # Every frame had at least one violator. Set causes to the last frame.
+            latest_frame_violators = violators_by_frame[-1]
+
+            # Create the causes clause for the response from the
+            # last frame's list of bounding boxes for people and missing
+            # accessories. 
+            # Also convert bounding box from x,y,w,h to x0,y0,x1,y1.
+            causes = [
+                {
+                    'accessories': ', '.join(accessory_violations),
+                    'violator': {
+                        'top_left': {
+                            'x': bb.x,
+                            'y': bb.y
+                        },
+                        'bottom_right': {
+                            'x': bb.x + bb.width,
+                            'y': bb.y + bb.height
+                        }                         
+                    }
+                } for bb, accessory_violations in latest_frame_violators
+            ]
+            msg_time, _ = recent_frames[-1]
+            alerts.append(
+                {
+                    'source_trigger': trigger,
+                    'time': msg_time,
+                    'causes': causes
+                }
+            )
         logger.info(f'Filtered {len(messages)} Detection messages through {len(triggers)} trigger(s), generating {len(alerts)} alert(s)')
         return alerts
     
@@ -176,7 +205,7 @@ def apply_triggers(triggers, messages):
         return []
 
 
-async def check_for_alerts(r : redis.Redis, group : asyncio.TaskGroup):
+async def check_for_alerts(r : redis.Redis):
     global message_list
     if len(message_list) == 0:
         return # no messages
@@ -190,9 +219,9 @@ async def check_for_alerts(r : redis.Redis, group : asyncio.TaskGroup):
     
     for alert in alerts:
         logger.debug(f'Publishing to channel {ALERT_CHANNEL}: {alert}')
-        group.create_task(r.publish(ALERT_CHANNEL, json.dumps(alert)))
+        asyncio.ensure_future(r.publish(ALERT_CHANNEL, json.dumps(alert)))
 
-async def register_pubsub_listener(r: redis.Redis, group: asyncio.TaskGroup):
+async def register_pubsub_listener(r: redis.Redis):
 
     def detection_message_handler(message):
         # called by the pubsub async runner when a message is received
@@ -209,8 +238,7 @@ async def register_pubsub_listener(r: redis.Redis, group: asyncio.TaskGroup):
         else:
             logger.debug('No message from get_message')
         if alert_period_has_elapsed(now):
-            nonlocal group
-            group.create_task(check_for_alerts(r, group))
+            asyncio.ensure_future(check_for_alerts(r))
 
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
@@ -230,12 +258,11 @@ async def async_main():
             logging.info('Got SIGTERM, cancelling listener task..')
             channel_listener_task.cancel()
 
-        async with asyncio.TaskGroup() as group:
-            pubsub = await register_pubsub_listener(r, group)
-            loop = asyncio.get_event_loop()
-            loop.add_signal_handler(signal.SIGTERM, quit_handler)
-            channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
-            await channel_listener_task
+        pubsub = await register_pubsub_listener(r)
+        loop = asyncio.get_event_loop()
+        loop.add_signal_handler(signal.SIGTERM, quit_handler)
+        channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
+        await channel_listener_task
 
     except asyncio.CancelledError:
         logger.info('Got cancelled exception, shutting down..')
@@ -246,6 +273,6 @@ async def async_main():
 if __name__ == "__main__":
 
     # logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(filename)s::%(funcName)s %(message)s')    
-    logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
+    logging.basicConfig(level=LOG_LEVEL, format='%(levelname)s %(message)s')
     asyncio.run(async_main())
     logging.info('Exiting server.')

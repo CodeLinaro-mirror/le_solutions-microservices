@@ -23,23 +23,14 @@ fi
 POPULATEMARIADB="${POPULATEMARIADB:-true}" # set to true unless set otherwise
 
 # Start Mariadb with or without initial data
-if [ $RB2 = "true" ]; then
-    mkdir -p /opt/data/mariadb
-    if [ $POPULATEMARIADB = "true" ]; then
-        echo "Creating database with initial data from init.sql"
-        docker run --name mariadb --net host --hostname mariadb -v /opt/init.sql:/docker-entrypoint-initdb.d/init.sql -v /opt/data/mariadb:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d docker-registry.qualcomm.com/library/mariadb
-    else
-        docker run --name mariadb --net host --hostname mariadb -v /opt/data/mariadb:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d docker-registry.qualcomm.com/library/mariadb
-    fi
-else 
-    if [ $POPULATEMARIADB = "true" ]; then
-        echo "Creating database with initial data from init.sql"
-        cp ./init.sql /local/mnt/workspace/
-        docker run --rm --name mariadb --net host --hostname mariadb -v /local/mnt/workspace/init.sql:/docker-entrypoint-initdb.d/init.sql -v /local/mnt/workspace/mdbtest:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d docker-registry.qualcomm.com/library/mariadb
-    else
-        docker run --rm --name mariadb --net host --hostname mariadb -v /local/mnt/workspace/mdbtest:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d docker-registry.qualcomm.com/library/mariadb
-    fi
+mkdir -p /opt/data/mariadb
+if [ $POPULATEMARIADB = "true" ]; then
+    echo "Creating database with initial data from init.sql"
+    docker run --name mariadb --net host --hostname mariadb -v /opt/init.sql:/docker-entrypoint-initdb.d/init.sql -v /opt/data/mariadb:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d mariadb
+else
+    docker run --name mariadb --net host --hostname mariadb -v /opt/data/mariadb:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=secretpw -d mariadb
 fi
+
 
 # Run the People Analytics Service; 172.17.0.1 is the default docker bridge IP to the host
 docker run --name pas --net host -e REDIS_HOST=172.17.0.1 -d pas
@@ -48,9 +39,11 @@ docker run --name pas --net host -e REDIS_HOST=172.17.0.1 -d pas
 docker run --name ras --net host -e REDIS_HOST=172.17.0.1 -d ras
 
 # Run the People Analytics Web API
-docker run --name paapi --net host -e redisHost=localhost -e mariadbHost=localhost --expose 8080 -d paapi
+docker run --name paapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8080 -d paapi
 
 # Run the Region of Interest Web API
-docker run --name raapi --net host -e redisHost=localhost -e mariadbHost=localhost --expose 8081 -d raapi
+docker run --name raapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8081 -d raapi
+
+docker run --name cameraapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 3000 -d cameraapi
 
 docker run --name nginx --net host -d nginx

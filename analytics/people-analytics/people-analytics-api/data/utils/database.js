@@ -19,8 +19,25 @@ const pool = mariadb.createPool({
 
 async function fetchConn() {
     let conn = await pool.getConnection();
-    // console.debug("Total connections: ", pool.totalConnections(), "Active connections: ", pool.activeConnections(), "Idle connections: ", pool.idleConnections());
+    if (process.env.LOG_LEVEL >= 2) {
+        console.debug("Total connections: ", pool.totalConnections(), "Active connections: ", pool.activeConnections(), "Idle connections: ", pool.idleConnections());
+    }
     return conn;
+}
+
+function cleanInput(data) {
+    // For now escape all apostrophes if type string just in case
+    if (typeof data == 'object') {
+        Object.keys(data).forEach((key) => {
+            if (typeof data[key] == 'string') {
+                data[key] = data[key].replace("'", "''");
+            }
+        });
+
+    } else if (typeof data == 'string') {
+        data = data.replace("'", "''");
+    }
+    return data;
 }
 
 async function insertPATrigger(data) {
@@ -28,6 +45,10 @@ async function insertPATrigger(data) {
     try {
         conn = await fetchConn();
         let paramsString = JSON.stringify(data.params);
+
+        // Escape apostrophes
+        data = cleanInput(data);
+
         const res = await conn.query(`INSERT INTO fov_triggers ` +
             `(monitor_id, trigger_id, trigger_name, trigger_condition, params)` +
             ` value ('${data.monitor_id}', '${data.trigger_id}', '${data.trigger_name}',` + 
@@ -64,6 +85,9 @@ async function getPATriggersByMonitor(data) {
     let conn;
     try {
         conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+
         const res = await conn.query(`SELECT * from fov_triggers where monitor_id = '${data}';`);
         return res;
     } catch (e) {
@@ -78,6 +102,9 @@ async function getPATrigger(data) {
     let conn;
     try {
         conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+
         const res = await conn.query(`SELECT * from fov_triggers where trigger_id = '${data}';`);
         return res;
     } catch (e) {
@@ -92,6 +119,9 @@ async function insertPAAlert(jsonData) {
     let conn;
     try {
         let data = JSON.parse(jsonData);
+        // Escape apostrophes
+        data = cleanInput(data);
+
         let causesString = JSON.stringify(data.causes);
         conn = await fetchConn();
         const res = await conn.query(`INSERT INTO fov_alerts ` +
@@ -110,17 +140,14 @@ async function getAlerts(data) {
     let conn;
     try {
         conn = await fetchConn();
-        console.log("Total connections: ", pool.totalConnections(), "Active connections: ", pool.activeConnections(), "Idle connections: ", pool.idleConnections());
 
         let retVal = [];
-        for await (const id of data.monitorIds) {
-            let rows = await conn.query(`select * FROM fov_alerts fa` +
-                ` inner join fov_triggers ft on fa.source_trigger_id = ft.trigger_id ` +
-                ` WHERE ft.monitor_id = '${id}' AND ` +
-                ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);
-            retVal = [...retVal, ...rows];
-        };
-        // const rows = await conn.query("select * FROM fov_alerts where ");
+        let monMap = data.monitorIds[0].split(",");
+        let rows = await conn.query(`select * FROM fov_alerts fa` +
+            ` inner join fov_triggers ft on fa.source_trigger_id = ft.trigger_id ` +
+            ` WHERE ft.monitor_id IN (${monMap.map(i=>`'${i}'`)}) AND ` +
+            ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);
+        retVal = [...retVal, ...rows];
         return retVal;
     } catch (e) {
         throw e;
@@ -134,8 +161,29 @@ async function removeTrigger(data) {
     let conn;
     try {
         conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+
         const res = await conn.query(`DELETE FROM fov_triggers WHERE ` +
             `trigger_id = '${data}';`);
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function removeAllMonitor(data) {
+    let conn;
+    try {
+        conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+
+        const res = await conn.query(`DELETE FROM fov_triggers WHERE ` +
+            `monitor_id = '${data}';`);
         return res;
     } catch (e) {
         throw e;
@@ -152,5 +200,6 @@ module.exports = {
     getPATrigger,
     insertPAAlert,
     getAlerts,
-    removeTrigger
+    removeTrigger,
+    removeAllMonitor
 };
