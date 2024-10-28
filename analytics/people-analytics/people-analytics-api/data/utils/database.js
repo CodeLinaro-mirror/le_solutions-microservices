@@ -140,10 +140,9 @@ async function getAlerts(data) {
     let conn;
     try {
         conn = await fetchConn();
-
         let retVal = [];
         let monMap = data.monitorIds[0].split(",");
-        let rows = await conn.query(`select * FROM fov_alerts fa` +
+        let rows = await conn.query(`select fa.source_trigger_id, UNIX_TIMESTAMP(fa.time) as time, fa.causes, ft.* FROM fov_alerts fa` +
             ` inner join fov_triggers ft on fa.source_trigger_id = ft.trigger_id ` +
             ` WHERE ft.monitor_id IN (${monMap.map(i=>`'${i}'`)}) AND ` +
             ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);

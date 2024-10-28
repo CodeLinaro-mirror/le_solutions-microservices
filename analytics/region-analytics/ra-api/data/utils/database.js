@@ -249,7 +249,7 @@ async function getAlerts(data) {
         conn = await fetchConn();
         let retVal = [];
         for await (const id of data.monitorIds) {
-            let rows = await conn.query(`select * FROM ra_alerts ra` +
+            let rows = await conn.query(`select ra.monitor_id, ra.source_trigger_id, UNIX_TIMESTAMP(ra.time) as time, ra.occupants, rt.* FROM ra_alerts ra` +
                 ` inner join ra_triggers rt on ra.source_trigger_id = rt.trigger_id ` +
                 ` WHERE ra.monitor_id = '${id}' AND ` +
                 ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);

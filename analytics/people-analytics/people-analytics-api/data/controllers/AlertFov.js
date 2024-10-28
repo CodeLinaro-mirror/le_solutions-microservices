@@ -23,7 +23,7 @@ module.exports.getAllAlerts = async function getAllAlerts (req, res, next, body)
                     "trigger_condition": e.trigger_condition,
                     "params": JSON.parse(e.params)
                 },
-                "time": e.time,
+                "time": parseFloat(e.time).toFixed(3),
                 "causes": JSON.parse(e.causes)
             });
         };

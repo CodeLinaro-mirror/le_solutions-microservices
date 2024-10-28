@@ -18,7 +18,7 @@ info:
     url: https://mysupport.qualcomm.com/supportforums/s/
   license:
     name: BSD-3-Clause-Clear
-  version: '0.0.1'
+  version: '1.0.0'
 servers:
   - url: https://{device-address}/camera-config/v1/api
     description: Server URL

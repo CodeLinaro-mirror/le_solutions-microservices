@@ -22,14 +22,18 @@ info:
     url: https://mysupport.qualcomm.com/supportforums/s/
   license:
     name: BSD-3-Clause-Clear
-  version: '0.0.1'
+  version: '1.0.0'
 servers:
   - url: https://{device-address}/region-analytics/v1/api
     description: Server URL
+    variables:
+      device-address:
+        description: IP address (and port) of the host of the Region Analytics API ingress.
+        default: your.device.ip.here:8080
 
 x-string-constants:
-  - timestamp: &TIMESTAMP_EXAMPLE "2024-01-23T14:56:07.890Z" # ISO-8601 at UTC with 3 decimals of fractional seconds
-  - later_timestamp: &TIMESTAMP_2_EXAMPLE "2024-01-23T16:00:00.000Z" # a later time
+  - timestamp:       &TIMESTAMP_EXAMPLE   1729118760.000 # Epoch time in seconds. May optionally provide fractional seconds
+  - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
   - monitor: &MONITOR_ID_EXAMPLE "camera1"
   - region_id: &REGION_ID_EXAMPLE "{unique-region-id}"
   - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
@@ -298,14 +302,16 @@ paths:
           required: true
           description: Earliest alert to return
           schema:
-            type: string
+            type: number
+            format: double
             example: *TIMESTAMP_EXAMPLE
         - name: toTime
           in: query          
           required: true
           description: Latest alert to return
           schema:
-            type: string
+            type: number
+            format: double
             example: *TIMESTAMP_2_EXAMPLE
 
       responses:
@@ -340,13 +346,14 @@ components:
             $ref: "#/components/schemas/Trigger"
         time:
           description: Timestamp at which alert was generated.
-          type: string
+          type: number
+          format: double
           example: *TIMESTAMP_EXAMPLE
         occupants:
           description: List of occupants within region at time of trigger.
           type: array
           items:
-            $ref: "#/components/schemas/BoundingBox"
+            $ref: "#/components/schemas/Occupant"
       required:
         - monitor_id
         - source_trigger
@@ -357,6 +364,13 @@ components:
       type: array
       items:
         $ref: "#/components/schemas/Alert"
+        
+    Occupant:
+      description: A person in the scene.
+      type: object
+      properties:
+        bounding_box:
+          $ref: "#/components/schemas/BoundingBox"
 
     BoundingBox:
       description: Describe rectangular area by top-left and bottom-right coordinates.

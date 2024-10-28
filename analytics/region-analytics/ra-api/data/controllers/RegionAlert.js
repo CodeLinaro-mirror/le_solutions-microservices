@@ -23,7 +23,7 @@ module.exports.getAllRegionAlerts = async function getAllRegionAlerts (req, res,
                     "trigger_name": e.trigger_name,
                     "trigger_condition": e.trigger_condition,
                 },
-                "time": e.time,
+                "time":  parseFloat(e.time)
             };
 
             // Check for existent of sub objects as each Alert type can be different based on schema
