@@ -20,7 +20,7 @@ info:
     url: https://mysupport.qualcomm.com/supportforums/s/
   license:
     name: BSD-3-Clause-Clear
-  version: '0.0.1'
+  version: '1.0.0'
 servers:
   - url: https://{device-address}/people-analytics/v1/api
     description: Server URL
@@ -30,8 +30,8 @@ servers:
         default: your.device.ip.here:8080
 
 x-string-constants:
-  - timestamp: &TIMESTAMP_EXAMPLE "2024-01-23T14:56:07.890Z" # ISO-8601 at UTC with 3 decimals of fractional seconds
-  - later_timestamp: &TIMESTAMP_2_EXAMPLE "2024-01-23T16:00:00.000Z" # a later time
+  - timestamp:       &TIMESTAMP_EXAMPLE   1729118760.000 # Epoch time in seconds. May optionally provide fractional seconds
+  - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
   - monitor: &MONITOR_EXAMPLE "camera1"
   - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
 
@@ -40,6 +40,8 @@ tags:
     description: Poll historical alerts
   - name: config
     description: Configure triggers which generate alerts
+  - name: health
+    description: Health checks for API service.
 security: []
 paths:
   /config/alerts/fov:
@@ -155,14 +157,16 @@ paths:
           required: true
           description: Earliest alert to return
           schema:
-            type: string
+            type: number
+            format: double
             example: *TIMESTAMP_EXAMPLE
         - name: toTime
           in: query          
           required: true
           description: Latest alert to return
           schema:
-            type: string
+            type: number
+            format: double
             example: *TIMESTAMP_2_EXAMPLE
 
       responses:
@@ -189,7 +193,6 @@ paths:
       responses:
         '200':
           description: Successful health;
-        # TODO: fill in rest of errors
         '405':
           description: Invalid input
       x-swagger-router-controller: Health
@@ -206,7 +209,8 @@ components:
           $ref: "#/components/schemas/Trigger"
         time:
           description: Timestamp at which alert was generated.
-          type: string
+          type: number
+          format: double
           example: *TIMESTAMP_EXAMPLE
         causes:
           description: List of people by bounding box, and what accessories are in violation.
