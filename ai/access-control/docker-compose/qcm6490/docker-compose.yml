@@ -13,6 +13,7 @@ services:
       - WAYLAND_DISPLAY=wayland-1
       - GST_DEBUG_NO_COLOR=1
       - RTSPSRC_URI=${RTSPSRC_URI:-"NULL"}
+      - GST_DEBUG=2
     command: bash qimsdk_access_control.sh $RTSPSRC_URI
     devices:
       - /dev/dri/card0

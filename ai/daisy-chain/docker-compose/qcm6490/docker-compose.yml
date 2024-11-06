@@ -12,6 +12,7 @@ services:
       - XDG_RUNTIME_DIR=/dev/socket/weston
       - WAYLAND_DISPLAY=wayland-1
       - GST_DEBUG_NO_COLOR=1
+      - GST_DEBUG=2
     command: bash qimsdk_daisy_chain.sh
     devices:
       - /dev/dri/card0

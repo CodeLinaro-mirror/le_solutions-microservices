@@ -76,6 +76,7 @@ services:
       - GST_DEBUG_NO_COLOR=1
       - ADSP_LIBRARY_PATH=\"/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;${ADSP_LIBRARY_PATH}\"
       - RTSPSRC_URI=${RTSPSRC_URI:-"NULL"}
+      - GST_DEBUG=2
     command: bash qimsdk_ppe.sh $RTSPSRC_URI
     devices:
       - /dev/dri/card0
