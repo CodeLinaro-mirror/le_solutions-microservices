@@ -11,8 +11,8 @@ services:
     network_mode: "host"
   qimsdk:
     image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/qimsdk:1.0.0
-    container_name: qimsdk-access-control
-    hostname: qimsdk-access-control
+    container_name: qimsdk-restricted-zone
+    hostname: qimsdk-restricted-zone
     user: qimsdk
     restart: always
     environment:
@@ -23,8 +23,9 @@ services:
       - GST_DEBUG=2
       - INPUT_TYPE=${INPUT_TYPE:-video}
       - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.mp4}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.face}:0
-    command: bash qimsdk_access_control.sh
+      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
+      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/models/foot_track_net_quantized.tflite}
+    command: bash qimsdk_restricted_zone.sh
     devices:
       - /dev/dri/card0
       - /dev/dri/renderD128

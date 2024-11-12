@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 services:
-  qimsdk-docker:
-    image: qimsdk-docker
-    container_name: qimsdk_24_stream_ai_concurrency
-    hostname: qimsdk_24_stream_ai_concurrency
+  qimsdk:
+    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/qimsdk:1.0.0
+    container_name: qimsdk-24-stream-ai-concurrency
+    hostname: qimsdk-24-stream-ai-concurrency
     user: qimsdk
     restart: always
     environment:
