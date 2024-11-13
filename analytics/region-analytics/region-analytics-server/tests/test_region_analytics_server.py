@@ -212,7 +212,7 @@ def make_message_list(messages, channel='0'):
         # messages are tuples of (system time, message)
         (0, # system time
             {
-                'channel': 'Detection::YoloV8::RZ::' + channel,
+                'channel': 'detection.rz:' + channel,
                 'data': json.dumps(message)
             }
         )

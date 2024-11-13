@@ -16,11 +16,12 @@ from region_algo import RegionHistory
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 REDIS_PORT = os.environ.get('REDIS_PORT', 6379)
 ALERT_PERIOD = os.environ.get('ALERT_PERIOD', 1.0)
-ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'RAAlerts')
+ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'region-analytics.alerts')
 REGION_KEY = os.environ.get('REGION_KEY', 'RARegions')
 TRIGGER_KEY = os.environ.get('TRIGGER_KEY', 'RATriggers')
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
-CHANNEL_PREIX = os.environ.get('CHANNEL_PREFIX', 'Detection::YoloV8::RZ::')
+DETECTION_CHANNEL_PREFIX = os.environ.get('REDIS_DETECTION_CHANNEL_PREFIX', 'detection.rz') + ':'
+# e.g., monitor 0 would be "detection.rz:0"
 
 TIME_DRIFT_LIMIT_SECS = 3.0 # TODO: pull from environment within loop
 seconds_offsets_by_channel : dict[str, float]= {}
@@ -135,7 +136,7 @@ def apply_triggers(triggers, regions, messages):
         for recv_time, message in messages:
             # first element is time message arrived, second element is Redis payload
             msg_obj = json.loads(message['data'], object_hook=lambda d: SimpleNamespace(**d))
-            monitor = message['channel'][len(CHANNEL_PREIX):] # monitor follows prefix
+            monitor = message['channel'][len(DETECTION_CHANNEL_PREFIX):] # monitor follows prefix
             messages_by_monitor[monitor].append((recv_time, msg_obj))
     except Exception as exc:
         logger.error(f'Error parsing message: {message}')
@@ -290,7 +291,7 @@ async def register_pubsub_listener(r: redis.Redis):
 
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
-    channel_pattern = CHANNEL_PREIX + '*'
+    channel_pattern = DETECTION_CHANNEL_PREFIX + '*'
     await pubsub.psubscribe(**{channel_pattern: detection_message_handler})
     return pubsub
 

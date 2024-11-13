@@ -15,7 +15,7 @@ if [ -z ${RB2+unset} ]; then
 fi
 
 # Run the Region Analytics Service;
-docker run --restart always --name ras --net host -e REDIS_HOST=172.17.0.1 -d ras
+docker run --restart always --name region-analytics-server --net host -e REDIS_HOST=172.17.0.1 -d region-analytics-server
 
 # Run the Region of Interest Web API
-docker run --restart always --name raapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8081 -d raapi
+docker run --restart always --name region-analytics-api --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8081 -d region-analytics-api

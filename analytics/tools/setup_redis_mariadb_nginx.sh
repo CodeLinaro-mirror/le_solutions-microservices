@@ -14,5 +14,5 @@ docker run --restart always --name mariadb --net host --hostname mariadb -v /opt
 # Start nginx
 docker run --restart always --name nginx --net host -d nginx
 
-# Start cameraapi
-docker run --restart always --name cameraapi --net host -e redisHost=localhost -e mariadbHost=localhost --expose 3000 -d cameraapi
+# Start camera-api
+docker run --restart always --name camera-api --net host -e redisHost=localhost -e mariadbHost=localhost --expose 3000 -d camera-api

@@ -15,10 +15,12 @@ import signal
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 REDIS_PORT = os.environ.get('REDIS_PORT', 6379)
 ALERT_PERIOD = os.environ.get('ALERT_PERIOD', 1.0)
-ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'PAAlerts')
+ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'people-analytics.alerts')
 TRIGGER_KEY = os.environ.get('TRIGGER_KEY', 'PATriggers')
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
 LOOKBACK_FRAMES = int(os.environ.get('LOOKBACK_FRAMES', 5))
+DETECTION_CHANNEL_PREFIX = os.environ.get('REDIS_DETECTION_CHANNEL_PREFIX', 'detection.ppe') + ':'
+# e.g., monitor 0 channel would be "detection.ppe:0"
 
 TIME_DRIFT_LIMIT_SECS = 3.0 # TODO: pull from environment within loop
 seconds_offsets_by_channel : dict[str, float]= {}
@@ -105,7 +107,7 @@ def apply_triggers(triggers, messages):
             
         for trigger in triggers:
             id = trigger['monitor_id']
-            trigger_channel = f'Detection::YoloV8::PPE::{id}'
+            trigger_channel = DETECTION_CHANNEL_PREFIX + id
             trigger_accessories = None
             for param in trigger['params']:
                 if param['name'] == 'accessories':
@@ -242,7 +244,7 @@ async def register_pubsub_listener(r: redis.Redis):
 
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
-    await pubsub.psubscribe(**{'Detection::YoloV8::PPE::*': detection_message_handler})
+    await pubsub.psubscribe(**{DETECTION_CHANNEL_PREFIX + '*': detection_message_handler})
     return pubsub
 
 async def async_main():

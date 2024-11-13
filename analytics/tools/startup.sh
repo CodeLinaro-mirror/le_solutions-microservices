@@ -33,17 +33,17 @@ fi
 
 
 # Run the People Analytics Service; 172.17.0.1 is the default docker bridge IP to the host
-docker run --name pas --net host -e REDIS_HOST=172.17.0.1 -d pas
+docker run --name people-analytics-server --net host -e REDIS_HOST=172.17.0.1 -d people-analytics-server
 
 # Run the Region Analytics Service;
-docker run --name ras --net host -e REDIS_HOST=172.17.0.1 -d ras
+docker run --name region-analytics-server --net host -e REDIS_HOST=172.17.0.1 -d region-analytics-server
 
 # Run the People Analytics Web API
-docker run --name paapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8080 -d paapi
+docker run --name people-analytics-api --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8080 -d people-analytics-api
 
 # Run the Region of Interest Web API
-docker run --name raapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8081 -d raapi
+docker run --name region-analytics-api --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 8081 -d region-analytics-api
 
-docker run --name cameraapi --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 3000 -d cameraapi
+docker run --name camera-api --net host -e redisHost=localhost -e mariadbHost=localhost -e mariadbPass=secretpw --expose 3000 -d camera-api
 
 docker run --name nginx --net host -d nginx

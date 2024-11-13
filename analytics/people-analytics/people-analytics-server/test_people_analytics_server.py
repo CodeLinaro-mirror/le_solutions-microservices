@@ -80,7 +80,7 @@ def make_message_list(messages, channel='0'):
         # messages are tuples of (loop_timestamp, message)
         (0, # loop timestamp
             {
-                'channel': 'Detection::YoloV8::PPE::' + channel,
+                'channel': 'detection.ppe:' + channel,
                 'data': json.dumps(message)
             }
         )
