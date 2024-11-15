@@ -16,6 +16,14 @@ const pool = mariadb.createPool({
     database: config.default_db,
 });
 
+async function fetchConn() {
+    let conn = await pool.getConnection();
+    if (process.env.LOG_LEVEL >= 2) {
+        console.debug("Total connections: ", pool.totalConnections(), "Active connections: ", pool.activeConnections(), "Idle connections: ", pool.idleConnections());
+    }
+    return conn;
+}
+
 function cleanInput(data) {
     // For now escape all apostrophes if type string just in case
     if (typeof data == 'object') {
@@ -61,7 +69,7 @@ async function insertNewCamera(data) {
     let conn;
     try {
         data = cleanInput(data);
-        conn = await pool.getConnection();
+        conn = await fetchConn();
         const res = await conn.query(`INSERT INTO camera_config ` +
             `(camera_name, camera_id, rtsp_url, camera_location, camera_fov, camera_direction)` +
             ` value ('${data.camera_name}', '${data.camera_id}', '${data.rtsp_url}',` + 
@@ -81,7 +89,7 @@ async function insertNewCamera(data) {
 async function getAllCameras() {
     let conn;
     try {
-        conn = await pool.getConnection();
+        conn = await fetchConn();
         const res = await conn.query(`SELECT * from camera_config;`);
         conn.end();
         return res;
@@ -96,7 +104,7 @@ async function getCameraById(data) {
     let conn;
     try {
         data = cleanInput(data);
-        conn = await pool.getConnection();
+        conn = await fetchConn();
         const res = await conn.query(`SELECT * from camera_config where camera_id = '${data}';`);
         conn.end();
         return res;
@@ -109,7 +117,7 @@ async function removeCamera(data) {
     let conn;
     try {
         data = cleanInput(data);
-        conn = await pool.getConnection();
+        conn = await fetchConn();
         const res = await conn.query(`DELETE FROM camera_config WHERE ` +
             `camera_id = '${data}';`);
         conn.end();
@@ -122,7 +130,7 @@ async function removeCamera(data) {
 async function updateCameraById(data) {
     let conn;
     try {
-        conn = await pool.getConnection();
+        conn = await fetchConn();
         let queryString = makeUpdateQuery(data);
         const res = await conn.query(queryString);
         console.log(queryString);
@@ -137,10 +145,69 @@ async function updateCameraById(data) {
         throw e;
     }
 }
+
+async function initializeCheckTables() {
+    let conn;
+    try {
+        let res = [];
+        res.push(await createDatabase());
+        res.push(await createCameraTable());
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createDatabase() {
+    let conn;
+    try {
+        const dbpool = mariadb.createPool({
+            host: config.mariadbHost,
+            port: config.mariadbPort,
+            user: config.mariadbUser, 
+            password: config.mariadbPass
+        });
+        
+        conn = await dbpool.getConnection();
+
+        const res = await conn.query(`CREATE DATABASE IF NOT EXISTS iot_solutions;`);
+        if (res.affectedRows == 1)
+            console.log("iot_solutions database created");
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createCameraTable() {
+    let conn;
+    try {
+        conn = await fetchConn();
+
+        const res = await conn.query(`CREATE TABLE IF NOT EXISTS camera_config ` +
+            `(camera_name text, camera_id VARCHAR(255) not null unique, ` +
+            `rtsp_url text, camera_location text, ` +
+            `camera_fov int, camera_direction int);`);
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
 module.exports = {
     insertNewCamera,
     getAllCameras,
     getCameraById,
     removeCamera,
-    updateCameraById
+    updateCameraById,
+    initializeCheckTables
 };

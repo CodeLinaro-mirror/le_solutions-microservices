@@ -6,15 +6,13 @@ FROM ubuntu:22.04
 RUN apt-get update && \
     apt-get install -y python3-venv && \
     rm -rf /var/lib/apt/lists/*
-RUN groupadd -g 1234 pythongroup && useradd -u 1234 -g pythongroup python
+RUN groupadd -g 1234 python && useradd -u 1234 -g python python
 
 # Set up venv, set ownership to python user
 RUN python3 -m venv /venv
 ENV PATH=/venv/bin:$PATH
 RUN chown -hR python /venv 
 
-# Install requirements and app as python user
-USER python
 
 WORKDIR /app
 
@@ -23,4 +21,5 @@ RUN pip install -r requirements.txt
 
 COPY --chown=python:python ./app .
 
+USER python
 CMD ["python", "people_analytics_server.py"]

@@ -21,6 +21,7 @@ var options = {
 
 (async () => {
     try {
+        await utils.initializeDB();
         await utils.populateRedis();
     } catch (e) {
         console.error('Error populating redis');

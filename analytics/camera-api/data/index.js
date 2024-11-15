@@ -6,6 +6,7 @@
 
 var path = require('path');
 var http = require('http');
+const utils = require('./utils/utils');
 
 var oas3Tools = require('oas3-tools');
 var serverPort = 3000;
@@ -16,6 +17,15 @@ var options = {
         controllers: path.join(__dirname, './controllers')
     },
 };
+
+(async () => {
+    try {
+        await utils.initializeDB();
+    } catch (e) {
+        console.error('Error intializing Database');
+        gracefulshutdown();
+    }
+})();
 
 var expressAppConfig = oas3Tools.expressAppConfig(path.join(__dirname, 'api/openapi.yaml'), options);
 var app = expressAppConfig.getApp();

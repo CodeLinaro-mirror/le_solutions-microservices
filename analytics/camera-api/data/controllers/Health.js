@@ -6,10 +6,15 @@
 
 module.exports.getHealth = async function getHealth (req, res, next, body) {
     try {
-        // Extremely simple health check for now
-        res.status(200).send(`Health Check Passed`);
+        // Check if Database and tables have properly been initialized
+        let dbCheck = await db.initializeCheckTables();
+        if (dbCheck.length == 2) {
+            res.status(200).send(`Health Check Passed`);
+        } else {
+            res.status(500).send(`Problem initializing Database tables. Is the server available?`);
+        }
     } catch (err) {
-        res.status(500).send(`Error updating Job. ${err}`);
+        res.status(500).send(`Problem setting up. Info: ${err}`);
     }
 };
 

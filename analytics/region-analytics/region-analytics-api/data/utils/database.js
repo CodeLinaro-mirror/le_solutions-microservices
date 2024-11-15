@@ -45,7 +45,7 @@ async function insertRARegion(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`INSERT INTO ra_regions ` +
+        const res = await conn.query(`INSERT INTO region_analytics_regions ` +
             `(monitor_id, region_id, region_name, coordinates)` +
             ` value ('${data.monitor_id}', '${data.region_id}', '${data.region_name}', ` +
             `'${coordinatesString}');`);
@@ -71,7 +71,7 @@ async function insertRATrigger(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`INSERT INTO ra_triggers ` +
+        const res = await conn.query(`INSERT INTO region_analytics_triggers ` +
             `(region_id, trigger_id, trigger_name, trigger_condition, params)` +
             ` value ('${data.region_id}', '${data.trigger_id}', '${data.trigger_name}',` + 
             `'${data.trigger_condition}', '${paramsString}');`);
@@ -93,7 +93,7 @@ async function getAllRARegions() {
     let conn;
     try {
         conn = await fetchConn();
-        const res = await conn.query(`SELECT * from ra_regions;`);
+        const res = await conn.query(`SELECT * from region_analytics_regions;`);
         return res;
     } catch (e) {
         throw e;
@@ -107,7 +107,7 @@ async function getAllRATriggers() {
     let conn;
     try {
         conn = await fetchConn();
-        const res = await conn.query(`SELECT * from ra_triggers;`);
+        const res = await conn.query(`SELECT * from region_analytics_triggers;`);
         let triggersRet = [];
         for await (let T of res) {
             if (T.params != null && T.params != undefined && T.params != 'undefined') {
@@ -133,7 +133,7 @@ async function getRARegionsByMonitor(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`SELECT * from ra_regions where monitor_id = '${data}';`);
+        const res = await conn.query(`SELECT * from region_analytics_regions where monitor_id = '${data}';`);
         return res;
     } catch (e) {
         throw e;
@@ -150,7 +150,7 @@ async function getRATriggersByRegion(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`SELECT * from ra_triggers where region_id = '${data}';`);
+        const res = await conn.query(`SELECT * from region_analytics_triggers where region_id = '${data}';`);
         return res;
     } catch (e) {
         throw e;
@@ -167,8 +167,8 @@ async function getRATriggersByMonitor(data) {
         // Escape apostrophes
         data = cleanInput(data);
         const res = await conn.query(`select rt.region_id, rt.trigger_id, rt.trigger_name, `+
-                `rt.trigger_condition, rt.params FROM ra_triggers rt` +
-                ` inner join ra_regions rr on rt.region_id = rr.region_id ` +
+                `rt.trigger_condition, rt.params FROM region_analytics_triggers rt` +
+                ` inner join region_analytics_regions rr on rt.region_id = rr.region_id ` +
                 ` WHERE rr.monitor_id = '${data}';`);
         let triggersRet = [];
         for await (let T of res) {
@@ -195,7 +195,7 @@ async function getRARegion(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`SELECT * from ra_regions where region_id = '${data}';`);
+        const res = await conn.query(`SELECT * from region_analytics_regions where region_id = '${data}';`);
         return res;
     } catch (e) {
         throw e;
@@ -212,7 +212,7 @@ async function getRATrigger(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`SELECT * from ra_triggers where trigger_id = '${data}';`);
+        const res = await conn.query(`SELECT * from region_analytics_triggers where trigger_id = '${data}';`);
         return res;
     } catch (e) {
         throw e;
@@ -231,7 +231,7 @@ async function insertRAAlert(jsonData) {
         data = cleanInput(data);
 
         conn = await fetchConn();
-        const res = await conn.query(`INSERT INTO ra_alerts ` +
+        const res = await conn.query(`INSERT INTO region_analytics_alerts ` +
             `(monitor_id, source_trigger_id, time, occupants)` +
             ` value ('${data.monitor_id}', '${data.source_trigger.trigger_id}', `+
             `FROM_UNIXTIME(${data.time}), '${causesString}');`);
@@ -249,8 +249,8 @@ async function getAlerts(data) {
         conn = await fetchConn();
         let retVal = [];
         for await (const id of data.monitorIds) {
-            let rows = await conn.query(`select ra.monitor_id, ra.source_trigger_id, UNIX_TIMESTAMP(ra.time) as time, ra.occupants, rt.* FROM ra_alerts ra` +
-                ` inner join ra_triggers rt on ra.source_trigger_id = rt.trigger_id ` +
+            let rows = await conn.query(`select ra.monitor_id, ra.source_trigger_id, UNIX_TIMESTAMP(ra.time) as time, ra.occupants, rt.* FROM region_analytics_alerts ra` +
+                ` inner join region_analytics_triggers rt on ra.source_trigger_id = rt.trigger_id ` +
                 ` WHERE ra.monitor_id = '${id}' AND ` +
                 ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);
             retVal = [...retVal, ...rows];
@@ -271,7 +271,7 @@ async function removeRegion(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`DELETE FROM ra_regions WHERE ` +
+        const res = await conn.query(`DELETE FROM region_analytics_regions WHERE ` +
             `region_id = '${data}';`);
         return res;
     } catch (e) {
@@ -289,7 +289,7 @@ async function removeTrigger(data) {
         // Escape apostrophes
         data = cleanInput(data);
         
-        const res = await conn.query(`DELETE FROM ra_triggers WHERE ` +
+        const res = await conn.query(`DELETE FROM region_analytics_triggers WHERE ` +
             `trigger_id = '${data}';`);
         return res;
     } catch (e) {
@@ -307,7 +307,7 @@ async function removeAllMonitor(data) {
         // Escape apostrophes
         data = cleanInput(data);
 
-        const res = await conn.query(`DELETE FROM ra_regions WHERE ` +
+        const res = await conn.query(`DELETE FROM region_analytics_regions WHERE ` +
             `monitor_id = '${data}';`);
         return res;
     } catch (e) {
@@ -317,6 +317,107 @@ async function removeAllMonitor(data) {
         if (conn) conn.end();
     }
 }
+
+async function initializeCheckTables() {
+    let conn;
+    try {
+        let res = [];
+        res.push(await createDatabase());
+        res.push(await createRegionsTable());
+        res.push(await createTriggersTable());
+        res.push(await createAlertsTable());
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createDatabase() {
+    let conn;
+    try {
+        const dbpool = mariadb.createPool({
+            host: config.mariadbHost,
+            port: config.mariadbPort,
+            user: config.mariadbUser, 
+            password: config.mariadbPass
+        });
+        
+        conn = await dbpool.getConnection();
+
+        const res = await conn.query(`CREATE DATABASE IF NOT EXISTS iot_solutions;`);
+        if (res.affectedRows == 1)
+            console.log("iot_solutions database created");
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createRegionsTable() {
+    let conn;
+    try {
+        conn = await fetchConn();
+
+        const res = await conn.query(`CREATE TABLE IF NOT EXISTS region_analytics_regions ` +
+            `(monitor_id text, region_id VARCHAR(255) unique not null, ` +
+            `region_name text, coordinates text);`);
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createTriggersTable() {
+    let conn;
+    try {
+        conn = await fetchConn();
+
+        const res = await conn.query(`CREATE TABLE IF NOT EXISTS region_analytics_triggers ` +
+            `(region_id VARCHAR(255) not null, ` +
+            `trigger_id VARCHAR(255) unique not null, trigger_name text, ` +
+            `trigger_condition text, params text, ` +
+            `FOREIGN KEY (region_id) REFERENCES region_analytics_regions (region_id) ` +
+            `on delete cascade ` +
+            `on update restrict);`);
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createAlertsTable() {
+    let conn;
+    try {
+        conn = await fetchConn();
+
+        const res = await conn.query('CREATE TABLE IF NOT EXISTS region_analytics_alerts ' +
+            '(monitor_id text, source_trigger_id VARCHAR(255) not null, ' +
+            'time datetime(6), occupants text, ' +
+            'CONSTRAINT `region_analytics_trigger_alerts_fk` ' +
+            'FOREIGN KEY (source_trigger_id) REFERENCES region_analytics_triggers (trigger_id) ' +
+            'on delete cascade ' +
+            'on update RESTRICT );');
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
 module.exports = {
     insertRARegion,
     insertRATrigger,
@@ -331,5 +432,6 @@ module.exports = {
     getAlerts,
     removeRegion,
     removeTrigger,
-    removeAllMonitor
+    removeAllMonitor,
+    initializeCheckTables
 };

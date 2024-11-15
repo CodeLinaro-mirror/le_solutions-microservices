@@ -48,7 +48,19 @@ async function cameraUpdates() {
     });
 }
 
+async function initializeDB() {
+    try {
+        console.log("Info: Creating Tables in DB if they do not exist");
+        let dbCheck = await db.initializeCheckTables();
+        console.debug(dbCheck);
+    } catch (e) {
+        console.error(e);
+        throw new Error({msg: e.message});
+    }
+}
+
 module.exports = {
     populateRedis,
-    cameraUpdates
+    cameraUpdates,
+    initializeDB
 };
