@@ -86,8 +86,8 @@ services:
       - INPUT_TYPE=${INPUT_TYPE:-video}
       - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.mp4}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.ppe}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/models/foot_track_net_quantized.tflite}
-      - MODEL_PATH_PPE=${MODEL_PATH_PPE:-/opt/models/gear_guard_net_quantized.tflite}
+      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/data/foot_track_net_quantized.tflite}
+      - MODEL_PATH_PPE=${MODEL_PATH_PPE:-/opt/data/gear_guard_net_quantized.tflite}
     command: bash qimsdk_ppe.sh
     devices:
       - /dev/dri/card0

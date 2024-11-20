@@ -86,7 +86,7 @@ services:
       - INPUT_TYPE=${INPUT_TYPE:-video}
       - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.mp4}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/models/foot_track_net_quantized.tflite}
+      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/data/foot_track_net_quantized.tflite}
     command: bash qimsdk_person_detect.sh
     devices:
       - /dev/dri/card0
