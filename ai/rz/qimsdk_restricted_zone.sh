@@ -11,9 +11,9 @@ rtspsrc location=$INPUT_URL ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
 qtimetamux name=metamux_1 ! queue  ! qtiobjtracker ! queue ! qtirestrictedzonedbg zone-config="params,zone1=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,zone2=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>;" ! queue ! qtivoverlay masks="{(structure)\"Zone1,polygon=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,color=0x7F00007F;\",(structure)\"Zone2,polygon=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>,color=0x7F00007F;\"}" ! queue ! tee name=t_split_2 \
-t_split_2. ! queue ! waylandsink async=false name=display sync=false fullscreen=true \
+t_split_2. ! queue ! waylandsink sync=false async=false fullscreen=true \
 t_split_2. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
-t_split_2. ! queue ! v4l2h264enc name=encoder capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
+t_split_2. ! queue ! v4l2h264enc capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
 
 else
 
@@ -25,8 +25,8 @@ filesrc location=$INPUT_URL ! qtdemux ! h264parse config-interval=1 ! v4l2h264de
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
 qtimetamux name=metamux_1 ! queue  ! qtiobjtracker ! queue ! qtirestrictedzonedbg zone-config="params,zone1=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,zone2=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>;" ! queue ! qtivoverlay masks="{(structure)\"Zone1,polygon=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,color=0x7F00007F;\",(structure)\"Zone2,polygon=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>,color=0x7F00007F;\"}" ! queue ! tee name=t_split_2 \
-t_split_2. ! queue ! waylandsink async=false name=display sync=false fullscreen=true \
+t_split_2. ! queue ! waylandsink sync=true async=false fullscreen=true \
 t_split_2. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
-t_split_2. ! queue ! v4l2h264enc name=encoder capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
+t_split_2. ! queue ! v4l2h264enc capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
 
 fi

@@ -50,7 +50,7 @@ export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 &&
     sink_45::position="<768, 864>" sink_45::dimensions="<384, 216>" \
     sink_46::position="<1152, 864>" sink_46::dimensions="<384, 216>" \
     sink_47::position="<1536, 864>" sink_47::dimensions="<384, 216>" \
-    mix. ! queue ! waylandsink enable-last-sample=false async=true sync=false fullscreen=true \
+    mix. ! queue ! waylandsink async=false sync=true fullscreen=true \
     filesrc location=/opt/data/Draw_1080p_180s_30FPS.mp4 ! qtdemux ! queue ! h264parse ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! queue ! tee name=split0 ! queue ! mix. \
     filesrc location=/opt/data/Carview_1080p_180s_30FPS.MOV ! qtdemux ! queue ! h264parse ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! queue ! tee name=split1 ! queue ! mix. \
     filesrc location=/opt/data/Street_Bridge_1080p_180s_30FPS.MOV ! qtdemux ! queue ! h264parse ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! queue ! tee name=split2 ! queue ! mix. \

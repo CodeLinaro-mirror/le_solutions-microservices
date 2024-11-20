@@ -18,8 +18,8 @@ t_split_2. ! queue ! metamux_2. \
 t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_inference. stage_02_inference. ! queue ! stage_02_postproc. stage_02_postproc. ! text/x-raw ! queue ! metamux_2. \
 qtimetamux name=metamux_2 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_3 \
 t_split_3. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false  channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
-t_split_3. ! queue ! waylandsink name=display x=0 y=540 width=960 height=540 sync=false async=false fullscreen=true \
-t_split_3. ! queue ! v4l2h264enc name=encoder capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
+t_split_3. ! queue ! waylandsink sync=false async=false fullscreen=true \
+t_split_3. ! queue ! v4l2h264enc capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
 
 else
 
@@ -38,7 +38,7 @@ t_split_2. ! queue ! metamux_2. \
 t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_inference. stage_02_inference. ! queue ! stage_02_postproc. stage_02_postproc. ! text/x-raw ! queue ! metamux_2. \
 qtimetamux name=metamux_2 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_3 \
 t_split_3. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false  channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
-t_split_3. ! queue ! waylandsink name=display x=0 y=540 width=960 height=540 sync=false async=false fullscreen=true \
-t_split_3. ! queue ! v4l2h264enc name=encoder capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
+t_split_3. ! queue ! waylandsink sync=true async=false fullscreen=true \
+t_split_3. ! queue ! v4l2h264enc capture-io-mode=5 output-io-mode=5 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
 
 fi
