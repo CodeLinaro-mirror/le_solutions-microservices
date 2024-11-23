@@ -3,7 +3,8 @@
 
 services:
   qimsdk:
-    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/qimsdk:1.0.0
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    platform: arm64
     container_name: qimsdk-daisy-chain
     hostname: qimsdk-daisy-chain
     user: qimsdk
@@ -12,6 +13,7 @@ services:
       - XDG_RUNTIME_DIR=/dev/socket/weston
       - WAYLAND_DISPLAY=wayland-1
       - GST_DEBUG_NO_COLOR=1
+      - ADSP_LIBRARY_PATH="/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;${ADSP_LIBRARY_PATH}"
       - GST_DEBUG=2
     command: bash qimsdk_daisy_chain.sh
     devices:
@@ -23,6 +25,7 @@ services:
       - /dev/dma_heap/system
       - /dev/dma_heap/qcom,system
       - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
     volumes:
       - /usr/lib/libatomic.so.1:/usr/lib/libatomic.so.1
       - /usr/lib/libatomic.so.1.2.0:/usr/lib/libatomic.so.1.2.0
@@ -37,7 +40,7 @@ services:
       - /usr/lib/libSnpeDspV66Stub.so:/usr/lib/libSnpeDspV66Stub.so
       - /usr/lib/libSnpeHta.so:/usr/lib/libSnpeHta.so
       - /usr/lib/libSnpeHtpPrepare.so:/usr/lib/libSnpeHtpPrepare.so
-      - /usr/lib/libSnpeHtpV68Stub.so:/usr/lib/libSnpeHtpV68Stub.so
+      - /usr/lib/libSnpeHtpV73Stub.so:/usr/lib/libSnpeHtpV73Stub.so
       - /usr/lib/libQnnChrometraceProfilingReader.so:/usr/lib/libQnnChrometraceProfilingReader.so
       - /usr/lib/libQnnGpu.so:/usr/lib/libQnnGpu.so
       - /usr/lib/libQnnHtpProfilingReader.so:/usr/lib/libQnnHtpProfilingReader.so
@@ -54,10 +57,10 @@ services:
       - /usr/lib/libQnnGpuProfilingReader.so:/usr/lib/libQnnGpuProfilingReader.so
       - /usr/lib/libQnnHtpPrepare.so:/usr/lib/libQnnHtpPrepare.so
       - /usr/lib/libQnnSystem.so:/usr/lib/libQnnSystem.so
-      - /usr/lib/libQnnHtpV68Stub.so:/usr/lib/libQnnHtpV68Stub.so
-      - /usr/lib/rfsa/adsp/libSnpeHtpV68Skel.so:/usr/lib/rfsa/adsp/libSnpeHtpV68Skel.so
-      - /usr/lib/rfsa/adsp/libQnnHtpV68Skel.so:/usr/lib/rfsa/adsp/libQnnHtpV68Skel.so
-      - /usr/lib/rfsa/adsp/libQnnHtpV68.so:/usr/lib/rfsa/adsp/libQnnHtpV68.so
+      - /usr/lib/libQnnHtpV73Stub.so:/usr/lib/libQnnHtpV73Stub.so
+      - /usr/lib/rfsa/adsp/libSnpeHtpV73Skel.so:/usr/lib/rfsa/adsp/libSnpeHtpV73Skel.so
+      - /usr/lib/rfsa/adsp/libQnnHtpV73Skel.so:/usr/lib/rfsa/adsp/libQnnHtpV73Skel.so
+      - /usr/lib/rfsa/adsp/libQnnHtpV73.so:/usr/lib/rfsa/adsp/libQnnHtpV73.so
       - /usr/lib/rfsa/adsp/libQnnSaver.so:/usr/lib/rfsa/adsp/libQnnSaver.so
       - /usr/lib/rfsa/adsp/libQnnSystem.so:/usr/lib/rfsa/adsp/libQnnSystem.so
       - /usr/lib/libenv_time.so:/usr/lib/libenv_time.so
@@ -100,6 +103,8 @@ services:
       - /usr/lib/libQnnTFLiteDelegate.so:/usr/lib/libQnnTFLiteDelegate.so
       - /usr/lib/libadsprpc.so:/usr/lib/libadsprpc.so
       - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - /usr/lib/libadsp_default_listener.so:/usr/lib/libadsp_default_listener.so
+      - /usr/lib/libcdsp_default_listener.so:/usr/lib/libcdsp_default_listener.so
       - /usr/lib/libfastcvopt.so:/usr/lib/libfastcvopt.so
       - /usr/lib/rfsa/adsp/libfastcvdsp_skel.so:/usr/lib/rfsa/adsp/libfastcvdsp_skel.so
       - /usr/lib/rfsa/adsp/libfastcvadsp.so:/usr/lib/rfsa/adsp/libfastcvadsp.so
@@ -107,5 +112,8 @@ services:
       - /usr/lib/libdmabufheap.so.0.0.0:/usr/lib/libdmabufheap.so.0.0.0
       - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
       - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
+      - /usr/lib/dsp/cdsp1/libc++.so.1:/usr/lib/dsp/cdsp1/libc++.so.1
+      - /usr/lib/dsp/cdsp1/libc++abi.so.1:/usr/lib/dsp/cdsp1/libc++abi.so.1
+      - /usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4:/usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4
       - /opt/data:/opt/data
     network_mode: "host"

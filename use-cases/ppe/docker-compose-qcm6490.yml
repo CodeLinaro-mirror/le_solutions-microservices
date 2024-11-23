@@ -4,6 +4,7 @@
 services:
   nginx:
     image: nginx:1.27.2-alpine
+    platform: arm64
     container_name: nginx
     restart: always
     network_mode: "host"
@@ -13,6 +14,7 @@ services:
       - ../configs/nginx/solutions/people-analytics-api.conf:/etc/nginx/solutions/people-analytics-api.conf
   mariadb:
     image: mariadb:11.5.2
+    platform: arm64
     container_name: mariadb
     hostname: mariadb
     restart: always
@@ -23,13 +25,15 @@ services:
     network_mode: "host"
   redis:
     image: redis:7.2.4-alpine
+    platform: arm64
     container_name: redis
     hostname: redis
     restart: always
     command: redis-server --loglevel notice
     network_mode: "host"
   camera-api:
-    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/camera-api:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/camera-api:1.0.1
+    platform: arm64
     container_name: camera-api
     depends_on:
       - redis
@@ -45,7 +49,8 @@ services:
       - "3000"
     network_mode: "host"
   people-analytics-api:
-    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/people-analytics-api:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/people-analytics-api:1.0.1
+    platform: arm64
     container_name: people-analytics-api
     depends_on:
       - redis
@@ -62,7 +67,8 @@ services:
       - "8080"
     network_mode: "host"
   people-analytics-server:
-    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/people-analytics-server:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/people-analytics-server:1.0.1
+    platform: arm64
     container_name: people-analytics-server
     depends_on:
       - redis
@@ -73,7 +79,8 @@ services:
       - ALERT_CHANNEL=${REDIS_ALERTS_CHANNEL:-people-analytics.alerts}
     network_mode: "host"
   qimsdk:
-    image: qartifactory-edge.qualcomm.com/qsc-docker-releases/services/iot-microservices/linux/qimsdk:1.0.0
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    platform: arm64
     container_name: qimsdk-ppe
     hostname: qimsdk-ppe
     user: qimsdk
