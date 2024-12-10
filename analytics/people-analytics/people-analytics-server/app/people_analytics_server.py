@@ -128,7 +128,7 @@ def apply_triggers(triggers, messages):
                     raise RuntimeError(f'Unexpected trigger condition \'{trigger_condition}\' in trigger {trigger}')
 
             # look for violators in the history buffer
-            recent_frames = frame_history_by_channel[trigger_channel]
+            recent_frames = frame_history_by_channel.get(trigger_channel, [])
 
             # If not enough history in buffer (beginning of stream), no alert
             if len(recent_frames) < LOOKBACK_FRAMES:
