@@ -13,7 +13,7 @@ services:
       - ../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
       - ../configs/nginx/solutions/people-analytics-api.conf:/etc/nginx/solutions/people-analytics-api.conf
   mariadb:
-    image: mariadb:11.5.2
+    image: mariadb:11.6.2
     platform: arm64
     container_name: mariadb
     hostname: mariadb
