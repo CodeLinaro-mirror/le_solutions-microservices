@@ -297,6 +297,13 @@ def test_multiple_frames_needed_for_trigger(triggers):
     alerts =  pas.apply_triggers(triggers, message_list)
     assert len(alerts) == 1, f'Should have one alert with 5 violation frames'
 
+def test_message_on_different_channel_ignored(triggers, caplog):
+    message_list = make_message_list([make_message('one_person_no_accessories')], channel="not 0")
+    alerts =  pas.apply_triggers(triggers, message_list)
+    assert len(alerts) == 0, f'Should be no alerts because message was for different channel'
+    assert len(caplog.records) == 0, 'Should be no logged errors'
+
+
 # Time conversion tests
 
 # TODO: when real time comes from camera, can remove the sys time override
