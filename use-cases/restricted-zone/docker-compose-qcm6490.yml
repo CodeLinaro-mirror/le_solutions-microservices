@@ -111,6 +111,7 @@ services:
       - /opt/qti/development:/opt/qti/development
       - /usr/lib/libgbm.so:/usr/lib/libgbm.so
       - /usr/lib/libgsl.so:/usr/lib/libgsl.so
+      - /usr/lib/libgsl.so.1:/usr/lib/libgsl.so.1
       - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
       - /usr/lib/libhta_hexagon_runtime_snpe.so:/usr/lib/libhta_hexagon_runtime_snpe.so
       - /usr/lib/libPlatformValidatorShared.so:/usr/lib/libPlatformValidatorShared.so
@@ -147,14 +148,18 @@ services:
       - /usr/lib/libjpeg_internal.so:/usr/lib/libjpeg_internal.so
       - /usr/lib/libtensorflowlite_c.so:/usr/lib/libtensorflowlite_c.so
       - /usr/lib/libtf_logging.so:/usr/lib/libtf_logging.so
+      - /usr/lib/libVideoCtrl.so:/usr/lib/libVideoCtrl.so
       - /usr/lib/libIB2C.so:/usr/lib/libIB2C.so
       - /usr/lib/libEGL_adreno.so:/usr/lib/libEGL_adreno.so
+      - /usr/lib/libEGL_adreno.so.1:/usr/lib/libEGL_adreno.so.1
       - /usr/lib/libGLESv2_adreno.so:/usr/lib/libGLESv2_adreno.so
+      - /usr/lib/libGLESv2_adreno.so.2:/usr/lib/libGLESv2_adreno.so.2
       - /usr/lib/libpropertyvault.so.0:/usr/lib/libpropertyvault.so.0
       - /usr/lib/libpropertyvault.so.0.0.0:/usr/lib/libpropertyvault.so.0.0.0
       - /usr/lib/libwayland-client.so.0:/usr/lib/libwayland-client.so.0
       - /usr/lib/libwayland-egl.so.1:/usr/lib/libwayland-egl.so.1
       - /usr/lib/libadreno_utils.so:/usr/lib/libadreno_utils.so
+      - /usr/lib/libadreno_utils.so.1:/usr/lib/libadreno_utils.so.1
       - /usr/lib/libCB.so:/usr/lib/libCB.so
       - /usr/lib/libEGL.so:/usr/lib/libEGL.so
       - /usr/lib/libEGL.so.1:/usr/lib/libEGL.so.1
@@ -171,6 +176,7 @@ services:
       - /usr/lib/libGLESv2.so.2.0:/usr/lib/libGLESv2.so.2.0
       - /usr/lib/libGLESv2.so.2.0.0:/usr/lib/libGLESv2.so.2.0.0
       - /usr/lib/libllvm-glnext.so:/usr/lib/libllvm-glnext.so
+      - /usr/lib/libllvm-glnext.so.1:/usr/lib/libllvm-glnext.so.1
       - /usr/lib/libllvm-qcom.so:/usr/lib/libllvm-qcom.so
       - /usr/lib/libllvm-qgl.so:/usr/lib/libllvm-qgl.so
       - /usr/lib/libOpenCL.so:/usr/lib/libOpenCL.so
@@ -181,14 +187,24 @@ services:
       - /usr/lib/libQnnTFLiteDelegate.so:/usr/lib/libQnnTFLiteDelegate.so
       - /usr/lib/libadsprpc.so:/usr/lib/libadsprpc.so
       - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - /usr/lib/libcdsprpc.so.1:/usr/lib/libcdsprpc.so.1
+      - /usr/lib/libcdsprpc.so.1.0.0:/usr/lib/libcdsprpc.so.1.0.0
       - /usr/lib/libfastcvopt.so:/usr/lib/libfastcvopt.so
-      - /usr/lib/rfsa/adsp/libfastcvdsp_skel.so:/usr/lib/rfsa/adsp/libfastcvdsp_skel.so
-      - /usr/lib/rfsa/adsp/libfastcvadsp.so:/usr/lib/rfsa/adsp/libfastcvadsp.so
+      - /usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvdsp_skel.so:/usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvdsp_skel.so
+      - /usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvadsp.so:/usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvadsp.so
       - /usr/lib/libfastcvdsp_stub.so:/usr/lib/libfastcvdsp_stub.so
+      - /usr/lib/libfastcvdsp_stub.so.1:/usr/lib/libfastcvdsp_stub.so.1
+      - /usr/lib/libfastcvdsp_stub.so.1.7.1:/usr/lib/libfastcvdsp_stub.so.1.7.1
       - /usr/lib/libdmabufheap.so.0.0.0:/usr/lib/libdmabufheap.so.0.0.0
       - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
       - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
+      - /var/run/pulse/native:/var/run/pulse/native
+      - /usr/lib/libcamera_metadata.so:/usr/lib/libcamera_metadata.so
+      - /tmp/socket/cam_server/:/tmp/socket/cam_server/
+      - /usr/lib/librv.so:/usr/lib/librv.so
+      - /usr/lib/libmv1.so:/usr/lib/libmv1.so
+      - /usr/lib/libmv3.so:/usr/lib/libmv3.so
       - /opt/data:/opt/data
     network_mode: "host"
 volumes:
-  mariadbVolume:
+  mariadbVolume: null
