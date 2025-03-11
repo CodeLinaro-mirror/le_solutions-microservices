@@ -38,11 +38,11 @@ services:
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
     volumes:
+      - /dev/socket/weston:/dev/socket/weston
+      - /var/run/pulse/native:/var/run/pulse/native
+      - /tmp/socket/cam_server/:/tmp/socket/cam_server/
       - /usr/lib/libatomic.so.1:/usr/lib/libatomic.so.1
       - /usr/lib/libatomic.so.1.2.0:/usr/lib/libatomic.so.1.2.0
-      - /dev/socket/weston:/dev/socket/weston
-      - /opt/qti/development:/opt/qti/development
-      - /usr/lib/libgbm.so:/usr/lib/libgbm.so
       - /usr/lib/libgsl.so:/usr/lib/libgsl.so
       - /usr/lib/libgsl.so.1:/usr/lib/libgsl.so.1
       - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
@@ -125,22 +125,21 @@ services:
       - /usr/lib/libadsp_default_listener.so:/usr/lib/libadsp_default_listener.so
       - /usr/lib/libcdsp_default_listener.so:/usr/lib/libcdsp_default_listener.so
       - /usr/lib/libfastcvopt.so:/usr/lib/libfastcvopt.so
+      - /usr/lib/libfastcvopt.so.1:/usr/lib/libfastcvopt.so.1
+      - /usr/lib/libfastcvopt.so.1.8.0:/usr/lib/libfastcvopt.so.1.8.0
       - /usr/lib/dsp/cdsp/cv/v73/LEMANS/libfastcvdsp_skel.so:/usr/lib/dsp/cdsp/cv/v73/LEMANS/libfastcvdsp_skel.so
       - /usr/lib/dsp/cdsp/cv/v73/LEMANS/libfastcvadsp.so:/usr/lib/dsp/cdsp/cv/v73/LEMANS/libfastcvadsp.so
       - /usr/lib/libfastcvdsp_stub.so:/usr/lib/libfastcvdsp_stub.so
       - /usr/lib/libfastcvdsp_stub.so.1:/usr/lib/libfastcvdsp_stub.so.1
-      - /usr/lib/libfastcvdsp_stub.so.1.7.1:/usr/lib/libfastcvdsp_stub.so.1.7.1
+      - /usr/lib/libfastcvdsp_stub.so.1.8.0:/usr/lib/libfastcvdsp_stub.so.1.8.0
       - /usr/lib/libdmabufheap.so.0.0.0:/usr/lib/libdmabufheap.so.0.0.0
       - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
       - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
       - /usr/lib/dsp/cdsp1/libc++.so.1:/usr/lib/dsp/cdsp1/libc++.so.1
       - /usr/lib/dsp/cdsp1/libc++abi.so.1:/usr/lib/dsp/cdsp1/libc++abi.so.1
       - /usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4:/usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4
-      - /var/run/pulse/native:/var/run/pulse/native
       - /usr/lib/libcamera_metadata.so:/usr/lib/libcamera_metadata.so
-      - /tmp/socket/cam_server/:/tmp/socket/cam_server/
       - /usr/lib/librv.so:/usr/lib/librv.so
       - /usr/lib/libmv1.so:/usr/lib/libmv1.so
       - /usr/lib/libmv3.so:/usr/lib/libmv3.so
-      - /opt/data:/opt/data
     network_mode: "host"
