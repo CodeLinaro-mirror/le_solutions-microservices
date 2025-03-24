@@ -2,19 +2,11 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 services:
-  redis:
-    image: redis:7.2.4-alpine
-    platform: arm64
-    container_name: redis
-    hostname: redis
-    restart: always
-    command: redis-server --loglevel notice
-    network_mode: "host"
   qimsdk:
     image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
     platform: arm64
-    container_name: qimsdk-person-foot-track
-    hostname: qimsdk-person-foot-track
+    container_name: qimsdk-daisy-chain
+    hostname: qimsdk-daisy-chain
     user: qimsdk
     restart: always
     environment:
@@ -22,11 +14,7 @@ services:
       - WAYLAND_DISPLAY=wayland-1
       - GST_DEBUG_NO_COLOR=1
       - GST_DEBUG=2
-      - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.mp4}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/opt/data/foot_track_net_quantized.tflite}
-    command: bash qimsdk_restricted_zone.sh
+    command: bash qimsdk_daisy_chain.sh
     devices:
       - /dev/dri/card0
       - /dev/dri/renderD128
@@ -37,11 +25,17 @@ services:
       - /dev/dma_heap/qcom,system
       - /dev/fastrpc-cdsp
     volumes:
+      - /dev/socket/weston:/dev/socket/weston
+      - /tmp/socket/cam_server/:/tmp/socket/cam_server/
+      - /var/run/pulse/native:/var/run/pulse/native
+      - /usr/lib/gbm/default_fmt_alignment.xml:/usr/lib/gbm/default_fmt_alignment.xml
+      - /usr/lib/gbm/msm_gbm.so:/usr/lib/gbm/msm_gbm.so
+      - /usr/lib/gbm/msm_gbm.so.1:/usr/lib/gbm/msm_gbm.so.1
+      - /usr/lib/gbm/msm_gbm.so.1.0.0:/usr/lib/gbm/msm_gbm.so.1.0.0
+      - /usr/lib/libgbm.so.1:/usr/lib/libgbm.so.1
+      - /usr/lib/libgbm.so.1.0.0:/usr/lib/libgbm.so.1.0.0
       - /usr/lib/libatomic.so.1:/usr/lib/libatomic.so.1
       - /usr/lib/libatomic.so.1.2.0:/usr/lib/libatomic.so.1.2.0
-      - /dev/socket/weston:/dev/socket/weston
-      - /opt/qti/development:/opt/qti/development
-      - /usr/lib/libgbm.so:/usr/lib/libgbm.so
       - /usr/lib/libgsl.so:/usr/lib/libgsl.so
       - /usr/lib/libgsl.so.1:/usr/lib/libgsl.so.1
       - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
@@ -82,6 +76,8 @@ services:
       - /usr/lib/libtf_logging.so:/usr/lib/libtf_logging.so
       - /usr/lib/libVideoCtrl.so:/usr/lib/libVideoCtrl.so
       - /usr/lib/libIB2C.so:/usr/lib/libIB2C.so
+      - /usr/lib/libIB2C.so.1:/usr/lib/libIB2C.so.1
+      - /usr/lib/libIB2C.so.1.0:/usr/lib/libIB2C.so.1.0
       - /usr/lib/libEGL_adreno.so:/usr/lib/libEGL_adreno.so
       - /usr/lib/libEGL_adreno.so.1:/usr/lib/libEGL_adreno.so.1
       - /usr/lib/libGLESv2_adreno.so:/usr/lib/libGLESv2_adreno.so
@@ -122,19 +118,21 @@ services:
       - /usr/lib/libcdsprpc.so.1:/usr/lib/libcdsprpc.so.1
       - /usr/lib/libcdsprpc.so.1.0.0:/usr/lib/libcdsprpc.so.1.0.0
       - /usr/lib/libfastcvopt.so:/usr/lib/libfastcvopt.so
+      - /usr/lib/libfastcvopt.so.1:/usr/lib/libfastcvopt.so.1
+      - /usr/lib/libfastcvopt.so.1.8.0:/usr/lib/libfastcvopt.so.1.8.0
       - /usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvdsp_skel.so:/usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvdsp_skel.so
       - /usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvadsp.so:/usr/lib/dsp/cdsp/cv/v68/KODIAK/libfastcvadsp.so
       - /usr/lib/libfastcvdsp_stub.so:/usr/lib/libfastcvdsp_stub.so
       - /usr/lib/libfastcvdsp_stub.so.1:/usr/lib/libfastcvdsp_stub.so.1
-      - /usr/lib/libfastcvdsp_stub.so.1.7.1:/usr/lib/libfastcvdsp_stub.so.1.7.1
+      - /usr/lib/libfastcvdsp_stub.so.1.8.0:/usr/lib/libfastcvdsp_stub.so.1.8.0
       - /usr/lib/libdmabufheap.so.0.0.0:/usr/lib/libdmabufheap.so.0.0.0
       - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
       - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
-      - /var/run/pulse/native:/var/run/pulse/native
       - /usr/lib/libcamera_metadata.so:/usr/lib/libcamera_metadata.so
-      - /tmp/socket/cam_server/:/tmp/socket/cam_server/
       - /usr/lib/librv.so:/usr/lib/librv.so
       - /usr/lib/libmv1.so:/usr/lib/libmv1.so
       - /usr/lib/libmv3.so:/usr/lib/libmv3.so
-      - /opt/data:/opt/data
-    network_mode: "host"
+      - /etc/labels:/etc/labels
+      - /etc/media:/etc/media
+      - /etc/models:/etc/models
+    network_mode: host

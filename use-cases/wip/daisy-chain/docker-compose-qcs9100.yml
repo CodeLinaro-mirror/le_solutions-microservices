@@ -30,6 +30,11 @@ services:
       - /dev/socket/weston:/dev/socket/weston
       - /var/run/pulse/native:/var/run/pulse/native
       - /tmp/socket/cam_server/:/tmp/socket/cam_server/
+      - /usr/lib/gbm/default_fmt_alignment.xml:/usr/lib/gbm/default_fmt_alignment.xml
+      - /usr/lib/gbm/msm_gbm.so:/usr/lib/gbm/msm_gbm.so
+      - /usr/lib/gbm/msm_gbm.so.1:/usr/lib/gbm/msm_gbm.so.1
+      - /usr/lib/gbm/msm_gbm.so.1.0.0:/usr/lib/gbm/msm_gbm.so.1.0.0
+      - /usr/lib/libgbm.so.1:/usr/lib/libgbm.so.1
       - /usr/lib/libatomic.so.1:/usr/lib/libatomic.so.1
       - /usr/lib/libatomic.so.1.2.0:/usr/lib/libatomic.so.1.2.0
       - /usr/lib/libgsl.so:/usr/lib/libgsl.so
@@ -72,6 +77,8 @@ services:
       - /usr/lib/libtf_logging.so:/usr/lib/libtf_logging.so
       - /usr/lib/libVideoCtrl.so:/usr/lib/libVideoCtrl.so
       - /usr/lib/libIB2C.so:/usr/lib/libIB2C.so
+      - /usr/lib/libIB2C.so.1:/usr/lib/libIB2C.so.1
+      - /usr/lib/libIB2C.so.1.0:/usr/lib/libIB2C.so.1.0
       - /usr/lib/libEGL_adreno.so:/usr/lib/libEGL_adreno.so
       - /usr/lib/libEGL_adreno.so.1:/usr/lib/libEGL_adreno.so.1
       - /usr/lib/libGLESv2_adreno.so:/usr/lib/libGLESv2_adreno.so
@@ -131,4 +138,7 @@ services:
       - /usr/lib/librv.so:/usr/lib/librv.so
       - /usr/lib/libmv1.so:/usr/lib/libmv1.so
       - /usr/lib/libmv3.so:/usr/lib/libmv3.so
-    network_mode: "host"
+      - /etc/labels:/etc/labels
+      - /etc/media:/etc/media
+      - /etc/models:/etc/models
+    network_mode: host
