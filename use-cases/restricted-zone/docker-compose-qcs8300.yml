@@ -1,0 +1,222 @@
+# Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+services:
+  nginx:
+    image: nginx:1.27.2-alpine
+    platform: arm64
+    container_name: nginx
+    restart: always
+    network_mode: host
+    volumes:
+      - ../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
+      - ../configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
+  mariadb:
+    image: mariadb:11.6.2
+    platform: arm64
+    container_name: mariadb
+    hostname: mariadb
+    restart: always
+    volumes:
+      - mariadbVolume:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=secretpw
+    network_mode: host
+  redis:
+    image: redis:7.2.4-alpine
+    platform: arm64
+    container_name: redis
+    hostname: redis
+    restart: always
+    command: redis-server --loglevel notice
+    network_mode: host
+  camera-api:
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/camera-api:1.0.1
+    platform: arm64
+    container_name: camera-api
+    depends_on:
+      - redis
+      - mariadb
+      - nginx
+    restart: always
+    environment:
+      - redisHost=172.17.0.1
+      - mariadbHost=172.17.0.1
+      - mariadbPass=secretpw
+      - redisCameraUpdates=${REDIS_CAMERA_UPDATES_CHANNEL:-camera-api.updates}
+    expose:
+      - '3000'
+    network_mode: host
+  region-analytics-api:
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/region-analytics-api:1.0.1
+    platform: arm64
+    container_name: region-analytics-api
+    depends_on:
+      - redis
+      - mariadb
+      - nginx
+    restart: always
+    environment:
+      - redisHost=172.17.0.1
+      - mariadbHost=172.17.0.1
+      - mariadbPass=secretpw
+      - redisRAAlertsChannel=${REDIS_ALERTS_CHANNEL:-region-analytics.alerts}
+      - redisCameraUpdates=${REDIS_CAMERA_UPDATES_CHANNEL:-camera-api.updates}
+    expose:
+      - '8081'
+    network_mode: host
+  region-analytics-server:
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/region-analytics-server:1.0.1
+    platform: arm64
+    container_name: region-analytics-server
+    depends_on:
+      - redis
+    restart: always
+    environment:
+      - REDIS_HOST=172.17.0.1
+      - REDIS_DETECTION_CHANNEL_PREFIX=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}
+      - ALERT_CHANNEL=${REDIS_ALERTS_CHANNEL:-region-analytics.alerts}
+    network_mode: host
+  qimsdk:
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    platform: arm64
+    container_name: qimsdk-restricted-zone
+    hostname: qimsdk-restricted-zone
+    user: qimsdk
+    restart: always
+    environment:
+      - XDG_RUNTIME_DIR=/dev/socket/weston
+      - WAYLAND_DISPLAY=wayland-1
+      - GST_DEBUG_NO_COLOR=1
+      - GST_DEBUG=2
+      - INPUT_TYPE=${INPUT_TYPE:-video}
+      - INPUT_URL=${INPUT_URL:-/etc/media/person_sample_video.mp4}
+      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
+      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
+      - MODEL_OFFSETS_PERSON=${MODEL_OFFSETS_PERSON:-<0.0,95.0,114.0,0.0>}
+      - MODEL_SCALES_PERSON=${MODEL_OFFSETS_PERSON:-<0.0037073439452797174,0.4590655267238617,2.336696147918701,0.00390625>}
+      - OUT_PORT=${OUT_PORT:-8900}
+    command: bash qimsdk_person_detect.sh
+    devices:
+      - /dev/dri/card0
+      - /dev/dri/renderD128
+      - /dev/kgsl-3d0
+      - /dev/video32
+      - /dev/video33
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+    volumes:
+      - /dev/socket/weston:/dev/socket/weston 
+      - /var/run/pulse/native:/var/run/pulse/native 
+      - /tmp/socket/cam_server/:/tmp/socket/cam_server/ 
+      - /usr/lib/gbm/default_fmt_alignment.xml:/usr/lib/gbm/default_fmt_alignment.xml 
+      - /usr/lib/gbm/msm_gbm.so:/usr/lib/gbm/msm_gbm.so 
+      - /usr/lib/gbm/msm_gbm.so.1:/usr/lib/gbm/msm_gbm.so.1 
+      - /usr/lib/gbm/msm_gbm.so.1.0.0:/usr/lib/gbm/msm_gbm.so.1.0.0 
+      - /usr/lib/libgbm.so.1:/usr/lib/libgbm.so.1 
+      - /usr/lib/libgbm.so.1.0.0:/usr/lib/libgbm.so.1.0.0 
+      - /usr/lib/libatomic.so.1:/usr/lib/libatomic.so.1 
+      - /usr/lib/libatomic.so.1.2.0:/usr/lib/libatomic.so.1.2.0 
+      - /usr/lib/libgsl.so:/usr/lib/libgsl.so 
+      - /usr/lib/libgsl.so.1:/usr/lib/libgsl.so.1 
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0 
+      - /usr/lib/libhta_hexagon_runtime_snpe.so:/usr/lib/libhta_hexagon_runtime_snpe.so 
+      - /usr/lib/libPlatformValidatorShared.so:/usr/lib/libPlatformValidatorShared.so 
+      - /usr/lib/libSNPE.so:/usr/lib/libSNPE.so 
+      - /usr/lib/libSnpeDspV66Stub.so:/usr/lib/libSnpeDspV66Stub.so 
+      - /usr/lib/libSnpeHta.so:/usr/lib/libSnpeHta.so 
+      - /usr/lib/libSnpeHtpPrepare.so:/usr/lib/libSnpeHtpPrepare.so 
+      - /usr/lib/libSnpeHtpV75Stub.so:/usr/lib/libSnpeHtpV75Stub.so 
+      - /usr/lib/libQnnChrometraceProfilingReader.so:/usr/lib/libQnnChrometraceProfilingReader.so 
+      - /usr/lib/libQnnGpu.so:/usr/lib/libQnnGpu.so 
+      - /usr/lib/libQnnHtpProfilingReader.so:/usr/lib/libQnnHtpProfilingReader.so 
+      - /usr/lib/libQnnCpu.so:/usr/lib/libQnnCpu.so 
+      - /usr/lib/libQnnDspV66Stub.so:/usr/lib/libQnnDspV66Stub.so 
+      - /usr/lib/libQnnHtpNetRunExtensions.so:/usr/lib/libQnnHtpNetRunExtensions.so 
+      - /usr/lib/libQnnHtp.so:/usr/lib/libQnnHtp.so 
+      - /usr/lib/libQnnJsonProfilingReader.so:/usr/lib/libQnnJsonProfilingReader.so 
+      - /usr/lib/libQnnDspNetRunExtensions.so:/usr/lib/libQnnDspNetRunExtensions.so 
+      - /usr/lib/libQnnGpuNetRunExtensions.so:/usr/lib/libQnnGpuNetRunExtensions.so 
+      - /usr/lib/libQnnHtpOptraceProfilingReader.so:/usr/lib/libQnnHtpOptraceProfilingReader.so 
+      - /usr/lib/libQnnSaver.so:/usr/lib/libQnnSaver.so 
+      - /usr/lib/libQnnDsp.so:/usr/lib/libQnnDsp.so 
+      - /usr/lib/libQnnGpuProfilingReader.so:/usr/lib/libQnnGpuProfilingReader.so 
+      - /usr/lib/libQnnHtpPrepare.so:/usr/lib/libQnnHtpPrepare.so 
+      - /usr/lib/libQnnSystem.so:/usr/lib/libQnnSystem.so 
+      - /usr/lib/libQnnHtpV75Stub.so:/usr/lib/libQnnHtpV75Stub.so 
+      - /usr/lib/rfsa/adsp/libSnpeHtpV75Skel.so:/usr/lib/rfsa/adsp/libSnpeHtpV75Skel.so 
+      - /usr/lib/rfsa/adsp/libQnnHtpV75Skel.so:/usr/lib/rfsa/adsp/libQnnHtpV75Skel.so 
+      - /usr/lib/rfsa/adsp/libQnnHtpV75.so:/usr/lib/rfsa/adsp/libQnnHtpV75.so 
+      - /usr/lib/rfsa/adsp/libQnnSaver.so:/usr/lib/rfsa/adsp/libQnnSaver.so 
+      - /usr/lib/rfsa/adsp/libQnnSystem.so:/usr/lib/rfsa/adsp/libQnnSystem.so 
+      - /usr/lib/libenv_time.so:/usr/lib/libenv_time.so 
+      - /usr/lib/libevaluation_proto.so:/usr/lib/libevaluation_proto.so 
+      - /usr/lib/libimage_metrics.so:/usr/lib/libimage_metrics.so 
+      - /usr/lib/libjpeg_internal.so:/usr/lib/libjpeg_internal.so 
+      - /usr/lib/libtensorflowlite_c.so:/usr/lib/libtensorflowlite_c.so 
+      - /usr/lib/libtf_logging.so:/usr/lib/libtf_logging.so 
+      - /usr/lib/libVideoCtrl.so:/usr/lib/libVideoCtrl.so 
+      - /usr/lib/libIB2C.so:/usr/lib/libIB2C.so 
+      - /usr/lib/libIB2C.so.1:/usr/lib/libIB2C.so.1 
+      - /usr/lib/libIB2C.so.1.0:/usr/lib/libIB2C.so.1.0 
+      - /usr/lib/libEGL_adreno.so:/usr/lib/libEGL_adreno.so 
+      - /usr/lib/libEGL_adreno.so.1:/usr/lib/libEGL_adreno.so.1 
+      - /usr/lib/libGLESv2_adreno.so:/usr/lib/libGLESv2_adreno.so 
+      - /usr/lib/libGLESv2_adreno.so.2:/usr/lib/libGLESv2_adreno.so.2 
+      - /usr/lib/libpropertyvault.so.0:/usr/lib/libpropertyvault.so.0 
+      - /usr/lib/libpropertyvault.so.0.0.0:/usr/lib/libpropertyvault.so.0.0.0 
+      - /usr/lib/libwayland-client.so.0:/usr/lib/libwayland-client.so.0 
+      - /usr/lib/libwayland-egl.so.1:/usr/lib/libwayland-egl.so.1 
+      - /usr/lib/libadreno_utils.so:/usr/lib/libadreno_utils.so 
+      - /usr/lib/libadreno_utils.so.1:/usr/lib/libadreno_utils.so.1 
+      - /usr/lib/libCB.so:/usr/lib/libCB.so 
+      - /usr/lib/libEGL.so:/usr/lib/libEGL.so 
+      - /usr/lib/libEGL.so.1:/usr/lib/libEGL.so.1 
+      - /usr/lib/libEGL.so.1.0:/usr/lib/libEGL.so.1.0 
+      - /usr/lib/libEGL.so.1.0.0:/usr/lib/libEGL.so.1.0.0 
+      - /usr/lib/libeglSubDriverWayland.so:/usr/lib/libeglSubDriverWayland.so 
+      - /usr/lib/libGLESv1_CM.so:/usr/lib/libGLESv1_CM.so 
+      - /usr/lib/libGLESv1_CM.so.1:/usr/lib/libGLESv1_CM.so.1 
+      - /usr/lib/libGLESv1_CM.so.1.0:/usr/lib/libGLESv1_CM.so.1.0 
+      - /usr/lib/libGLESv1_CM.so.1.0.0:/usr/lib/libGLESv1_CM.so.1.0.0 
+      - /usr/lib/libGLESv1_CM_adreno.so:/usr/lib/libGLESv1_CM_adreno.so 
+      - /usr/lib/libGLESv2.so:/usr/lib/libGLESv2.so 
+      - /usr/lib/libGLESv2.so.2:/usr/lib/libGLESv2.so.2 
+      - /usr/lib/libGLESv2.so.2.0:/usr/lib/libGLESv2.so.2.0 
+      - /usr/lib/libGLESv2.so.2.0.0:/usr/lib/libGLESv2.so.2.0.0 
+      - /usr/lib/libllvm-glnext.so:/usr/lib/libllvm-glnext.so 
+      - /usr/lib/libllvm-glnext.so.1:/usr/lib/libllvm-glnext.so.1 
+      - /usr/lib/libllvm-qcom.so:/usr/lib/libllvm-qcom.so 
+      - /usr/lib/libllvm-qgl.so:/usr/lib/libllvm-qgl.so 
+      - /usr/lib/libOpenCL.so:/usr/lib/libOpenCL.so 
+      - /usr/lib/libOpenCL_adreno.so:/usr/lib/libOpenCL_adreno.so 
+      - /usr/lib/libq3dtools_adreno.so:/usr/lib/libq3dtools_adreno.so 
+      - /usr/lib/libq3dtools_esx.so:/usr/lib/libq3dtools_esx.so 
+      - /usr/lib/libvulkan_adreno.so:/usr/lib/libvulkan_adreno.so 
+      - /usr/lib/libQnnTFLiteDelegate.so:/usr/lib/libQnnTFLiteDelegate.so 
+      - /usr/lib/libadsprpc.so:/usr/lib/libadsprpc.so 
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so 
+      - /usr/lib/libcdsprpc.so.1:/usr/lib/libcdsprpc.so.1 
+      - /usr/lib/libcdsprpc.so.1.0.0:/usr/lib/libcdsprpc.so.1.0.0 
+      - /usr/lib/libfastcvopt.so:/usr/lib/libfastcvopt.so 
+      - /usr/lib/libfastcvopt.so.1:/usr/lib/libfastcvopt.so.1 
+      - /usr/lib/libfastcvopt.so.1.8.0:/usr/lib/libfastcvopt.so.1.8.0 
+      - /usr/lib/libfastcvdsp_stub.so:/usr/lib/libfastcvdsp_stub.so 
+      - /usr/lib/libfastcvdsp_stub.so.1:/usr/lib/libfastcvdsp_stub.so.1 
+      - /usr/lib/libfastcvdsp_stub.so.1.8.0:/usr/lib/libfastcvdsp_stub.so.1.8.0 
+      - /usr/lib/libdmabufheap.so.0.0.0:/usr/lib/libdmabufheap.so.0.0.0 
+      - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1 
+      - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1 
+      - /usr/lib/libcamera_metadata.so:/usr/lib/libcamera_metadata.so 
+      - /usr/lib/librv.so:/usr/lib/librv.so 
+      - /usr/lib/libmv1.so:/usr/lib/libmv1.so 
+      - /usr/lib/libmv3.so:/usr/lib/libmv3.so 
+      - /etc/labels:/etc/labels 
+      - /etc/media:/etc/media 
+      - /etc/models:/etc/models 
+      - /etc/configs:/etc/configs
+    network_mode: host
+volumes:
+  mariadbVolume: null
