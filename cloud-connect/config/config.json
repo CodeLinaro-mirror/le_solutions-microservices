@@ -1,0 +1,41 @@
+{
+    "RedisConsumers": [
+        {
+            "source": [
+                "detection:ppe:*"
+            ],
+            "dest": [
+                "detection.ppe.usecase.*"
+            ]
+        },
+        {
+            "source": [
+                "detection:rz:*"
+            ],
+            "dest": [
+                "detection.ppe.usecase.rz.*"
+            ]
+        },
+        {
+            "source": [
+                "detection:channel:1",
+                "detection:channel:2"
+            ],
+            "dest": [
+                "detection.channel.ppe.1",
+                "detection.channel.rz.2"
+            ]
+        }
+    ],
+    "log_level": "INFO",
+    "msg_err_handling_bool": 1,
+    "client_id_prefix": "default",
+    "enable_ssl_connection": 1,
+    "ssl_config": 
+    {
+        "root_ca_file": "/var/ssl/rootca.pem.crt",
+        "client_cert_file": "/var/ssl/certificate.pem.crt",
+        "client_private_key_file": "/var/ssl/private.pem.key",
+        "domain_validation_enabled_bool": 0
+    }
+}
