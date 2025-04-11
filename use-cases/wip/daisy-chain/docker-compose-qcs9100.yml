@@ -3,7 +3,7 @@
 
 services:
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.3
     platform: arm64
     container_name: qimsdk-daisy-chain
     hostname: qimsdk-daisy-chain
@@ -30,6 +30,8 @@ services:
       - /dev/socket/weston:/dev/socket/weston
       - /var/run/pulse/native:/var/run/pulse/native
       - /tmp/socket/cam_server/:/tmp/socket/cam_server/
+      - /usr/lib/dri/kms_swrast_dri.so:/usr/lib/dri/kms_swrast_dri.so
+      - /usr/lib/dri/swrast_dri.so:/usr/lib/dri/swrast_dri.so
       - /usr/lib/gbm/default_fmt_alignment.xml:/usr/lib/gbm/default_fmt_alignment.xml
       - /usr/lib/gbm/msm_gbm.so:/usr/lib/gbm/msm_gbm.so
       - /usr/lib/gbm/msm_gbm.so.1:/usr/lib/gbm/msm_gbm.so.1

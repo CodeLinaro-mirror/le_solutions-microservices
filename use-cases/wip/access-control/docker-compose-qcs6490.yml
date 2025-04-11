@@ -11,7 +11,7 @@ services:
     command: redis-server --loglevel notice
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.3
     platform: arm64
     container_name: qimsdk-access-control
     hostname: qimsdk-access-control
@@ -39,6 +39,8 @@ services:
       - /dev/socket/weston:/dev/socket/weston
       - /tmp/socket/cam_server/:/tmp/socket/cam_server/
       - /var/run/pulse/native:/var/run/pulse/native
+      - /usr/lib/dri/kms_swrast_dri.so:/usr/lib/dri/kms_swrast_dri.so
+      - /usr/lib/dri/swrast_dri.so:/usr/lib/dri/swrast_dri.so
       - /usr/lib/gbm/default_fmt_alignment.xml:/usr/lib/gbm/default_fmt_alignment.xml
       - /usr/lib/gbm/msm_gbm.so:/usr/lib/gbm/msm_gbm.so
       - /usr/lib/gbm/msm_gbm.so.1:/usr/lib/gbm/msm_gbm.so.1
