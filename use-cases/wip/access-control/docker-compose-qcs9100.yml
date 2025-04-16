@@ -11,7 +11,7 @@ services:
     command: redis-server --loglevel notice
     network_mode: "host"
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.1
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.2
     platform: arm64
     container_name: qimsdk-access-control
     hostname: qimsdk-access-control
