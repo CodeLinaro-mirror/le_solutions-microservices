@@ -24,12 +24,13 @@ services:
       - ADSP_LIBRARY_PATH=\"/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;${ADSP_LIBRARY_PATH}\"
       - GST_DEBUG=2
       - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.mp4}
+      - INPUT_URL=${INPUT_URL:-/opt/sample-videos/person_sample_video.ts}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
       - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
       - MODEL_OFFSETS_PERSON=${MODEL_OFFSETS_PERSON:-<0.0,95.0,114.0,0.0>}
       - MODEL_SCALES_PERSON=${MODEL_OFFSETS_PERSON:-<0.0037073439452797174,0.4590655267238617,2.336696147918701,0.00390625>}
       - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.labels}
+      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
     command: bash qimsdk_restricted_zone.sh
     devices:
