@@ -1,0 +1,9 @@
+{
+    "reporter": [
+        "text",
+        "html",
+        "lcov",
+        "json"
+    ],
+    "report-dir": "coverage/it"
+}

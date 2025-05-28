@@ -1,0 +1,24 @@
+{
+    "Key1": [
+        {
+            "Key1SubKey1": [
+                "Value1"
+            ],
+            "Key1SubKey2": [
+                "Value2"
+            ]
+        },
+        {
+            "Key1SubKey1": [
+                "Value3",
+                "Value4"
+            ],
+            "Key1SubKey2": [
+                "Value5",
+                "Value6"
+            ]
+        }
+    ],
+    "Key2": 0,
+    "Key3": "Value7"
+}
