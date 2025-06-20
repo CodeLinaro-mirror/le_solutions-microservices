@@ -31,16 +31,18 @@ t_split_2. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-i
 else
 
 demuxer=qtdemux
+source_sequence="filesrc location=${INPUT_URL} ! ${demuxer}"
 
 if [[ "${INPUT_URL##*.}" == "ts" ]]; then
-demuxer=tsdemux
+    demuxer=tsdemux
+    source_sequence="multifilesrc location=${INPUT_URL} ! ${demuxer}"
 fi
 
 export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlvdetection name=stage_01_postproc threshold=90.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
-multifilesrc location=${INPUT_URL} ! ${demuxer} ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
+${source_sequence} ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
 qtimetamux name=metamux_1 ! queue ! qtiobjtracker ! qtivoverlay engine=gles ! queue ! tee name=t_split_2 \
