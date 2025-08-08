@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 'use strict';
@@ -23,7 +23,9 @@ module.exports.getAllRegionAlerts = async function getAllRegionAlerts (req, res,
                     "trigger_name": e.trigger_name,
                     "trigger_condition": e.trigger_condition,
                 },
-                "time":  parseFloat(e.time)
+                "alert_id": e.alert_id,
+                "time":  parseFloat(e.time).toFixed(3),
+                "end_time": e.time ? parseFloat(e.time).toFixed(3) : 0
             };
 
             // Check for existent of sub objects as each Alert type can be different based on schema
@@ -44,12 +46,24 @@ module.exports.getAllRegionAlerts = async function getAllRegionAlerts (req, res,
 
 RAAlertsRedisHook();
 function RAAlertsRedisHook() {
-    redis.listenToChannel(config.redisRAAlertsChannel, async function(err, data) {
+    redis.listenToChannel(config.redisRAAlertsChannel, async function(err, jsonData) {
         try {
             if (err) {
                 console.error(err);
             } else {
+                // Check to see if we need to update an Alert vs a new one
+                let data = JSON.parse(jsonData);
                 await db.insertRAAlert(data);
+
+                // let al = await db.getAlertById(data.alert_id);
+
+                // // New Alert so insert it
+                // if (al.length !== 1) {
+                //     await db.insertRAAlert(data);
+                // } else {
+                //     // Update existing Alert with new end_time data
+                //     await db.updateRAAlert(data);
+                // }
             }
         } catch (e) {
             console.error(e.message);

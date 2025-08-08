@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 'use strict';
@@ -11,9 +11,12 @@ const utils = require('../utils/utils');
 
 
 module.exports.configTrigger = async function configTrigger (req, res, next, body) {
-    // Creates new trigger attached to specified monitor. 
+    // Creates new trigger attached to specified monitor.
 
     try {
+        // Make sure that the params match the trigger_condition
+        await utils.checkTriggerConditionParams(body);
+
         await db.insertPATrigger(body);
         await redis.insertPATrigger(body);
         res.status(200).send("New trigger was successfully configured");
@@ -23,7 +26,7 @@ module.exports.configTrigger = async function configTrigger (req, res, next, bod
         });
     }
 
-    
+
 
 };
 
@@ -60,7 +63,9 @@ module.exports.getTriggers = async function getTriggers (req, res, next, body) {
         let triggerList = await db.getPATriggersByMonitor(body);
         let retVal = [];
         for await (let T of triggerList) {
-            T.params = JSON.parse(T.params);
+            if (T.params) {
+                T.params = JSON.parse(T.params);
+            }
             retVal.push(T);
         }
         res.status(200).json(retVal);

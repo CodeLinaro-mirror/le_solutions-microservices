@@ -1,4 +1,4 @@
-# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 openapi: 3.0.3
 info:
@@ -22,7 +22,7 @@ info:
     url: https://mysupport.qualcomm.com/supportforums/s/
   license:
     name: BSD-3-Clause-Clear
-  version: '1.0.0'
+  version: '1.0.3'
 servers:
   - url: https://{device-address}/region-analytics/v1/api
     description: Server URL
@@ -37,12 +37,15 @@ x-string-constants:
   - monitor: &MONITOR_ID_EXAMPLE "camera1"
   - region_id: &REGION_ID_EXAMPLE "{unique-region-id}"
   - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
+  - alert_uuid: &ALERT_UUID_EXAMPLE "{unique-alert-uuid}"
 
-tags: 
+tags:
   - name: alerts
     description: Poll historical alerts
   - name: config
     description: Configure regions and triggers that generate alerts from regions
+  - name: analytics
+    description: Query analytics data
   - name: util
     description: Utility APIs
 security: []
@@ -63,7 +66,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: Health        
+      x-swagger-router-controller: Health
 
   /config/region:
     post:
@@ -80,7 +83,7 @@ paths:
           list of `Coord` {x,y} objects that define the vertices of a polygon. The values
           of x and y range from 0.0 to 1.0, with {x: 0.0, y: 0.0} defined as the top-left
           corner of the monitor.
-          
+
           The region is interpreted as a polygon whose edges connect `coordinates[0..N]` like so:
           - The first edge is the line from `coordinates[0]` to `coordinates[1]`.
           - The next edge is the line from `coordinates[1]` to `coordinates[2]`.
@@ -107,7 +110,7 @@ paths:
                 $ref: '#/components/examples/illegalRegionTwoVertex'
               ILLEGAL!! Region with intersecting lines:
                 $ref: '#/components/examples/illegalRegionIntersecting'
-              
+
       responses:
         '200':
           description: New region was successfully configured.
@@ -117,7 +120,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigRegion        
+      x-swagger-router-controller: ConfigRegion
     delete:
       tags:
         - config
@@ -126,7 +129,7 @@ paths:
       operationId: configRegionDelete
       parameters:
       - name: regionId
-        in: query          
+        in: query
         required: true
         description: Region ID to delete.
         schema:
@@ -141,7 +144,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigRegion        
+      x-swagger-router-controller: ConfigRegion
     get:
       tags:
         - config
@@ -150,7 +153,7 @@ paths:
       operationId: configRegionGet
       parameters:
       - name: monitorId
-        in: query          
+        in: query
         required: true
         description: Monitor ID whose regions are listed.
         schema:
@@ -190,6 +193,7 @@ paths:
             * 'occupancy_changed': Alert whenever number of persons in region changes. Use to see all occupancy changes.
             * 'occupancy_over': Alert when an occupancy increase crosses over a limit. Use when there's a maximum amount of people expected in a region.
             * 'occupancy_under': Alert when an occupancy decrease crosses under a limit. Use when there's at least some number of people expected in a region.
+            * 'loitering_over': Alert when an occupant's dwell time within the given region crosses over a limit (in seconds).
 
           The 'occupancy_changed' condition will trigger whenever there's a change of
           occupancy in the region, and does not require `params`.
@@ -199,9 +203,15 @@ paths:
           or under. For example, a trigger with 'occupancy_over' with a threshold of "3"
           will generate an alert when the occupancy becomes _greater than_ 3. The alert won't
           be triggered again until the occupancy crosses back over the threshold.
+
+          The 'loitering_over' condition require a `params` of
+          `["name": "threshold", "value": "<value>"]`, where '<value>' is the numeric threshold for the over.
+          For example, a trigger with 'loitering_over' with a threshold of "300000" (5 minutes)
+          will generate an alert when the occupant's dwell time within the given region
+          becomes _greater than_ 300000.
+
           The "params" field depends on the trigger condition selected.
-          
-          See the examples below for different trigger conditions and their required "params".          
+          See the examples below for different trigger conditions and their required "params".
 
         required: true
         content:
@@ -215,7 +225,9 @@ paths:
                 $ref: '#/components/examples/triggerOccupancyUnder'
               Occupancy Changed:
                 $ref: '#/components/examples/triggerOccupancyChanged'
-              
+              Loitering Over:
+                $ref: '#/components/examples/triggerLoiteringOver'
+
       responses:
         '200':
           description: New trigger was successfully configured.
@@ -225,7 +237,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigRegionTrigger        
+      x-swagger-router-controller: ConfigRegionTrigger
     delete:
       tags:
         - config
@@ -234,7 +246,7 @@ paths:
       operationId: configTriggerRegionDelete
       parameters:
       - name: triggerId
-        in: query          
+        in: query
         required: true
         description: Trigger ID to delete.
         schema:
@@ -249,7 +261,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigRegionTrigger        
+      x-swagger-router-controller: ConfigRegionTrigger
     get:
       tags:
         - config
@@ -258,7 +270,7 @@ paths:
       operationId: configTriggerRegionGet
       parameters:
       - name: monitorId
-        in: query          
+        in: query
         required: true
         description: Monitor ID whose triggers are listed.
         schema:
@@ -284,11 +296,16 @@ paths:
       tags:
         - alerts
       summary: Get all alerts
-      description: Return all alerts from a list of monitors.
+      description: |
+        Return all alerts from a list of monitors.
+
+        The `trigger_condition` defines when a trigger generates alerts.
+
+        See examples below for different trigger_conditions and the data that is in the message.
       operationId: getAllRegionAlerts
       parameters:
         - name: monitorIds
-          in: query          
+          in: query
           required: true
           description: Alerts on these monitors are returned.
           schema:
@@ -296,9 +313,9 @@ paths:
             items:
               type: string
               example: *MONITOR_ID_EXAMPLE
-          
+
         - name: fromTime
-          in: query          
+          in: query
           required: true
           description: Earliest alert to return
           schema:
@@ -306,7 +323,7 @@ paths:
             format: double
             example: *TIMESTAMP_EXAMPLE
         - name: toTime
-          in: query          
+          in: query
           required: true
           description: Latest alert to return
           schema:
@@ -329,11 +346,59 @@ paths:
                 $ref: '#/components/schemas/Error'
       x-swagger-router-controller: RegionAlert
 
+  /analytics/count/region:
+    get:
+      tags:
+        - analytics
+      summary: Query occupancy statistics within timeframe for a given region.
+      description: |
+        Returns the occupancy statistics for the timeframe specified.
+
+        The minimum Interval is 5minutes.
+      operationId: getAnalyticsCount
+      parameters:
+        - name: regionId
+          in: query
+          required: true
+          description: Occupancy count from this region is returned.
+          schema:
+            type: string
+            example: *REGION_ID_EXAMPLE
+        - name: fromTime
+          in: query
+          required: true
+          description: Start of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: End of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+      responses:
+        '200':
+          description: Occupancy statistics within the given timeframe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OccupancyCount'
+        '400':
+          description: Error retrieving value.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: AnalyticsRegionCount
 
 components:
-  
+
   schemas:
-    
+
     Alert:
       description: Information about an alert that has been generated by a configured Trigger.
       type: object
@@ -344,11 +409,20 @@ components:
           example: *MONITOR_ID_EXAMPLE
         source_trigger:
             $ref: "#/components/schemas/Trigger"
+        alert_id:
+          description: Alert identifier
+          type: string
+          format: uuid
+          example: *ALERT_UUID_EXAMPLE
         time:
           description: Timestamp at which alert was generated.
           type: number
           format: double
           example: *TIMESTAMP_EXAMPLE
+        end_time:
+          description: Timestamp at which alert was cleared. Not included if alert has not cleared.
+          format: double
+          example: *TIMESTAMP_2_EXAMPLE
         occupants:
           description: List of occupants within region at time of trigger.
           type: array
@@ -358,19 +432,37 @@ components:
         - monitor_id
         - source_trigger
         - time
-    
+
     Alerts:
       description: List of Alert objects
       type: array
       items:
         $ref: "#/components/schemas/Alert"
-        
+
     Occupant:
       description: A person in the scene.
       type: object
       properties:
         bounding_box:
           $ref: "#/components/schemas/BoundingBox"
+        person_id:
+          description: ID of the person
+          type: string
+          example: "0"
+        dwell_time:
+          description: How long the person has been dwelling
+          type: number
+          example: 60000
+        enter_time:
+          description: Timestamp of when occupant was first seen
+          type: number
+          format: double
+          example: *TIMESTAMP_EXAMPLE
+        exit_time:
+          description: Timestamp of when occupant was last seen or 0 if occupant is still in the region.
+          type: number
+          format: double
+          example: *TIMESTAMP_EXAMPLE
 
     BoundingBox:
       description: Describe rectangular area by top-left and bottom-right coordinates.
@@ -424,7 +516,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Coord"
-    
+
     Regions:
       description: List of Region objects
       type: array
@@ -452,7 +544,7 @@ components:
         trigger_condition:
           type: string
           description: When this trigger should generate alerts. See request body description.
-          enum: ["occupancy_changed", "occupancy_over", "occupancy_under"]
+          enum: ["occupancy_changed", "occupancy_over", "occupancy_under", "loitering_over"]
           example: occupancy_over
         params:
           description: List of parameters required to configure alert. Depends on `trigger_condition`
@@ -467,7 +559,7 @@ components:
         - trigger_id
         - trigger_name
         - trigger_condition
-    
+
     Triggers:
       description: List of Trigger objects
       type: array
@@ -487,6 +579,20 @@ components:
           description: Value of parameter.
           type: string
           example: "parameter_value_string"
+
+    OccupancyCount:
+      description: Occupancy Count
+      type: object
+      properties:
+        min:
+          type: integer
+          example: 0
+        max:
+          type: integer
+          example: 26
+        average:
+          type: integer
+          example: 8
 
     Error:
       description: "Error response"
@@ -580,4 +686,12 @@ components:
         trigger_name: "Alert each time occupancy changes in region; no params needed."
         trigger_condition: "occupancy_changed"
 
-
+    triggerLoiteringOver:
+      value:
+        region_id: *REGION_ID_EXAMPLE
+        trigger_id: *TRIGGER_ID_EXAMPLE
+        trigger_name: "Occupant has been loitering for more than 5 minutes."
+        trigger_condition: "loitering_over"
+        params:
+          - name: "threshold"
+            value: "300000"

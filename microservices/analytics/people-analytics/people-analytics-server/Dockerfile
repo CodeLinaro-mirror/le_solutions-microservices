@@ -11,7 +11,7 @@ RUN groupadd -g 1234 python && useradd -u 1234 -g python python
 # Set up venv, set ownership to python user
 RUN python3 -m venv /venv
 ENV PATH=/venv/bin:$PATH
-RUN chown -hR python /venv 
+RUN chown -hR python /venv
 
 
 WORKDIR /app

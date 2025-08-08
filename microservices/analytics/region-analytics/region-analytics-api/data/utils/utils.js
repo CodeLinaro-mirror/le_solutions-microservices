@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
  */
@@ -59,8 +59,14 @@ async function initializeDB() {
     }
 }
 
+function convertToms(time) {
+    if (time > 10000000000) return time;
+    else return time*1000;
+}
+
 module.exports = {
     populateRedis,
     cameraUpdates,
-    initializeDB
+    initializeDB,
+    convertToms
 };

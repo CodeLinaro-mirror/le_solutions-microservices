@@ -1,7 +1,7 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
- * 
+ *
  */
 'use strict';
 
@@ -11,7 +11,7 @@ const mariadb = require('mariadb');
 const pool = mariadb.createPool({
     host: config.mariadbHost,
     port: config.mariadbPort,
-    user: config.mariadbUser, 
+    user: config.mariadbUser,
     password: config.mariadbPass,
     connectionLimit: 25,
     database: config.default_db
@@ -51,7 +51,7 @@ async function insertPATrigger(data) {
 
         const res = await conn.query(`INSERT INTO people_analytics_triggers ` +
             `(monitor_id, trigger_id, trigger_name, trigger_condition, params)` +
-            ` value ('${data.monitor_id}', '${data.trigger_id}', '${data.trigger_name}',` + 
+            ` value ('${data.monitor_id}', '${data.trigger_id}', '${data.trigger_name}',` +
             `'${data.trigger_condition}', '${paramsString}');`);
         console.log(res);
     } catch (e) {
@@ -115,19 +115,44 @@ async function getPATrigger(data) {
     }
 }
 
-async function insertPAAlert(jsonData) {
+async function insertPAAlert(data) {
     let conn;
     try {
-        let data = JSON.parse(jsonData);
         // Escape apostrophes
         data = cleanInput(data);
 
         let causesString = JSON.stringify(data.causes);
         conn = await fetchConn();
         const res = await conn.query(`INSERT INTO people_analytics_alerts ` +
-            `(source_trigger_id, time, causes)` +
-            ` value ('${data.source_trigger.trigger_id}', FROM_UNIXTIME(${data.time}),` +
-            ` '${causesString}');`);
+            `(source_trigger_id, alert_id, time, end_time, type, causes)` +
+            ` value ('${data.source_trigger.trigger_id}', '${data.alert_id}',` +
+            ` FROM_UNIXTIME(${data.time}), FROM_UNIXTIME(${data.end_time}),` +
+            ` '${data.type}', '${causesString}');`);
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function insertPAAlertOccupancy(data) {
+    let conn;
+    try {
+        // TODO: Update the same alert with end_time
+
+        // Escape apostrophes
+        data = cleanInput(data);
+
+        let occupancyString = JSON.stringify(data.occupants);
+        conn = await fetchConn();
+
+        //TODO: If end_time == '' make it 0 instead.
+        const res = await conn.query(`INSERT INTO people_analytics_alerts_occupancy ` +
+            `(source_trigger_id, alert_id, time, end_time, type, occupants)` +
+            ` value ('${data.source_trigger.trigger_id}', '${data.alert_id}',` +
+            ` FROM_UNIXTIME(${data.time}), FROM_UNIXTIME(${data.end_time}),` +
+            ` '${data.type}', '${occupancyString}');`);
     } catch (e) {
         throw e;
     } finally {
@@ -142,10 +167,21 @@ async function getAlerts(data) {
         conn = await fetchConn();
         let retVal = [];
         let monMap = data.monitorIds[0].split(",");
-        let rows = await conn.query(`select fa.source_trigger_id, UNIX_TIMESTAMP(fa.time) as time, fa.causes, ft.* FROM people_analytics_alerts fa` +
+
+        let rows = await conn.query(
+            `select fa.source_trigger_id, UNIX_TIMESTAMP(fa.time) as time, UNIX_TIMESTAMP(fa.end_time) as end_time,` +
+            ` fa.type, fa.alert_id, fa.causes, ft.* FROM people_analytics_alerts fa` +
             ` inner join people_analytics_triggers ft on fa.source_trigger_id = ft.trigger_id ` +
             ` WHERE ft.monitor_id IN (${monMap.map(i=>`'${i}'`)}) AND ` +
-            ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);
+            ` (time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}))` +
+            ` OR (end_time >= FROM_UNIXTIME(${data.fromTime}) AND end_time <= FROM_UNIXTIME(${data.toTime}))` +
+            ` UNION ` +
+            `select fao.source_trigger_id, UNIX_TIMESTAMP(fao.time) as time, UNIX_TIMESTAMP(fao.end_time) as end_time,` +
+            ` fao.type, fao.alert_id, fao.occupants, ft.* FROM people_analytics_alerts_occupancy fao` +
+            ` inner join people_analytics_triggers ft on fao.source_trigger_id = ft.trigger_id ` +
+            ` WHERE ft.monitor_id IN (${monMap.map(i=>`'${i}'`)}) AND ` +
+            ` (time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}))` +
+            ` OR (end_time >= FROM_UNIXTIME(${data.fromTime}) AND end_time <= FROM_UNIXTIME(${data.toTime})) ORDER BY TIME;`);
         retVal = [...retVal, ...rows];
         return retVal;
     } catch (e) {
@@ -199,6 +235,7 @@ async function initializeCheckTables() {
         res.push(await createDatabase());
         res.push(await createTriggersTable());
         res.push(await createAlertsTable());
+        res.push(await createAlertsOccupancyTable());
         return res;
     } catch (e) {
         throw e;
@@ -214,10 +251,10 @@ async function createDatabase() {
         const dbpool = mariadb.createPool({
             host: config.mariadbHost,
             port: config.mariadbPort,
-            user: config.mariadbUser, 
+            user: config.mariadbUser,
             password: config.mariadbPass
         });
-        
+
         conn = await dbpool.getConnection();
 
         const res = await conn.query(`CREATE DATABASE IF NOT EXISTS iot_solutions;`);
@@ -257,8 +294,31 @@ async function createAlertsTable() {
 
         const res = await conn.query('CREATE TABLE IF NOT EXISTS people_analytics_alerts ' +
             '(source_trigger_id VARCHAR(255) not null, ' +
-            'time datetime(6), causes text, ' +
+            'alert_id text not null, ' +
+            'time datetime(6), end_time datetime(6), type text, causes text, ' +
             'CONSTRAINT `pa_trigger_alerts_fk` ' +
+            'FOREIGN KEY (source_trigger_id) REFERENCES people_analytics_triggers (trigger_id) ' +
+            'on delete cascade ' +
+            'on update RESTRICT );');
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function createAlertsOccupancyTable() {
+    let conn;
+    try {
+        conn = await fetchConn();
+
+        const res = await conn.query('CREATE TABLE IF NOT EXISTS people_analytics_alerts_occupancy ' +
+            '(source_trigger_id VARCHAR(255) not null, ' +
+            'alert_id text not null, ' +
+            'time datetime(6), end_time datetime(6), type text, occupants text, ' +
+            'CONSTRAINT `pa_trigger_alerts_occupancy_fk` ' +
             'FOREIGN KEY (source_trigger_id) REFERENCES people_analytics_triggers (trigger_id) ' +
             'on delete cascade ' +
             'on update RESTRICT );');
@@ -277,6 +337,7 @@ module.exports = {
     getPATriggersByMonitor,
     getPATrigger,
     insertPAAlert,
+    insertPAAlertOccupancy,
     getAlerts,
     removeTrigger,
     removeAllMonitor,

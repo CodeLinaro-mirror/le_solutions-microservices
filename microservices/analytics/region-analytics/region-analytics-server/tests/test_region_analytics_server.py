@@ -1,4 +1,4 @@
-# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 from app import region_analytics_server as ras
 import json
@@ -15,14 +15,13 @@ def set_pas_context_to_default():
     ras.last_trigger_occupancy = {}
 
 
-
 @pytest.fixture
 async def regions():
     class FakeRedis:
         async def hgetall(self, *args):
             return {
                 # From default loaded in the mariadb on the demo platform
-                "THE_REGION": "{\"monitor_id\":\"0\",\"region_id\":\"THE_REGION\",\"region_name\":\"Triangle covering bottom-right diagonal half of monitor\",\"coordinates\":\"[{\\\"x\\\": 1,\\\"y\\\": 1},{\\\"x\\\": 1,\\\"y\\\": 0},{\\\"x\\\": 0,\\\"y\\\": 1}]\"}"
+                "THE_REGION": "{\"monitor_id\":\"0\",\"region_id\":\"THE_REGION\",\"region_name\":\"Triangle covering bottom-right diagonal half of monitor\",\"coordinates\":[{\"x\": 1,\"y\": 1},{\"x\": 1,\"y\": 0},{\"x\": 0,\"y\": 1}]}"
             }
     return await ras.get_regions(FakeRedis())
 
@@ -133,10 +132,10 @@ def make_message(type : str):
 
     if type == 'default':
         return frame_message
-    
+
     if type == 'empty':
         return json.loads("{\"parameters\":{\"timestamp\":\"433766666\"}}")
-    
+
     if type == 'person_2_outside':
         # same string but person 2 is in the top-left corner {0.01, 0.01}
         redis_message_from_sep_30_build_with_person_2_moved = '''
@@ -198,9 +197,9 @@ def make_message(type : str):
             \"parameters\":{\"timestamp\":\"8375033333\"}
             }
             '''
-            
+
         return json.loads(redis_message_from_sep_30_build_with_person_2_moved)
-    
+
     if type == 'person_no_feet':
         del frame_message['object_detection'][0]['landmarks'] # person 0 has no feet
         return frame_message
@@ -368,7 +367,7 @@ async def triggers_occ_over():
                         'params': [
                             {
                                 'name': 'threshold',
-                                'value': 3
+                                'value': '3' # comes through as string
                             }
                         ]
                     }
@@ -401,7 +400,7 @@ async def test_occupancy_over_triggers_after_above_threshold(regions, triggers_o
         messages = make_message_list([make_message('default')])
         alerts = ras.apply_triggers(triggers_occ_over, regions, messages)
         assert len(alerts) == 1, f'Unexpected trigger at {count} in loop'
-    
+
 
 async def test_occupancy_over_stops_triggering_after_below_threshold(regions, triggers_occ_over):
     messages = make_message_list([make_message('default')] * 3) # default = 4 people
@@ -437,7 +436,7 @@ async def triggers_occ_under():
                         'params': [
                             {
                                 'name': 'threshold',
-                                'value': 4
+                                'value': '4'
                             }
                         ]
                     }
@@ -468,7 +467,7 @@ async def test_occupancy_under_stops_after_occupancy_fills(regions, triggers_occ
 async def test_empty_message(regions, triggers_occ_changed):
     messages = make_message_list([make_message('empty')])
     alerts = ras.apply_triggers(triggers_occ_changed, regions, messages)
-    assert len(alerts) == 0, f'Expect no alert if nobody in frame' 
+    assert len(alerts) == 0, f'Expect no alert if nobody in frame'
 
 # TODO: tests for no landmarks
 # TODO: tests for missing left ankle
