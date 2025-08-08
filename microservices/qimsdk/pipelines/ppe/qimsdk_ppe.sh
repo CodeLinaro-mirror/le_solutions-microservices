@@ -13,7 +13,7 @@ qtimlvdetection name=stage_02_postproc threshold=75.0 stabilization=true results
 rtspsrc location=${INPUT_URL} ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtiobjtracker ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! metamux_2. \
 t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_inference. stage_02_inference. ! queue ! stage_02_postproc. stage_02_postproc. ! text/x-raw ! queue ! metamux_2. \
 qtimetamux name=metamux_2 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_3 \
@@ -33,7 +33,7 @@ qtimlvdetection name=stage_02_postproc threshold=75.0 stabilization=true results
 qtiqmmfsrc name=camsrc camera=${INPUT_URL} ! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,interlace-mode=progressive,colorimetry=bt601 ! identity sync=true  ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtiobjtracker ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! metamux_2. \
 t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_inference. stage_02_inference. ! queue ! stage_02_postproc. stage_02_postproc. ! text/x-raw ! queue ! metamux_2. \
 qtimetamux name=metamux_2 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_3 \
@@ -61,7 +61,7 @@ qtimlvdetection name=stage_02_postproc threshold=75.0 stabilization=true results
 ${source_sequence} ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtiobjtracker ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! metamux_2. \
 t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_inference. stage_02_inference. ! queue ! stage_02_postproc. stage_02_postproc. ! text/x-raw ! queue ! metamux_2. \
 qtimetamux name=metamux_2 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_3 \
