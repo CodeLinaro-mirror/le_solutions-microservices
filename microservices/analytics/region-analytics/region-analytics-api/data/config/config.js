@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 'use strict';
@@ -11,7 +11,7 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const config = {
-    
+
     mariadbName: process.env.mariadbName,
     mariadbHost: process.env.mariadbHost,
     mariadbPass: process.env.mariadbPass,
@@ -21,6 +21,7 @@ const config = {
     redisHost: process.env.redisHost,
     redisPort: process.env.redisPort,
     redisRAAlertsChannel: process.env.redisRAAlertsChannel,
+    redisRAAnalyticsChannel: process.env.redisRAAnalyticsChannel,
     redisRARegionKey: process.env.RA_REGION_KEY,
     redisRATriggerKey: process.env.RA_TRIGGER_KEY,
     redisCameraUpdates: process.env.redisCameraUpdates

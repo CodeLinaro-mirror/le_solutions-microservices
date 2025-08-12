@@ -1,4 +1,4 @@
-# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 openapi: 3.0.3
 info:
@@ -6,7 +6,8 @@ info:
   description: |
     A service that consumes the AI Workflow for object detection, and will generate alerts
     given triggers defined through this API. This service is specialized to analyze
-    people and objects attached-to or carried-by people, known as "accessories".
+    people including people counting, occupancy analytics, and objects attached-to
+    or carried-by people, known as "accessories".
 
     Alerts will be triggered at most once per second. Alert history is stored
     by the service and can be queried through this API by polling alerts.
@@ -20,7 +21,7 @@ info:
     url: https://mysupport.qualcomm.com/supportforums/s/
   license:
     name: BSD-3-Clause-Clear
-  version: '1.0.0'
+  version: '1.0.3'
 servers:
   - url: https://{device-address}/people-analytics/v1/api
     description: Server URL
@@ -34,31 +35,117 @@ x-string-constants:
   - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
   - monitor: &MONITOR_EXAMPLE "camera1"
   - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
+  - alert_uuid: &ALERT_UUID_EXAMPLE "{unique-alert-uuid}"
 
-tags: 
+tags:
   - name: alerts
     description: Poll historical alerts
   - name: config
-    description: Configure triggers which generate alerts
+    description: Configure triggers which generate alerts as well as microservice settings
+  - name: analytics
+    description: Query analytics data
   - name: health
     description: Health checks for API service.
 security: []
 paths:
+  /alerts/fov:
+    get:
+      tags:
+        - alerts
+      summary: Get all alerts
+      description: |
+        Return all alerts from a list of monitors.
+
+        The `trigger_condition` defines when a trigger generates alerts.
+
+        See examples below for different trigger_conditions and the data that is in the message.
+      operationId: getAllAlerts
+      parameters:
+        - name: monitorIds
+          in: query
+          required: true
+          description: Alerts on these monitors are returned.
+          schema:
+            type: array
+            items:
+              type: string
+              example: *MONITOR_EXAMPLE
+
+        - name: fromTime
+          in: query
+          required: true
+          description: Earliest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: Latest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+
+      responses:
+        '200':
+          description: List of All types of alerts in response sorted by time.
+          content:
+            accessories:
+              schema:
+                $ref: '#/components/schemas/Alerts'
+            occupancy:
+              schema:
+                $ref: '#/components/schemas/AlertsOccupancy'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: AlertFov
+
   /config/alerts/fov:
     post:
       tags:
         - config
-      summary: Configure a new trigger to generate alerts
+      summary: Configure triggers which generate alerts
       description: Configures a new trigger attached to monitor which will generate alerts given conditions.
       operationId: configTrigger
       requestBody:
-        description:
+        description: |
           Creates a new trigger attached to the specified monitor. When trigger conditions are matched,
           an alert will be generated.
 
-          The "params" field depends on the trigger condition selected. See the examples
-          below for different trigger conditions and their required "params", as well as
-          the detailed schema definition.
+          Triggers are defined by a client-provided globally-unique identifier (`trigger_id`)
+          and a human-readable name `trigger_name` to describe the reason for the trigger.
+
+          The `trigger_condition` defines when a trigger generates alerts:
+            * 'required_accessories': Alert if person is present missing one or more of required accesseries.
+            * 'restricted_accessories': Alert if person is present with any restricted accessory.
+            * 'occupancy_changed': Alert whenever number of persons in frame changes. Use to see all occupancy changes.
+            * 'occupancy_over': Alert when an occupancy increase crosses over a limit. Use when there's a maximum amount of people expected in a frame.
+            * 'occupancy_under': Alert when an occupancy decrease crosses under a limit. Use when there's at least some number of people expected in a frame.
+            * 'loitering_over': Alert when an occupant's dwell time within the screen crosses over a limit (in seconds).
+
+          The 'occupancy_changed' condition will trigger whenever there's a change of
+          occupancy in the frame, and does not require `params`.
+
+          The 'occupancy_over' and 'occupancy_under' conditions require a `params` of
+          `["name": "threshold", "value": "<count>"]`, where '<count>' is the numeric threshold for the over
+          or under. For example, a trigger with 'occupancy_over' with a threshold of "3"
+          will generate an alert when the occupancy becomes _greater than_ 3. The alert won't
+          be triggered again until the occupancy crosses back over the threshold.
+          The "params" field depends on the trigger condition selected.
+
+          The 'loitering_over' condition require a `params` of
+          `["name": "threshold", "value": "<value>"]`, where '<value>' is the numeric threshold for the over.
+          For example, a trigger with 'loitering_over' with a threshold of "300000" (5 minutes)
+          will generate an alert when the occupant's dwell time within the given monitor
+          becomes _greater than_ 300000.
+
+          See the examples below for different trigger conditions and their required "params".
 
         required: true
         content:
@@ -70,7 +157,15 @@ paths:
                 $ref: '#/components/examples/triggerExampleRequiredAccessories'
               Restricted Accessories:
                 $ref: '#/components/examples/triggerExampleRestrictedAccessories'
-              
+              Occupancy Over:
+                $ref: '#/components/examples/triggerOccupancyOver'
+              Occupancy Under:
+                $ref: '#/components/examples/triggerOccupancyUnder'
+              Occupancy Changed:
+                $ref: '#/components/examples/triggerOccupancyChanged'
+              Loitering Over:
+                $ref: '#/components/examples/triggerLoiteringOver'
+
       responses:
         '200':
           description: New trigger was successfully configured.
@@ -89,7 +184,7 @@ paths:
       operationId: deleteTrigger
       parameters:
       - name: triggerId
-        in: query          
+        in: query
         required: true
         description: Trigger ID to delete.
         schema:
@@ -113,7 +208,7 @@ paths:
       operationId: getTriggers
       parameters:
       - name: monitorId
-        in: query          
+        in: query
         required: true
         description: Monitor ID whose triggers are listed.
         schema:
@@ -127,62 +222,113 @@ paths:
               schema:
                 $ref: '#/components/schemas/Triggers'
         '400':
-          description: Error deleting trigger.
+          description: Error getting triggers.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
       x-swagger-router-controller: ConfigFovTrigger
 
-  /alerts/fov:
+  /analytics/count/fov:
     get:
       tags:
-        - alerts
-      summary: Get all alerts
-      description: Return all alerts from a list of monitors.
-      operationId: getAllAlerts
+        - analytics
+      summary: Query occupancy statistics within timeframe.
+      description: |
+        Returns the occupancy statistics for the timeframe specified.
+
+        The minimum Interval is 5minutes.
+      operationId: getAnalyticsCount
       parameters:
-        - name: monitorIds
-          in: query          
+        - name: monitorId
+          in: query
           required: true
-          description: Alerts on these monitors are returned.
+          description: Statistics from this monitor is returned.
           schema:
-            type: array
-            items:
-              type: string
-              example: *MONITOR_EXAMPLE
-          
+            type: string
+            example: *MONITOR_EXAMPLE
         - name: fromTime
-          in: query          
+          in: query
           required: true
-          description: Earliest alert to return
+          description: Start of timeframe
           schema:
             type: number
             format: double
             example: *TIMESTAMP_EXAMPLE
         - name: toTime
-          in: query          
+          in: query
           required: true
-          description: Latest alert to return
+          description: End of timeframe
           schema:
             type: number
             format: double
             example: *TIMESTAMP_2_EXAMPLE
-
       responses:
         '200':
-          description: Response contains alerts.
+          description: Occupancy statistics within the given timeframe
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Alerts'
+                $ref: '#/components/schemas/OccupancyCount'
         '400':
-          description: Invalid input
+          description: Error retrieving value.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: AlertFov
+      x-swagger-router-controller: AnalyticsFovCount
+
+
+  /analytics/heatmap/fov:
+    get:
+      tags:
+        - analytics
+      summary: Query occupancy heatmap within timeframe.
+      description: |
+         The heatmap is specified in a 64x64 2D array.
+
+         The minimum Interval is 5minutes.
+
+      operationId: getAnalyticsCount
+      parameters:
+        - name: monitorId
+          in: query
+          required: true
+          description: Statistics from this monitor is returned.
+          schema:
+            type: string
+            example: *MONITOR_EXAMPLE
+        - name: fromTime
+          in: query
+          required: true
+          description: Start of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: End of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+      responses:
+        '200':
+          description: Occupancy heatmap within the given timeframe, specified in a row x col 2D array
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OccupancyHeatmap'
+        '400':
+          description: Error retrieving value.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: AnalyticsFovHeatmap
+
   /health:
     get:
       tags:
@@ -198,20 +344,34 @@ paths:
       x-swagger-router-controller: Health
 
 components:
-  
+
   schemas:
-    
+
     Alert:
       description: Information about an alert that has been generated by a configured Trigger.
       type: object
       properties:
         source_trigger:
           $ref: "#/components/schemas/Trigger"
+        alert_id:
+          description: Alert identifier
+          type: string
+          format: uuid
+          example: *ALERT_UUID_EXAMPLE
         time:
           description: Timestamp at which alert was generated.
           type: number
           format: double
           example: *TIMESTAMP_EXAMPLE
+        end_time:
+          description: Timestamp at which alert was cleared. Not included if alert has not cleared.
+          format: double
+          example: *TIMESTAMP_2_EXAMPLE
+        type:
+          description: Alert type
+          type: string
+          enum: ["accessories", "occupancy"]
+          example: accessories
         causes:
           description: List of people by bounding box, and what accessories are in violation.
           type: array
@@ -223,12 +383,49 @@ components:
                 example: "helmet, glove"
               violator:
                 $ref: "#/components/schemas/BoundingBox"
-    
+
+    AlertOccupancy:
+      description: Information about an alert that has been generated by a configured Trigger.
+      type: object
+      properties:
+        source_trigger:
+          $ref: '#/components/schemas/TriggerOccupancy'
+        alert_id:
+          description: Alert identifier
+          type: string
+          format: uuid
+          example: *ALERT_UUID_EXAMPLE
+        time:
+          description: Timestamp at which alert was generated.
+          type: number
+          format: double
+          example: *TIMESTAMP_EXAMPLE
+        end_time:
+          description: Timestamp at which alert was cleared. Not included if alert has not cleared.
+          format: double
+          example: *TIMESTAMP_2_EXAMPLE
+        type:
+          description: Alert type
+          type: string
+          enum: ["accessories", "occupancy"]
+          example: occupancy
+        occupants:
+          description: List of occupants within frame at time of trigger.
+          type: array
+          items:
+            $ref: "#/components/schemas/Occupant"
+
     Alerts:
       description: List of Alert objects
       type: array
       items:
         $ref: "#/components/schemas/Alert"
+
+    AlertsOccupancy:
+      description: List of Alert objects
+      type: array
+      items:
+        $ref: "#/components/schemas/AlertOccupancy"
 
     BoundingBox:
       description: Describe rectangular area by top-left and bottom-right coordinates.
@@ -281,11 +478,15 @@ components:
           type: string
           description: >
             When this trigger should generate alerts.
-            
+
             Types of conditions:
              * `required_accessories` - Alert if person is present missing one or more of required accesseries.
              * `restricted_accessories` - Alert if person is present with any restricted accessory.
-          enum: ["required_accessories", "restricted_accessories"]
+             * 'occupancy_changed': Alert whenever number of persons in frame changes. Use to see all occupancy changes.
+             * 'occupancy_over': Alert when an occupancy increase crosses over a limit. Use when there's a maximum amount of people expected in a frame.
+             * 'occupancy_under': Alert when an occupancy decrease crosses under a limit. Use when there's at least some number of people expected in a frame.
+             * 'loitering_over': Alert when an occupant's dwell time within the given monitor crosses over a limit (in seconds).
+          enum: ["required_accessories", "restricted_accessories", "occupancy_changed", "occupancy_over", "occupancy_under", "loitering_over"]
           example: required_accessories
         params:
           description: List of parameters required to configure alert.
@@ -295,6 +496,43 @@ components:
           example:
             - name: "accessories"
               value: "helmet, goggles, glove"
+    TriggerOccupancy:
+      description: Monitor and conditions on which to trigger an alert.
+      type: object
+      properties:
+        monitor_id:
+          description: Monitor on which to place trigger.
+          type: string
+          example: *MONITOR_EXAMPLE
+        trigger_id:
+          description: Globally-unique identifier used when referring to trigger.
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+        trigger_name:
+          description: Human-readable name for the trigger.
+          type: string
+          example: "Person lacking hemlet, goggles, or gloves."
+        trigger_condition:
+          type: string
+          description: >
+            When this trigger should generate alerts.
+
+            Types of conditions:
+             * 'occupancy_changed': Alert whenever number of persons in frame changes. Use to see all occupancy changes.
+             * 'occupancy_over': Alert when an occupancy increase crosses over a limit. Use when there's a maximum amount of people expected in a frame.
+             * 'occupancy_under': Alert when an occupancy decrease crosses under a limit. Use when there's at least some number of people expected in a frame.
+             * 'loitering_over': Alert when an occupant's dwell time within the given monitor crosses over a limit (in seconds).
+          enum: ["required_accessories", "restricted_accessories", "occupancy_changed", "occupancy_over", "occupancy_under", "loitering_over"]
+          example: "occupancy_over"
+        params:
+          description: List of parameters required to configure alert.
+          type: array
+          items:
+            $ref: "#/components/schemas/Param"
+          example:
+            - name: "threshold"
+              value: "3"
+
     Triggers:
       description: List of Trigger objects
       type: array
@@ -324,6 +562,56 @@ components:
           description: Detailed reason for error.
           example: "Invalid user input in parameter..(etc.)"
 
+    Occupant:
+      description: A person in the scene.
+      type: object
+      properties:
+        bounding_box:
+          $ref: "#/components/schemas/BoundingBox"
+        person_id:
+          description: ID of the person
+          type: string
+          example: "0"
+        dwell_time:
+          description: How long the person has been dwelling
+          type: number
+          example: 60000
+
+    OccupancyCount:
+      description: Occupancy Count
+      type: object
+      properties:
+        min:
+          type: integer
+          example: 0
+        max:
+          type: integer
+          example: 26
+        average:
+          type: integer
+          example: 8
+
+    OccupancyHeatmap:
+      description: Occupancy Heatmap
+      type: object
+      properties:
+        rows:
+          type: integer
+          example: 64
+        cols:
+          type: integer
+          example: 64
+        data:
+          type: array
+          items:
+            type: array
+            items:
+              type: integer
+            minItems: 64
+            maxItems: 64
+          minItems: 64
+          maxItems: 64
+
   examples:
 
     triggerExampleRequiredAccessories:
@@ -345,3 +633,40 @@ components:
         params:
           - name: "accessories"
             value: "cellphone"
+
+    triggerOccupancyOver:
+      value:
+        monitor_id: *MONITOR_EXAMPLE
+        trigger_id: *TRIGGER_ID_EXAMPLE
+        trigger_name: "Trigger an alert whenever occupancy changes from <= 2 to >= 3."
+        trigger_condition: "occupancy_over"
+        params:
+          - name: "threshold"
+            value: "2"
+
+    triggerOccupancyUnder:
+      value:
+        monitor_id: *MONITOR_EXAMPLE
+        trigger_id: *TRIGGER_ID_EXAMPLE
+        trigger_name: "Trigger an alert whenever occupancy changes from >= 3 to <= 2."
+        trigger_condition: "occupancy_under"
+        params:
+          - name: "threshold"
+            value: "3"
+
+    triggerOccupancyChanged:
+      value:
+        monitor_id: *MONITOR_EXAMPLE
+        trigger_id: *TRIGGER_ID_EXAMPLE
+        trigger_name: "Alert each time occupancy changes in frame; no params needed."
+        trigger_condition: "occupancy_changed"
+
+    triggerLoiteringOver:
+      value:
+        monitor_id: *MONITOR_EXAMPLE
+        trigger_id: *TRIGGER_ID_EXAMPLE
+        trigger_name: "Occupant has been loitering for more than 5 minutes."
+        trigger_condition: "loitering_over"
+        params:
+          - name: "threshold"
+            value: "300000"

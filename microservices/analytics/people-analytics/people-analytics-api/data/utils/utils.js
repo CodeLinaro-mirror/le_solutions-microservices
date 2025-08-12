@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
  */
@@ -57,8 +57,33 @@ async function initializeDB() {
     }
 }
 
+function convertToms(time) {
+    if (time > 10000000000) return time;
+    else return time*1000;
+}
+
+async function checkTriggerConditionParams(data) {
+    let tc = data.trigger_condition;
+    // Check if params match object detection
+    if (config.accessoriesTriggerConditions.includes(tc)) {
+        if (!data.params) {throw new Error("Accessory detection requested but no params were detected. Please provide a list of Accessories to Alert on.")}
+        if (!data.params.some((obj => obj.name === "accessories"))) {
+            throw new Error("Mismatch between Params and Trigger Condition. Accessories to detect were not provided")
+        }
+    }
+    // Check if params match people counting
+    else if (config.peopleCountTriggerConditions.includes(tc)) {
+        if (tc === "occupancy_changed") return;
+        else if (!data.params.some((obj => obj.name === "threshold"))) {
+            throw new Error("Mismatch between Params and Trigger Condition. Accessories to detect were not provided")
+        }
+    }
+}
+
 module.exports = {
     populateRedis,
     cameraUpdates,
-    initializeDB
+    initializeDB,
+    convertToms,
+    checkTriggerConditionParams
 };

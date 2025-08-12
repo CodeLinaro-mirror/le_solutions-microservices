@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 'use strict';
@@ -10,7 +10,7 @@ const mariadb = require('mariadb');
 const pool = mariadb.createPool({
     host: config.mariadbHost,
     port: config.mariadbPort,
-    user: config.mariadbUser, 
+    user: config.mariadbUser,
     password: config.mariadbPass,
     connectionLimit: 25,
     database: config.default_db,
@@ -73,7 +73,7 @@ async function insertRATrigger(data) {
 
         const res = await conn.query(`INSERT INTO region_analytics_triggers ` +
             `(region_id, trigger_id, trigger_name, trigger_condition, params)` +
-            ` value ('${data.region_id}', '${data.trigger_id}', '${data.trigger_name}',` + 
+            ` value ('${data.region_id}', '${data.trigger_id}', '${data.trigger_name}',` +
             `'${data.trigger_condition}', '${paramsString}');`);
         console.log(res);
     } catch (e) {
@@ -222,19 +222,20 @@ async function getRATrigger(data) {
     }
 }
 
-async function insertRAAlert(jsonData) {
+async function insertRAAlert(data) {
     let conn;
     try {
-        let data = JSON.parse(jsonData);
         let causesString = JSON.stringify(data.occupants);
+        // if (data.end_time == 0 || data.end_time == null || data.end_time == undefined) data.end_time =
         // Escape apostrophes
         data = cleanInput(data);
 
         conn = await fetchConn();
         const res = await conn.query(`INSERT INTO region_analytics_alerts ` +
-            `(monitor_id, source_trigger_id, time, occupants)` +
-            ` value ('${data.monitor_id}', '${data.source_trigger.trigger_id}', `+
-            `FROM_UNIXTIME(${data.time}), '${causesString}');`);
+            `(monitor_id, source_trigger_id, alert_id, time, end_time, occupants)` +
+            ` value ('${data.monitor_id}', '${data.source_trigger.trigger_id}',` +
+            ` '${data.alert_id}', FROM_UNIXTIME(${data.time}),` +
+            ` FROM_UNIXTIME(${data.end_time}), '${causesString}');`);
     } catch (e) {
         throw e;
     } finally {
@@ -249,13 +250,50 @@ async function getAlerts(data) {
         conn = await fetchConn();
         let retVal = [];
         for await (const id of data.monitorIds) {
-            let rows = await conn.query(`select ra.monitor_id, ra.source_trigger_id, UNIX_TIMESTAMP(ra.time) as time, ra.occupants, rt.* FROM region_analytics_alerts ra` +
+            let rows = await conn.query(
+                `select ra.monitor_id, ra.source_trigger_id, UNIX_TIMESTAMP(ra.time) as time, UNIX_TIMESTAMP(ra.end_time) as end_time,` +
+                ` ra.alert_id, ra.occupants, rt.* FROM region_analytics_alerts ra` +
                 ` inner join region_analytics_triggers rt on ra.source_trigger_id = rt.trigger_id ` +
                 ` WHERE ra.monitor_id = '${id}' AND ` +
-                ` time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}) ORDER BY time;`);
+                ` (time >= FROM_UNIXTIME(${data.fromTime}) AND time <= FROM_UNIXTIME(${data.toTime}))` +
+                ` OR (end_time >= FROM_UNIXTIME(${data.fromTime}) AND end_time <= FROM_UNIXTIME(${data.toTime})) ORDER BY time;`);
+
             retVal = [...retVal, ...rows];
         };
         return retVal;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function getAlertById(data) {
+    let conn;
+    try {
+        conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+
+        const res = await conn.query(`SELECT * from region_analytics_alerts where alert_id = '${data}';`);
+        return res;
+    } catch (e) {
+        throw e;
+    } finally {
+        // Close connection if it was still open
+        if (conn) conn.end();
+    }
+}
+
+async function updateRAAlert(data) {
+    let conn;
+    try {
+        conn = await fetchConn();
+        // Escape apostrophes
+        data = cleanInput(data);
+        const res = await conn.query(`UPDATE region_analytics_alerts SET end_time = FROM_UNIXTIME(${data.end_time}) where alert_id = '${data.alert_id}';`);
+        return res;
     } catch (e) {
         throw e;
     } finally {
@@ -288,7 +326,7 @@ async function removeTrigger(data) {
         conn = await fetchConn();
         // Escape apostrophes
         data = cleanInput(data);
-        
+
         const res = await conn.query(`DELETE FROM region_analytics_triggers WHERE ` +
             `trigger_id = '${data}';`);
         return res;
@@ -341,10 +379,10 @@ async function createDatabase() {
         const dbpool = mariadb.createPool({
             host: config.mariadbHost,
             port: config.mariadbPort,
-            user: config.mariadbUser, 
+            user: config.mariadbUser,
             password: config.mariadbPass
         });
-        
+
         conn = await dbpool.getConnection();
 
         const res = await conn.query(`CREATE DATABASE IF NOT EXISTS iot_solutions;`);
@@ -404,7 +442,8 @@ async function createAlertsTable() {
 
         const res = await conn.query('CREATE TABLE IF NOT EXISTS region_analytics_alerts ' +
             '(monitor_id text, source_trigger_id VARCHAR(255) not null, ' +
-            'time datetime(6), occupants text, ' +
+            'alert_id text not null, ' +
+            'time datetime(6), end_time datetime(6), occupants text, ' +
             'CONSTRAINT `region_analytics_trigger_alerts_fk` ' +
             'FOREIGN KEY (source_trigger_id) REFERENCES region_analytics_triggers (trigger_id) ' +
             'on delete cascade ' +
@@ -430,6 +469,8 @@ module.exports = {
     getRATrigger,
     insertRAAlert,
     getAlerts,
+    getAlertById,
+    updateRAAlert,
     removeRegion,
     removeTrigger,
     removeAllMonitor,
