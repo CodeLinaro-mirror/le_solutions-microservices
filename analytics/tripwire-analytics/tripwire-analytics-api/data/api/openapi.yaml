@@ -1,0 +1,479 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+openapi: 3.0.3
+info:
+  title: Tripwire Analytics API
+  description: |
+    TODO: description
+  contact:
+    name: Qualcomm Support Forums
+    url: https://mysupport.qualcomm.com/supportforums/s/
+  license:
+    name: BSD-3-Clause-Clear
+  version: '1.0.0'
+servers:
+  - url: "{device-address}/tripwire-analytics/v1/api"
+    description: Secured server URL
+    variables:
+      device-address:
+        description: IP address (and port) of the host of the Tripwire Analytics API ingress.
+        default: https://your.device.ip.here:8080
+
+x-string-constants:
+  - timestamp:       &TIMESTAMP_EXAMPLE   1729118760.000 # Epoch time in seconds. May optionally provide fractional seconds
+  - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
+  - monitor: &MONITOR_ID_EXAMPLE "camera1"
+  - tripwire_id: &TRIPWIRE_ID_EXAMPLE "{unique-tripwire-id}"
+  - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
+
+tags: 
+  - name: alerts
+    description: Poll historical alerts
+  - name: config
+    description: Configure tripwires and triggers that generate alerts from tripwires
+  - name: util
+    description: Utility APIs
+security: []
+paths:
+  /healthz:
+    get:
+      tags:
+        - util
+      summary: Check server health
+      description: Responds health of the server and its connections.
+      operationId: getHealth
+      responses:
+        '200':
+          description: OK
+        '501':
+          description: Server unhealthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: Health        
+
+  /config/tripwire:
+    post:
+      tags:
+        - config
+      summary: Create a new tripwire
+      description: Create a tripwire that can be addressed by alerts
+      operationId: configTripwireCreate
+      requestBody:
+        description: |
+          TODO: tripwire description
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Tripwire'
+            # TODO: example
+              
+      responses:
+        '200':
+          description: New tripwire was successfully configured.
+        default:
+          description: Error configuring tripwire.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwire        
+    delete:
+      tags:
+        - config
+      summary: Delete tripwire
+      description: Deletes an existing tripwire by tripwire ID.
+      operationId: configTripwireDelete
+      parameters:
+      - name: tripwireId
+        in: query          
+        required: true
+        description: Tripwire ID to delete.
+        schema:
+          type: string
+          example: *TRIPWIRE_ID_EXAMPLE
+      responses:
+        '200':
+          description: Tripwire was successfully deleted.
+        default:
+          description: Error deleting tripwire.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwire        
+    get:
+      tags:
+        - config
+      summary: Get tripwires
+      description: Return list of tripwires on a given monitor ID.
+      operationId: configTripwireGet
+      parameters:
+      - name: monitorId
+        in: query          
+        required: true
+        description: Monitor ID whose tripwires are listed.
+        schema:
+          type: string
+          example: *MONITOR_ID_EXAMPLE
+      responses:
+        '200':
+          description: List of tripwires in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tripwires'
+        default:
+          description: Error getting tripwires.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwire
+
+  /config/alerts/tripwire:
+    post:
+      tags:
+        - config
+      summary: Configure a new trigger to generate alerts on tripwire
+      description: Configures a new trigger attached to a tripwire which will generate alerts given conditions.
+      operationId: configTriggerTripwireCreate
+      requestBody:
+        description: |
+          TODO: better description
+
+          Only one type right now: flow-rate (trigger_condition: flowrate)
+
+          Required parameters:
+          - threshold, integer: people per duration over which alert will trigger
+          - duration, integer: number of seconds to look for threshold, max: 60
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Trigger'
+            examples:
+              Flow-rate Trigger:
+                $ref: '#/components/examples/flowrate_trigger'
+              
+      responses:
+        '200':
+          description: New trigger was successfully configured.
+        default:
+          description: Error configuring trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwireTrigger        
+    delete:
+      tags:
+        - config
+      summary: Delete trigger
+      description: Deletes an existing trigger by trigger ID.
+      operationId: configTriggerTripwireDelete
+      parameters:
+      - name: triggerId
+        in: query          
+        required: true
+        description: Trigger ID to delete.
+        schema:
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+      responses:
+        '200':
+          description: Trigger was successfully deleted.
+        '400':
+          description: Error deleting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwireTrigger        
+    get:
+      tags:
+        - config
+      summary: Get triggers
+      description: Return list of triggers on a given monitor ID.
+      operationId: configTriggerTripwireGet
+      parameters:
+      - name: monitorId
+        in: query          
+        required: true
+        description: Monitor ID whose triggers are listed.
+        schema:
+          type: string
+          example: *MONITOR_ID_EXAMPLE
+      responses:
+        '200':
+          description: List of triggers in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triggers'
+        '400':
+          description: Error deleting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigTripwireTrigger
+
+  /alerts/tripwire:
+    get:
+      tags:
+        - alerts
+      summary: Get all alerts
+      description: Return all alerts from a list of monitors.
+      operationId: getAllTripwireAlerts
+      parameters:
+        - name: monitorIds
+          in: query          
+          required: true
+          description: Alerts on these monitors are returned.
+          schema:
+            type: array
+            items:
+              type: string
+              example: *MONITOR_ID_EXAMPLE
+          
+        - name: fromTime
+          in: query          
+          required: true
+          description: Earliest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query          
+          required: true
+          description: Latest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+
+      responses:
+        '200':
+          description: Response contains alerts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alerts'
+              examples:
+                Flow-rate alert:
+                  $ref: '#/components/examples/flowrate_alert'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: TripwireAlert
+
+
+components:
+  
+  schemas:
+    
+    Alert:
+      description: Information about an alert that has been generated by a configured Trigger.
+      type: object
+      properties:
+        monitor_id:
+          description: Monitor corresponding to this alert.
+          type: string
+          example: *MONITOR_ID_EXAMPLE
+        source_trigger:
+            $ref: "#/components/schemas/Trigger"
+        time:
+          description: Timestamp at which alert was generated.
+          type: number
+          format: double
+          example: *TIMESTAMP_EXAMPLE
+        crossings:
+          description: Information about crossings that triggered the alert.
+          type: object
+          properties:
+            count:
+              description: How many people have crossed.
+              type: number
+              example: 3
+            duration:
+              description: Time over which count was calculated in seconds.
+              type: number
+              format: double
+              example: 4.0
+      required:
+        - monitor_id
+        - source_trigger
+        - time
+    
+    Alerts:
+      description: List of Alert objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Alert"
+        
+
+    Coord:
+      description: Coordinate in a monitor
+      type: object
+      properties:
+        x:
+          type: number
+          format: double
+          description: From 0.0 (left side of monitor) to 1.0 (right side of monitor)
+          example: 0.5
+        y:
+          type: number
+          format: double
+          description: From 0.0 (top of monitor) to 1.0 (bottom of monitor)
+          example: 0.5
+
+    Trigger:
+      description: |
+        Definition of a trigger. See POST /config/alerts/tripwire for details.
+
+      type: object
+      properties:
+        tripwire_id:
+          description: Tripwire on which to place trigger.
+          type: string
+          example: *TRIPWIRE_ID_EXAMPLE
+        trigger_id:
+          description: Globally-unique identifier used when referring to trigger.
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+        trigger_name:
+          description: Human-readable name for the trigger.
+          type: string
+          example: "People entering lobby"
+        trigger_direction:
+          type: string
+          description: Whether alerts should be triggered on people entering or exiting the tripwire.
+          enum: ["entry", "exit"]
+          example: entry
+        trigger_condition:
+          type: string
+          description: When this trigger should generate alerts. See request body description.
+          enum: ["flowrate"]
+          example: flowrate
+        params:
+          description: List of parameters required to configure alert. Depends on `trigger_condition`
+          type: array
+          items:
+            $ref: "#/components/schemas/Param"
+          example:
+            - name: "threshold"
+              value: "3"
+      required:
+        - tripwire_id
+        - trigger_id
+        - trigger_name
+        - trigger_condition
+        - params
+    
+    Triggers:
+      description: List of Trigger objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Trigger"
+
+    Tripwire:
+      description: Defines a tripwire in a monitor.
+      type: object
+      properties:
+        monitor_id:
+          description: Monitor on which to place tripwire.
+          type: string
+          example: *MONITOR_ID_EXAMPLE
+        tripwire_id:
+          description: Globally-unique identifier used when referring to tripwire.
+          type: string
+          example: *TRIPWIRE_ID_EXAMPLE
+        tripwire_name:
+          description: Human-readable name for the tripwire.
+          type: string
+          example: "Entrance to lobby"
+        wire:
+          description: List of vertices that define wire.
+          type: array
+          items:
+            $ref: "#/components/schemas/Coord"
+        direction:
+          description: Two coordinates crossing the wire that define the entry and exit sides of the wire
+          type: object
+          properties:
+            entry:
+              $ref: "#/components/schemas/Coord"
+            exit:
+              $ref: "#/components/schemas/Coord"
+
+    Tripwires:
+      description: List of Tripwire objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Tripwire"
+
+
+    Param:
+      description: Generic name, value pair for parameters or settings.
+      type: object
+
+      properties:
+        name:
+          description: Name of parameter.
+          type: string
+          example: "parameter_name"
+        value:
+          description: Value of parameter.
+          type: string
+          example: "parameter_value_string"
+
+    Error:
+      description: "Error response"
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Detailed reason for error.
+          example: "Invalid user input in parameter..(etc.)"
+
+  examples:
+      flowrate_trigger:
+        value:
+          tripwire_id: *TRIPWIRE_ID_EXAMPLE
+          trigger_id: *TRIGGER_ID_EXAMPLE
+          trigger_name: "More than 2 ppl/sec entering"
+          trigger_direction: "entry"
+          trigger_condition: "flowrate"
+          params:
+            - name: "threshold"
+              value: "2"
+            - name: "duration"
+              value: "1"      
+
+      flowrate_alert:
+        value:
+          - monitor_id: *MONITOR_ID_EXAMPLE
+            source_trigger:
+              tripwire_id: *TRIPWIRE_ID_EXAMPLE
+              trigger_id: *TRIGGER_ID_EXAMPLE
+              trigger_name: "More than 2 ppl/sec entering"
+              trigger_direction: "entry"
+              trigger_condition: "flowrate"
+              params:
+                - name: "threshold"
+                  value: "2"
+                - name: "duration"
+                  value: "1"
+            time: *TIMESTAMP_EXAMPLE
+            crossings:
+              count: 3
+              duration: 1
