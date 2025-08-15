@@ -34,13 +34,6 @@
 
 #include "llm-buffer.h"
 
-typedef struct {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    bool* queryDone;
-    std::string* responseStr;
-} QueryMutex;
-
 class Profile
 {
     public:
@@ -107,7 +100,7 @@ class LLMObject
             UNKNOWN = -1
         };
 
-        LLMObject(std::string model);
+        LLMObject(std::string model, bool streaming);
         ~LLMObject() {delete diag;}
         // Disable both copying and moving
         LLMObject(const LLMObject&) = delete;
@@ -116,10 +109,15 @@ class LLMObject
         LLMObject& operator=(LLMObject&&) = delete;
 
         std::unique_ptr<Query> query;
-        std::unique_ptr<Response> response;
         std::shared_ptr<Profile> profiler;
 
         char id[256];
+
+        bool stream;
+
+        char modelSelected[256];
+
+        LLMResponseCallback responseCallback = nullptr;
 
         void chat_completion_create ();
         void chat_completion_retrieve ();
@@ -140,5 +138,11 @@ class LLMObject
         LLMModel getModelFromQuery(const std::string& model);
 
 };
+
+typedef struct {
+    std::string* responseStr;
+    bool* stream;
+    LLMObject* llmObj;
+} QueryStruct;
 
 #endif// LLM_SERVICE_H

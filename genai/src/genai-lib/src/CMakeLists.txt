@@ -33,9 +33,6 @@ target_include_directories(llmservice PUBLIC
 # Link the library
 target_link_libraries(llmservice Genie)
 
-# Install the header
-install(DIRECTORY ../include/ DESTINATION include)
-
 # Install the executable
 install(
   TARGETS llmservice

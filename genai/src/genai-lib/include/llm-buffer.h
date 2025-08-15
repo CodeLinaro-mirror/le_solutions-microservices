@@ -53,4 +53,7 @@ typedef struct {
     Usage usage;
 } Response;
 
+// Callback for Token
+typedef void (*LLMResponseCallback)(const Response* response);
+
 #endif  // LLM_BUFFER_H
