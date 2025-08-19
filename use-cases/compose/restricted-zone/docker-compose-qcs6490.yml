@@ -9,9 +9,9 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
-      - ../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
-      - ../configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
+      - ../../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ../../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
+      - ../../configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
   mariadb:
     image: mariadb:11.6.2
     platform: arm64
