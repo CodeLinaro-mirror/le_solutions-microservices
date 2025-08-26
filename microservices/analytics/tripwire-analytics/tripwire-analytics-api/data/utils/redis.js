@@ -5,6 +5,7 @@
 'use strict';
 
 const config = require('../config/config');
+const { randomUUID } = require('crypto');
 
 const { createClient } = require('redis');
 
@@ -96,11 +97,54 @@ async function removeTrigger(data) {
     }
 }
 
+async function publishAndListenOnce(data, cb) {
+    try {
+        let TARedisClient = client.duplicate();
+        await TARedisClient.connect();
+        let sync_id = randomUUID();
+        // Send a message on the Analytics Channel
+        // {
+        //     'sync_id': sync_id,
+        //     'monitor_id': data.monitorId,
+        //     'from_time': data.fromTime,
+        //     'to_time': data.toTime,
+        //     'analytics_type': analytics_type, // either 'count' or 'heatmap'
+        // }
+
+        // Insert unique ID to ensure a synchronous callback
+        data.sync_id = sync_id;
+
+        // Make sure data matches above format
+        await TARedisClient.publish(config.redisTAAnalyticsChannel, JSON.stringify(data));
+
+        // Listen to the analytics channel until a message is received with same ID
+        await TARedisClient.subscribe(config.redisTAAnalyticsChannel, (message) => {
+            try {
+                // Check to see if message matches unique ID from earlier
+                let retData = JSON.parse(message);
+                // If message matches the unique ID run Callback
+                if (retData.sync_id == sync_id) {
+                    cb(false, retData.result);
+
+                    TARedisClient.unsubscribe();
+                    TARedisClient.quit();
+                }
+            } catch (e) {
+                console.error(e.message);
+                cb(true, e)
+            }
+        });
+    } catch (e) {
+        console.error(e);
+    }
+}
+
 module.exports = {
     insertTATripwire,
     insertTATrigger,
     populateRedis,
     listenToChannel,
     removeTripwire,
-    removeTrigger
+    removeTrigger,
+    publishAndListenOnce
 };
