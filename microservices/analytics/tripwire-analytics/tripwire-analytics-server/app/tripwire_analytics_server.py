@@ -6,19 +6,22 @@ import asyncio
 import os
 import logging
 import time
-
-from tripwire_analytics import TripwireAnalytics
+import sys
+import json
+from mysql.connector.constants import _obsolete_option
+from types import SimpleNamespace
+from tripwire_analytics import TripwireAnalytics, ANALYTICS_CHANNEL, DETECTION_CHANNEL_PREFIX
 
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
+logger = logging.getLogger(__file__)
+LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
+
 REDIS_PORT = os.environ.get('REDIS_PORT', 6379)
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
-DETECTION_CHANNEL_PREFIX = os.environ.get('REDIS_DETECTION_CHANNEL_PREFIX', 'detection.rz') + ':'
+
 # e.g., monitor 0 would be "detection.rz:0"
 
 message_list = [] # list of (loop.time(), message)
-
-logger = logging.getLogger(__file__)
-
 
 async def connect_to_redis(r):
     logger.info(f'Pinging redis at {REDIS_HOST}:{REDIS_PORT}..')
@@ -35,7 +38,7 @@ async def register_pubsub_listener(r: redis.Redis, ta: TripwireAnalytics):
         now = time.time()
         if message is not None:
             ta.enqueue_message(now, message)
-            
+
             # create a readable log with first & last SNIP_SIZE characters of message
             data = message["data"]
             data_len = len(data)
@@ -45,10 +48,58 @@ async def register_pubsub_listener(r: redis.Redis, ta: TripwireAnalytics):
         else:
             logger.debug('No message from get_message')
 
+    def analytics_request_handler(message):
+        logger.debug(f'Received message on analytics channel')
+
+        if message and message['type'] == 'message':
+
+            # {
+            #     'sync_id': sync_id,
+            #     'monitor_id': data.monitorId,
+            #     'from_time': data.fromTime,
+            #     'to_time': data.toTime,
+            #     'analytics_type': analytics_type, # either 'count' or 'heatmap'
+            # }
+
+            try:
+                #logger.info(f'Analytics Request: {message}')
+                request = json.loads(message['data'], object_hook=lambda d: SimpleNamespace(**d))
+
+                if hasattr(request, 'result'):
+                    #logger.debug(f'Ignore own messages')
+                    return
+
+                #data = json.loads(message['data'])
+                #logger.debug(f"[{ANALYTICS_CHANNEL}] Received JSON: {json.dumps(data, indent=2)}")
+                #sync_id = data.get('sync_id')
+                #monitor_id = data.get('monitor_id')
+                #from_time = data.get('from_time')
+                #to_time = data.get('to_time')
+                #analytics_type = data.get('analytics_type')
+
+                def handle_unknown_analytics(query_type):
+                    logger.error(f'Unknown {query_type} analytics type')
+
+                # Handling should be non-blocking
+                if( request.analytics_type == 'count'):
+                    asyncio.create_task(ta.run_count_query(r, request.sync_id, request.monitor_id, request.from_time, request.to_time))
+                elif( request.analytics_type == 'heatmap'):
+                    asyncio.create_task(ta.run_heatmap_query(r, request.sync_id, request.monitor_id, request.from_time, request.to_time))
+                else:
+                    handle_unknown_analytics()
+            except json.JSONDecodeError:
+                print(f"[Subscriber] Received non-JSON message: {message['data'].decode('utf-8')}")
+        else:
+            logger.debug('No message for analytics')
+
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
     channel_pattern = DETECTION_CHANNEL_PREFIX + '*'
     await pubsub.psubscribe(**{channel_pattern: detection_message_handler})
+
+    await pubsub.subscribe(**{ANALYTICS_CHANNEL: analytics_request_handler})
+    logger.debug(f'subscribed to {ANALYTICS_CHANNEL} channel')
+
     return pubsub
 
 
@@ -56,6 +107,7 @@ async def async_main():
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     ta = TripwireAnalytics(r)
     channel_listener_task = None
+    statistics_process_task = None
 
     try:
         await connect_to_redis(r)
@@ -66,11 +118,19 @@ async def async_main():
             logging.info('Got SIGTERM, cancelling listener task..')
             channel_listener_task.cancel()
 
+            ta.deInit()
+
         pubsub = await register_pubsub_listener(r, ta)
         loop = asyncio.get_event_loop()
         loop.add_signal_handler(signal.SIGTERM, quit_handler)
+
+        await ta.init()
+        statistics_process_task = ta.start_statistics_task()
+
         channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
+
         await channel_listener_task
+        await statistics_process_task
 
     except asyncio.CancelledError:
         logger.info('Got cancelled exception, shutting down..')
@@ -81,6 +141,7 @@ async def async_main():
 
 if __name__ == "__main__":
 
-    # logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(filename)s::%(funcName)s %(message)s')    
+    # logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(filename)s::%(funcName)s %(message)s')
     logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
     asyncio.run(async_main())
+    logging.info('Exiting server.')

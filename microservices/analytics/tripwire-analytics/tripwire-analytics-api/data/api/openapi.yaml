@@ -26,7 +26,7 @@ x-string-constants:
   - tripwire_id: &TRIPWIRE_ID_EXAMPLE "{unique-tripwire-id}"
   - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
 
-tags: 
+tags:
   - name: alerts
     description: Poll historical alerts
   - name: config
@@ -51,7 +51,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: Health        
+      x-swagger-router-controller: Health
 
   /config/tripwire:
     post:
@@ -70,7 +70,7 @@ paths:
             schema:
               $ref: '#/components/schemas/Tripwire'
             # TODO: example
-              
+
       responses:
         '200':
           description: New tripwire was successfully configured.
@@ -80,7 +80,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigTripwire        
+      x-swagger-router-controller: ConfigTripwire
     delete:
       tags:
         - config
@@ -89,7 +89,7 @@ paths:
       operationId: configTripwireDelete
       parameters:
       - name: tripwireId
-        in: query          
+        in: query
         required: true
         description: Tripwire ID to delete.
         schema:
@@ -104,7 +104,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigTripwire        
+      x-swagger-router-controller: ConfigTripwire
     get:
       tags:
         - config
@@ -113,7 +113,7 @@ paths:
       operationId: configTripwireGet
       parameters:
       - name: monitorId
-        in: query          
+        in: query
         required: true
         description: Monitor ID whose tripwires are listed.
         schema:
@@ -159,7 +159,7 @@ paths:
             examples:
               Flow-rate Trigger:
                 $ref: '#/components/examples/flowrate_trigger'
-              
+
       responses:
         '200':
           description: New trigger was successfully configured.
@@ -169,7 +169,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigTripwireTrigger        
+      x-swagger-router-controller: ConfigTripwireTrigger
     delete:
       tags:
         - config
@@ -178,7 +178,7 @@ paths:
       operationId: configTriggerTripwireDelete
       parameters:
       - name: triggerId
-        in: query          
+        in: query
         required: true
         description: Trigger ID to delete.
         schema:
@@ -193,7 +193,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      x-swagger-router-controller: ConfigTripwireTrigger        
+      x-swagger-router-controller: ConfigTripwireTrigger
     get:
       tags:
         - config
@@ -202,7 +202,7 @@ paths:
       operationId: configTriggerTripwireGet
       parameters:
       - name: monitorId
-        in: query          
+        in: query
         required: true
         description: Monitor ID whose triggers are listed.
         schema:
@@ -232,7 +232,7 @@ paths:
       operationId: getAllTripwireAlerts
       parameters:
         - name: monitorIds
-          in: query          
+          in: query
           required: true
           description: Alerts on these monitors are returned.
           schema:
@@ -240,9 +240,9 @@ paths:
             items:
               type: string
               example: *MONITOR_ID_EXAMPLE
-          
+
         - name: fromTime
-          in: query          
+          in: query
           required: true
           description: Earliest alert to return
           schema:
@@ -250,7 +250,7 @@ paths:
             format: double
             example: *TIMESTAMP_EXAMPLE
         - name: toTime
-          in: query          
+          in: query
           required: true
           description: Latest alert to return
           schema:
@@ -276,11 +276,108 @@ paths:
                 $ref: '#/components/schemas/Error'
       x-swagger-router-controller: TripwireAlert
 
+  /analytics/count/tripwire:
+      get:
+        tags:
+          - analytics
+        summary: Query occupancy statistics within timeframe.
+        description: |
+          Returns the occupancy statistics for the timeframe specified.
+
+          The minimum Interval is 5minutes.
+        operationId: getAnalyticsCount
+        parameters:
+          - name: monitorId
+            in: query
+            required: true
+            description: Statistics from this monitor is returned.
+            schema:
+              type: string
+              example: *MONITOR_ID_EXAMPLE
+          - name: fromTime
+            in: query
+            required: true
+            description: Start of timeframe
+            schema:
+              type: number
+              format: double
+              example: *TIMESTAMP_EXAMPLE
+          - name: toTime
+            in: query
+            required: true
+            description: End of timeframe
+            schema:
+              type: number
+              format: double
+              example: *TIMESTAMP_2_EXAMPLE
+        responses:
+          '200':
+            description: Occupancy statistics within the given timeframe
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/OccupancyCount'
+          '400':
+            description: Error retrieving value.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/Error'
+        x-swagger-router-controller: AnalyticsTripwireCount
+
+  /analytics/heatmap/tripwire:
+    get:
+      tags:
+        - analytics
+      summary: Query occupancy heatmap within timeframe.
+      description: |
+          The heatmap is specified in a 64x64 2D array.
+
+          The minimum Interval is 5minutes.
+
+      operationId: getAnalyticsHeatmap
+      parameters:
+        - name: monitorId
+          in: query
+          required: true
+          description: Statistics from this monitor is returned.
+          schema:
+            type: string
+            example: *MONITOR_ID_EXAMPLE
+        - name: fromTime
+          in: query
+          required: true
+          description: Start of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: End of timeframe
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+      responses:
+        '200':
+          description: Occupancy heatmap within the given timeframe, specified in a row x col 2D array
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OccupancyHeatmap'
+        '400':
+          description: Error retrieving value.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: AnalyticsTripwireHeatmap
 
 components:
-  
+
   schemas:
-    
     Alert:
       description: Information about an alert that has been generated by a configured Trigger.
       type: object
@@ -313,13 +410,12 @@ components:
         - monitor_id
         - source_trigger
         - time
-    
+
     Alerts:
       description: List of Alert objects
       type: array
       items:
         $ref: "#/components/schemas/Alert"
-        
 
     Coord:
       description: Coordinate in a monitor
@@ -378,7 +474,7 @@ components:
         - trigger_name
         - trigger_condition
         - params
-    
+
     Triggers:
       description: List of Trigger objects
       type: array
@@ -445,6 +541,41 @@ components:
           description: Detailed reason for error.
           example: "Invalid user input in parameter..(etc.)"
 
+    OccupancyCount:
+      description: Occupancy Count
+      type: object
+      properties:
+        min:
+          type: integer
+          example: 0
+        max:
+          type: integer
+          example: 26
+        average:
+          type: integer
+          example: 8
+
+    OccupancyHeatmap:
+      description: Occupancy Heatmap
+      type: object
+      properties:
+        rows:
+          type: integer
+          example: 64
+        cols:
+          type: integer
+          example: 64
+        data:
+          type: array
+          items:
+            type: array
+            items:
+              type: integer
+            minItems: 64
+            maxItems: 64
+          minItems: 64
+          maxItems: 64
+
   examples:
       flowrate_trigger:
         value:
@@ -457,7 +588,7 @@ components:
             - name: "threshold"
               value: "2"
             - name: "duration"
-              value: "1"      
+              value: "1"
 
       flowrate_alert:
         value:
