@@ -106,9 +106,8 @@ services:
       - INPUT_URL=${INPUT_URL:-/opt/sample-videos/rtsp2_6_region_top_right_qtr.ts}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
       - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      - MODEL_OFFSETS_PERSON=${MODEL_OFFSETS_PERSON:-<0.0,95.0,114.0,0.0>}
-      - MODEL_SCALES_PERSON=${MODEL_SCALES_PERSON:-<0.0037073439452797174,0.4590655267238617,2.336696147918701,0.00390625>}
-      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.labels}
+      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.json}
+      - SETTINGS_PATH_PERSON=${SETTINGS_PATH_PERSON:-/opt/labels/foot_track_net_settings.json}
       - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
     command: bash qimsdk_person_detect.sh
