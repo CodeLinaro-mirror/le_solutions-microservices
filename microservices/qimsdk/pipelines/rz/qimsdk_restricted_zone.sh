@@ -7,7 +7,7 @@ if [[ $INPUT_TYPE == "rtsp" ]]; then
 export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
-qtimlvdetection name=stage_01_postproc threshold=80.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
+qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
 rtspsrc location=${INPUT_URL} ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
@@ -21,8 +21,8 @@ elif [[ $INPUT_TYPE == "on-device-camera" ]]; then
 export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
-qtimlvdetection name=stage_01_postproc threshold=80.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
-qtiqmmfsrc name=camsrc camera=${INPUT_URL} ! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,interlace-mode=progressive,colorimetry=bt601 ! identity sync=true ! queue ! tee name=t_split_1 \
+qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
+qtiqmmfsrc name=camsrc camera=${INPUT_URL} ! video/x-raw,format=NV12,width=1280,height=720,framerate=30/1,interlace-mode=progressive,colorimetry=bt601 ! identity sync=true ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
 qtimetamux name=metamux_1 ! queue  ! qtiobjtracker ! queue ! qtirestrictedzonedbg zone-config="params,zone1=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,zone2=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>;" ! queue ! qtivoverlay masks="{(structure)\"Zone1,polygon=<<100,700>,<750,700>,<750,1000>,<550,1050>,<100,900>>,color=0x7F00007F;\",(structure)\"Zone2,polygon=<<1200,700>,<1850,700>,<1850,1000>,<1350,1050>,<1200,900>>,color=0x7F00007F;\"}" ! queue ! tee name=t_split_2 \
@@ -43,7 +43,7 @@ fi
 export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0  -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
-qtimlvdetection name=stage_01_postproc threshold=80.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
+qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
 ${source_sequence} ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
