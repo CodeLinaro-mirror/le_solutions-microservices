@@ -1,0 +1,26 @@
+{
+  "confidence": 70.0,
+  "landmarks": [
+    {"id":  1, "landmarks_names":
+      [
+        {"id": 0,  "name":"nose"},
+        {"id": 1,  "name":"left_eye"},
+        {"id": 2,  "name":"right_eye"},
+        {"id": 3,  "name":"left_ear"},
+        {"id": 4,  "name":"right_ear"},
+        {"id": 5,  "name":"left_shoulder"},
+        {"id": 6,  "name":"right_shoulder"},
+        {"id": 7,  "name":"left_elbow"},
+        {"id": 8,  "name":"right_elbow"},
+        {"id": 9,  "name":"left_wrist"},
+        {"id": 10, "name":"right_wrist"},
+        {"id": 11, "name":"left_hip"},
+        {"id": 12, "name":"right_hip"},
+        {"id": 13, "name":"left_knee"},
+        {"id": 14, "name":"right_knee"},
+        {"id": 15, "name":"left_ankle"},
+        {"id": 16, "name":"right_ankle"}
+      ]
+    }
+  ]
+}
