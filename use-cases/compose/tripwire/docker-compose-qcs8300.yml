@@ -9,9 +9,9 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
-      - ../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
-      - ../configs/nginx/solutions/tripwire-analytics-api.conf:/etc/nginx/solutions/tripwire-analytics-api.conf
+      - ../../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ../../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
+      - ../../configs/nginx/solutions/tripwire-analytics-api.conf:/etc/nginx/solutions/tripwire-analytics-api.conf
   mariadb:
     image: mariadb:11.6.2
     platform: arm64
@@ -91,7 +91,7 @@ services:
       - DEFAULT_HEATMAP_COLS=64
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.4
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.5
     platform: arm64
     container_name: qimsdk-restricted-zone
     hostname: qimsdk-restricted-zone
@@ -112,7 +112,7 @@ services:
       - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.labels}
       - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
-    command: bash /etc/media/qimsdk_person_detect.sh
+    command: bash qimsdk_person_detect.sh
     volumes:
       - /etc/labels:/etc/labels
       - /etc/media:/etc/media
