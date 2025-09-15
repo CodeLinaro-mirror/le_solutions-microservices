@@ -11,7 +11,7 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const config = {
-    
+
     mariadbName: process.env.mariadbName,
     mariadbHost: process.env.mariadbHost,
     mariadbPass: process.env.mariadbPass,
@@ -21,6 +21,7 @@ const config = {
     redisHost: process.env.redisHost,
     redisPort: process.env.redisPort,
     redisTAAlertsChannel: process.env.redisTAAlertsChannel,
+    redisTAAnalyticsChannel: process.env.redisTAAnalyticsChannel,
     redisTATripwireKey: process.env.TA_TRIPWIRE_KEY,
     redisTATriggerKey: process.env.TA_TRIGGER_KEY,
     redisCameraUpdates: process.env.redisCameraUpdates

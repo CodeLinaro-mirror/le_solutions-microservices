@@ -59,8 +59,15 @@ async function initializeDB() {
     }
 }
 
+function convertToms(time) {
+    if (time > 10000000000) return time;
+    else return time*1000;
+}
+
+
 module.exports = {
     populateRedis,
     cameraUpdates,
-    initializeDB
+    initializeDB,
+    convertToms
 };
