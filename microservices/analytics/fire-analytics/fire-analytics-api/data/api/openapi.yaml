@@ -1,0 +1,302 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+openapi: 3.0.3
+info:
+  title: Fire Analytics API
+  description: |
+    A service that consumes the AI Workflow for object detection, and will generate alerts
+    given triggers defined through this API. This service is specialized to detect fire
+    and smoke, known as "events".
+
+    Alerts will be triggered at most once per second. Alert history is stored
+    by the service and can be queried through this API by polling alerts.
+
+    As an example, to get started on an FOV alert, a client would:
+    * POST to /config/alerts/fov to create a new trigger to generate alerts.
+    * Periodically GET from /alerts/fov to observe new alerts.
+
+  contact:
+    name: Qualcomm Support Forums
+    url: https://mysupport.qualcomm.com/supportforums/s/
+  license:
+    name: BSD-3-Clause-Clear
+  version: '1.0.0'
+servers:
+  - url: https://{device-address}/fire-analytics/v1/api
+    description: Server URL
+    variables:
+      device-address:
+        description: IP address (and port) of the host of the Fire Analytics API ingress.
+        default: your.device.ip.here:8082
+
+x-string-constants:
+  - timestamp:       &TIMESTAMP_EXAMPLE   1729118760.000 # Epoch time in seconds. May optionally provide fractional seconds
+  - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
+  - monitor: &MONITOR_EXAMPLE "camera1"
+  - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
+
+tags:
+  - name: alerts
+    description: Poll historical alerts
+  - name: config
+    description: Configure triggers which generate alerts
+  - name: health
+    description: Health checks for API service.
+security: []
+paths:
+  /config/alerts/fov:
+    post:
+      tags:
+        - config
+      summary: Configure a new trigger to generate alerts
+      description: Configures a new trigger attached to monitor which will generate alerts given conditions.
+      operationId: configTrigger
+      requestBody:
+        description:
+          Creates a new trigger attached to the specified monitor. When trigger conditions are matched,
+          an alert will be generated.
+
+          The "params" field depends on the trigger condition selected. See the examples
+          below for different trigger conditions and their required "params", as well as
+          the detailed schema definition.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Trigger'
+
+      responses:
+        '200':
+          description: New trigger was successfully configured.
+        '400':
+          description: Error configuring trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigFovTrigger
+    delete:
+      tags:
+        - config
+      summary: Delete trigger
+      description: Deletes an existing trigger by trigger ID.
+      operationId: deleteTrigger
+      parameters:
+      - name: triggerId
+        in: query
+        required: true
+        description: Trigger ID to delete.
+        schema:
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+      responses:
+        '200':
+          description: Trigger was successfully deleted.
+        '400':
+          description: Error delting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigFovTrigger
+    get:
+      tags:
+        - config
+      summary: Get triggers
+      description: Return list of triggers on a given monitor ID.
+      operationId: getTriggers
+      parameters:
+      - name: monitorId
+        in: query
+        required: true
+        description: Monitor ID whose triggers are listed.
+        schema:
+          type: string
+          example: *MONITOR_EXAMPLE
+      responses:
+        '200':
+          description: List of triggers in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triggers'
+        '400':
+          description: Error deleting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: ConfigFovTrigger
+
+  /alerts/fov:
+    get:
+      tags:
+        - alerts
+      summary: Get all alerts
+      description: Return all alerts from a list of monitors.
+      operationId: getAllAlerts
+      parameters:
+        - name: monitorIds
+          in: query
+          required: true
+          description: Alerts on these monitors are returned.
+          schema:
+            type: array
+            items:
+              type: string
+              example: *MONITOR_EXAMPLE
+
+        - name: fromTime
+          in: query
+          required: true
+          description: Earliest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: Latest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+
+      responses:
+        '200':
+          description: Response contains alerts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alerts'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: AlertFov
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health Check
+      description: Health Check
+      operationId: getHealth
+      responses:
+        '200':
+          description: Successful health;
+        '405':
+          description: Invalid input
+      x-swagger-router-controller: Health
+
+components:
+
+  schemas:
+
+    Alert:
+      description: Information about an alert that has been generated by a configured Trigger.
+      type: object
+      properties:
+        source_trigger:
+          $ref: "#/components/schemas/Trigger"
+        time:
+          description: Timestamp at which alert was generated.
+          type: number
+          format: double
+          example: *TIMESTAMP_EXAMPLE
+        causes:
+          description: List of events by bounding box.
+          type: array
+          items:
+            type: object
+            properties:
+              event:
+                type: string
+                example: "fire, smoke"
+              violator:
+                $ref: "#/components/schemas/BoundingBox"
+
+    Alerts:
+      description: List of Alert objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Alert"
+
+    BoundingBox:
+      description: Describe rectangular area by top-left and bottom-right coordinates.
+      type: object
+      properties:
+        top_left:
+          $ref: "#/components/schemas/Coord"
+        bottom_right:
+          $ref: "#/components/schemas/Coord"
+      example:
+        top_left:
+          x: 0.2
+          y: 0.3
+        bottom_right:
+          x: 0.4
+          y: 0.5
+
+    Coord:
+      description: Coordinate in a monitor
+      type: object
+      properties:
+        x:
+          type: number
+          format: double
+          description: From 0.0 (left side of monitor) to 1.0 (right side of monitor)
+          example: 0.5
+        y:
+          type: number
+          format: double
+          description: From 0.0 (top of monitor) to 1.0 (bottom of monitor)
+          example: 0.5
+
+    Trigger:
+      description: Monitor and conditions on which to trigger an alert.
+      type: object
+      properties:
+        monitor_id:
+          description: Monitor on which to place trigger.
+          type: string
+          example: *MONITOR_EXAMPLE
+        trigger_id:
+          description: Globally-unique identifier used when referring to trigger.
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+        trigger_name:
+          description: Human-readable name for the trigger.
+          type: string
+          example: "Fire or Smoke."
+    Triggers:
+      description: List of Trigger objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Trigger"
+
+    Param:
+      description: Generic name, value pair for parameters or settings.
+      type: object
+
+      properties:
+        name:
+          description: Name of parameter.
+          type: string
+          example: "parameter_name"
+        value:
+          description: Value of parameter.
+          type: string
+          example: "parameter_value_string"
+
+    Error:
+      description: "Error response {TBD: fill out}"
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Detailed reason for error.
+          example: "Invalid user input in parameter..(etc.)"
