@@ -79,7 +79,7 @@ services:
       - ALERT_CHANNEL=${REDIS_ALERTS_CHANNEL:-people-analytics.alerts}
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.3
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.4
     platform: arm64
     container_name: qimsdk-ppe
     hostname: qimsdk-ppe
