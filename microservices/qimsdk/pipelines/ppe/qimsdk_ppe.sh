@@ -3,7 +3,7 @@
 
 if [[ $INPUT_TYPE == "rtsp" ]]; then
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlvdetection name=stage_01_postproc threshold=90.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
@@ -23,7 +23,7 @@ t_split_3. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-i
 
 elif [[ $INPUT_TYPE == "on-device-camera" ]]; then
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlvdetection name=stage_01_postproc threshold=90.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \
@@ -51,7 +51,7 @@ if [[ "${INPUT_URL##*.}" == "ts" ]]; then
     source_sequence="multifilesrc location=${INPUT_URL} ! ${demuxer}"
 fi
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlvdetection name=stage_01_postproc threshold=90.0 stabilization=true results=10 module=qpd constants="qpd,q-offsets=${MODEL_OFFSETS_PERSON},q-scales=${MODEL_SCALES_PERSON};" labels=${LABELS_PATH_PERSON} \

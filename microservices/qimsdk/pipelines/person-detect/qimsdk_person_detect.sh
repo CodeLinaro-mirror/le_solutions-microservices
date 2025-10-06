@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 if [[ $INPUT_TYPE == "rtsp" ]]; then
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
@@ -16,7 +16,7 @@ t_split_2. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-i
 
 elif [[ $INPUT_TYPE == "on-device-camera" ]]; then
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
@@ -38,7 +38,7 @@ if [[ "${INPUT_URL##*.}" == "ts" ]]; then
     source_sequence="multifilesrc location=${INPUT_URL} ! ${demuxer}"
 fi
 
-export XDG_RUNTIME_DIR=/dev/socket/weston && export WAYLAND_DISPLAY=wayland-1 && ulimit -n 4096 && gst-launch-1.0 -e \
+ulimit -n 4096 && gst-launch-1.0 -e \
 qtimlvconverter name=stage_01_preproc mode=image-batch-non-cumulative \
 qtimltflite name=stage_01_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PERSON} \
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
