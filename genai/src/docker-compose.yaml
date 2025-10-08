@@ -1,0 +1,24 @@
+services:
+  genai:
+    platform: ${TARGET_ARCH}
+    image: genai_service
+    container_name: genai_service
+    hostname: genai
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: service
+    ports:
+      - "${GENAI_PORT}:${GENAI_PORT}"
+    environment:
+      - GENAI_MODEL_NAME=${GENAI_MODEL_NAME}
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
+    volumes:
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${GENAI_LIBS_DIR}:/root/app/site-packages/
+    command: sh -c "ln -sf /usr/include/genai_interface.h /root/app/site-packages/genai_interface.h && ln -sf /usr/lib/libllmservice.so libllmservice.so && hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT} --reload"
