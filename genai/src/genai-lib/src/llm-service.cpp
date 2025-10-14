@@ -8,41 +8,41 @@
 #include "llm-service.hpp"
 
 Profile::Profile() {
-  const int32_t status = GenieProfile_create(nullptr, &m_handle);
-  if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-    throw std::runtime_error("Failed to create the profile handle.");
-  }
+    const int32_t status = GenieProfile_create(nullptr, &m_handle);
+    if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
+      throw std::runtime_error("Failed to create the profile handle.");
+    }
 }
 
 void Profile::getJsonData() {
-  const char* jsonData = nullptr;
-  const Genie_AllocCallback_t callback([](size_t size, const char** data) {
-    *data = (char*)malloc(size);
-    if (*data == nullptr) {
-      throw std::runtime_error("Cannot allocate memory for JSON data");
-    }
+    const char* jsonData = nullptr;
+    const Genie_AllocCallback_t callback([](size_t size, const char** data) {
+      *data = (char*)malloc(size);
+      if (*data == nullptr) {
+        throw std::runtime_error("Cannot allocate memory for JSON data");
+      }
   });
 
-  const int32_t status = GenieProfile_getJsonData(m_handle, callback, &jsonData);
-  if (GENIE_STATUS_SUCCESS != status) {
-    throw std::runtime_error("Failed to get the profile data");
-  }
+    const int32_t status = GenieProfile_getJsonData(m_handle, callback, &jsonData);
+    if (GENIE_STATUS_SUCCESS != status) {
+      throw std::runtime_error("Failed to get the profile data");
+    }
 
-  std::ofstream outFile;
-  outFile.open(profilePath);
-  if (!outFile.good()) {
-    throw std::runtime_error("Cannot create profile output file with name:" + profilePath);
-  }
-  outFile << jsonData;
-  outFile.close();
-  free((char*)jsonData);
+    std::ofstream outFile;
+    outFile.open(profilePath);
+    if (!outFile.good()) {
+      throw std::runtime_error("Cannot create profile output file with name:" + profilePath);
+    }
+    outFile << jsonData;
+    outFile.close();
+    free((char*)jsonData);
 }
 
 Profile::~Profile() {
-  const int32_t status = GenieProfile_free(m_handle);
-  if (GENIE_STATUS_SUCCESS != status) {
-    std::cerr << "Failed to free the profile handle." << std::endl;
-  }
+    const int32_t status = GenieProfile_free(m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+      std::cerr << "Failed to free the profile handle." << std::endl;
+    }
 }
 
 Dialog::Config::Config(const std::string& config, std::shared_ptr<Profile> profile) {
@@ -68,10 +68,10 @@ Dialog::Config::~Config() {
 }
 
 Dialog::Dialog(Config config) {
-  int32_t status = GenieDialog_create(config(), &m_handle);
-  if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-    throw std::runtime_error("Failed to create the dialog.");
-  }
+    int32_t status = GenieDialog_create(config(), &m_handle);
+    if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
+      throw std::runtime_error("Failed to create the dialog.");
+    }
 }
 
 Dialog::~Dialog() {
@@ -110,29 +110,70 @@ void Dialog::queryCallback(const char* responseStr,
     const GenieDialog_SentenceCode_t sentenceCode,
     const void* userData) {
 
-      QueryMutex* qmtx = static_cast<QueryMutex*>(const_cast<void*>(userData));
+    QueryStruct* qmtx = static_cast<QueryStruct*>(const_cast<void*>(userData));
+    if (*qmtx->stream == false) { // Non Streaming
+        if (responseStr && qmtx->responseStr) {
+          *(qmtx->responseStr) += responseStr;
+        }
 
-      if (responseStr && qmtx->responseStr){
-        *(qmtx->responseStr) += responseStr;
+        if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
+          std::unique_ptr<Response> response = std::make_unique<Response>();
+          strlcpy(response->model, qmtx->llmObj->modelSelected, sizeof(response->model));
+          Message message;
+
+          strlcpy(message.role, "assistant", sizeof(message.role));
+          strlcpy(message.content, qmtx->responseStr->c_str(), sizeof(message.content));
+
+          response->choices[0].message = message;
+
+          if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
+            qmtx->llmObj->responseCallback(response.get());
+          } else {
+            std::cout << "Callback NOT Registered" << std::endl;
+          }
+        }
+    } else { // Streaming
+      std::unique_ptr<Response> response = std::make_unique<Response>();
+      strlcpy(response->model, qmtx->llmObj->modelSelected, sizeof(response->model));
+      Message message;
+      strlcpy(message.role, "assistant", sizeof(message.role));
+
+      if (responseStr) {
+        //Token by Token
+
+        strlcpy(message.content, responseStr, sizeof(message.content));
+        response->choices[0].message = message;
+
+        if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
+          qmtx->llmObj->responseCallback(response.get());
+        } else {
+          std::cout << "Callback NOT Registered" << std::endl;
+        }
       }
 
-      if (sentenceCode == GENIE_DIALOG_SENTENCE_END){
-        std::unique_lock<std::mutex> lock(*qmtx->mtx);
-        *(qmtx->queryDone) = true;
-        qmtx->cv->notify_one();
+      if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
+        std::unique_ptr<Response> endResponse = std::make_unique<Response>();
+        Message message;
+
+        strlcpy(message.content, "", sizeof(message.content));
+        endResponse->choices[0].message = message;
+        strlcpy(endResponse->choices[0].finish_reason, "stop",
+            sizeof(endResponse->choices[0].finish_reason));
+        qmtx->llmObj->responseCallback(endResponse.get());
       }
+    }
 }
 
-LLMObject::LLMObject(std::string model){
+LLMObject::LLMObject(std::string model, bool streaming) {
     std::string file;
     query = std::make_unique<Query>();
-    response = std::make_unique<Response>();
     profiler = std::make_shared<Profile>();
-    strlcpy(response->model, model.c_str(), sizeof(response->model));
-    response->model[sizeof(response->model) - 1] = '\0';
+    stream = streaming;
+
+    strlcpy(modelSelected, model.c_str(), sizeof(modelSelected));
 
   //Utilize model to select correct genie_config for certain model
-      LLMModel selectedModel = getModelFromQuery(model);
+    LLMModel selectedModel = getModelFromQuery(model);
 
     switch(selectedModel) {
         case LLMModel::LLAMA3_1_8B: {
@@ -241,31 +282,13 @@ void LLMObject::chat_completion_create () {
 
     constructPrompt(prompt, model);
 
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool queryDone = false;
     std::string responseText;
-
-    QueryMutex qmtx;
-    qmtx.mtx = &mtx;
-    qmtx.cv = &cv;
-    qmtx.queryDone = &queryDone;
+    QueryStruct qmtx;
     qmtx.responseStr = &responseText;
+    qmtx.stream = &stream;
+    qmtx.llmObj = this;
 
     diag->query(prompt, GenieDialog_SentenceCode_t::GENIE_DIALOG_SENTENCE_COMPLETE, &qmtx);
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&] { return queryDone; });
-    }
-
-    Message message;
-    strlcpy(message.role, "assistant", sizeof(message.role));
-
-    strlcpy(message.content, responseText.c_str(), sizeof(message.content));
-    response->choices[0].message = message;
-
-    // Add Response to History
-    conversation.push_back(message);
 }
 
 void LLMObject::chat_completion_retrieve () {
@@ -279,15 +302,10 @@ void LLMObject::chat_completion_list () {
 
 void LLMObject::chat_completion_delete () {
   // Web API will call this function to delete a specified LLM Object
+  ~LLMObject();
 }
 
 void LLMObject::chat_completion_messages_list() {
   //This function will list ALL the messages from the specified LLM Object
 }
 
-/* Example of how to call LLM Object and print a specific message
-  chat_completion.content[0].message.content
-  LLMObject.message.content
-  messages=[{"role": "user", "content": "What's a good name for a bakery?"}]
-
-*/
