@@ -75,7 +75,7 @@ class ChatQueryUtils:
                 err = Error(code = f"{HttpStatusCodes.CONFLICT}", message=ErrorMessages.CHAT_ID_EXISTS + conv_id, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
                 return err, handle, query
 
-            handle = llm_service.lib.llm_create_object(model_input)
+            handle = llm_service.lib.llm_create_object(model_input, request_data.stream)
             if handle == llm_service.ffi.NULL:
                 logger.error("Failed to create LLM object: received NULL pointer.")
                 err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.OBJ_CREATION_FAILED, param=Parameters.LLM_OBJECT, type=Parameters.INTERNAL_TYPE)

@@ -81,8 +81,6 @@ int main(int argc, char** argv) {
 
         *(obj.query) = inputQuery;
 
-        Response output;
-
         std::cout << "Using libGenie.so version " << Genie_getApiMajorVersion() << "."
                             << Genie_getApiMinorVersion() << "." << Genie_getApiPatchVersion()
                             << "\n"

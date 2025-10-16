@@ -40,15 +40,13 @@ class TestCreateTranslationRequest(unittest.TestCase):
         if include_optional:
             return CreateTranslationRequest(
                 file = bytes(b'blah'),
-                model = whisper-1,
                 prompt = '',
                 response_format = 'json',
                 temperature = 1.337
             )
         else:
             return CreateTranslationRequest(
-                file = bytes(b'blah'),
-                model = whisper-1,
+                file = bytes(b'blah')
         )
         """
 

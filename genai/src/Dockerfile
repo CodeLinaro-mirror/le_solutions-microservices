@@ -2,8 +2,20 @@
 # Stage 1: Build Stage
 #######################
 
-FROM python:3.10.12 AS builder
+FROM ubuntu:24.04 AS builder
 WORKDIR /usr/src/app
+
+# Install build dependencies for C/C++ compilation and other utilities
+
+# Install Python 3.12 and required tools
+RUN apt-get update && \
+    apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    unzip build-essential cmake wget && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
 
 # create python virtual environment
 RUN python3 -m venv /venv
@@ -31,18 +43,11 @@ ADD . ${LLM_BUILD_DIR}/
 
 WORKDIR ${LLM_BUILD_DIR}/
 
-RUN apt-get update                                                                              && \
-        DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y                               \
-        git tar unzip bash-completion build-essential cmake wget                                && \
-        apt-get autoremove -y                                                                   && \
-        apt-get clean                                                                           && \
-        rm -rf /var/lib/apt/lists* /var/tmp/*
-
 #Add LLM install directory
 ENV LLM_ADSP_DIR=${LLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
 
 # qnp-sdk: fetch and copy the needed headers and libraries
-ENV LLM_QNP_VER=2.34.0.250424
+ENV LLM_QNP_VER=2.35.0.250530
 ENV LLM_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV LLM_QNN_LIB_PATH=${LLM_DOWNLOAD_DIR}/qairt/${LLM_QNP_VER}/lib
 
@@ -157,6 +162,12 @@ RUN wget -t 2 -T 30 -P ${LLM_DOWNLOAD_DIR}                                      
         ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
     cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSNPE.so                                  \
         ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
+    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHta.so                                \
+        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
+    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtaNetRunExtensions.so                \
+        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
+    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libhta_hexagon_runtime_qnn.so               \
+        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
     rm -rf ${LLM_DOWNLOAD_DIR}/qairt
 
 # Configure the project with a custom install prefix
@@ -168,26 +179,33 @@ RUN cd /usr/src/app/genai-lib && make -j$(nproc)
 # Install the project to the specified location
 RUN cd /usr/src/app/genai-lib && make install
 
-
 #########################
 # Stage 2: Runtime Stage
 #########################
 
-FROM python:3.10.12 AS service
+FROM ubuntu:24.04 AS service
 WORKDIR /root/app/site-packages
+
+# Install Python 3.12 and required tools
+RUN apt-get update && \
+    apt-get install -y \
+    python3 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
 
 # create directory
 RUN mkdir -p /root/app/site-packages
 
 # copy the virtual environment with web-api package installed with dependencies
 COPY --from=builder /venv /venv
+
 # copy interface file
 COPY --from=builder /usr/src/app/web-api/openapi_server/impl/genie_wrapper/include/genai_interface.h /usr/include/
 
-# copy all libraries 
+# copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr
-# create symlink of libllmservice library 
+
+# create symlink of libllmservice library
 RUN ln -s /usr/lib/libllmservice.so /root/app/site-packages/libllmservice.so
 
 ENV PATH=/venv/bin:$PATH
-

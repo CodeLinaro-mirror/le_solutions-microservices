@@ -36,7 +36,7 @@ class RealtimeTranscriptionSessionCreateRequestInputAudioTranscription(BaseModel
     """ # noqa: E501
     model: Optional[StrictStr] = Field(default=None, description="The model to use for transcription. ")
     language: Optional[StrictStr] = Field(default=None, description="The language of the input audio. Supplying the input language in ISO-639-1 (e.g. `en`) format will improve accuracy and latency. ")
-    prompt: Optional[StrictStr] = Field(default=None, description="An optional text to guide the model's style or continue a previous audio segment. ")
+    prompt: Optional[StrictStr] = Field(default=None, description="An optional text to guide the model's style or continue a previous audio segment. the prompt is a free text string, for example \"expect words related to technology\". ")
     __properties: ClassVar[List[str]] = ["model", "language", "prompt"]
 
     @field_validator('model')

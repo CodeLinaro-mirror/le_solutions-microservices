@@ -8,7 +8,7 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **model** | **str** | The model to use for transcription.  | [optional] 
 **language** | **str** | The language of the input audio. Supplying the input language in ISO-639-1 (e.g. &#x60;en&#x60;) format will improve accuracy and latency.  | [optional] 
-**prompt** | **str** | An optional text to guide the model&#39;s style or continue a previous audio segment. The prompt is a free text string, for example \&quot;expect words related to technology\&quot;.  | [optional] 
+**prompt** | **str** | An optional text to guide the model&#39;s style or continue a previous audio segment.  | [optional] 
 
 ## Example
 

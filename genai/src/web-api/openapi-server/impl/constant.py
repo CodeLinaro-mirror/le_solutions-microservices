@@ -42,6 +42,19 @@ class APIResponseKeys:
     """ API response keys. """
     MODEL = "model"
     DESCRIPTION = "description"
+    # Chat Completion Response Keys
+    CHAT_ID = "id"
+    CHAT_OBJECT = "object"
+    CHAT_CREATED = "created"
+    CHAT_CHOICES = "choices"
+    CHOICE_INDEX = "index"
+    CHOICE_MESSAGE = "message"
+    CHOICE_DELTA = "delta"
+    CHOICE_FINISH_REASON = "finish_reason"
+
+    # Message Keys
+    MESSAGE_ROLE = "role"
+    MESSAGE_CONTENT = "content"
 
 class APIDescription:
     """ API description. """

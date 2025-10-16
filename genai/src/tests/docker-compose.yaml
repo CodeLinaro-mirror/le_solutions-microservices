@@ -15,8 +15,8 @@ services:
     command: >
              sh -c "pwd && \
               mkdir -p /root/app/site-packages/report/html && \
-              cd /root/app/site-packages && 
-              pytest /root/tests -s --junitxml=/root/app/site-packages/report/report.xml --cov=/venv/lib/python3.10/site-packages/openapi-server/impl --cov=/venv/lib/python3.10/site-packages/openapi-server/apis --cov-report=html:/root/app/site-packages/report/html && \
+              cd /root/app/site-packages &&
+              pytest /root/tests -s --junitxml=/root/app/site-packages/report/report.xml --cov=/venv/lib/python3.10/site-packages/openapi_server/impl --cov=/venv/lib/python3.10/site-packages/openapi_server/apis --cov-report=html:/root/app/site-packages/report/html && \
               chmod 777 -R /root/app/site-packages/report/"
   genai_stub:
     platform: ${TARGET_ARCH}
@@ -32,8 +32,8 @@ services:
     volumes:
       - ${GENAI_REPORT_DIR}:/root/app/site-packages/report
     command: >
-              sh -c ". /venv/bin/activate && coverage run --source=openapi-server -m hypercorn openapi-server.main:app --bind 0.0.0.0:${GENAI_PORT:-8080} --reload; \
-               coverage report; 
+              sh -c ". /venv/bin/activate && coverage run --source=openapi_server -m hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT:-8080} --reload; \
+               coverage report;
                coverage html -d /root/app/site-packages/report/it_html;
                chmod 777 -R /root/app/site-packages/report/"
-             
+

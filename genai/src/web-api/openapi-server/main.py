@@ -14,19 +14,41 @@
     Do not edit the class manually.
 """  # noqa: E501
 
-
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from openapi_server.apis.chat_api import router as ChatApiRouter
 from openapi_server.apis.completions_api import router as CompletionsApiRouter
 from openapi_server.apis.health_api import router as HealthApiRouter
 from openapi_server.apis.ping_api import router as PingApiRouter
+import logging
+from openapi_server.version import __version__
+from openapi_server.logger.logger_config import LoggerConfig
+from starlette.middleware.base import BaseHTTPMiddleware
+
+LoggerConfig.initialize()
+logger = LoggerConfig.get_logger(__name__)
 
 app = FastAPI(
     title="IOT Solutions - Gen-AI Microservice APIs",
     description="These REST APIs provide the capability to run inference on Qualcomm 9100 devices.",
-    version="1.0.0",
+    version=__version__,
 )
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        body = await request.body()
+        logger.info(f"Incoming request: {request.method} {request.url}")
+        logger.info(f"Request body: {body.decode('utf-8')}")
+        # Re-create request with the same body for downstream
+        request = Request(request.scope, receive=lambda: {"type": "http.request", "body": body})
+        response = await call_next(request)
+        return response
+
+app.add_middleware(LoggingMiddleware)
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info(f"Starting Gen-AI Microservice - Version {__version__}")
 
 app.include_router(ChatApiRouter)
 app.include_router(CompletionsApiRouter)
