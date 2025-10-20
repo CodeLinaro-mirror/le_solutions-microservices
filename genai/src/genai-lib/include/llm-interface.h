@@ -22,8 +22,6 @@ void llm_destroy_object(LLMHandle handle); //invokes the Destructor of LLM Objec
 // Chat completion functions
 void llm_chat_completion_create(LLMHandle handle, const Query* query, bool streaming,
                                 LLMResponseCallback cb);
-void llm_chat_completion_retrieve(LLMHandle handle);
-void llm_chat_completion_delete(LLMHandle handle);
 
 #ifdef __cplusplus
 }

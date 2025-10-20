@@ -120,10 +120,7 @@ class LLMObject
         LLMResponseCallback responseCallback = nullptr;
 
         void chat_completion_create ();
-        void chat_completion_retrieve ();
-        void chat_completion_list ();
-        void chat_completion_delete ();
-        void chat_completion_messages_list();
+
     private:
         Dialog *diag;
         std::string config{};

@@ -30,16 +30,4 @@ void llm_chat_completion_create(LLMHandle handle, const Query* query, bool strea
     }
 }
 
-void llm_chat_completion_retrieve(LLMHandle handle) { //Calls Chat Completion Retrieve
-    if (handle) {
-        static_cast<LLMObject*>(handle)->chat_completion_retrieve();
-    }
-}
-
-void llm_chat_completion_delete(LLMHandle handle) { //Calls Chat Completion Delete
-    if (handle) {
-        static_cast<LLMObject*>(handle)->chat_completion_delete();
-    }
-}
-
 }

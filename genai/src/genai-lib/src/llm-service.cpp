@@ -290,22 +290,3 @@ void LLMObject::chat_completion_create () {
 
     diag->query(prompt, GenieDialog_SentenceCode_t::GENIE_DIALOG_SENTENCE_COMPLETE, &qmtx);
 }
-
-void LLMObject::chat_completion_retrieve () {
-  // Web API will call this function to get a certain LLM Object
-  // This function will return that LLM Object requested
-}
-
-void LLMObject::chat_completion_list () {
-  // THis function when called by Web API will List ALL of the LLMObjects
-}
-
-void LLMObject::chat_completion_delete () {
-  // Web API will call this function to delete a specified LLM Object
-  ~LLMObject();
-}
-
-void LLMObject::chat_completion_messages_list() {
-  //This function will list ALL the messages from the specified LLM Object
-}
-
