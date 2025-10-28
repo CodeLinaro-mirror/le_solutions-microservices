@@ -78,6 +78,7 @@ class Dialog
         void* userData);
         void save(const std::string name);
         void restore(const std::string name);
+        void reset();
 
         static void queryCallback(const char* responseStr,
             const GenieDialog_SentenceCode_t sentenceCode,
@@ -120,6 +121,8 @@ class LLMObject
         LLMResponseCallback responseCallback = nullptr;
 
         void chat_completion_create ();
+
+        void resetDialog();
 
     private:
         Dialog *diag;

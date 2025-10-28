@@ -18,6 +18,7 @@ typedef void* LLMHandle;
 
 LLMHandle llm_create_object(const char* model, bool streaming); //invokes the Constructor of LLM Object
 void llm_destroy_object(LLMHandle handle); //invokes the Destructor of LLM Object
+void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
 
 // Chat completion functions
 void llm_chat_completion_create(LLMHandle handle, const Query* query, bool streaming,

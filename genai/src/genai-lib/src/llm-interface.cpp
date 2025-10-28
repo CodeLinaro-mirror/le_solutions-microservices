@@ -17,6 +17,13 @@ void llm_destroy_object(LLMHandle handle) { //Destroys Handle
     delete static_cast<LLMObject*>(handle);
 }
 
+void llm_reset_object(LLMHandle handle) { //Resets Dialog
+   if (handle) {
+        LLMObject* obj = static_cast<LLMObject*>(handle);
+        obj->resetDialog();
+   }
+}
+
 void llm_chat_completion_create(LLMHandle handle, const Query* query, bool streaming,
                                 LLMResponseCallback cb) { //Calls Chat Completion Create
    if (handle) {

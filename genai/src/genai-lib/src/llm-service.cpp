@@ -106,6 +106,13 @@ void Dialog::restore(const std::string name) {
     }
 }
 
+void Dialog::reset() {
+    int32_t status = GenieDialog_reset(m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+      throw std::runtime_error("Failed to reset the dialog KV cache.");
+    }
+}
+
 void Dialog::queryCallback(const char* responseStr,
     const GenieDialog_SentenceCode_t sentenceCode,
     const void* userData) {
@@ -215,6 +222,10 @@ LLMObject::LLMObject(std::string model, bool streaming) {
         }
     }
     diag = new Dialog(Dialog::Config(config, profiler));
+}
+
+void LLMObject::resetDialog() {
+    diag->reset();
 }
 
 LLMObject::LLMModel LLMObject::getModelFromQuery(const std::string& model){
