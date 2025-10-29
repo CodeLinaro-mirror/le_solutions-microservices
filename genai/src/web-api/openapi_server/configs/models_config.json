@@ -1,7 +1,7 @@
 {
   "models": {
     "qwen2.5-7b": {
-      "config_file": "/root/app/site-packages/genie_bundle_qwen2_5_7B/genie_config_qwen2_5_7B.json",
+      "config_file": "/mnt/work/models/genie_config_qwen2_5_7B.json",
       "display_name": "Qwen 2.5 7B",
       "prompt_template": "<|im_start|>{role}\n{content}<|im_end|>\n",
       "assistant_prompt": "<|im_start|>assistant\n",
@@ -13,7 +13,7 @@
       }
     },
     "qwen2.5-vl-3b": {
-      "config_file": "/root/app/site-packages/genie_bundle_qwen2_5_VL_3B/genie_config_qwen2_5_vl_3b.json",
+      "config_file": "/mnt/work/models/genie_config_qwen2_5_vl_3b.json",
       "display_name": "Qwen 2.5 VL 3B",
       "prompt_template": "qwen2",
       "max_tokens": 4096,

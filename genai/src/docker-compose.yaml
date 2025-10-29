@@ -1,13 +1,25 @@
 services:
-  genai:
-    platform: ${TARGET_ARCH:-linux/arm64}
-    image: genai_service
-    container_name: genai_service
+  genai-builder:
+    user: root
+    platform: ${HOST_ARCH}
+    image: genai-builder
+    container_name: genai-builder
     hostname: genai
     build:
       context: .
       dockerfile: Dockerfile
-      target: service
+      target: genai-builder
+
+  genai:
+    user: root
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai-service
+    container_name: genai-service
+    hostname: genai
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: genai-service
     ports:
       - "${GENAI_PORT:-8080}:${GENAI_PORT:-8080}"
     environment:

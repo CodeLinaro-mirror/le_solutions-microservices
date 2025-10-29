@@ -1,13 +1,32 @@
 services:
+  genai-builder:
+    user: root
+    platform: ${HOST_ARCH}
+    image: genai-builder-chatcompletion
+    container_name: genai-builder-chatcompletion
+    hostname: genai
+    build:
+      context: .
+      dockerfile: Dockerfile.chatcompletion
+      target: genai-builder-chatcompletion
+    volumes:
+      - ./genai-lib:/mnt/work/src/genai-lib
+      - ./web-api:/mnt/work/src/web-api
+      - /dev/bus/usb:/dev/bus/usb
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    command: tail -f /dev/null
+
   genai-vlm:
     platform: ${TARGET_ARCH:-linux/arm64}
     image: genai_chatcompletion_service
     container_name: genai_chatcompletion_service
     hostname: genai-chatcompletion
+    working_dir: /mnt/work/models
     build:
       context: .
       dockerfile: Dockerfile.chatcompletion
-      target: service
+      target: genai-service-chatcompletion
     ports:
       - "${GENAI_PORT:-8081}:${GENAI_PORT:-8081}"
     environment:
@@ -39,5 +58,5 @@ services:
     volumes:
       - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
       - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
-      - ${GENAI_MODEL_DIR:-/etc/models/genie_bundle_qwen2_5_vl_3b}:/root/app/site-packages/
-    command: sh -c "ln -sf /usr/include/genai_interface.h /root/app/site-packages/genai_interface.h && ln -sf /usr/lib/libvlmservice.so libvlmservice.so && ln -sf /usr/lib/libllmservice.so libllmservice.so && hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT:-8081} --reload --access-log - --error-log - --log-level info"
+      - ${GENAI_MODEL_DIR:-/etc/models/genie_bundle_qwen2_5_vl_3b}:/mnt/work/models/
+    command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT:-8081} --reload --access-log - --error-log - --log-level info"

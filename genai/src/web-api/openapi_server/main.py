@@ -33,6 +33,7 @@ from openapi_server.thread_pool import (
 )
 from starlette.middleware.base import BaseHTTPMiddleware
 import yaml
+import os
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -101,8 +102,11 @@ app = FastAPI(
     lifespan=lifespan,  # Add lifespan context manager
 )
 
+base_dir = os.getenv("VLM_SITE_PACKAGES_PATH")
+file_path = os.path.join(base_dir, "openapi.yaml")
+
 # Load Custom Open AI API Schema
-with open("openapi.yaml", "r") as f:
+with open(file_path, "r") as f:
     openapi_schema = yaml.safe_load(f)
 
 app.openapi_schema = openapi_schema
