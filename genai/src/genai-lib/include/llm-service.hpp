@@ -31,6 +31,7 @@
 #include "GenieCommon.h"
 #include "GenieDialog.h"
 #include "GenieProfile.h"
+#include "GenieSampler.h"
 
 #include "llm-buffer.h"
 
@@ -45,6 +46,19 @@ class Profile
 
     private:
         GenieProfile_Handle_t m_handle = NULL;
+};
+
+class SamplerConfig
+{
+    public:
+        void createSamplerConfig(const std::string& configPath);
+        std::string getConfigString() { return m_config; }
+        void setParam(const std::string& keyStr, const std::string& valueStr);
+        ~SamplerConfig();
+        GenieSamplerConfig_Handle_t operator()() const { return m_handle; }
+    private:
+        GenieSamplerConfig_Handle_t m_handle = NULL;
+        std::string m_config;
 };
 
 class Dialog
@@ -79,11 +93,16 @@ class Dialog
         void save(const std::string name);
         void restore(const std::string name);
 
+        void getSampler();
+        void applySamplerConfig(GenieSamplerConfig_Handle_t samplerConfigHandle);
+        void setMaxNumTokens(const int maxNumTokens);
+
         static void queryCallback(const char* responseStr,
             const GenieDialog_SentenceCode_t sentenceCode,
             const void* userData);
     private:
         GenieDialog_Handle_t m_handle         = NULL;
+        GenieSampler_Handle_t m_samplerHandle = NULL;
 };
 
 
@@ -129,6 +148,7 @@ class LLMObject
         std::string restorePath{};
         std::string profilePath;
         std::vector<Message> conversation;
+        std::string sc_configPath;
 
         void constructPrompt(const std::string query, LLMModel model);
 
