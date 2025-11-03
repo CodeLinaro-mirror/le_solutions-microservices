@@ -33,22 +33,15 @@ typedef struct {
 } Choices;
 
 typedef struct {
-    // Not Supported by Genie
-    //int frequency_penalty;
-    //bool logprobs;
-    //int n;
-    //bool parallel_tool_calls;
-    //int presence_penalty;
-    //bool stream;
-    //int top_logprobs;
-
     // Supported by Genie
     Message message;
     char model[MAX_STRING_LENGTH];
-    //int max_completion_tokens;
-    //float temperature;
-    //float top_k;
-    //float top_p;
+    int max_completion_tokens;
+    float temperature;
+    float top_p;
+    float seed;
+    float presence_penalty;
+    float frequency_penalty;
 } Query;
 
 typedef struct {
@@ -70,6 +63,8 @@ typedef void (*LLMResponseCallback)(const Response* response);
 LLMHandle llm_create_object(
     const char* model,
     bool streaming);
+
+void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
 
 //invokes the Destructor of LLM Object
 void llm_destroy_object(LLMHandle handle);

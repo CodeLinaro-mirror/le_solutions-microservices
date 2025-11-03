@@ -7,8 +7,6 @@ from openapi_server.models.create_chat_completion_response import CreateChatComp
 from openapi_server.models.chat_completion_deleted import ChatCompletionDeleted
 from openapi_server.models.error import Error
 from openapi_server.impl.genie_wrapper.chat.genie_wrapper_create_chat_completion import GenieWrapperCreateChatCompletion
-from openapi_server.impl.genie_wrapper.chat.genie_wrapper_add_chat_completion import GenieWrapperAddChatCompletion
-from openapi_server.impl.genie_wrapper.chat.genie_wrapper_delete_chat_completion import GenieWrapperDeleteChatCompletion
 from openapi_server.impl.genie_wrapper.chat.utils.chat_utils import ChatQueryUtils
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
@@ -89,32 +87,3 @@ class ChatApiImpl(BaseChatApi):
             logger.error(f"Unexpected error in create_chat_completion: {e}")
             raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.UNEXPECTED_ERROR)
 
-    async def delete_chat_completion(
-        self,
-        completion_id: str
-    ) -> ChatCompletionDeleted:
-        """
-        Deletes a stored chat completion.
-        Args:
-            completion_id (str): The ID of the chat completion to delete.
-        Returns:
-            ChatCompletionDeleted: The deleted chat completion.
-        Raises:
-            HTTPException: If the chat completion is not found or if there is an error deleting the chat completion.
-
-        """
-        try:
-            result = GenieWrapperDeleteChatCompletion.delete_chat_completion(completion_id)
-            if isinstance(result, Error):
-                logger.error(f"Expected ChatCompletionDeleted, got {type(result)}")
-                raise HTTPException(status_code=int(result.code), detail=result.message)
-            else:
-                logger.info(f"delete_chat_completion result: {result}")
-                return result
-
-        except HTTPException as http_exc:
-                logger.error(f"HTTPException error in delete_chat_completion: {http_exc}")
-                raise HTTPException(status_code=http_exc.status_code, detail=http_exc.detail)
-        except Exception as e:
-            logger.error(f"Unexpected error in delete_chat_completion: {e}")
-            raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.UNEXPECTED_ERROR)

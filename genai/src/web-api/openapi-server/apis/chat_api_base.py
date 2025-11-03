@@ -18,23 +18,9 @@ class BaseChatApi:
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         BaseChatApi.subclasses = BaseChatApi.subclasses + (cls,)
-    async def add_chat_completion(
-        self,
-        completion_id: Annotated[StrictStr, Field(description="id of conversation")],
-        create_chat_completion_request: CreateChatCompletionRequest,
-    ) -> CreateChatCompletionResponse:
-        ...
-
 
     async def create_chat_completion(
         self,
         create_chat_completion_request: CreateChatCompletionRequest,
     ) -> CreateChatCompletionResponse:
-        ...
-
-
-    async def delete_chat_completion(
-        self,
-        completion_id: Annotated[StrictStr, Field(description="The ID of the chat completion to delete.")],
-    ) -> ChatCompletionDeleted:
         ...

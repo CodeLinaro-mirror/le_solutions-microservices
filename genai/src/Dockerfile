@@ -45,7 +45,7 @@ WORKDIR ${LLM_BUILD_DIR}/
 ENV LLM_ADSP_DIR=${LLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
 
 # qnp-sdk: fetch and copy the needed headers and libraries
-ENV LLM_QNP_VER=2.35.0.250530
+ENV LLM_QNP_VER=2.39.0.250926
 ENV LLM_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV LLM_QNN_LIB_PATH=${LLM_DOWNLOAD_DIR}/qairt/${LLM_QNP_VER}/lib
 
@@ -68,103 +68,7 @@ RUN wget -t 2 -T 30 -P ${LLM_DOWNLOAD_DIR}                                      
     cp ${LLM_QNN_LIB_PATH}/hexagon-v79/unsigned/* ${LLM_ADSP_DIR}/                             && \
     cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                                 \
         ${LLM_DEPLOY_DIR}/usr/lib/                                                          &&  \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libhta_hexagon_runtime_snpe.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libPlatformValidatorShared.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnChrometraceProfilingReader.so         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnCpu.so                                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnDspNetRunExtensions.so                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnDsp.so                                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnDspV66CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnDspV66Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGenAiTransformerCpuOpPkg.so           \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGenAiTransformerModel.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGenAiTransformer.so                   \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGpuNetRunExtensions.so                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGpuProfilingReader.so                 \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnGpu.so                                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpNetRunExtensions.so                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpOptraceProfilingReader.so          \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpPrepare.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpProfilingReader.so                 \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtp.so                                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV68CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV68Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV69CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV69Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV73CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV73Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV75CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV75Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV79CalculatorStub.so               \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtpV79Stub.so                         \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnIr.so                                 \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnJsonProfilingReader.so                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnModelDlc.so                           \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnSaver.so                              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnSystem.so                             \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnTFLiteDelegate.so                     \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeDspV66Stub.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpPrepare.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV68CalculatorStub.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV68Stub.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV73CalculatorStub.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV73Stub.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV75CalculatorStub.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV75Stub.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV79CalculatorStub.so              \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSnpeHtpV79Stub.so                        \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSNPE.so                                  \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHta.so                                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnnHtaNetRunExtensions.so                \
-        ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
-    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libhta_hexagon_runtime_qnn.so               \
+    cp ${LLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*            \
         ${LLM_DEPLOY_DIR}/usr/lib/                                                          && \
     rm -rf ${LLM_DOWNLOAD_DIR}/qairt
 
@@ -199,6 +103,8 @@ COPY --from=builder /venv /venv
 
 # copy interface file
 COPY --from=builder /usr/src/app/web-api/openapi_server/impl/genie_wrapper/include/genai_interface.h /usr/include/
+
+COPY --from=builder /usr/src/app/web-api/openapi_server /usr/src/app/web-api
 
 # copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr

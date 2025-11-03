@@ -45,10 +45,12 @@ class GenieWrapperCreateChatCompletion:
             )
 
         query_composer = ChatQueryUtils()
-        llm_service, handle, query = query_composer.chat_compose_query(request_data)
+        llm_service, handle, query, completion_id = query_composer.chat_compose_query(request_data)
 
         if isinstance(llm_service, Error):
             return llm_service
+
+        logger.info(f"Received completion_id from chat_compose_query: {completion_id}")
 
         q = Queue()
 
@@ -116,17 +118,9 @@ class GenieWrapperCreateChatCompletion:
                         }
 
                         if not first_chunk_sent:
-                            if len(request_data.messages) == 1:
-                                key = GenieWrapperCreateChatCompletion.__generate_chat_id()
-                                chunk["id"] = key
-                                map_obj = HandleIdObjectMap()
-                                handle_obj = HandleObject(handle)
-                                handle_obj.streaming = True
-                                map_obj.set_handle(handle_obj, key)
-                            else:
-                                map_obj = HandleIdObjectMap()
-                                conv_ids = map_obj.get_all_conversation()
-                                chunk["id"] = conv_ids[0]
+                            # Use the completion_id returned from chat_compose_query
+                            key = completion_id
+                            chunk["id"] = key
                             chunk["choices"][0]["delta"]["role"] = item["role"]
                             first_chunk_sent = True
 
@@ -171,17 +165,8 @@ class GenieWrapperCreateChatCompletion:
                 logprobs=None
             )
 
-            key = item["id"]
-            if not key and len(request_data.messages) == 1:
-                key = GenieWrapperCreateChatCompletion.__generate_chat_id()
-                map_obj = HandleIdObjectMap()
-                handle_obj = HandleObject(handle)
-                handle_obj.streaming = False
-                map_obj.set_handle(handle_obj, key)
-            else:
-                map_obj = HandleIdObjectMap()
-                conv_ids = map_obj.get_all_conversation()
-                key = conv_ids[0]
+            # Use the completion_id returned from chat_compose_query
+            key = completion_id
 
             return CreateChatCompletionResponse(
                 id=key,

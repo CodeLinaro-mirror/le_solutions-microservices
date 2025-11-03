@@ -32,11 +32,12 @@ class HttpStatusCodes:
 
 class EnvVariableKeys:
     """ Constants for environment variable keys. """
-    ENV_LIBRARY_PATH_KEY = "LIBRARY_PATH" # Key for the library path environment variable
+    ENV_LIBRARY_PATH_KEY = "GENAI_LIBRARY_PATH" # Key for the library path environment variable
+    GENAI_INTERFACE_FILE_KEY = "GENAI_INTERFACE_FILE" # Key for the interface header env variable
 
 class EnvVariableValues:
     """ Constants for environment variable values. """
-    ENV_LIBRARY_PATH_DEFAULT_VAL = "/root/app/site-packages/libllmservice.so" # Default value for the library path environment variable
+    ENV_LIBRARY_PATH_DEFAULT_VAL = None # Will be computed dynamically if not set
 
 class APIResponseKeys:
     """ API response keys. """
@@ -87,7 +88,7 @@ class LLMServiceQueryConstant:
     ROLE_MAX_SIZE = 256
     MESSAGE_CONTENT_MAX_SIZE = 12300
     MODEL_STR_MAX_SIZE = 256
-    DEFAULT_COMPLETION_TOKEN = 16
+    DEFAULT_COMPLETION_TOKEN = 0
     DEFAULT_TEMPERATURE = 1.0
     DEFAULT_TOP_K = 0
     DEFAULT_TOP_P = 1.0
@@ -101,6 +102,10 @@ class LLMServiceQueryConstant:
     DEFAULT_ROLE = "user"
     DEFAULT_MODEL = "LLAMA3_1_8B"
     MAX_MESSAGE_COUNT = 12
+    # Session and token management constants
+    MAX_MESSAGE_PAIRS = 50  # Maximum conversation pairs (100 messages total)
+    DEFAULT_MAX_COMPLETION_TOKENS = 300  # Default if not provided by user
+    CONTEXT_THRESHOLD_PERCENTAGE = 0.8  # 80% threshold for summarization
 
 class ErrorMessages:
     """ Error Messages. """
@@ -130,3 +135,9 @@ class Parameters:
     COMPLETION_ID = "completion_id"
     LLM_OBJECT = "llm_object"
     INTERNAL_TYPE = "internal"
+
+class ModelConfigConstants:
+    """ Model Configuration Constants """
+    DEFAULT_CONFIG_PATH = "/root/app/openapi_server/configs/models_config.json"
+    DEFAULT_CONFIGS_DIR = "/root/app/openapi_server/configs"
+    ENV_CONFIG_PATH_KEY = "GENAI_MODELS_CONFIG_PATH"

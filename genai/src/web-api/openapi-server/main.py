@@ -17,14 +17,15 @@
 from fastapi import FastAPI, Request
 
 from openapi_server.apis.chat_api import router as ChatApiRouter
-from openapi_server.apis.completions_api import router as CompletionsApiRouter
 from openapi_server.apis.health_api import router as HealthApiRouter
 from openapi_server.apis.ping_api import router as PingApiRouter
 from openapi_server.apis.models_api import router as ModelApiRouter
 import logging
 from openapi_server.version import __version__
 from openapi_server.logger.logger_config import LoggerConfig
+from openapi_server.impl.model_config_manager import ModelConfigManager
 from starlette.middleware.base import BaseHTTPMiddleware
+import yaml
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -34,6 +35,12 @@ app = FastAPI(
     description="These REST APIs provide the capability to run inference on Qualcomm 9100 devices.",
     version=__version__,
 )
+
+# Load Custom Open AI API Schema
+with open("openapi.yaml", "r") as f:
+    openapi_schema = yaml.safe_load(f)
+
+app.openapi_schema = openapi_schema
 
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -50,8 +57,18 @@ app.add_middleware(LoggingMiddleware)
 async def startup_event():
     logger.info(f"Starting Gen-AI Microservice - Version {__version__}")
 
+    # Initialize ModelConfigManager to load configuration
+    try:
+        config_manager = ModelConfigManager()
+        models = config_manager.get_available_models()
+        logger.info(f"Loaded {len(models)} models from configuration")
+        for model in models:
+            logger.info(f"  - {model['id']}: {model.get('display_name', 'N/A')}")
+    except Exception as e:
+        logger.error(f"Failed to initialize ModelConfigManager: {e}")
+        logger.warning("Service will continue with fallback configuration")
+
 app.include_router(ModelApiRouter)
 app.include_router(ChatApiRouter)
-app.include_router(CompletionsApiRouter)
 app.include_router(HealthApiRouter)
 app.include_router(PingApiRouter)

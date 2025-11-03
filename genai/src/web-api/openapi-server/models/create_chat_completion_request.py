@@ -61,6 +61,7 @@ class CreateChatCompletionRequest(BaseModel):
     top_p: Optional[Union[Annotated[float, Field(le=1, strict=True, ge=0)], Annotated[int, Field(le=1, strict=True, ge=0)]]] = Field(default=1, description="An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.  We generally recommend altering this or `temperature` but not both. ")
     user: Optional[StrictStr] = Field(default=None, description="A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids). ")
     service_tier: Optional[ServiceTier] = ServiceTier.AUTO
+    model: Optional[StrictStr] = Field(default=None, description="ID of the model to use. You can use the List models API to see all of your available models, or see our Model overview for descriptions of them.")
     messages: Annotated[List[ChatCompletionRequestMessage], Field(min_length=1)] = Field(description="A list of messages comprising the conversation so far. Depending on the [model](/docs/models) you use, different message types (modalities) are supported, like [text](/docs/guides/text-generation), [images](/docs/guides/vision), and [audio](/docs/guides/audio). ")
     modalities: Optional[List[StrictStr]] = Field(default=None, description="Output types that you would like the model to generate. Most models are capable of generating text, which is the default:  `[\"text\"]`  The specific model can also be used to  [generate audio](/docs/guides/audio). To request that this model generate  both text and audio responses, you can use:  `[\"text\", \"audio\"]` ")
     reasoning_effort: Optional[ReasoningEffort] = ReasoningEffort.MEDIUM
@@ -303,6 +304,7 @@ class CreateChatCompletionRequest(BaseModel):
             "top_p": obj.get("top_p") if obj.get("top_p") is not None else 1,
             "user": obj.get("user"),
             "service_tier": obj.get("service_tier") if obj.get("service_tier") is not None else ServiceTier.AUTO,
+            "model": obj.get("model"),
             "messages": [ChatCompletionRequestMessage.from_dict(_item) for _item in obj.get("messages")] if obj.get("messages") is not None else None,
             "modalities": obj.get("modalities"),
             "reasoning_effort": obj.get("reasoning_effort") if obj.get("reasoning_effort") is not None else ReasoningEffort.MEDIUM,
@@ -330,5 +332,3 @@ class CreateChatCompletionRequest(BaseModel):
             "functions": [ChatCompletionFunctions.from_dict(_item) for _item in obj.get("functions")] if obj.get("functions") is not None else None
         })
         return _obj
-
-
