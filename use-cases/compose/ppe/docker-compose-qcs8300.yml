@@ -107,13 +107,10 @@ services:
       - INPUT_URL=${INPUT_URL:-/opt/sample-videos/people_sample_video.ts}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.ppe}:0
       - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      - MODEL_OFFSETS_PERSON=${MODEL_OFFSETS_PERSON:-<0.0,95.0,114.0,0.0>}
-      - MODEL_SCALES_PERSON=${MODEL_SCALES_PERSON:-<0.0037073439452797174,0.4590655267238617,2.336696147918701,0.00390625>}
-      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.labels}
+      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.json}
+      - SETTINGS_PATH_PERSON=${SETTINGS_PATH_PERSON:-/opt/labels/foot_track_net_settings.json}
       - MODEL_PATH_PPE=${MODEL_PATH_PPE:-/etc/models/gear_guard_net_quantized.tflite}
-      - MODEL_OFFSETS_PPE=${MODEL_OFFSETS_PPE:-<180.0,178.0,170.0>}
-      - MODEL_SCALES_PPE=${MODEL_SCALES_PPE:-<0.09695824235677719,0.08805476874113083,0.08215426653623581>}
-      - LABELS_PATH_PPE=${LABELS_PATH_PPE:-/opt/labels/gear_guard_net.labels}
+      - LABELS_PATH_PPE=${LABELS_PATH_PPE:-/opt/labels/ppe_labels.json}
       - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
     command: bash qimsdk_ppe.sh
