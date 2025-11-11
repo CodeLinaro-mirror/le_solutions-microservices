@@ -120,7 +120,7 @@ class LLMObject
             UNKNOWN = -1
         };
 
-        LLMObject(std::string model, bool streaming);
+        LLMObject(std::string model, std::string config_path, bool streaming);
         ~LLMObject() {delete diag;}
         // Disable both copying and moving
         LLMObject(const LLMObject&) = delete;

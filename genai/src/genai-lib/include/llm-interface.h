@@ -16,7 +16,7 @@ extern "C" {
 // Opaque handle to the C++ LLMObject
 typedef void* LLMHandle;
 
-LLMHandle llm_create_object(const char* model, bool streaming); //invokes the Constructor of LLM Object
+LLMHandle llm_create_object(const char* model, const char* config_path, bool streaming); //invokes the Constructor of LLM Object
 void llm_destroy_object(LLMHandle handle); //invokes the Destructor of LLM Object
 void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
 
@@ -27,4 +27,3 @@ void llm_chat_completion_create(LLMHandle handle, const Query* query, bool strea
 #ifdef __cplusplus
 }
 #endif
-

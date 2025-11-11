@@ -11,6 +11,7 @@
 
 int main(int argc, char** argv) {
     std::string model;
+    std::string config_path;
     bool stream;
     std::cout << "What model will be used? 0 for LLAMA3_1_8B, 1 for LLAMA3_2_3B, "
             << "and 2 for QWEN2_5_7B: ";
@@ -22,14 +23,17 @@ int main(int argc, char** argv) {
     {
         case 0:
             model = "LLAMA3_1_8B";
+            config_path = "genie_config_llama3_1_8B.json";
             break;
 
         case 1:
             model = "LLAMA3_2_3B";
+            config_path = "genie_config_llama3_2_3B.json";
             break;
 
         case 2:
             model = "QWEN2_5_7B";
+            config_path = "genie_config_qwen2_5_7B.json";
             break;
 
         default:
@@ -61,7 +65,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::endl;
 
-    LLMObject obj(model, stream);
+    LLMObject obj(model, config_path, stream);
 
     while (1)
     {

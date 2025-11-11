@@ -216,56 +216,26 @@ void Dialog::queryCallback(const char* responseStr,
     }
 }
 
-LLMObject::LLMObject(std::string model, bool streaming) {
-    std::string file;
+LLMObject::LLMObject(std::string model, std::string config_path, bool streaming) {
     query = std::make_unique<Query>();
     profiler = std::make_shared<Profile>();
     stream = streaming;
 
     strlcpy(modelSelected, model.c_str(), sizeof(modelSelected));
 
-  //Utilize model to select correct genie_config for certain model
-    LLMModel selectedModel = getModelFromQuery(model);
+    // Load config from provided path
+    std::cout << "Loading model config from: " << config_path << std::endl;
+    std::ifstream configStream(config_path);
 
-    switch(selectedModel) {
-        case LLMModel::LLAMA3_1_8B: {
-            file = "genie_config_llama3_1_8B.json";
-            std::ifstream configStream(file);
-
-            if (!configStream.is_open()) {
-                std::cerr << "Failed to open config file: " << file << std::endl;
-            }
-
-            std::getline(configStream, config, '\0');
-            break;
-        }
-        case LLMModel::LLAMA3_2_3B: {
-            file = "genie_config_llama3_2_3B.json";
-            std::ifstream configStream(file);
-
-            if (!configStream.is_open()) {
-                std::cerr << "Failed to open config file: " << file << std::endl;
-            }
-
-            std::getline(configStream, config, '\0');
-            break;
-        }
-        case LLMModel::QWEN2_5_7B: {
-            file = "genie_config_qwen2_5_7B.json";
-            std::ifstream configStream(file);
-
-            if (!configStream.is_open()) {
-                std::cerr << "Failed to open config file: " << file << std::endl;
-            }
-
-            std::getline(configStream, config, '\0');
-            break;
-        }
-        default: {
-            std::cout << "ERROR Unsupported model selected" << std::endl;
-            break;
-        }
+    if (!configStream.is_open()) {
+        throw std::runtime_error("Failed to open config file: " + std::string(config_path));
     }
+
+    std::getline(configStream, config, '\0');
+    configStream.close();
+
+    std::cout << "Successfully loaded config for model: " << model << std::endl;
+
     sc_configPath = "sampler.json";
     diag = new Dialog(Dialog::Config(config, profiler));
 }
@@ -373,4 +343,8 @@ void LLMObject::chat_completion_create () {
     qmtx.llmObj = this;
 
     diag->query(prompt, GenieDialog_SentenceCode_t::GENIE_DIALOG_SENTENCE_COMPLETE, &qmtx);
+
+    qmtx.responseStr = nullptr;
+    qmtx.stream = nullptr;
+    qmtx.llmObj = nullptr;
 }

@@ -18,6 +18,7 @@ void my_response_callback(const Response* response) {
 int main() {
 
     char model[16];
+    char config_path[256];
 
     printf("What model will be used? 0 for LLAMA3_1_8B, 1 for LLAMA3_2_3B, and 2 for QWEN2_5_7B: ");
     char choiceString[16];
@@ -31,14 +32,17 @@ int main() {
     switch (choice) {
         case 0:
             strlcpy(model, "LLAMA3_1_8B", sizeof(model));
+            strlcpy(config_path, "genie_config_llama3_1_8B.json", sizeof(config_path));
             break;
 
         case 1:
             strlcpy(model, "LLAMA3_2_3B", sizeof(model));
+            strlcpy(config_path, "genie_config_llama3_2_3B.json", sizeof(config_path));
             break;
 
         case 2:
             strlcpy(model, "QWEN2_5_7B", sizeof(model));
+            strlcpy(config_path, "genie_config_qwen2_5_7B.json", sizeof(config_path));
             break;
 
         default:
@@ -71,7 +75,7 @@ int main() {
             break;
     }
 
-    LLMHandle llm = llm_create_object(model, stream);
+    LLMHandle llm = llm_create_object(model, config_path, stream);
 
     while (1) {
         Message message;

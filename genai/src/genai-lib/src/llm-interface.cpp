@@ -9,8 +9,8 @@
 
 extern "C" {
 
-LLMHandle llm_create_object(const char* model, bool streaming) { //Creates LLM Object
-    return new LLMObject(std::string(model), streaming);
+LLMHandle llm_create_object(const char* model, const char* config_path, bool streaming) { //Creates LLM Object
+    return new LLMObject(std::string(model), std::string(config_path), streaming);
 }
 
 void llm_destroy_object(LLMHandle handle) { //Destroys Handle
