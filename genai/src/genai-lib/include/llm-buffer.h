@@ -40,8 +40,10 @@ typedef struct {
     char model[MAX_STRING_LENGTH];
     int max_completion_tokens;
     float temperature;
-    float top_k;
     float top_p;
+    float seed;
+    float presence_penalty;
+    float frequency_penalty;
 } Query;
 
 typedef struct {

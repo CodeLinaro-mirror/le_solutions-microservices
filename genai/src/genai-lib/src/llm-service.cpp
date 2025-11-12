@@ -45,6 +45,31 @@ Profile::~Profile() {
     }
 }
 
+void SamplerConfig::createSamplerConfig(const std::string& configPath) {
+    std::ifstream confStream(configPath);
+    std::string config;
+    std::getline(confStream, config, '\0');
+    m_config = config;
+    const int32_t status = GenieSamplerConfig_createFromJson(config.c_str(), &m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+        throw std::runtime_error("Failed to create sampler config.");
+    }
+}
+
+void SamplerConfig::setParam(const std::string& keyStr, const std::string& valueStr) {
+    const int32_t status = GenieSamplerConfig_setParam(m_handle, keyStr.c_str(), valueStr.c_str());
+    if (GENIE_STATUS_SUCCESS != status) {
+        throw std::runtime_error("Failed to setParam");
+    }
+}
+
+SamplerConfig::~SamplerConfig() {
+    const int32_t status = GenieSamplerConfig_free(m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+        std::cerr << "Failed to free the sampler config." << std::endl;
+    }
+}
+
 Dialog::Config::Config(const std::string& config, std::shared_ptr<Profile> profile) {
     int32_t status = GenieDialogConfig_createFromJson(config.c_str(), &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
@@ -103,6 +128,26 @@ void Dialog::restore(const std::string name) {
     int32_t status = GenieDialog_restore(m_handle, name.c_str());
     if (GENIE_STATUS_SUCCESS != status) {
       throw std::runtime_error("Failed to restore.");
+    }
+}
+void Dialog::getSampler() {
+    const int32_t status = GenieDialog_getSampler(m_handle, &m_samplerHandle);
+    if (GENIE_STATUS_SUCCESS != status) {
+        throw std::runtime_error("Failed to get sampler.");
+    }
+}
+
+void Dialog::applySamplerConfig(GenieSamplerConfig_Handle_t samplerConfigHandle) {
+    const int32_t status = GenieSampler_applyConfig(m_samplerHandle, samplerConfigHandle);
+    if (GENIE_STATUS_SUCCESS != status) {
+      throw std::runtime_error("Failed to apply sampler config.");
+    }
+}
+
+void Dialog::setMaxNumTokens(const int maxNumTokens) {
+    const int32_t status = GenieDialog_setMaxNumTokens(m_handle, maxNumTokens);
+    if (GENIE_STATUS_SUCCESS != status) {
+      throw std::runtime_error("Failed to set max num tokens.");
     }
 }
 
@@ -221,6 +266,7 @@ LLMObject::LLMObject(std::string model, bool streaming) {
             break;
         }
     }
+    sc_configPath = "sampler.json";
     diag = new Dialog(Dialog::Config(config, profiler));
 }
 
@@ -287,6 +333,32 @@ void LLMObject::constructPrompt(const std::string query, LLMModel model){
 void LLMObject::chat_completion_create () {
     prompt = query->message.content;
     LLMModel model = getModelFromQuery(query->model);
+
+    //Check if Sampling Parameters are used
+    if (query->temperature != 1 || query->top_p != 1 || query->presence_penalty != 0.0 || query->frequency_penalty != 0.0){
+        SamplerConfig sc;
+        diag->getSampler();
+        sc.createSamplerConfig(sc_configPath);
+        if (query->temperature != 1) {
+            sc.setParam("temp", std::to_string(query->temperature));
+        }
+        if (query->top_p != 1) {
+            sc.setParam("top-p", std::to_string(query->top_p));
+        }
+        if (query->presence_penalty != 0.0) {
+            sc.setParam("presence-penalty", std::to_string(query->presence_penalty));
+        }
+        if (query->frequency_penalty != 0.0) {
+            sc.setParam("frequency-penalty", std::to_string(query->frequency_penalty));
+        }
+        //diag->getSampler();
+        diag->applySamplerConfig(sc());
+    }
+
+    //Check if max completion tokens is set
+    if (query->max_completion_tokens != 0) {
+        diag->setMaxNumTokens(query->max_completion_tokens);
+    }
 
     // Add Query to History
     conversation.push_back(query->message);
