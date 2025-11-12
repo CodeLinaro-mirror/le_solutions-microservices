@@ -103,4 +103,9 @@ class Model(BaseModel):
         })
         return _obj
 
-
+class ModelListResponse(BaseModel):
+    """
+    Response model for listing available models.
+    """
+    object: str = Field(default="list", description="The object type, always 'list'.")
+    data: List[Model] = Field(description="List of available models.")

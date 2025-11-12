@@ -93,7 +93,6 @@ class GenieWrapperCreateChatCompletion:
                 loop = asyncio.get_event_loop()
                 first_chunk_sent = False
                 key = ""
-
                 while True:
                     item = await loop.run_in_executor(None, q.get)
 
@@ -117,14 +116,19 @@ class GenieWrapperCreateChatCompletion:
                         }
 
                         if not first_chunk_sent:
-                            key = GenieWrapperCreateChatCompletion.__generate_chat_id()
-                            chunk["id"] = key
+                            if len(request_data.messages) == 1:
+                                key = GenieWrapperCreateChatCompletion.__generate_chat_id()
+                                chunk["id"] = key
+                                map_obj = HandleIdObjectMap()
+                                handle_obj = HandleObject(handle)
+                                handle_obj.streaming = True
+                                map_obj.set_handle(handle_obj, key)
+                            else:
+                                map_obj = HandleIdObjectMap()
+                                conv_ids = map_obj.get_all_conversation()
+                                chunk["id"] = conv_ids[0]
                             chunk["choices"][0]["delta"]["role"] = item["role"]
                             first_chunk_sent = True
-                            map_obj = HandleIdObjectMap()
-                            handle_obj = HandleObject(handle)
-                            handle_obj.streaming = True
-                            map_obj.set_handle(handle_obj, key)
 
                         if item["content"]:
                             chunk["choices"][0]["delta"]["content"] = item["content"]
@@ -168,13 +172,16 @@ class GenieWrapperCreateChatCompletion:
             )
 
             key = item["id"]
-            if not key:
+            if not key and len(request_data.messages) == 1:
                 key = GenieWrapperCreateChatCompletion.__generate_chat_id()
-
-            map_obj = HandleIdObjectMap()
-            handle_obj = HandleObject(handle)
-            handle_obj.streaming = False
-            map_obj.set_handle(handle_obj, key)
+                map_obj = HandleIdObjectMap()
+                handle_obj = HandleObject(handle)
+                handle_obj.streaming = False
+                map_obj.set_handle(handle_obj, key)
+            else:
+                map_obj = HandleIdObjectMap()
+                conv_ids = map_obj.get_all_conversation()
+                key = conv_ids[0]
 
             return CreateChatCompletionResponse(
                 id=key,

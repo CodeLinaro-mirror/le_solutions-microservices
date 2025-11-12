@@ -29,7 +29,6 @@ class GenieWrapperAddChatCompletion:
         last_msg = request_data.messages[-1]
         map_obj = HandleIdObjectMap()
         handle_obj = map_obj.get_handle(completion_id)
-
         if not last_msg.content or not last_msg.content.strip():
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
 
@@ -88,7 +87,6 @@ class GenieWrapperAddChatCompletion:
             async def stream_generator():
                 loop = asyncio.get_event_loop()
                 first_chunk_sent = False
-
                 while True:
                     item = await loop.run_in_executor(None, q.get)
 
@@ -155,7 +153,6 @@ class GenieWrapperAddChatCompletion:
                 message=msg,
                 logprobs=None
             )
-
             return CreateChatCompletionResponse(
                 id=completion_id,
                 choices=[ccir],

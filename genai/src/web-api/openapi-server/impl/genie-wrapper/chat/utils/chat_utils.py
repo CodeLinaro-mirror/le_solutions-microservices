@@ -9,7 +9,10 @@ from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
 from openapi_server.impl.genie_wrapper.utils.handle_object_interface import HandleIdObjectMap
 from openapi_server.impl.constant import HttpStatusCodes
 from openapi_server.impl.constant import ErrorMessages, Parameters, LLMServiceKeys, LLMServiceQueryConstant as QUERY_CONST
-LoggerConfig.initialize()
+from openapi_server.impl.genie_wrapper.chat.genie_wrapper_delete_chat_completion import GenieWrapperDeleteChatCompletion
+import logging
+
+LoggerConfig.initialize(level=logging.DEBUG)
 logger = LoggerConfig.get_logger(__name__)
 
 from fastapi import (
@@ -18,7 +21,7 @@ from fastapi import (
 
 class ChatQueryUtils:
     @staticmethod
-    def chat_compose_query(request_data: CreateChatCompletionRequest, completion_id: str = None ):
+    def chat_compose_query(request_data: CreateChatCompletionRequest, completion_id: str = None):
         """
         Executes a chat query using the provided request data.
 
@@ -33,21 +36,36 @@ class ChatQueryUtils:
         if not request_data.messages:
             raise ValueError("No messages provided in request")
 
+        # Detect new conversation and delete existing chat-id
+        if len(request_data.messages) == 1:
+            logger.info("New conversation detected with a single message. Checking for existing chat sessions.")
+            map_obj = HandleIdObjectMap()
+            conv_ids = map_obj.get_all_conversation()
+            logger.info(f"Existing conversation IDs: {conv_ids}")
+
+            for completion_id_to_delete in conv_ids:
+                #completion_id_to_delete = conv_ids[0]
+                logger.info(f"Deleting existing chat completion for ID: {completion_id_to_delete}")
+                GenieWrapperDeleteChatCompletion.delete_chat_completion(completion_id_to_delete)
+                logger.info(f"Deleted chat completion for ID: {completion_id_to_delete}")
+
         last_msg = request_data.messages[-1]
         if not last_msg.content or not last_msg.content.strip():
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
 
         model_str = str(CommonUtils.get_model_name())
-        logger.debug(f"Value of model_str: {model_str}")
+        logger.info(f"Value of model_str: {model_str}")
+
         llm_service = LLMService()
         handle = None
         query = None
+
         if completion_id:
             # get the existing handle
-            logger.debug(f"Getting existing handle for completion_id: {completion_id}")
+            logger.info(f"Getting existing handle for completion_id: {completion_id}")
             map_obj = HandleIdObjectMap()
             handle_obj = map_obj.get_handle(completion_id)
-            logger.debug(f"Existing handle: {handle_obj}")
+            logger.info(f"Existing handle: {handle_obj}")
             if handle_obj is None or handle_obj.handle_object is None:
                 err = Error(code = f"{HttpStatusCodes.NOT_FOUND}", message=ErrorMessages.COMPLETION_ID_NOT_EXIST, param=Parameters.COMPLETION_ID, type=Parameters.INTERNAL_TYPE)
                 return err, handle, query
@@ -59,14 +77,9 @@ class ChatQueryUtils:
             handle = handle_obj.handle_object
         else:
 
-            model_input = llm_service.ffi.new("char[]", model_str.encode('utf-8'))
-            if model_input == llm_service.ffi.NULL:
-                logger.error("Failed to allocate Model pointer.")
-                err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.MEM_ALLOCATION_ERR, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-                return err, handle, query
-
             # Add check for existing chat-id for existing handle
             map_obj = HandleIdObjectMap()
+            """
             if map_obj.get_current_size() > 0:
                 conv_ids = map_obj.get_all_conversation()
                 print(conv_ids)
@@ -74,8 +87,19 @@ class ChatQueryUtils:
                 logger.error("Existing conversation with chat-id")
                 err = Error(code = f"{HttpStatusCodes.CONFLICT}", message=ErrorMessages.CHAT_ID_EXISTS + conv_id, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
                 return err, handle, query
-
-            handle = llm_service.lib.llm_create_object(model_input, request_data.stream)
+            """
+            if len(request_data.messages) == 1:
+              model_input = llm_service.ffi.new("char[]", model_str.encode('utf-8'))
+              if model_input == llm_service.ffi.NULL:
+                logger.error("Failed to allocate Model pointer.")
+                err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.MEM_ALLOCATION_ERR, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
+                return err, handle, query
+              handle = llm_service.lib.llm_create_object(model_input, request_data.stream)
+            else:
+              conv_ids = map_obj.get_all_conversation()
+              completion_id = conv_ids[0]
+              handle_obj = map_obj.get_handle(completion_id)
+              handle = handle_obj.handle_object
             if handle == llm_service.ffi.NULL:
                 logger.error("Failed to create LLM object: received NULL pointer.")
                 err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.OBJ_CREATION_FAILED, param=Parameters.LLM_OBJECT, type=Parameters.INTERNAL_TYPE)

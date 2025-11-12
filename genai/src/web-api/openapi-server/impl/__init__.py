@@ -5,3 +5,4 @@ from .ping_impl import PingApiImpl
 from .chat_api_impl import ChatApiImpl
 from .completion_api_impl import CompletionApiImpl
 from .health_api_impl import HealthApiImpl
+from .models_api_impl import ModelsApiImpl

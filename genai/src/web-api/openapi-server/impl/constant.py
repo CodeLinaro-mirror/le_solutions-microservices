@@ -70,6 +70,7 @@ class APITags:
     COMPLETIONS = "Completions"
     HEALTH = "Health"
     PING = "Ping"
+    MODELS = "Models"
 
 class APISummary:
     """ API SUMMARY """
@@ -79,6 +80,7 @@ class APISummary:
     COMPLETION_CREATE = "Creates a completion for the provided prompt and parameters."
     HEALTH_CHECK = "Check the health of microservice"
     PING = "Checks if server is accessable to the client"
+    MODELS_LIST = "Gets the Supported Models"
 
 class LLMServiceQueryConstant:
     """ LLM service Query constants. All size in bytes. """

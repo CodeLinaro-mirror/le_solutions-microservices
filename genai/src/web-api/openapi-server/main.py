@@ -20,6 +20,7 @@ from openapi_server.apis.chat_api import router as ChatApiRouter
 from openapi_server.apis.completions_api import router as CompletionsApiRouter
 from openapi_server.apis.health_api import router as HealthApiRouter
 from openapi_server.apis.ping_api import router as PingApiRouter
+from openapi_server.apis.models_api import router as ModelApiRouter
 import logging
 from openapi_server.version import __version__
 from openapi_server.logger.logger_config import LoggerConfig
@@ -43,13 +44,13 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         request = Request(request.scope, receive=lambda: {"type": "http.request", "body": body})
         response = await call_next(request)
         return response
-
 app.add_middleware(LoggingMiddleware)
 
 @app.on_event("startup")
 async def startup_event():
     logger.info(f"Starting Gen-AI Microservice - Version {__version__}")
 
+app.include_router(ModelApiRouter)
 app.include_router(ChatApiRouter)
 app.include_router(CompletionsApiRouter)
 app.include_router(HealthApiRouter)

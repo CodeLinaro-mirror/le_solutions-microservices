@@ -106,7 +106,6 @@ class ChatApi:
 
         if create_chat_completion_request.stream :
             return response_data.response
-
         response_data.read()
         return self.api_client.response_deserialize(
             response_data=response_data,
@@ -382,7 +381,6 @@ class ChatApi:
 
         if create_chat_completion_request.stream :
             return response_data.response
-
         response_data.read()
         return self.api_client.response_deserialize(
             response_data=response_data,

@@ -33,8 +33,6 @@ RUN mv web-api/openapi_server/impl/genie-wrapper/ web-api/openapi_server/impl/ge
 # install web-api server as python package
 RUN pip install --no-cache-dir .
 
-# Enable color prompt
-RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /root/.bashrc
 
 ENV LLM_BUILD_DIR="/mnt/work/build"
 ENV LLM_DEPLOY_DIR="/mnt/work/deploy"
