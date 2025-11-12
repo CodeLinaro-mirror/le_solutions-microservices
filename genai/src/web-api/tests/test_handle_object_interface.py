@@ -51,7 +51,7 @@ def test_handle_object_interface(client: TestClient):
    map1.clear_mapping()
    map1.MAX_ELEMENTS = HANDLE_OBJ_CONST.MAX_ELEMENT_COUNT_FOUR
    for i in range(map1.MAX_ELEMENTS + 1):
-      handle = llm_service.lib.llm_create_object(model_input)
+      handle = llm_service.lib.llm_create_object(model_input,False)
       map1.set_handle(handle, f"id{i}")
    assert map1.get_current_size() ==  map1.MAX_ELEMENTS
    assert map1.get_handle(HANDLE_OBJ_CONST.ID_0) == None

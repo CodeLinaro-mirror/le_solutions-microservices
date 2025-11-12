@@ -27,6 +27,7 @@ class HandleObject:
         """
         self.handle_object = handle_obj
         self.messages_count = msg_count
+        self.streaming = False
 
 
 class HandleIdObjectMap:
@@ -84,9 +85,6 @@ class HandleIdObjectMap:
 
                 llm_service = LLMService()
                 oldest_handle = self._handle_mapping.get(oldest_entry)
-
-                # Call the C function to delete the chat history associated with handel
-                llm_service.lib.llm_chat_completion_delete(oldest_handle)
 
                 # Destroy the LLM handle object
                 llm_service.lib.llm_destroy_object(oldest_handle)

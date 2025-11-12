@@ -1,6 +1,6 @@
 services:
   genai:
-    platform: ${TARGET_ARCH}
+    platform: ${TARGET_ARCH:-linux/arm64}
     image: genai_service
     container_name: genai_service
     hostname: genai
@@ -9,9 +9,10 @@ services:
       dockerfile: Dockerfile
       target: service
     ports:
-      - "${GENAI_PORT}:${GENAI_PORT}"
+      - "${GENAI_PORT:-8080}:${GENAI_PORT:-8080}"
     environment:
       - GENAI_MODEL_NAME=${GENAI_MODEL_NAME}
+      - GENAI_PORT=${GENAI_PORT}
     devices:
       - /dev/dma_heap/system
       - /dev/dma_heap/qcom,system
@@ -20,5 +21,5 @@ services:
     volumes:
       - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
       - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
-      - ${GENAI_LIBS_DIR}:/root/app/site-packages/
+      - ${GENAI_MODEL_DIR:-/etc/models/genie_bundle_llama3_1_8B}:/root/app/site-packages/
     command: sh -c "ln -sf /usr/include/genai_interface.h /root/app/site-packages/genai_interface.h && ln -sf /usr/lib/libllmservice.so libllmservice.so && hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT} --reload"

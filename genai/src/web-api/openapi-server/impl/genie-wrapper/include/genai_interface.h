@@ -60,14 +60,23 @@ typedef struct {
     Usage usage;
 } Response;
 
-
 // Handle to the LLMObject C++
 typedef void* LLMHandle;
 
-LLMHandle llm_create_object(const char* model); //invokes the Constructor of LLM Object
-void llm_destroy_object(LLMHandle handle); //invokes the Destructor of LLM Object
+// Callback for Token
+typedef void (*LLMResponseCallback)(const Response* response);
 
-// Chat completion functions
-void llm_chat_completion_create(LLMHandle handle, const Query* query, Response* response);
-void llm_chat_completion_retrieve(LLMHandle handle);
-void llm_chat_completion_delete(LLMHandle handle);
+//invokes the Constructor of LLM Object
+LLMHandle llm_create_object(
+    const char* model,
+    bool streaming);
+
+//invokes the Destructor of LLM Object
+void llm_destroy_object(LLMHandle handle);
+
+// Chat completion function
+void llm_chat_completion_create(
+    LLMHandle handle,
+    const Query* query,
+    bool streaming,
+    LLMResponseCallback cb);

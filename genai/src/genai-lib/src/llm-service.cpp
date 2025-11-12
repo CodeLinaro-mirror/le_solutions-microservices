@@ -367,6 +367,7 @@ void LLMObject::chat_completion_create () {
 
     std::string responseText;
     QueryStruct qmtx;
+
     qmtx.responseStr = &responseText;
     qmtx.stream = &stream;
     qmtx.llmObj = this;

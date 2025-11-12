@@ -9,9 +9,15 @@ from openapi_server.models.create_completion_response_choices_inner import Creat
 from openapi_server.impl.genie_wrapper.gen_ai_service_singleton import LLMService
 from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
 from openapi_server.logger.logger_config import LoggerConfig
-from openapi_server.impl.constant import LLMServiceKeys, Parameters, HttpStatusCodes, ErrorMessages, LLMServiceQueryConstant as QUERY_CONST
+from openapi_server.impl.constant import LLMServiceKeys, Parameters, HttpStatusCodes, ErrorMessages, LLMServiceQueryConstant as QUERY_CONST, APIResponseKeys as RESPNS_KEYS
 from openapi_server.impl.genie_wrapper.utils.handle_object_interface import HandleIdObjectMap
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+from queue import Queue
+import threading
+import asyncio
+from typing import Union
+import json
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -28,52 +34,69 @@ class GenieWrapperCreateCompletion:
         Returns:
             CreateCompletionResponse: The response object containing the generated completion.
         """
-
-        # Add check for existing chat-id for existing handle
+        # Check for existing chat-id
         map_obj = HandleIdObjectMap()
         if map_obj.get_current_size() > 0:
             conv_ids = map_obj.get_all_conversation()
-            print(conv_ids)
             conv_id = conv_ids[0]
             logger.error("Existing conversation with chat-id")
-            err = Error(code = f"{HttpStatusCodes.CONFLICT}", message=ErrorMessages.CHAT_ID_EXISTS + conv_id, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-            return err
+            return Error(
+                code=f"{HttpStatusCodes.CONFLICT}",
+                message=ErrorMessages.CHAT_ID_EXISTS + conv_id,
+                param=Parameters.INTERNAL_TYPE,
+                type=Parameters.INTERNAL_TYPE
+            )
 
-        if len(create_completion_request.prompt.strip()) == 0:
+        # Validate prompt
+        if not create_completion_request.prompt or not create_completion_request.prompt.strip():
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
+
         if len(create_completion_request.prompt) > QUERY_CONST.MESSAGE_CONTENT_MAX_SIZE:
-            err = Error(code = f"{HttpStatusCodes.BAD_REQUEST}", message=ErrorMessages.MAX_CONTENT_EXCEED, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-            return err
-        
+            return Error(
+                code=f"{HttpStatusCodes.BAD_REQUEST}",
+                message=ErrorMessages.MAX_CONTENT_EXCEED,
+                param=Parameters.INTERNAL_TYPE,
+                type=Parameters.INTERNAL_TYPE
+            )
+
+        # Prepare model and query
         model_str = str(CommonUtils.get_model_name())
-
         llm_service = LLMService()
-        model_input = llm_service.ffi.new("char[]", model_str.encode('utf-8'))
-        if model_input == llm_service.ffi.NULL:
-                logger.error("Failed to allocate model pointer.")
-                err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.MEM_ALLOCATION_ERR, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-                return err
+        model_input = llm_service.ffi.new("char[]", model_str.encode("utf-8"))
 
-        handle = llm_service.lib.llm_create_object(model_input)
+        if model_input == llm_service.ffi.NULL:
+            logger.error("Failed to allocate model pointer.")
+            return Error(
+                code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                message=ErrorMessages.MEM_ALLOCATION_ERR,
+                param=Parameters.INTERNAL_TYPE,
+                type=Parameters.INTERNAL_TYPE
+            )
+
+        handle = llm_service.lib.llm_create_object(model_input, create_completion_request.stream)
         if handle == llm_service.ffi.NULL:
-            logger.error(f"Failed to create LLM object: received NULL pointer.")
-            return {"error": "LLM object creation failed"}
-        # Prepare the Query struct
+            logger.error("Failed to create LLM object.")
+            return Error(
+                code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                message="LLM object creation failed",
+                param=Parameters.INTERNAL_TYPE,
+                type=Parameters.INTERNAL_TYPE
+            )
+
         query = llm_service.ffi.new(LLMServiceKeys.QUERY)
         if query == llm_service.ffi.NULL:
             logger.error("Failed to allocate Query pointer.")
-            err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.MEM_ALLOCATION_ERR, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-            return err
+            return Error(
+                code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                message=ErrorMessages.MEM_ALLOCATION_ERR,
+                param=Parameters.INTERNAL_TYPE,
+                type=Parameters.INTERNAL_TYPE
+            )
 
-        # Fill message.role and message.content and model
-
-        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.model,
-                        model_str, QUERY_CONST.MODEL_STR_MAX_SIZE)
-        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.role,
-                        QUERY_CONST.DEFAULT_ROLE, QUERY_CONST.ROLE_MAX_SIZE)
-        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.content,
-                        create_completion_request.prompt, QUERY_CONST.MESSAGE_CONTENT_MAX_SIZE)
-
+        # Fill query fields
+        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.model, model_str, QUERY_CONST.MODEL_STR_MAX_SIZE)
+        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.role, QUERY_CONST.DEFAULT_ROLE, QUERY_CONST.ROLE_MAX_SIZE)
+        CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.content, create_completion_request.prompt, QUERY_CONST.MESSAGE_CONTENT_MAX_SIZE)
 
         """
         # Fill numeric fields
@@ -90,30 +113,110 @@ class GenieWrapperCreateCompletion:
         query.n = QUERY_CONST.DEFAULT_N
         query.parallel_tool_calls = QUERY_CONST.DEFAULT_PARALLEL_TOOL_CALLS
         """
-        # Prepare the Response struct
-        response = llm_service.ffi.new(LLMServiceKeys.RESPONSE)
-        if response == llm_service.ffi.NULL:
-            err = Error(code = f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}", message=ErrorMessages.MEM_ALLOCATION_ERR, param=Parameters.INTERNAL_TYPE, type=Parameters.INTERNAL_TYPE)
-            return err
+        # Prepare queue and callback
+        q = Queue()
 
-        # Call the C function
-        logger.info("Making query call to C interface")
-        llm_service.lib.llm_chat_completion_create(handle, query, response)
+        @llm_service.ffi.callback("void(const Response *)")
+        def callback(response_ptr):
+            resp = response_ptr[0]
+            choice = resp.choices[0]
+            msg = choice.message
 
-        # Call the C function to delete the chat completion
-        llm_service.lib.llm_chat_completion_delete(handle)
+            content = llm_service.ffi.string(msg.content).decode("utf-8")
+            finish_reason = llm_service.ffi.string(choice.finish_reason).decode("utf-8")
 
-        # Destroy the LLM object
-        llm_service.lib.llm_destroy_object(handle)
+            q.put({
+                RESPNS_KEYS.CHAT_ID: llm_service.ffi.string(resp.id).decode("utf-8"),
+                RESPNS_KEYS.CHAT_OBJECT: llm_service.ffi.string(resp.object).decode('utf-8'),
+                RESPNS_KEYS.CHAT_CREATED: resp.created,
+                RESPNS_KEYS.MODEL: llm_service.ffi.string(resp.model).decode("utf-8"),
+                RESPNS_KEYS.MESSAGE_CONTENT: content,
+                RESPNS_KEYS.CHOICE_FINISH_REASON: finish_reason
+            })
 
-        # Extract choices
-        #for i in range(10):  # MAX_CHOICES
-        choice = response.choices[0]
-        msg_choice = choice.message
+            if create_completion_request.stream and finish_reason == "stop" and content == "":
+                q.put("[DONE]")
 
-        logger.info(f"choice.rrole: {llm_service.ffi.string(msg_choice.role).decode('utf-8')}")
-        ccir = CreateCompletionResponseChoicesInner(finish_reason=LLMServiceKeys.FINISH_REASON_DEFAULT_VAL, index=choice.index, logprobs=None, text=llm_service.ffi.string(msg_choice.content).decode('utf-8'))
-        response.object = LLMServiceKeys.RESPONSE_OBJ_TEXT_COMPLETION.encode("utf-8")
-        res = CreateCompletionResponse(id = llm_service.ffi.string(response.id).decode('utf-8'), choices=[ccir], created=int(response.created), model=QUERY_CONST.DEFAULT_MODEL, object=llm_service.ffi.string(response.object).decode('utf-8'))
+        def run_llm():
+            try:
+                llm_service.lib.llm_chat_completion_create(handle, query, create_completion_request.stream, callback)
+            except Exception as e:
+                logger.error(f"Error in C callback execution: {e}")
+                q.put({"error": str(e)})
+            finally:
+                if not create_completion_request.stream:
+                    q.put("[DONE]")
+                llm_service.lib.llm_destroy_object(handle)
 
-        return res
+        threading.Thread(target=run_llm, daemon=True).start()
+
+        if create_completion_request.stream:
+            async def stream_generator():
+                loop = asyncio.get_event_loop()
+                first_chunk_sent = False
+
+                while True:
+                    item = await loop.run_in_executor(None, q.get)
+
+                    if item == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    elif isinstance(item, dict) and "error" in item:
+                        yield f"data: [ERROR] {item['error']}\n\n"
+                        break
+                    elif isinstance(item, dict):
+                        content = item.get(RESPNS_KEYS.MESSAGE_CONTENT, "")
+                        if not content:
+                            continue
+
+                        chunk = {
+                            "id": item[RESPNS_KEYS.CHAT_ID],
+                            "object": "text_completion",
+                            "model": item[RESPNS_KEYS.MODEL],
+                            "created": item[RESPNS_KEYS.CHAT_CREATED],
+                            "choices": [{
+                                "text": content,
+                                "index": 0,
+                                "finish_reason": None
+                            }]
+                        }
+
+                        if item[RESPNS_KEYS.CHOICE_FINISH_REASON] == "stop" and not content:
+                            chunk["choices"][0]["finish_reason"] = "stop"
+
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        else:
+            # Non-streaming response
+            item = q.get()
+            if item == "[DONE]":
+                return Error(
+                    code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                    message="Empty response received",
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
+            elif isinstance(item, dict) and "error" in item:
+                return Error(
+                    code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                    message=item["error"],
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
+
+            ccir = CreateCompletionResponseChoicesInner(
+                finish_reason='stop',
+                index=0,
+                logprobs=None,
+                text=item[RESPNS_KEYS.MESSAGE_CONTENT]
+            )
+
+            return CreateCompletionResponse(
+                id=item[RESPNS_KEYS.CHAT_ID],
+                choices=[ccir],
+                created=int(item[RESPNS_KEYS.CHAT_CREATED]),
+                model=item[RESPNS_KEYS.MODEL],
+                object="text_completion"
+            )

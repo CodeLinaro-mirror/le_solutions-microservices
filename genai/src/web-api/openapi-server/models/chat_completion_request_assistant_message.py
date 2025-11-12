@@ -14,25 +14,25 @@
     Do not edit the class manually.
 """  # noqa: E501
 
-
 from __future__ import annotations
 import pprint
 import re  # noqa: F401
 import json
-
-
-
+from typing import Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 from typing import Any, ClassVar, Dict, List, Optional
 from openapi_server.models.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 from openapi_server.models.chat_completion_request_assistant_message_audio import ChatCompletionRequestAssistantMessageAudio
-from openapi_server.models.chat_completion_request_assistant_message_content import ChatCompletionRequestAssistantMessageContent
+#from openapi_server.models.chat_completion_request_assistant_message_content import ChatCompletionRequestAssistantMessageContent
+from openapi_server.models.chat_completion_request_assistant_message_content_part import ChatCompletionRequestAssistantMessageContentPart
 from openapi_server.models.chat_completion_request_assistant_message_function_call import ChatCompletionRequestAssistantMessageFunctionCall
 try:
     from typing import Self
 except ImportError:
     from typing_extensions import Self
+
+ChatCompletionRequestAssistantMessageContent = Union[StrictStr, List[ChatCompletionRequestAssistantMessageContentPart]]
 
 class ChatCompletionRequestAssistantMessage(BaseModel):
     """
@@ -59,7 +59,6 @@ class ChatCompletionRequestAssistantMessage(BaseModel):
         "validate_assignment": True,
         "protected_namespaces": (),
     }
-
 
     def to_str(self) -> str:
         """Returns the string representation of the model using alias"""
@@ -148,5 +147,4 @@ class ChatCompletionRequestAssistantMessage(BaseModel):
             "function_call": ChatCompletionRequestAssistantMessageFunctionCall.from_dict(obj.get("function_call")) if obj.get("function_call") is not None else None
         })
         return _obj
-
 

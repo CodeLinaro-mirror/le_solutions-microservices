@@ -65,7 +65,6 @@ class RESTClientObject:
     def __init__(self, configuration) -> None:
         # urllib3.PoolManager will pass all kw parameters to connectionpool
         # Custom SSL certificates and client certificates:  # noqa: E501
-
         # cert_reqs
         if configuration.verify_ssl:
             cert_reqs = ssl.CERT_REQUIRED
@@ -77,7 +76,6 @@ class RESTClientObject:
             "ca_certs": configuration.ssl_ca_cert,
             "cert_file": configuration.cert_file,
             "key_file": configuration.key_file,
-            "ca_cert_data": configuration.ca_cert_data,
         }
         if configuration.assert_hostname is not None:
             pool_args['assert_hostname'] = (

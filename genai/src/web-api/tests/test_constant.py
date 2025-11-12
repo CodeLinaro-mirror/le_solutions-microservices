@@ -6,7 +6,7 @@ class ChatTestConstants:
     KEY_CHOICES = "choices"
     KEY_MESSAGE = "message"
     KEY_CONTENT = "content"
-    VAL_CONTENT = "The capital of india is new delhi"
+    VAL_CONTENT = "The capital of India is New Delhi"
     KEY_OBJECT = "object"
     VAL_OBJECT = "chat.completion.deleted"
     KEY_DELETED = "deleted"
@@ -30,7 +30,7 @@ class CompletionTestConstant:
     # String keys
     KEY_CHOCIES = "choices"
     KEY_CONTENT = "text"
-    VAL_CONTENT = "The capital of india is new delhi"
+    VAL_CONTENT = "The capital of India is New Delhi"
 
     CREATE_COMPLETION_REQUEST = {"prompt":"What is the capital of india?"}
 

@@ -29,7 +29,7 @@ from typing_extensions import Self
 
 class RealtimeServerEventConversationItemInputAudioTranscriptionCompleted(BaseModel):
     """
-    This event is the output of audio transcription for user audio written to the  user audio buffer. Transcription begins when the input audio buffer is  committed by the client or server (in `server_vad` mode). Transcription runs  asynchronously with Response creation, so this event may come before or after  the Response events.  Realtime API models accept audio natively, and thus input transcription is a  separate process run on a separate ASR (Automatic Speech Recognition) model,  currently always `whisper-1`. Thus the transcript may diverge somewhat from  the model's interpretation, and should be treated as a rough guide.
+    This event is the output of audio transcription for user audio written to the  user audio buffer. Transcription begins when the input audio buffer is  committed by the client or server (in `server_vad` mode). Transcription runs  asynchronously with Response creation, so this event may come before or after  the Response events.  Realtime API models accept audio natively, and thus input transcription is a  separate process run on a separate ASR (Automatic Speech Recognition) model. Thus the transcript may diverge somewhat from  the model's interpretation, and should be treated as a rough guide.
     """ # noqa: E501
     event_id: StrictStr = Field(description="The unique ID of the server event.")
     type: StrictStr = Field(description="The event type, must be `conversation.item.input_audio_transcription.completed`. ")

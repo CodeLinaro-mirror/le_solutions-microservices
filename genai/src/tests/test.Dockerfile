@@ -2,8 +2,11 @@
 # Stage 1: Build Stage
 #######################
 
-FROM python:3.10.12 AS builder
+FROM python:3.10.12-alpine AS builder
 WORKDIR /usr/src/app
+
+# Install build dependencies for Python packages and make
+RUN apk add --no-cache build-base libstdc++ make
 
 # create python virtual environment
 RUN python3 -m venv /venv
@@ -30,8 +33,11 @@ RUN pip install coverage==7.9.1
 # Stage 2: Runtime Stage
 #########################
 
-FROM python:3.10.12 AS service
+FROM python:3.10.12-alpine AS service
 WORKDIR /usr/src/app
+
+# Install build dependencies for Python packages and make
+RUN apk add --no-cache build-base libstdc++ make
 
 # copy the virtual environment with web-api package installed with dependency
 COPY --from=builder /venv /venv
@@ -44,7 +50,7 @@ COPY --from=builder /usr/src/app/web-api/openapi_server/impl/genie_wrapper/inclu
 
 ENV PATH=/venv/bin:$PATH
 
-RUN cd /root/tests/mock_lib &&  /bin/make clean && /bin/make && \
+RUN cd /root/tests/mock_lib &&  /usr/bin/make clean && /usr/bin/make && \
               mkdir -p /root/app/site-packages/test/ && \
               chmod 777 -R /root/app/site-packages/test/ && \
               mkdir -p /root/app/site-packages/report/html && \

@@ -16,6 +16,7 @@ from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
 from fastapi import (
     HTTPException
 )
+from fastapi.responses import JSONResponse, StreamingResponse
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -58,33 +59,32 @@ class ChatApiImpl(BaseChatApi):
             raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.UNEXPECTED_ERROR)
 
     async def create_chat_completion(
-        self,
-        create_chat_completion_request: CreateChatCompletionRequest
-    ) -> CreateChatCompletionResponse:
+    self,
+    create_chat_completion_request: CreateChatCompletionRequest
+    ):
         """
         Creates a new chat conversation.
         Args:
             create_chat_completion_request (CreateChatCompletionRequest): The chat completion to create.
         Returns:
-            CreateChatCompletionResponse: The created chat completion.
+            StreamingResponse or JSONResponse: The created chat completion.
         Raises:
             HTTPException: If there is an error creating the chat completion.
-
         """
         try:
-            result = GenieWrapperCreateChatCompletion.create_chat_completion(
-                create_chat_completion_request
-            )
+            result = GenieWrapperCreateChatCompletion.create_chat_completion(create_chat_completion_request)
+
             if isinstance(result, Error):
                 logger.error(f"Expected CreateChatCompletionResponse, got {type(result)}")
                 raise HTTPException(status_code=int(result.code), detail=result.message)
-            else:
-                logger.info(f"create_chat_completion result: {result}")
-                return result
+
+            logger.info(f"create_chat_completion result: {result}")
+            return result
 
         except HTTPException as http_exc:
-                logger.error(f"HTTPException error in create_chat_completion: {http_exc}")
-                raise HTTPException(status_code=http_exc.status_code, detail=http_exc.detail)
+            logger.error(f"HTTPException error in create_chat_completion: {http_exc}")
+            raise HTTPException(status_code=http_exc.status_code, detail=http_exc.detail)
+
         except Exception as e:
             logger.error(f"Unexpected error in create_chat_completion: {e}")
             raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.UNEXPECTED_ERROR)

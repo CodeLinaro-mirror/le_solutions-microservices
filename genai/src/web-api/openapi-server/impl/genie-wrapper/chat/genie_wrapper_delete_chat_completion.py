@@ -36,9 +36,6 @@ class GenieWrapperDeleteChatCompletion:
 
         handle = handle_obj.handle_object
 
-        # Call the C function to delete the chat completion
-        llm_service.lib.llm_chat_completion_delete(handle)
-
         # Destroy the LLM object
         llm_service.lib.llm_destroy_object(handle)
 
