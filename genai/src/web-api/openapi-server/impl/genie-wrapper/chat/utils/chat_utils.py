@@ -31,12 +31,15 @@ class ChatQueryUtils:
     def _get_content_string(msg):
         """
         Helper method to extract content as string from a message object,
-        handling both string and object content types.
+        handling text, objects, and image content types for proper hash calculation.
+
+        For images: Uses URL if available, otherwise samples ~256 chars from base64.
+        This ensures consistent hashing for session tracking with multimodal content.
 
         Args:
             msg: Message object
         Returns:
-            String representation of content
+            String representation of content including image identifiers
         """
         if not hasattr(msg, "content"):
             return ""
@@ -46,9 +49,77 @@ class ChatQueryUtils:
 
         if isinstance(msg.content, str):
             return msg.content.strip()
-        else:
-            # Convert object content to string representation
-            return str(msg.content)
+
+        # Handle list content (multimodal messages with text and images)
+        if isinstance(msg.content, list):
+            parts = []
+            for item in msg.content:
+                if isinstance(item, dict):
+                    # Raw JSON content item
+                    if item.get('type') == 'text':
+                        text_content = item.get('text', '').strip()
+                        if text_content:
+                            parts.append(text_content)
+                    elif item.get('type') == 'image_url':
+                        image_url_data = item.get('image_url', {})
+                        if isinstance(image_url_data, dict):
+                            url = image_url_data.get('url', '')
+                        else:
+                            url = str(image_url_data)
+
+                        if url:
+                            if url.startswith('http'):
+                                # Use full URL for hash (external images)
+                                parts.append(f"[IMAGE:{url}]")
+                            elif url.startswith('data:image'):
+                                # Base64 image - sample ~256 characters for hash
+                                # Format: data:image/jpeg;base64,<base64_data>
+                                if ',' in url:
+                                    base64_part = url.split(',', 1)[1]
+                                    sample = base64_part[:256] if len(base64_part) > 256 else base64_part
+                                    parts.append(f"[IMAGE:base64:{sample}]")
+                                else:
+                                    parts.append("[IMAGE:base64:invalid]")
+                            else:
+                                # Other image format
+                                parts.append(f"[IMAGE:other:{url[:256]}]")
+
+                # Handle Pydantic objects
+                elif hasattr(item, 'type'):
+                    if item.type == 'text' and hasattr(item, 'text'):
+                        text_content = getattr(item, 'text', '').strip()
+                        if text_content:
+                            parts.append(text_content)
+                    elif item.type == 'image_url' and hasattr(item, 'image_url'):
+                        image_url_obj = getattr(item, 'image_url', None)
+                        if image_url_obj:
+                            if hasattr(image_url_obj, 'url'):
+                                url = image_url_obj.url
+                            elif isinstance(image_url_obj, dict):
+                                url = image_url_obj.get('url', '')
+                            else:
+                                url = str(image_url_obj)
+
+                            if url:
+                                if url.startswith('http'):
+                                    # Use full URL for hash (external images)
+                                    parts.append(f"[IMAGE:{url}]")
+                                elif url.startswith('data:image'):
+                                    # Base64 image - sample ~256 characters for hash
+                                    if ',' in url:
+                                        base64_part = url.split(',', 1)[1]
+                                        sample = base64_part[:256] if len(base64_part) > 256 else base64_part
+                                        parts.append(f"[IMAGE:base64:{sample}]")
+                                    else:
+                                        parts.append("[IMAGE:base64:invalid]")
+                                else:
+                                    # Other image format
+                                    parts.append(f"[IMAGE:other:{url[:256]}]")
+
+            return " ".join(parts).strip()
+
+        # Fallback: convert object to string representation
+        return str(msg.content)
 
     @staticmethod
     def _has_tool_calls(msg):

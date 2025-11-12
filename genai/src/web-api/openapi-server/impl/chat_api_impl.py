@@ -46,7 +46,7 @@ class ChatApiImpl(BaseChatApi):
                     error_message = ErrorMessages.MODEL_NOT_FOUND.format(model=create_chat_completion_request.model)
                     logger.error(f"Invalid model requested: {create_chat_completion_request.model}")
                     raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=error_message)
-                logger.info(f"Model validation passed for: {create_chat_completion_request.model}")
+                logger.debug(f"Model validation passed for: {create_chat_completion_request.model}")
 
             result = GenieWrapperAddChatCompletion.add_chat_completion(
                 completion_id,
@@ -69,12 +69,14 @@ class ChatApiImpl(BaseChatApi):
 
     async def create_chat_completion(
     self,
-    create_chat_completion_request: CreateChatCompletionRequest
+    create_chat_completion_request: CreateChatCompletionRequest,
+    raw_json: dict = None
     ):
         """
         Creates a new chat conversation.
         Args:
             create_chat_completion_request (CreateChatCompletionRequest): The chat completion to create.
+            raw_json (dict): Raw JSON request body to bypass Pydantic deserialization issues.
         Returns:
             StreamingResponse or JSONResponse: The created chat completion.
         Raises:
@@ -88,9 +90,16 @@ class ChatApiImpl(BaseChatApi):
                     error_message = ErrorMessages.MODEL_NOT_FOUND.format(model=create_chat_completion_request.model)
                     logger.error(f"Invalid model requested: {create_chat_completion_request.model}")
                     raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=error_message)
-                logger.info(f"Model validation passed for: {create_chat_completion_request.model}")
+                logger.debug(f"Model validation passed for: {create_chat_completion_request.model}")
 
-            result = GenieWrapperCreateChatCompletion.create_chat_completion(create_chat_completion_request)
+            # FIX: Pass raw JSON to bypass Pydantic OneOf deserialization issues
+            if raw_json:
+                logger.debug("Received raw JSON dict to bypass Pydantic OneOf issues")
+                logger.debug(f"Raw JSON contains {len(raw_json.get('messages', []))} messages")
+            else:
+                logger.debug("No raw JSON provided - may encounter Pydantic OneOf deserialization issues")
+
+            result = await GenieWrapperCreateChatCompletion.create_chat_completion(create_chat_completion_request, raw_json)
 
             if isinstance(result, Error):
                 logger.error(f"Expected CreateChatCompletionResponse, got {type(result)}")

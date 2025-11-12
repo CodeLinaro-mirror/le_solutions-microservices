@@ -32,7 +32,8 @@ class HttpStatusCodes:
 
 class EnvVariableKeys:
     """ Constants for environment variable keys. """
-    ENV_LIBRARY_PATH_KEY = "GENAI_LIBRARY_PATH" # Key for the library path environment variable
+    ENV_LIBRARY_PATH_KEY = "LLM_LIBRARY_PATH" # Key for the LLM library path environment variable
+    ENV_VLM_LIBRARY_PATH_KEY = "VLM_LIBRARY_PATH" # Key for the VLM library path environment variable
     GENAI_INTERFACE_FILE_KEY = "GENAI_INTERFACE_FILE" # Key for the interface header env variable
 
 class EnvVariableValues:

@@ -6,13 +6,14 @@
 //=============================================================================
 
 #include "vlm-service.hpp"
-#include <iostream>
+#include <iostream> // Explicitly included for std::cerr
 #include <fstream>
 #include <sstream>
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
 #include <json/json.h>
+#include <cstddef> // Explicitly included for size_t
 
 Profile::Profile() {
     const int32_t status = GenieProfile_create(nullptr, &m_handle);
@@ -184,6 +185,9 @@ inline void Pipeline::connect(std::shared_ptr<Node> producerNode,
 }
 
 inline void Pipeline::execute(void* userData) {
+    // Blocking call: expected to return only after the pipeline finishes and
+    // all callbacks using 'userData' have completed. If this changes to async,
+    // the VLMObject must be updated to manage 'userData' lifetime accordingly.
     const Genie_Status_t status = GeniePipeline_execute(m_handle, userData);
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to execute");
@@ -606,16 +610,20 @@ void VLMObject::vlm_chat_completion_create() {
     // 4. Execute the pipeline
     // -----------------------------------------------------------------
     std::string responseText;
-    VLMQueryMutex qmtx;
-    qmtx.responseStr = &responseText;
-    qmtx.stream = &stream;
-    qmtx.vlmObj = this;
+    VLMUserData userData;
+    userData.responseStr = &responseText;
+    userData.stream = &stream;
+    userData.vlmObj = this;
+    userData.cv = &cv;
+    userData.request_in_progress = &request_in_progress;
 
-    pipeline->execute(&qmtx);
+    request_in_progress = true;
 
-    qmtx.responseStr = nullptr;
-    qmtx.stream = nullptr;
-    qmtx.vlmObj = nullptr;
+    pipeline->execute(&userData);
+
+    // Wait for the callback to signal completion
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait(lock, [this]{ return !request_in_progress; });
 }
 
 /*--------------------------------------------------------------
@@ -624,55 +632,84 @@ void VLMObject::vlm_chat_completion_create() {
 Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
                                              GenieNode_TextOutput_SentenceCode_t sentenceCode,
                                              const void* userData) {
-    VLMQueryMutex* qmtx = static_cast<VLMQueryMutex*>(const_cast<void*>(userData));
-    if (!qmtx) return GENIE_STATUS_ERROR_INVALID_ARGUMENT;
-
-    // Non‑streaming mode: accumulate full response until END
-    if (!(*qmtx->stream)) {
-        if (responseStr && qmtx->responseStr) {
-            *(qmtx->responseStr) += responseStr;
+    // This callback is invoked from an external C library. It MUST NOT throw exceptions.
+    try {
+        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
+        if (!udata || !udata->vlmObj || !udata->stream || !udata->cv || !udata->request_in_progress) {
+            std::cerr << "[textOutputCallback] ERROR: Critical user data is null." << std::endl;
+            return GENIE_STATUS_ERROR_INVALID_ARGUMENT;
         }
 
-        if (sentenceCode == GENIE_NODE_SENTENCE_END) {
-            // Build OpenAI‑compatible Response object
-            std::unique_ptr<Response> resp = std::make_unique<Response>();
-            strlcpy(resp->model, qmtx->vlmObj->modelSelected, sizeof(resp->model));
+        bool isStreaming = *udata->stream;
+        bool isEndOfSentence = (sentenceCode == GENIE_NODE_SENTENCE_END);
+        // Assume any code other than CONTINUE is a form of termination.
+        bool isEndOfStream = (sentenceCode != GENIE_NODE_SENTENCE_CONTINUE);
 
+        if (isStreaming) {
+            // Streaming mode: send each token immediately.
+            std::unique_ptr<Response> resp = std::make_unique<Response>();
+            strlcpy(resp->model, udata->vlmObj->modelSelected, sizeof(resp->model));
             Message msg;
             strlcpy(msg.role, "assistant", sizeof(msg.role));
-            strlcpy(msg.content, qmtx->responseStr->c_str(), sizeof(msg.content));
+            if (responseStr) {
+                strlcpy(msg.content, responseStr, sizeof(msg.content));
+            }
             resp->choices[0].message = msg;
 
-            if (qmtx->vlmObj->responseCallback) {
-                qmtx->vlmObj->responseCallback(resp.get());
+            if (isEndOfSentence) {
+                strlcpy(resp->choices[0].finish_reason, "stop", sizeof(resp->choices[0].finish_reason));
+            }
+
+            if (udata->vlmObj->responseCallback) {
+                udata->vlmObj->responseCallback(resp.get());
+            }
+        } else {
+            // Non-streaming mode: accumulate the full response.
+            if (responseStr && udata->responseStr) {
+                *(udata->responseStr) += responseStr;
+            }
+
+            if (isEndOfSentence) {
+                // End of sentence: send the complete response.
+                std::unique_ptr<Response> resp = std::make_unique<Response>();
+                strlcpy(resp->model, udata->vlmObj->modelSelected, sizeof(resp->model));
+                Message msg;
+                strlcpy(msg.role, "assistant", sizeof(msg.role));
+                strlcpy(msg.content, udata->responseStr->c_str(), sizeof(msg.content));
+                resp->choices[0].message = msg;
+                strlcpy(resp->choices[0].finish_reason, "stop", sizeof(resp->choices[0].finish_reason));
+
+                if (udata->vlmObj->responseCallback) {
+                    udata->vlmObj->responseCallback(resp.get());
+                }
             }
         }
-    } else {
-        // Streaming mode – send each token / chunk immediately
-        std::unique_ptr<Response> resp = std::make_unique<Response>();
-        strlcpy(resp->model, qmtx->vlmObj->modelSelected, sizeof(resp->model));
 
-        Message msg;
-        strlcpy(msg.role, "assistant", sizeof(msg.role));
-        if (responseStr) {
-            strlcpy(msg.content, responseStr, sizeof(msg.content));
-        }
-        resp->choices[0].message = msg;
-
-        if (qmtx->vlmObj->responseCallback) {
-            qmtx->vlmObj->responseCallback(resp.get());
+        // If the stream has ended (for any reason), notify the waiting thread.
+        if (isEndOfStream) {
+            *udata->request_in_progress = false;
+            udata->cv->notify_one();
         }
 
-        if (sentenceCode == GENIE_NODE_SENTENCE_END) {
-            // Send a final empty message with finish_reason = "stop"
-            std::unique_ptr<Response> endResp = std::make_unique<Response>();
-            Message endMsg;
-            strlcpy(endMsg.content, "", sizeof(endMsg.content));
-            endResp->choices[0].message = endMsg;
-            strlcpy(endResp->choices[0].finish_reason, "stop", sizeof(endResp->choices[0].finish_reason));
-            qmtx->vlmObj->responseCallback(endResp.get());
+        return GENIE_STATUS_SUCCESS;
+
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Exception caught in textOutputCallback: " << e.what() << std::endl;
+        // Attempt to unblock the waiting thread even on error.
+        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
+        if (udata && udata->request_in_progress && udata->cv) {
+            *udata->request_in_progress = false;
+            udata->cv->notify_one();
         }
+        return GENIE_STATUS_ERROR_QUERY_FAILED; // Signal an error back to the SDK.
+    } catch (...) {
+        std::cerr << "ERROR: Unknown exception caught in textOutputCallback" << std::endl;
+        // Attempt to unblock the waiting thread even on error.
+        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
+        if (udata && udata->request_in_progress && udata->cv) {
+            *udata->request_in_progress = false;
+            udata->cv->notify_one();
+        }
+        return GENIE_STATUS_ERROR_QUERY_FAILED; // Signal an error back to the SDK.
     }
-
-    return GENIE_STATUS_SUCCESS;
 }

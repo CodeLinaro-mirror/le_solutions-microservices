@@ -20,6 +20,7 @@ from fastapi import (  # noqa: F401
     HTTPException,
     Path,
     Query,
+    Request,
     Response,
     Security,
     status,
@@ -39,6 +40,11 @@ from openapi_server.impl.constant import (
     APITags,
     APISummary
 )
+from openapi_server.logger.logger_config import LoggerConfig
+import logging
+
+LoggerConfig.initialize()
+logger = LoggerConfig.get_logger(__name__)
 
 router = APIRouter()
 
@@ -56,8 +62,27 @@ for _, name, _ in pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + "."):
     response_model_by_alias=True,
 )
 async def create_chat_completion(
+    request: Request,
     create_chat_completion_request: CreateChatCompletionRequest = Body(None, description=""),
 ) -> CreateChatCompletionResponse:
     if not BaseChatApi.subclasses:
         raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.NOT_IMPELEMENTED)
-    return await BaseChatApi.subclasses[0]().create_chat_completion(create_chat_completion_request)
+
+    # FIX: Get raw JSON body to bypass broken Pydantic OneOf deserialization
+    # The Pydantic OneOf wrapper for multimodal content fails to deserialize properly,
+    # so we extract the raw JSON before Pydantic processes it
+    import json
+    logger.debug("=== PYDANTIC ONEOF BYPASS FIX ===")
+    logger.debug("Extracting raw JSON body to bypass broken Pydantic OneOf deserialization")
+
+    raw_body = await request.body()
+    raw_json = json.loads(raw_body.decode('utf-8')) if raw_body else {}
+
+    if raw_json:
+        messages_count = len(raw_json.get('messages', []))
+        logger.debug(f"Successfully extracted raw JSON with {messages_count} messages")
+        logger.debug(f"Raw JSON keys: {list(raw_json.keys())}")
+    else:
+        logger.debug("Raw JSON extraction resulted in empty dict")
+
+    return await BaseChatApi.subclasses[0]().create_chat_completion(create_chat_completion_request, raw_json)

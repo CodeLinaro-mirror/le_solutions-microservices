@@ -15,6 +15,7 @@
 """  # noqa: E501
 
 from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
 
 from openapi_server.apis.chat_api import router as ChatApiRouter
 from openapi_server.apis.health_api import router as HealthApiRouter
@@ -24,16 +25,80 @@ import logging
 from openapi_server.version import __version__
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.model_config_manager import ModelConfigManager
+from openapi_server.thread_pool import (
+    initialize_vlm_thread_pool,
+    shutdown_vlm_thread_pool,
+    initialize_vlm_operation_lock,
+    clear_preinit_vlm_objects
+)
 from starlette.middleware.base import BaseHTTPMiddleware
 import yaml
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI application.
+    Manages the lifecycle of VLM resources including:
+    - VLM thread pool for blocking operations
+    - VLM execution thread for thread-affinity operations
+    - VLM operation lock for serializing requests
+
+    VLM initialization is controlled by the ENABLE_VLM environment variable.
+    Set ENABLE_VLM=true to enable VLM support, or ENABLE_VLM=false to disable it.
+    """
+    # Check if VLM should be enabled via environment variable
+    import os
+    enable_vlm = os.getenv("ENABLE_VLM", "true").lower() in ("true", "1", "yes", "on")
+
+    vlm_initialized = False
+
+    if enable_vlm:
+        # Startup - Initialize VLM Resources
+        logger.info("=== VLM Enabled - Initializing VLM Resources ===")
+
+        # Initialize thread pool for general blocking operations
+        logger.info("Initializing VLM thread pool with 4 workers")
+        initialize_vlm_thread_pool(max_workers=4)
+        logger.info("VLM thread pool initialized")
+
+        # Initialize VLM operation lock for serializing VLM requests
+        logger.info("Initializing VLM operation lock")
+        initialize_vlm_operation_lock()
+        logger.info("VLM operation lock initialized")
+
+        vlm_initialized = True
+        logger.info("=== VLM Resources Initialized ===")
+    else:
+        logger.info("=== VLM Disabled - Skipping VLM initialization (ENABLE_VLM=false) ===")
+
+    yield
+
+    # Shutdown - Only if VLM was initialized
+    if vlm_initialized:
+        logger.info("=== Shutting Down VLM Resources ===")
+
+        # Shutdown thread pool
+        logger.info("Shutting down VLM thread pool...")
+        shutdown_vlm_thread_pool(wait=True)
+        logger.info("VLM thread pool shut down")
+
+        # Clear pre-initialized VLM objects
+        logger.info("Clearing pre-initialized VLM objects...")
+        clear_preinit_vlm_objects()
+        logger.info("Pre-initialized VLM objects cleared")
+
+        logger.info("=== VLM Resources Shut Down ===")
+    else:
+        logger.info("=== VLM was not initialized - No VLM resources to shut down ===")
+
 app = FastAPI(
     title="IOT Solutions - Gen-AI Microservice APIs",
     description="These REST APIs provide the capability to run inference on Qualcomm 9100 devices.",
     version=__version__,
+    lifespan=lifespan,  # Add lifespan context manager
 )
 
 # Load Custom Open AI API Schema
@@ -45,8 +110,8 @@ app.openapi_schema = openapi_schema
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         body = await request.body()
-        logger.info(f"Incoming request: {request.method} {request.url}")
-        logger.info(f"Request body: {body.decode('utf-8')}")
+        logger.debug(f"Incoming request: {request.method} {request.url}")
+        logger.debug(f"Request body: {body.decode('utf-8')}")
         # Re-create request with the same body for downstream
         request = Request(request.scope, receive=lambda: {"type": "http.request", "body": body})
         response = await call_next(request)
@@ -65,8 +130,12 @@ async def startup_event():
         for model in models:
             logger.info(f"  - {model['id']}: {model.get('display_name', 'N/A')}")
     except Exception as e:
-        logger.error(f"Failed to initialize ModelConfigManager: {e}")
+        logger.error(f"Failed to initialize ModelConfigManager: {e}", exc_info=True)
         logger.warning("Service will continue with fallback configuration")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down Gen-AI Microservice")
 
 app.include_router(ModelApiRouter)
 app.include_router(ChatApiRouter)

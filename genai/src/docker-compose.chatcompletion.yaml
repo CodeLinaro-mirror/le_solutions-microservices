@@ -1,0 +1,43 @@
+services:
+  genai-vlm:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai_chatcompletion_service
+    container_name: genai_chatcompletion_service
+    hostname: genai-chatcompletion
+    build:
+      context: .
+      dockerfile: Dockerfile.chatcompletion
+      target: service
+    ports:
+      - "${GENAI_PORT:-8081}:${GENAI_PORT:-8081}"
+    environment:
+      - GENAI_MODEL_NAME=${GENAI_VLM_MODEL_NAME:-QWEN2_5_VL_3B}
+      - GENAI_PORT=${GENAI_PORT:-8081}
+      - VLM_LIBRARY_PATH=${VLM_LIBRARY_PATH:-/root/app/site-packages/libvlmservice.so}
+      - LLM_LIBRARY_PATH=${LLM_LIBRARY_PATH:-/root/app/site-packages/libllmservice.so}
+      - GENAI_INTERFACE_FILE=${GENAI_INTERFACE_FILE:-/usr/include/genai_interface.h}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/root/app/site-packages/models_config.json}
+    # Memory and resource limits for VLM model loading
+    deploy:
+      resources:
+        limits:
+          memory: 12G  # VLM models typically need 8-12GB+ for loading and inference
+        reservations:
+          memory: 8G   # Reserve at least 8GB
+    # Alternative memory limit syntax (use if deploy.resources doesn't work)
+    mem_limit: 12g
+    memswap_limit: 12g
+    # Prevent OOM killer from terminating the container
+    oom_kill_disable: false
+    # Increase shared memory size for model loading
+    shm_size: 2g
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
+    volumes:
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${GENAI_MODEL_DIR:-/etc/models/genie_bundle_qwen2_5_vl_3b}:/root/app/site-packages/
+    command: sh -c "ln -sf /usr/include/genai_interface.h /root/app/site-packages/genai_interface.h && ln -sf /usr/lib/libvlmservice.so libvlmservice.so && ln -sf /usr/lib/libllmservice.so libllmservice.so && hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT:-8081} --reload --access-log - --error-log - --log-level info"

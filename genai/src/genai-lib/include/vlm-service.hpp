@@ -17,6 +17,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cstddef>
+#include <mutex>
+#include <condition_variable>
 
 #include "GeniePipeline.h"
 #include "GenieNode.h"
@@ -205,8 +207,14 @@ private:
     std::shared_ptr<Node> textGeneratorNode;
     std::string sc_configPath;
 
-    /* Keep binary image data alive for the duration of execution */
+    /* Per-request image bytes that must remain valid at least until pipeline->execute() returns.
+     * This avoids dangling pointers if the SDK reads the buffer after setData() but before/while execute(). */
     std::vector<uint8_t> currentImageData;
+
+    /* Persistent storage for static custom inputs (e.g., position IDs, masks) loaded from files.
+     * These must remain valid for the life of the VLMObject because the SDK may access them
+     * during execute() or subsequent operations; we therefore keep them owned here. */
+    std::vector<std::vector<uint8_t>> staticInputBuffers;
 
     /* Helper structures */
     struct ModelConfig {
@@ -222,6 +230,9 @@ private:
     };
 
     ModelConfig modelConfig;
+    std::string imageEncoderConfigStr;
+    std::string lutEncoderConfigStr;
+    std::string textGeneratorConfigStr;
 
     /* Internal helpers */
     void loadConfig(const std::string& modelName);
@@ -234,6 +245,10 @@ private:
     static Genie_Status_t textOutputCallback(const char* responseStr,
                                              GenieNode_TextOutput_SentenceCode_t sentenceCode,
                                              const void* userData);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool request_in_progress = false;
 };
 
 
@@ -241,6 +256,8 @@ typedef struct {
     std::string* responseStr;
     bool* stream;
     VLMObject* vlmObj;
-} VLMQueryMutex;
+    std::condition_variable* cv;
+    bool* request_in_progress;
+} VLMUserData;
 
 #endif // VLM_SERVICE_HPP

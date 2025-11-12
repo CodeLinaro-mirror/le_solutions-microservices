@@ -229,10 +229,43 @@ class ModelConfigManager:
             return model_config['context'].get('summarization_threshold', 0.7)
         return 0.7  # Default to 70%
 
+    def supports_vision(self, model_id: str) -> bool:
+        """
+        Check if a model supports vision/image inputs.
+
+        Args:
+            model_id: The model identifier
+
+        Returns:
+            bool: True if model supports vision, False otherwise
+        """
+        model_config = self.get_model_config(model_id)
+        if model_config:
+            return model_config.get('supports_vision', False)
+        return False
+
     def reload_config(self):
         """Reload the configuration from file."""
         logger.info("Reloading model configuration")
         self.models_config = self._load_models_config()
+
+    def has_vision_models(self) -> bool:
+        """
+        Check if any configured models support vision.
+
+        Returns:
+            bool: True if any model has 'supports_vision': true, False otherwise
+        """
+        try:
+            for model_id, model_config in self.models_config.get("models", {}).items():
+                if model_config.get("supports_vision", False):
+                    logger.debug(f"Vision model detected: {model_id}")
+                    return True
+            logger.debug("No vision models found in configuration")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking for vision models: {e}")
+            return False
 
 
 def get_config_manager() -> ModelConfigManager:

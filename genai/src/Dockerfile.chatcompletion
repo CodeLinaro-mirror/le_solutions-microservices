@@ -1,0 +1,120 @@
+#######################
+# Stage 1: Build Stage
+#######################
+
+FROM ubuntu:24.04 AS builder
+
+# Install build dependencies for C/C++ compilation and image processing
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    unzip build-essential cmake wget \
+    pkg-config \
+    python3-dev \
+    libffi-dev \
+    libjpeg-dev libpng-dev libwebp-dev libjsoncpp-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+ENV VLM_BUILD_DIR="/mnt/work/build"
+ENV VLM_DEPLOY_DIR="/mnt/work/deploy"
+
+#Add VLM install directory
+ENV VLM_ADSP_DIR=${VLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
+
+# qnp-sdk: fetch and copy the needed headers and libraries
+ENV VLM_QNP_VER=2.40.0.251030
+ENV VLM_DOWNLOAD_DIR="/mnt/work/downloads"
+ENV VLM_QNN_LIB_PATH=${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/lib
+
+ENV VLM_QNP_SDK=v${VLM_QNP_VER}.zip
+RUN wget -t 2 -T 30 -P ${VLM_DOWNLOAD_DIR}                                                      \
+        https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${VLM_QNP_VER}/${VLM_QNP_SDK} && \
+    cd ${VLM_DOWNLOAD_DIR}                                                                     && \
+    unzip ${VLM_QNP_SDK}                                                                       && \
+    rm -f ${VLM_QNP_SDK}                                                                       && \
+    cp -r ${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/lib/aarch64-oe-linux-gcc11.2/libGenie.so \
+          /usr/lib/                                                                            && \
+    cp -r ${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/include/Genie/*                    \
+          /usr/include/                                                                        && \
+    mkdir -p ${VLM_ADSP_DIR}                                                                   && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v66/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v68/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v69/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v73/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v75/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/hexagon-v79/unsigned/* ${VLM_ADSP_DIR}/                             && \
+    cp ${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                                 \
+        ${VLM_DEPLOY_DIR}/usr/lib/                                                          &&  \
+    cp ${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*            \
+        ${VLM_DEPLOY_DIR}/usr/lib/                                                          && \
+    rm -rf ${VLM_DOWNLOAD_DIR}/qairt
+
+
+# create python virtual environment
+RUN python3 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+RUN pip install --upgrade pip
+
+WORKDIR /usr/src/app
+# copy source code
+COPY . .
+
+# package folder name can not contain the hyphen(-) so replacing it with underscore(_)
+RUN mv web-api/openapi-server web-api/openapi_server && \
+    mv web-api/openapi_server/impl/genie-wrapper/ web-api/openapi_server/impl/genie_wrapper/
+
+# install web-api server as python package with VLM dependencies
+RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir requests Pillow numpy
+
+# Configure the project with a custom install prefix
+RUN cd /usr/src/app/genai-lib && cmake . -DCMAKE_INSTALL_PREFIX=${VLM_DEPLOY_DIR}/usr
+
+# Build the project
+RUN cd /usr/src/app/genai-lib && make -j$(nproc)
+
+# Install the project to the specified location
+RUN cd /usr/src/app/genai-lib && make install
+
+#########################
+# Stage 2: Runtime Stage
+#########################
+
+FROM ubuntu:24.04 AS service
+WORKDIR /root/app/site-packages
+
+# Install Python 3.12 and runtime image processing libraries
+RUN apt-get update && \
+    apt-get install -y \
+    python3 \
+    libjpeg8 libpng16-16 libwebp7 libjsoncpp25 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# create directory
+RUN mkdir -p /root/app/site-packages
+
+# copy the virtual environment with web-api package installed with dependencies
+COPY --from=builder /venv /venv
+
+# copy interface file
+COPY --from=builder /usr/src/app/web-api/openapi_server/impl/genie_wrapper/include/genai_interface.h /usr/include/
+
+COPY --from=builder /usr/src/app/web-api/openapi_server/ /usr/src/app/web-api/openapi_server/
+
+# copy all libraries
+COPY --from=builder /mnt/work/deploy/usr /usr
+
+# create symlink of libvlmservice library
+RUN ln -s /usr/lib/libvlmservice.so /root/app/site-packages/libvlmservice.so
+# create symlink of libllmservice library
+RUN ln -s /usr/lib/libllmservice.so /root/app/site-packages/libllmservice.so
+
+ENV PATH=/venv/bin:$PATH
+ENV VLM_LIBRARY_PATH=/root/app/site-packages/libvlmservice.so
+ENV LLM_LIBRARY_PATH=/root/app/site-packages/libllmservice.so
+ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h

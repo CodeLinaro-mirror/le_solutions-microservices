@@ -1,6 +1,22 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
+import os
+import threading
+import uuid
+from queue import Empty # For non-asyncio.Queue specific usage if needed
+from typing import Union, Dict, Any
+from queue import Queue
+
+from cffi import FFI
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse # Keep for type hinting for now, though not used for streaming response
+
+from openapi_server.models.error import Error
+from openapi_server.impl.constant import  EnvVariableKeys
+from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
+from openapi_server.impl.genie_wrapper.utils.image_validator import decode_image
+from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
 from openapi_server.models.create_chat_completion_request import CreateChatCompletionRequest
 from openapi_server.models.create_chat_completion_response import CreateChatCompletionResponse
 from openapi_server.models.create_chat_completion_response_choices_inner import ChatCompletionResponseMessage, CreateChatCompletionResponseChoicesInner
@@ -10,6 +26,9 @@ from openapi_server.models.chat_completion_token_logprob import ChatCompletionTo
 from openapi_server.models.error import Error
 from openapi_server.impl.genie_wrapper.chat.utils.chat_utils import ChatQueryUtils
 from openapi_server.impl.genie_wrapper.chat.utils.tool_handler import ToolHandler
+from openapi_server.impl.genie_wrapper.chat.genie_wrapper_create_vlm_chat_completion import GenieWrapperCreateVLMChatCompletion
+from openapi_server.impl.genie_wrapper.utils.image_validator import has_image_content
+from openapi_server.impl.model_config_manager import ModelConfigManager
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.genie_wrapper.utils.handle_object_interface import HandleIdObjectMap, HandleObject
 from fastapi import HTTPException
@@ -32,7 +51,55 @@ class GenieWrapperCreateChatCompletion:
         return f"chat-{uuid.uuid4()}"
 
     @staticmethod
-    def create_chat_completion(request_data: CreateChatCompletionRequest) -> Union[StreamingResponse, CreateChatCompletionResponse]:
+    async def create_chat_completion(request_data: CreateChatCompletionRequest, raw_json: dict = None, fastapi_request = None) -> Union[StreamingResponse, CreateChatCompletionResponse]:
+        # FIX: Extract raw messages from JSON to bypass broken Pydantic OneOf deserialization
+        logger.info("=== IMAGE DETECTION USING RAW JSON ===")
+
+        if raw_json:
+            raw_messages = raw_json.get('messages', [])
+            logger.info(f"Using raw JSON messages for image detection (bypassing Pydantic OneOf)")
+            logger.info(f"Raw messages count: {len(raw_messages)}")
+
+            # Log content structure for debugging
+            for idx, msg in enumerate(raw_messages):
+                if isinstance(msg, dict):
+                    content = msg.get('content')
+                    if isinstance(content, list):
+                        logger.info(f"Message {idx}: multimodal content with {len(content)} items")
+                        for item_idx, item in enumerate(content):
+                            if isinstance(item, dict):
+                                logger.info(f"  Item {item_idx}: type={item.get('type')}")
+                    else:
+                        logger.info(f"Message {idx}: text-only content")
+        else:
+            raw_messages = []
+            logger.warning("No raw JSON provided - falling back to Pydantic models (may fail for images)")
+
+        # Check if request contains images - route to VLM if so
+        if has_image_content(raw_messages):
+            logger.info("✓ IMAGE CONTENT DETECTED - Routing to VLM handler")
+
+            # Validate model supports vision
+            requested_model = getattr(request_data, 'model', None)
+            if requested_model:
+                config_manager = ModelConfigManager()
+                if not config_manager.supports_vision(requested_model):
+                    raise HTTPException(
+                        status_code=HttpStatusCodes.BAD_REQUEST,
+                        detail=f"Model '{requested_model}' does not support vision/image inputs. Please use a vision-enabled model."
+                    )
+            else:
+                raise HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail="Model must be specified for requests with images"
+                )
+
+            # Route to VLM handler - pass raw_json for image extraction
+            return await GenieWrapperCreateVLMChatCompletion.create_vlm_chat_completion(request_data, raw_json)
+
+        # No images - proceed with LLM handler
+        logger.info("✗ NO IMAGE CONTENT DETECTED - Using LLM handler")
+
         last_msg = request_data.messages[-1]
         if not last_msg.content or not last_msg.content.strip():
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
@@ -184,7 +251,8 @@ class GenieWrapperCreateChatCompletion:
 
         else:
             # Non-streaming response
-            item = q.get()
+            loop = asyncio.get_event_loop()
+            item = await loop.run_in_executor(None, q.get)
             if item == "[DONE]":
                 return Error(
                     code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
