@@ -63,10 +63,6 @@ WORKDIR /usr/src/app
 # copy source code
 COPY . .
 
-# package folder name can not contain the hyphen(-) so replacing it with underscore(_)
-RUN mv web-api/openapi-server web-api/openapi_server && \
-    mv web-api/openapi_server/impl/genie-wrapper/ web-api/openapi_server/impl/genie_wrapper/
-
 # install web-api server as python package with VLM dependencies
 RUN pip install --no-cache-dir .
 RUN pip install --no-cache-dir requests Pillow numpy

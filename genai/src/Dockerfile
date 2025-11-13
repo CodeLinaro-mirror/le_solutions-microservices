@@ -26,10 +26,6 @@ RUN pip install --upgrade pip
 # copy source code
 COPY . .
 
-# package folder name can not contain the hyphen(-) so replacing it with underscore(_)
-RUN mv web-api/openapi-server web-api/openapi_server
-RUN mv web-api/openapi_server/impl/genie-wrapper/ web-api/openapi_server/impl/genie_wrapper/
-
 # install web-api server as python package
 RUN pip install --no-cache-dir .
 
