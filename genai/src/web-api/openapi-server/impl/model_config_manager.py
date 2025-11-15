@@ -233,3 +233,13 @@ class ModelConfigManager:
         """Reload the configuration from file."""
         logger.info("Reloading model configuration")
         self.models_config = self._load_models_config()
+
+
+def get_config_manager() -> ModelConfigManager:
+    """
+    Get the ModelConfigManager singleton instance.
+
+    Returns:
+        ModelConfigManager: The singleton instance
+    """
+    return ModelConfigManager()

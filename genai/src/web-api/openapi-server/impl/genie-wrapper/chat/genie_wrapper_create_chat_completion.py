@@ -121,7 +121,7 @@ class GenieWrapperCreateChatCompletion:
                             # Use the completion_id returned from chat_compose_query
                             key = completion_id
                             chunk["id"] = key
-                            chunk["choices"][0]["delta"]["role"] = item["role"]
+                            chunk["choices"][0]["delta"]["role"] = "assistant"  # Response role is always assistant
                             first_chunk_sent = True
 
                         if item["content"]:
@@ -153,7 +153,7 @@ class GenieWrapperCreateChatCompletion:
                 )
 
             msg = ChatCompletionResponseMessage(
-                role=item["role"],
+                role="assistant",  # Response messages are always from assistant
                 content=item["content"],
                 refusal=LLMServiceKeys.REFUSE
             )

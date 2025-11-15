@@ -62,6 +62,7 @@ typedef void (*LLMResponseCallback)(const Response* response);
 //invokes the Constructor of LLM Object
 LLMHandle llm_create_object(
     const char* model,
+    char* config_path,
     bool streaming);
 
 void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object

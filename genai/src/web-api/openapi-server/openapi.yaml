@@ -198,6 +198,12 @@ components:
         - $ref: "#/components/schemas/ChatCompletionRequestSystemMessage"
         - $ref: "#/components/schemas/ChatCompletionRequestUserMessage"
         - $ref: "#/components/schemas/ChatCompletionRequestAssistantMessage"
+      discriminator:
+        propertyName: role
+        mapping:
+          system: "#/components/schemas/ChatCompletionRequestSystemMessage"
+          user: "#/components/schemas/ChatCompletionRequestUserMessage"
+          assistant: "#/components/schemas/ChatCompletionRequestAssistantMessage"
 
     ChatCompletionRequestSystemMessage:
       type: object

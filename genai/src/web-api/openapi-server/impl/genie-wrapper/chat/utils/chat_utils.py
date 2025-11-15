@@ -32,18 +32,23 @@ class ChatQueryUtils:
         """
         Calculate deterministic hash of complete user-assistant pairs only.
         This ensures consistent hashing across requests as the conversation grows.
+        System messages are excluded from hash calculation as they are context, not conversation.
+
         Args:
             messages: List of message objects
             exclude_last_pair: If True, exclude the last complete pair
         Returns:
             16-character hex hash string, or empty string if no complete pairs to hash
         """
+        # Filter out system messages before calculating hash
+        conversation_messages = [msg for msg in messages if msg.role != "system"]
+
         # Extract only complete user-assistant pairs
         complete_pairs = []
         i = 0
-        while i < len(messages) - 1:
-            if messages[i].role == "user" and messages[i + 1].role == "assistant":
-                complete_pairs.append((messages[i], messages[i + 1]))
+        while i < len(conversation_messages) - 1:
+            if conversation_messages[i].role == "user" and conversation_messages[i + 1].role == "assistant":
+                complete_pairs.append((conversation_messages[i], conversation_messages[i + 1]))
                 i += 2
             else:
                 # Skip malformed sequences (shouldn't happen due to validation)
@@ -107,11 +112,36 @@ class ChatQueryUtils:
         if not request_data.messages:
             raise ValueError("No messages provided in request")
 
-        # Validate message alternation (user/assistant pattern)
-        if len(request_data.messages) > 1:
-            for i in range(len(request_data.messages) - 1):
-                current_role = request_data.messages[i].role
-                next_role = request_data.messages[i + 1].role
+        # Separate system messages from conversation messages
+        system_messages = [msg for msg in request_data.messages if msg.role == "system"]
+        conversation_messages = [msg for msg in request_data.messages if msg.role != "system"]
+
+        # Concatenate all system messages
+        system_context = "\n\n".join([msg.content for msg in system_messages]) if system_messages else ""
+
+        # Get user identifier for tracking
+        safety_identifier = request_data.user or "anonymous"
+
+        if system_context:
+            logger.info(f"Extracted {len(system_messages)} system message(s) with total length {len(system_context)} chars")
+            # Store system prompt in conversation tracker for later use during summarization
+            from openapi_server.impl.conversation_tracker import ConversationTracker
+            tracker = ConversationTracker()
+            tracker.update_system_prompt(safety_identifier, system_context)
+            logger.info(f"Stored system prompt for user {safety_identifier}: {len(system_context)} chars")
+
+        # Ensure at least one conversation message exists
+        if not conversation_messages:
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail="At least one user or assistant message is required"
+            )
+
+        # Validate message alternation (user/assistant pattern) - ONLY for conversation messages
+        if len(conversation_messages) > 1:
+            for i in range(len(conversation_messages) - 1):
+                current_role = conversation_messages[i].role
+                next_role = conversation_messages[i + 1].role
 
                 # Check for consecutive messages with same role
                 if current_role == next_role:
@@ -124,18 +154,24 @@ class ChatQueryUtils:
 
                 # Ensure proper alternation (user -> assistant -> user -> assistant)
                 if i == 0 and current_role != "user":
-                    error_msg = f"Invalid message sequence: First message must be from 'user', but found '{current_role}'."
+                    error_msg = f"Invalid message sequence: First conversation message must be from 'user', but found '{current_role}'."
                     logger.error(error_msg)
                     raise HTTPException(
                         status_code=HttpStatusCodes.BAD_REQUEST,
                         detail=error_msg
                     )
 
-            logger.debug(f"Message alternation validation passed for {len(request_data.messages)} messages")
+            logger.debug(f"Message alternation validation passed for {len(conversation_messages)} conversation messages")
 
-        last_msg = request_data.messages[-1]
+        # Get the last conversation message
+        last_msg = conversation_messages[-1]
         if not last_msg.content or not last_msg.content.strip():
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
+
+        # Note: System messages are kept separate in request_data.messages
+        # They will be formatted properly by the backend with the template
+        if system_context:
+            logger.info(f"System context present: {len(system_context)} chars (will be sent as separate system role)")
 
         # Get model from request or fall back to environment variable/config
         requested_model = getattr(request_data, 'model', None)
@@ -337,10 +373,34 @@ class ChatQueryUtils:
 
         # Get user identifier
         safety_identifier = request_data.user or "anonymous"
-        logger.info(f"Processing request for user: {safety_identifier}, message count: {len(request_data.messages)}")
+        logger.info(f"Processing request for user: {safety_identifier}, total messages: {len(request_data.messages)}, conversation messages: {len(conversation_messages)}")
 
-        # NEW CONVERSATION (len(messages) == 1)
-        if len(request_data.messages) == 1:
+        # Check if this is a continuing conversation by looking for existing thread
+        # Calculate hash to see if we have an existing conversation
+        is_new_conversation = len(conversation_messages) == 1
+        existing_thread_key = None
+        existing_handle_obj = None
+
+        if not is_new_conversation:
+            # Try to find existing thread for continuing conversation
+            lookup_hash = ChatQueryUtils.calculate_conversation_hash(
+                request_data.messages,
+                exclude_last_pair=True
+            )
+            logger.info(f"Looking up existing thread with hash: {lookup_hash}")
+            existing_thread_key, existing_handle_obj = ChatQueryUtils.find_thread_by_hash(
+                safety_identifier,
+                lookup_hash,
+                map_obj
+            )
+
+            if not existing_handle_obj:
+                # No matching thread found, but we have multiple messages
+                # This shouldn't happen in normal flow, but treat as error
+                logger.warning(f"Multiple conversation messages but no matching thread found")
+
+        # NEW CONVERSATION (only 1 conversation message AND no existing thread)
+        if is_new_conversation:
             logger.info(f"=== NEW CONVERSATION for user {safety_identifier} ===")
 
             # Get next thread number for this user
@@ -397,26 +457,16 @@ class ChatQueryUtils:
             logger.info(f"New thread created successfully: {composite_key} with completion_id: {openai_uuid}")
             completion_id = openai_uuid
 
-        # CONTINUING CONVERSATION (len(messages) > 1)
+        # CONTINUING CONVERSATION (multiple conversation messages)
         else:
             logger.info(f"=== CONTINUING CONVERSATION for user {safety_identifier} ===")
 
-            # Calculate hash excluding last pair to identify thread
-            lookup_hash = ChatQueryUtils.calculate_conversation_hash(
-                request_data.messages,
-                exclude_last_pair=True
-            )
-            logger.info(f"Looking up thread with hash: {lookup_hash}")
-
-            # Find matching thread
-            composite_key, handle_obj = ChatQueryUtils.find_thread_by_hash(
-                safety_identifier,
-                lookup_hash,
-                map_obj
-            )
+            # Use the thread we already found
+            composite_key = existing_thread_key
+            handle_obj = existing_handle_obj
 
             if not handle_obj:
-                error_msg = f"No matching conversation thread found for user {safety_identifier} with hash {lookup_hash}"
+                error_msg = f"No matching conversation thread found for user {safety_identifier}"
                 logger.error(error_msg)
                 logger.error(f"Available threads for user: {[k for k, _ in map_obj.get_user_threads(safety_identifier)]}")
                 err = Error(code=f"{HttpStatusCodes.NOT_FOUND}",
@@ -469,10 +519,39 @@ class ChatQueryUtils:
         # Populate query fields
         CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.model,
                         model_str, QUERY_CONST.MODEL_STR_MAX_SIZE)
+
+        # Build the complete formatted prompt with system + user messages
+        formatted_parts = []
+
+        # Add system messages if present
+        if system_context:
+            formatted_system = CommonUtils.format_message_with_template(
+                model_str, "system", system_context
+            )
+            formatted_parts.append(formatted_system)
+            logger.info(f"Formatted system message: {len(formatted_system)} chars")
+
+        # Add user message
+        formatted_user = CommonUtils.format_message_with_template(
+            model_str, last_msg.role, last_msg.content
+        )
+        formatted_parts.append(formatted_user)
+        logger.info(f"Formatted user message: {len(formatted_user)} chars")
+
+        # Add assistant prompt at the end
+        assistant_prompt = CommonUtils.get_assistant_prompt(model_str)
+        if assistant_prompt:
+            formatted_parts.append(assistant_prompt)
+            logger.info(f"Added assistant prompt: {len(assistant_prompt)} chars")
+
+        # Combine all parts
+        formatted_content = "".join(formatted_parts)
+        logger.info(f"Total formatted content: {len(formatted_content)} chars")
+
         CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.role,
                         last_msg.role, QUERY_CONST.ROLE_MAX_SIZE)
         CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.content,
-                        last_msg.content, QUERY_CONST.MESSAGE_CONTENT_MAX_SIZE)
+                        formatted_content, QUERY_CONST.MESSAGE_CONTENT_MAX_SIZE)
 
         # Set numeric parameters - use 300 as default if not provided
         max_tokens = request_data.max_completion_tokens if request_data.max_completion_tokens else QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS

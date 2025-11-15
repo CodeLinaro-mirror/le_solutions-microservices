@@ -152,11 +152,6 @@ class LLMObject
         std::string profilePath;
         std::vector<Message> conversation;
         std::string sc_configPath;
-
-        void constructPrompt(const std::string query, LLMModel model);
-
-        LLMModel getModelFromQuery(const std::string& model);
-
 };
 
 typedef struct {

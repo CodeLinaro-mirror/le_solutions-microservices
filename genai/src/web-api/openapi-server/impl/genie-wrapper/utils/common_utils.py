@@ -3,6 +3,11 @@
 
 import os
 from openapi_server.impl.constant import LLMServiceQueryConstant as QUERY_CONST
+from openapi_server.impl.model_config_manager import get_config_manager
+from openapi_server.logger.logger_config import LoggerConfig
+
+LoggerConfig.initialize()
+logger = LoggerConfig.get_logger(__name__)
 
 class CommonUtils:
     @staticmethod
@@ -135,3 +140,103 @@ class CommonUtils:
         except Exception as e:
             logger.error(f"Error getting config path for model {model_id}: {e}")
             return "genie_config_llama3_1_8B.json"
+
+    @staticmethod
+    def get_model_prompt_template(model_id: str) -> str:
+        """
+        Get the prompt template for a given model.
+
+        Args:
+            model_id: The model identifier (can be internal ID or external ID)
+
+        Returns:
+            str: The model's prompt template string with {role} and {content} placeholders
+        """
+        try:
+            config_manager = get_config_manager()
+
+            # Try as external model ID first
+            prompt_template = config_manager.get_prompt_template(model_id)
+            if prompt_template:
+                logger.info(f"Found prompt template for model {model_id}")
+                return prompt_template
+
+            # Try to find by internal ID
+            external_id = config_manager.get_model_by_internal_id(model_id)
+            if external_id:
+                prompt_template = config_manager.get_prompt_template(external_id)
+                if prompt_template:
+                    logger.info(f"Found prompt template for internal model {model_id} (external: {external_id})")
+                    return prompt_template
+
+            # Fallback to default template from config
+            logger.warning(f"No prompt template found for model {model_id}, using fallback")
+            fallback_template = config_manager.models_config.get("fallback_template",
+                "<|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>")
+            return fallback_template
+
+        except Exception as e:
+            logger.error(f"Error getting prompt template for model {model_id}: {e}")
+            # Hardcoded fallback
+            return "<|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+
+    @staticmethod
+    def get_assistant_prompt(model_id: str) -> str:
+        """
+        Get the assistant prompt suffix for a given model.
+
+        Args:
+            model_id: The model identifier (can be internal ID or external ID)
+
+        Returns:
+            str: The assistant prompt string to append at the end
+        """
+        try:
+            config_manager = get_config_manager()
+
+            # Try as external model ID first
+            model_config = config_manager.get_model_config(model_id)
+            if model_config and 'assistant_prompt' in model_config:
+                return model_config['assistant_prompt']
+
+            # Try to find by internal ID
+            external_id = config_manager.get_model_by_internal_id(model_id)
+            if external_id:
+                model_config = config_manager.get_model_config(external_id)
+                if model_config and 'assistant_prompt' in model_config:
+                    return model_config['assistant_prompt']
+
+            # Fallback - return empty string
+            logger.warning(f"No assistant prompt found for model {model_id}, using empty string")
+            return ""
+
+        except Exception as e:
+            logger.error(f"Error getting assistant prompt for model {model_id}: {e}")
+            return ""
+
+    @staticmethod
+    def format_message_with_template(model_id: str, role: str, content: str) -> str:
+        """
+        Format a message with the appropriate prompt template for the model.
+
+        Args:
+            model_id: The model identifier
+            role: The message role (system, user, assistant)
+            content: The message content
+
+        Returns:
+            str: The formatted message content
+        """
+        template = CommonUtils.get_model_prompt_template(model_id)
+        logger.info(f"Formatting message with template for model: {model_id}, role: {role}")
+
+        try:
+            # Replace placeholders in template
+            formatted = template.replace("{role}", role).replace("{content}", content)
+            logger.debug(f"Successfully formatted message for role '{role}' using model '{model_id}'")
+            return formatted
+        except Exception as e:
+            logger.error(f"Error formatting message with template: {e}")
+            # Return original content as fallback
+            logger.warning("Returning original content without template formatting")
+            return content

@@ -19,17 +19,17 @@ from __future__ import annotations
 import pprint
 import re  # noqa: F401
 import json
-
-
-
+from typing import Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 from typing import Any, ClassVar, Dict, List, Optional
-from openapi_server.models.chat_completion_request_system_message_content import ChatCompletionRequestSystemMessageContent
+from openapi_server.models.chat_completion_request_system_message_content_part import ChatCompletionRequestSystemMessageContentPart
 try:
     from typing import Self
 except ImportError:
     from typing_extensions import Self
+
+ChatCompletionRequestSystemMessageContent = Union[StrictStr, List[ChatCompletionRequestSystemMessageContentPart]]
 
 class ChatCompletionRequestSystemMessage(BaseModel):
     """
@@ -84,9 +84,6 @@ class ChatCompletionRequestSystemMessage(BaseModel):
             },
             exclude_none=True,
         )
-        # override the default output from pydantic by calling `to_dict()` of content
-        if self.content:
-            _dict['content'] = self.content.to_dict()
         return _dict
 
     @classmethod
@@ -99,10 +96,8 @@ class ChatCompletionRequestSystemMessage(BaseModel):
             return cls.model_validate(obj)
 
         _obj = cls.model_validate({
-            "content": ChatCompletionRequestSystemMessageContent.from_dict(obj.get("content")) if obj.get("content") is not None else None,
+            "content": obj.get("content"),
             "role": obj.get("role"),
             "name": obj.get("name")
         })
         return _obj
-
-

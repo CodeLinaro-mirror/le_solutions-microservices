@@ -28,6 +28,7 @@ class ConversationState:
     last_summary: Optional[str] = None
     summary_tokens: int = 0
     last_activity: float = field(default_factory=time.time)
+    last_system_prompt: Optional[str] = None
 
 
 class ConversationTracker:
@@ -184,6 +185,38 @@ class ConversationTracker:
         with self._lock:
             if safety_id in self.conversations:
                 return self.conversations[safety_id].last_summary
+            return None
+
+    def update_system_prompt(self, safety_id: str, system_prompt: str) -> None:
+        """
+        Update the most recent system prompt for a user.
+
+        Args:
+            safety_id: User's safety identifier
+            system_prompt: The system prompt content to store
+        """
+        with self._lock:
+            if safety_id not in self.conversations:
+                self.conversations[safety_id] = ConversationState()
+                logger.info(f"Created new conversation for user: {safety_id}")
+
+            self.conversations[safety_id].last_system_prompt = system_prompt
+            self.conversations[safety_id].last_activity = time.time()
+            logger.debug(f"Updated system prompt for {safety_id}: {len(system_prompt)} chars")
+
+    def get_system_prompt(self, safety_id: str) -> Optional[str]:
+        """
+        Get the most recent system prompt for a user.
+
+        Args:
+            safety_id: User's safety identifier
+
+        Returns:
+            Last system prompt text or None
+        """
+        with self._lock:
+            if safety_id in self.conversations:
+                return self.conversations[safety_id].last_system_prompt
             return None
 
     def clear_conversation(self, safety_id: str) -> None:
