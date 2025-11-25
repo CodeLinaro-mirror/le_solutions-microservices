@@ -9,6 +9,7 @@ from openapi_server.models.chat_completion_token_logprob_top_logprobs_inner impo
 from openapi_server.models.chat_completion_token_logprob import ChatCompletionTokenLogprob
 from openapi_server.models.error import Error
 from openapi_server.impl.genie_wrapper.chat.utils.chat_utils import ChatQueryUtils
+from openapi_server.impl.genie_wrapper.chat.utils.tool_handler import ToolHandler
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.genie_wrapper.utils.handle_object_interface import HandleIdObjectMap, HandleObject
 from fastapi import HTTPException
@@ -44,8 +45,21 @@ class GenieWrapperCreateChatCompletion:
                 type=Parameters.INTERNAL_TYPE
             )
 
+        # Handle function calling if tools are provided
+        has_tools = request_data.tools and len(request_data.tools) > 0
+        modified_request = request_data
+
+        if has_tools:
+            logger.info(f"Function calling enabled with {len(request_data.tools)} tools")
+            # Create a deep copy to avoid modifying the original request
+            modified_request = request_data.model_copy(deep=True)
+            modified_request.messages = ToolHandler.inject_tool_instructions(
+                modified_request.messages,
+                request_data.tools
+            )
+
         query_composer = ChatQueryUtils()
-        llm_service, handle, query, completion_id = query_composer.chat_compose_query(request_data)
+        llm_service, handle, query, completion_id = query_composer.chat_compose_query(modified_request)
 
         if isinstance(llm_service, Error):
             return llm_service
@@ -95,10 +109,43 @@ class GenieWrapperCreateChatCompletion:
                 loop = asyncio.get_event_loop()
                 first_chunk_sent = False
                 key = ""
+                accumulated_content = ""  # Accumulate content to check for tool calls
+
                 while True:
                     item = await loop.run_in_executor(None, q.get)
 
                     if item == "[DONE]":
+                        # Before finishing, check if accumulated content contains tool calls
+                        if has_tools and accumulated_content and ToolHandler.should_check_for_tools(accumulated_content):
+                            detected_tool_calls = ToolHandler.parse_tool_response(accumulated_content)
+                            if detected_tool_calls:
+                                logger.info(f"Detected {len(detected_tool_calls)} tool call(s) in streaming response")
+                                # Send tool calls chunk
+                                tool_chunk = {
+                                    "id": key,
+                                    "object": "chat.completion.chunk",
+                                    "model": modified_request.model,  # Use model from request
+                                    "created": int(asyncio.get_event_loop().time()),  # Use current timestamp
+                                    "choices": [{
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": idx,
+                                                    "id": tc.id,
+                                                    "type": tc.type,
+                                                    "function": {
+                                                        "name": tc.function.name,
+                                                        "arguments": tc.function.arguments
+                                                    }
+                                                } for idx, tc in enumerate(detected_tool_calls)
+                                            ]
+                                        },
+                                        "index": 0,
+                                        "finish_reason": "tool_calls"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(tool_chunk)}\n\n"
+
                         yield "data: [DONE]\n\n"
                         break
                     elif isinstance(item, dict) and "error" in item:
@@ -125,6 +172,7 @@ class GenieWrapperCreateChatCompletion:
                             first_chunk_sent = True
 
                         if item["content"]:
+                            accumulated_content += item["content"]
                             chunk["choices"][0]["delta"]["content"] = item["content"]
 
                         if item["finish_reason"] == "stop" and not item["content"]:
@@ -152,14 +200,28 @@ class GenieWrapperCreateChatCompletion:
                     type=Parameters.INTERNAL_TYPE
                 )
 
+            content = item["content"]
+            finish_reason = 'stop'
+            tool_calls = None
+
+            # Check for tool calls if tools were provided
+            if has_tools and content and ToolHandler.should_check_for_tools(content):
+                detected_tool_calls = ToolHandler.parse_tool_response(content)
+                if detected_tool_calls:
+                    logger.info(f"Detected {len(detected_tool_calls)} tool call(s) in response")
+                    tool_calls = detected_tool_calls
+                    content = None  # Clear content when returning tool calls
+                    finish_reason = 'tool_calls'
+
             msg = ChatCompletionResponseMessage(
                 role="assistant",  # Response messages are always from assistant
-                content=item["content"],
-                refusal=LLMServiceKeys.REFUSE
+                content=content,
+                refusal=LLMServiceKeys.REFUSE,
+                tool_calls=tool_calls
             )
 
             ccir = CreateChatCompletionResponseChoicesInner(
-                finish_reason='stop',
+                finish_reason=finish_reason,
                 index=0,
                 message=msg,
                 logprobs=None
