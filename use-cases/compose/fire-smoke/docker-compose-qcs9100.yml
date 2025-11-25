@@ -1,0 +1,116 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+services:
+  nginx:
+    image: nginx:1.27.2-alpine
+    platform: arm64
+    container_name: nginx
+    restart: always
+    network_mode: host
+    volumes:
+      - ../../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ../../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
+      - ../../configs/nginx/solutions/fire-analytics-api.conf:/etc/nginx/solutions/fire-analytics-api.conf
+  mariadb:
+    image: mariadb:11.6.2
+    platform: arm64
+    container_name: mariadb
+    hostname: mariadb
+    restart: always
+    volumes:
+      - mariadbVolume:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=secretpw
+    network_mode: host
+  redis:
+    image: redis:7.2.4-alpine
+    platform: arm64
+    container_name: redis
+    hostname: redis
+    restart: always
+    command: redis-server --loglevel notice
+    network_mode: host
+  camera-api:
+    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/camera-api:1.0.1
+    platform: arm64
+    container_name: camera-api
+    depends_on:
+      - redis
+      - mariadb
+      - nginx
+    restart: always
+    environment:
+      - redisHost=172.17.0.1
+      - mariadbHost=172.17.0.1
+      - mariadbPass=secretpw
+      - redisCameraUpdates=${REDIS_CAMERA_UPDATES_CHANNEL:-camera-api.updates}
+    expose:
+      - '3000'
+    network_mode: host
+  fire-analytics-api:
+    image: fire-analytics-api
+    platform: arm64
+    container_name: fire-analytics-api
+    depends_on:
+      - redis
+      - mariadb
+      - nginx
+    restart: always
+    environment:
+      - redisHost=172.17.0.1
+      - mariadbHost=172.17.0.1
+      - mariadbPass=secretpw
+      - redisFAAlertsChannel=${REDIS_ALERTS_CHANNEL:-fire-analytics.alerts}
+      - redisCameraUpdates=${REDIS_CAMERA_UPDATES_CHANNEL:-camera-api.updates}
+    expose:
+      - '8082'
+    network_mode: host
+  fire-analytics-server:
+    image: fire-analytics-server
+    platform: arm64
+    container_name: fire-analytics-server
+    depends_on:
+      - redis
+    restart: always
+    environment:
+      - REDIS_HOST=172.17.0.1
+      - REDIS_DETECTION_CHANNEL_PREFIX=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.fire}
+      - ALERT_CHANNEL=${REDIS_ALERTS_CHANNEL:-fire-analytics.alerts}
+    network_mode: host
+  qimsdk:
+    image: qimsdk
+    platform: arm64
+    container_name: qimsdk-fs
+    hostname: qimsdk-fs
+    user: qimsdk
+    restart: always
+    environment:
+      - XDG_RUNTIME_DIR=/dev/socket/weston
+      - WAYLAND_DISPLAY=wayland-1
+      - GST_PLUGIN_SCANNER=/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
+      - GST_DEBUG_NO_COLOR=1
+      - ADSP_LIBRARY_PATH=\"/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;${ADSP_LIBRARY_PATH}\"
+      - GST_DEBUG=2
+      - INPUT_TYPE=${INPUT_TYPE:-video}
+      - INPUT_URL=${INPUT_URL:-/etc/media/fire.mp4}
+      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.fire}:0
+      - MODEL_PATH_FIRE_SMOKE=${MODEL_PATH_FIRE_SMOKE:-/etc/models/yolov11_det.tflite}
+      - LABELS_PATH_FIRE_SMOKE=${LABELS_PATH_FIRE_SMOKE:-/etc/labels/fire_smoke.json}
+      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
+      - OUT_PORT=${OUT_PORT:-8900}
+    command: bash qimsdk_fire_smoke_detect.sh
+    volumes:
+      - /etc/labels:/etc/labels
+      - /etc/media:/etc/media
+      - /etc/models:/etc/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - qualcomm.com/device=cdi-hw-acc
+    network_mode: host
+volumes:
+  mariadbVolume: null

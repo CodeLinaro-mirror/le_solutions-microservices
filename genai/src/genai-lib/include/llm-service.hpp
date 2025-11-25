@@ -31,15 +31,9 @@
 #include "GenieCommon.h"
 #include "GenieDialog.h"
 #include "GenieProfile.h"
+#include "GenieSampler.h"
 
 #include "llm-buffer.h"
-
-typedef struct {
-    std::mutex* mtx;
-    std::condition_variable* cv;
-    bool* queryDone;
-    std::string* responseStr;
-} QueryMutex;
 
 class Profile
 {
@@ -52,6 +46,19 @@ class Profile
 
     private:
         GenieProfile_Handle_t m_handle = NULL;
+};
+
+class SamplerConfig
+{
+    public:
+        void createSamplerConfig(const std::string& configPath);
+        std::string getConfigString() { return m_config; }
+        void setParam(const std::string& keyStr, const std::string& valueStr);
+        ~SamplerConfig();
+        GenieSamplerConfig_Handle_t operator()() const { return m_handle; }
+    private:
+        GenieSamplerConfig_Handle_t m_handle = NULL;
+        std::string m_config;
 };
 
 class Dialog
@@ -85,12 +92,18 @@ class Dialog
         void* userData);
         void save(const std::string name);
         void restore(const std::string name);
+        void reset();
+
+        void getSampler();
+        void applySamplerConfig(GenieSamplerConfig_Handle_t samplerConfigHandle);
+        void setMaxNumTokens(const int maxNumTokens);
 
         static void queryCallback(const char* responseStr,
             const GenieDialog_SentenceCode_t sentenceCode,
             const void* userData);
     private:
         GenieDialog_Handle_t m_handle         = NULL;
+        GenieSampler_Handle_t m_samplerHandle = NULL;
 };
 
 
@@ -107,7 +120,7 @@ class LLMObject
             UNKNOWN = -1
         };
 
-        LLMObject(std::string model);
+        LLMObject(std::string model, std::string config_path, bool streaming);
         ~LLMObject() {delete diag;}
         // Disable both copying and moving
         LLMObject(const LLMObject&) = delete;
@@ -116,16 +129,20 @@ class LLMObject
         LLMObject& operator=(LLMObject&&) = delete;
 
         std::unique_ptr<Query> query;
-        std::unique_ptr<Response> response;
         std::shared_ptr<Profile> profiler;
 
         char id[256];
 
+        bool stream;
+
+        char modelSelected[256];
+
+        LLMResponseCallback responseCallback = nullptr;
+
         void chat_completion_create ();
-        void chat_completion_retrieve ();
-        void chat_completion_list ();
-        void chat_completion_delete ();
-        void chat_completion_messages_list();
+
+        void resetDialog();
+
     private:
         Dialog *diag;
         std::string config{};
@@ -134,11 +151,18 @@ class LLMObject
         std::string restorePath{};
         std::string profilePath;
         std::vector<Message> conversation;
+        std::string sc_configPath;
 
         void constructPrompt(const std::string query, LLMModel model);
 
         LLMModel getModelFromQuery(const std::string& model);
 
 };
+
+typedef struct {
+    std::string* responseStr;
+    bool* stream;
+    LLMObject* llmObj;
+} QueryStruct;
 
 #endif// LLM_SERVICE_H

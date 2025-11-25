@@ -10,9 +10,15 @@
 #include <stdlib.h>
 #include <llm-interface.h>
 
+
+void my_response_callback(const Response* response) {
+    printf("%s\n", response->choices[0].message.content);
+}
+
 int main() {
 
     char model[16];
+    char config_path[256];
 
     printf("What model will be used? 0 for LLAMA3_1_8B, 1 for LLAMA3_2_3B, and 2 for QWEN2_5_7B: ");
     char choiceString[16];
@@ -23,17 +29,20 @@ int main() {
 
     int choice = atoi(choiceString);
 
-    switch(choice) {
+    switch (choice) {
         case 0:
             strlcpy(model, "LLAMA3_1_8B", sizeof(model));
+            strlcpy(config_path, "genie_config_llama3_1_8B.json", sizeof(config_path));
             break;
 
         case 1:
             strlcpy(model, "LLAMA3_2_3B", sizeof(model));
+            strlcpy(config_path, "genie_config_llama3_2_3B.json", sizeof(config_path));
             break;
 
         case 2:
             strlcpy(model, "QWEN2_5_7B", sizeof(model));
+            strlcpy(config_path, "genie_config_qwen2_5_7B.json", sizeof(config_path));
             break;
 
         default:
@@ -41,10 +50,34 @@ int main() {
             break;
     }
 
-    LLMHandle llm = llm_create_object(model);
+    printf("Do you want to enable streaming? 0 for No Stream and 1 for Yes Stream: ");
 
-    while(1) {
+    char choiceStringStream[16];
 
+    if (!fgets(choiceStringStream, sizeof(choiceStringStream), stdin)) {
+        fprintf(stderr, "Error reading input.\n");
+    }
+
+    int choiceStream = atoi(choiceStringStream);
+    bool stream = false;
+
+    switch (choiceStream) {
+        case 0:
+            stream = false;
+            break;
+
+        case 1:
+            stream = true;
+            break;
+
+        default:
+            printf("ERROR Unsupported option selected");
+            break;
+    }
+
+    LLMHandle llm = llm_create_object(model, config_path, stream);
+
+    while (1) {
         Message message;
 
         char userQuery[1024];
@@ -62,12 +95,7 @@ int main() {
         query.message = message;
         strlcpy(query.model, model, sizeof(query.model));
 
-        Response response;
-
-        llm_chat_completion_create(llm, &query, &response);
-
-        printf("%s\n", response.choices[0].message.content);
-
+        llm_chat_completion_create(llm, &query,stream, my_response_callback);
     }
 
     llm_destroy_object(llm);
