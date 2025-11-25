@@ -40,6 +40,7 @@ from openapi_server.models.stop_configuration import StopConfiguration
 from openapi_server.models.web_search import WebSearch
 from openapi_server.models.chat_completion_request_assistant_message import ChatCompletionRequestAssistantMessage
 from openapi_server.models.chat_completion_request_system_message import ChatCompletionRequestSystemMessage
+from openapi_server.models.chat_completion_request_tool_message import ChatCompletionRequestToolMessage
 from openapi_server.models.chat_completion_request_user_message import ChatCompletionRequestUserMessage
 
 try:
@@ -48,7 +49,7 @@ except ImportError:
     from typing_extensions import Self
 
 # Only include message types defined in the OpenAPI spec
-ChatCompletionRequestMessage = Union[ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestAssistantMessage]
+ChatCompletionRequestMessage = Union[ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestAssistantMessage, ChatCompletionRequestToolMessage]
 
 class CreateChatCompletionRequest(BaseModel):
     """

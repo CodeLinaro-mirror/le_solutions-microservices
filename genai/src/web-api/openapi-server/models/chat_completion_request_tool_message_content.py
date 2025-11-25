@@ -91,7 +91,14 @@ class ChatCompletionRequestToolMessageContent(BaseModel):
             return v
 
     @classmethod
-    def from_dict(cls, obj: dict) -> Self:
+    def from_dict(cls, obj) -> Self:
+        # Handle the case where obj is already a string
+        if isinstance(obj, str):
+            instance = cls.model_construct()
+            instance.oneof_schema_1_validator = obj
+            instance.actual_instance = obj
+            return instance
+        # Otherwise, proceed with normal JSON serialization
         return cls.from_json(json.dumps(obj))
 
     @classmethod
@@ -101,24 +108,33 @@ class ChatCompletionRequestToolMessageContent(BaseModel):
         error_messages = []
         match = 0
 
-        # deserialize data into str
         try:
-            # validation
-            instance.oneof_schema_1_validator = json.loads(json_str)
-            # assign value to actual_instance
-            instance.actual_instance = instance.oneof_schema_1_validator
-            match += 1
+            # First try to parse the JSON string
+            parsed_value = json.loads(json_str)
+
+            # If parsed_value is a string, use it directly as a string
+            if isinstance(parsed_value, str):
+                instance.oneof_schema_1_validator = parsed_value
+                instance.actual_instance = parsed_value
+                match += 1
+            # If parsed_value is a list, try to validate it as a list of content parts
+            elif isinstance(parsed_value, list):
+                instance.oneof_schema_2_validator = parsed_value
+                instance.actual_instance = parsed_value
+                match += 1
+            # If parsed_value is neither a string nor a list, it's not valid
+            else:
+                error_messages.append(f"Expected string or list, got {type(parsed_value)}")
         except (ValidationError, ValueError) as e:
-            error_messages.append(str(e))
-        # deserialize data into List[ChatCompletionRequestToolMessageContentPart]
-        try:
-            # validation
-            instance.oneof_schema_2_validator = json.loads(json_str)
-            # assign value to actual_instance
-            instance.actual_instance = instance.oneof_schema_2_validator
-            match += 1
-        except (ValidationError, ValueError) as e:
-            error_messages.append(str(e))
+            # If JSON parsing fails, try to use the raw string directly
+            try:
+                if isinstance(json_str, str):
+                    instance.oneof_schema_1_validator = json_str
+                    instance.actual_instance = json_str
+                    match += 1
+            except (ValidationError, ValueError) as e2:
+                error_messages.append(str(e))
+                error_messages.append(str(e2))
 
         if match > 1:
             # more than 1 match
@@ -155,5 +171,3 @@ class ChatCompletionRequestToolMessageContent(BaseModel):
     def to_str(self) -> str:
         """Returns the string representation of the actual instance"""
         return pprint.pformat(self.model_dump())
-
-

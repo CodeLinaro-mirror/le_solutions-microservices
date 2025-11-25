@@ -111,7 +111,7 @@ class ModelConfigManager:
             models.append({
                 "id": model_id,
                 "object": "model",
-                "owned_by": "qualcomm",
+                "owned_by": "",
                 "display_name": config.get("display_name", model_id),
                 "max_tokens": config.get("max_tokens", 4096),
                 "supports_streaming": config.get("supports_streaming", True)

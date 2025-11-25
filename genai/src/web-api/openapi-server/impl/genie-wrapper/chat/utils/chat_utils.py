@@ -28,11 +28,71 @@ from fastapi import (
 
 class ChatQueryUtils:
     @staticmethod
+    def _get_content_string(msg):
+        """
+        Helper method to extract content as string from a message object,
+        handling both string and object content types.
+
+        Args:
+            msg: Message object
+        Returns:
+            String representation of content
+        """
+        if not hasattr(msg, "content"):
+            return ""
+
+        if msg.content is None:
+            return ""
+
+        if isinstance(msg.content, str):
+            return msg.content.strip()
+        else:
+            # Convert object content to string representation
+            return str(msg.content)
+
+    @staticmethod
+    def _has_tool_calls(msg):
+        """
+        Helper method to check if a message has tool calls.
+
+        Args:
+            msg: Message object
+        Returns:
+            Boolean indicating if message has tool calls
+        """
+        return hasattr(msg, "tool_calls") and msg.tool_calls and len(msg.tool_calls) > 0
+
+    @staticmethod
+    def _get_tool_call_info(msg):
+        """
+        Helper method to extract tool call information from a message.
+
+        Args:
+            msg: Message object with tool calls
+        Returns:
+            String representation of tool call information
+        """
+        if not ChatQueryUtils._has_tool_calls(msg):
+            return ""
+
+        tool_info = []
+        for tc in msg.tool_calls:
+            if hasattr(tc, "function") and hasattr(tc, "id"):
+                tool_info.append(f"{tc.function.name}:{tc.id}")
+
+        return "|".join(tool_info)
+
+    @staticmethod
     def calculate_conversation_hash(messages, exclude_last_pair=True):
         """
-        Calculate deterministic hash of complete user-assistant pairs only.
+        Calculate deterministic hash of complete user-assistant pairs only,
+        including tool calling sequences.
+
         This ensures consistent hashing across requests as the conversation grows.
         System messages are excluded from hash calculation as they are context, not conversation.
+
+        Tool calling sequences (user → assistant(tool_call) → tool → assistant(response))
+        are treated as a single complete pair. Incomplete tool sequences are handled specially.
 
         Args:
             messages: List of message objects
@@ -43,33 +103,103 @@ class ChatQueryUtils:
         # Filter out system messages before calculating hash
         conversation_messages = [msg for msg in messages if msg.role != "system"]
 
-        # Extract only complete user-assistant pairs
         complete_pairs = []
+        incomplete_sequence = None
         i = 0
-        while i < len(conversation_messages) - 1:
-            if conversation_messages[i].role == "user" and conversation_messages[i + 1].role == "assistant":
-                complete_pairs.append((conversation_messages[i], conversation_messages[i + 1]))
-                i += 2
-            else:
-                # Skip malformed sequences (shouldn't happen due to validation)
+
+        while i < len(conversation_messages):
+            if conversation_messages[i].role == "user":
+                user_msg = conversation_messages[i]
                 i += 1
 
-        # Exclude last complete pair if requested
-        if exclude_last_pair and len(complete_pairs) > 0:
-            pairs_to_hash = complete_pairs[:-1]
+                # Collect ALL assistant and tool messages until next user message
+                assistant_sequence = []
+                while i < len(conversation_messages) and conversation_messages[i].role != "user":
+                    assistant_sequence.append(conversation_messages[i])
+                    i += 1
+
+                # If we have assistant messages, check if this is a complete pair
+                if assistant_sequence:
+                    # Find the FINAL assistant message (last one with content)
+                    final_assistant = None
+                    for msg in reversed(assistant_sequence):
+                        if msg.role == "assistant" and ChatQueryUtils._get_content_string(msg):
+                            final_assistant = msg
+                            break
+
+                    if final_assistant:
+                        # This is a COMPLETE pair - has final assistant response
+                        tool_calls_info = []
+                        for msg in assistant_sequence:
+                            if msg.role == "assistant" and ChatQueryUtils._has_tool_calls(msg):
+                                tool_info = ChatQueryUtils._get_tool_call_info(msg)
+                                if tool_info:
+                                    tool_calls_info.append(tool_info)
+
+                        complete_pairs.append({
+                            'user': user_msg,
+                            'assistant': final_assistant,
+                            'tool_calls': tool_calls_info
+                        })
+                    else:
+                        # This is an INCOMPLETE sequence - no final assistant response yet
+                        # Check if it has tool calls (indicating it's a tool calling sequence)
+                        has_tool_call = any(
+                            msg.role == "assistant" and ChatQueryUtils._has_tool_calls(msg)
+                            for msg in assistant_sequence
+                        )
+
+                        if has_tool_call:
+                            # Store as incomplete sequence for special handling
+                            incomplete_sequence = {
+                                'user': user_msg,
+                                'sequence': assistant_sequence
+                            }
+                            logger.debug(f"Found incomplete tool calling sequence for user: {ChatQueryUtils._get_content_string(user_msg)[:50]}...")
+                        # If no tool calls, it's just a malformed sequence - skip it
+                else:
+                    # User message with no assistant response - this could be the current query
+                    # Don't treat as incomplete sequence, just ignore for now
+                    pass
+            else:
+                # Skip orphaned assistant/tool messages (shouldn't happen)
+                i += 1
+
+        # Apply exclude_last_pair logic with special handling for incomplete sequences
+        if exclude_last_pair:
+            if incomplete_sequence:
+                # If we have an incomplete sequence at the end, exclude it entirely
+                # Hash only the complete pairs before it
+                pairs_to_hash = complete_pairs
+                logger.debug(f"Excluding incomplete tool sequence, hashing {len(pairs_to_hash)} complete pairs")
+            elif len(complete_pairs) > 0:
+                # Normal case - exclude the last complete pair
+                pairs_to_hash = complete_pairs[:-1]
+                logger.debug(f"Excluding last complete pair, hashing {len(pairs_to_hash)} pairs")
+            else:
+                pairs_to_hash = []
         else:
+            # Include all complete pairs, but NOT incomplete sequences
             pairs_to_hash = complete_pairs
+            if incomplete_sequence:
+                logger.debug(f"Not including incomplete sequence in hash, using {len(pairs_to_hash)} complete pairs")
 
         if not pairs_to_hash:
             logger.debug("No complete pairs to hash, returning empty string")
             return ""
 
-        # Create deterministic string from complete pairs (NORMALIZE: strip content)
+        # Build hash string
         conversation_str = ""
-        for user_msg, asst_msg in pairs_to_hash:
-            user_content = user_msg.content.strip() if hasattr(user_msg, "content") and isinstance(user_msg.content, str) else ""
-            asst_content = asst_msg.content.strip() if hasattr(asst_msg, "content") and isinstance(asst_msg.content, str) else ""
-            conversation_str += f"user:{user_content}|assistant:{asst_content}|"
+        for pair in pairs_to_hash:
+            user_content = ChatQueryUtils._get_content_string(pair['user'])
+            asst_content = ChatQueryUtils._get_content_string(pair['assistant'])
+
+            # Include tool call info for determinism
+            if pair['tool_calls']:
+                tool_info = "|".join(pair['tool_calls'])
+                conversation_str += f"user:{user_content}|tools:{tool_info}|assistant:{asst_content}|"
+            else:
+                conversation_str += f"user:{user_content}|assistant:{asst_content}|"
 
         hash_result = hashlib.sha256(conversation_str.encode()).hexdigest()[:16]
         logger.debug(f"Calculated hash for {len(pairs_to_hash)} complete pairs: {hash_result}")
@@ -165,7 +295,15 @@ class ChatQueryUtils:
 
         # Get the last conversation message
         last_msg = conversation_messages[-1]
-        if not last_msg.content or not last_msg.content.strip():
+
+        # Check if content is empty or whitespace, handling both string and object content
+        content_is_empty = False
+        if not last_msg.content:
+            content_is_empty = True
+        elif isinstance(last_msg.content, str) and not last_msg.content.strip():
+            content_is_empty = True
+
+        if content_is_empty:
             raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=ErrorMessages.INCORRECT_CONTENT)
 
         # Note: System messages are kept separate in request_data.messages
@@ -266,15 +404,32 @@ class ChatQueryUtils:
                 logger.warning("Not enough message pairs to summarize")
 
             if messages_to_summarize:
-                # Convert to ConversationMessage format
+                # Convert to ConversationMessage format, filtering out tool infrastructure
                 conv_messages = []
                 for msg in messages_to_summarize:
+                    # Skip assistant messages that only have tool calls (no content)
+                    if msg.role == "assistant":
+                        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls and len(msg.tool_calls) > 0
+                        has_content = msg.content and (isinstance(msg.content, str) and msg.content.strip())
+
+                        if has_tool_calls and not has_content:
+                            logger.debug(f"Skipping assistant tool call message from summarization")
+                            continue
+
+                    # Skip tool response messages
+                    if msg.role == "tool":
+                        logger.debug(f"Skipping tool response message from summarization")
+                        continue
+
+                    # Include this message in summarization
                     conv_msg = ConversationMessage(
                         role=msg.role,
                         content=msg.content,
                         tokens=TokenCounter.estimate_tokens(msg.content)
                     )
                     conv_messages.append(conv_msg)
+
+                logger.info(f"Filtered {len(messages_to_summarize)} messages to {len(conv_messages)} for summarization")
 
                 # Perform summarization with retry logic
                 summary_text = None
@@ -429,11 +584,19 @@ class ChatQueryUtils:
                            type=Parameters.INTERNAL_TYPE)
                 return err, None, None, None
 
-            handle = llm_service.lib.llm_create_object(model_input, config_path_input, request_data.stream)
-            if handle == llm_service.ffi.NULL:
-                logger.error("Failed to create LLM object: received NULL pointer")
-                err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
-                           message=ErrorMessages.OBJ_CREATION_FAILED,
+            try:
+                handle = llm_service.lib.llm_create_object(model_input, config_path_input, request_data.stream)
+                if handle == llm_service.ffi.NULL:
+                    logger.error("Failed to create LLM object: received NULL pointer")
+                    err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                               message=ErrorMessages.OBJ_CREATION_FAILED,
+                               param=Parameters.LLM_OBJECT,
+                               type=Parameters.INTERNAL_TYPE)
+                    return err, None, None, None
+            except Exception as e:
+                logger.error(f"Exception during model initialization for {model_str}: {str(e)}")
+                err = Error(code=f"{HttpStatusCodes.SERVICE_UNAVAILABLE}",
+                           message=ErrorMessages.MODEL_INIT_FAILED.format(model=model_str),
                            param=Parameters.LLM_OBJECT,
                            type=Parameters.INTERNAL_TYPE)
                 return err, None, None, None
@@ -477,13 +640,11 @@ class ChatQueryUtils:
 
             logger.info(f"Found existing thread: {composite_key} (thread #{handle_obj.thread_number})")
 
-            # Update hash to include current message pair
+            # Calculate new hash but don't update yet - will update after model switch if needed
             new_hash = ChatQueryUtils.calculate_conversation_hash(
                 request_data.messages,
                 exclude_last_pair=False
             )
-            handle_obj.conversation_hash = new_hash
-            logger.info(f"Updated thread hash from {lookup_hash} to {new_hash}")
 
             # Check message pair limit
             if handle_obj.message_pairs_count >= QUERY_CONST.MAX_MESSAGE_PAIRS:
@@ -495,10 +656,192 @@ class ChatQueryUtils:
 
             # Check for model switch
             if handle_obj.model_id and handle_obj.model_id != model_str:
-                logger.warning(f"Model switch detected: {handle_obj.model_id} -> {model_str}")
-                logger.warning("Model switching within a thread is not fully supported yet")
-                # For now, continue with existing handle
-                # TODO: Implement proper model switching with summarization
+                logger.info(f"Model switch detected for user {safety_identifier}: {handle_obj.model_id} → {model_str}")
+
+                # Store old model info
+                old_model = handle_obj.model_id
+
+                # Validate the new model first
+                config_manager = ModelConfigManager()
+                if not config_manager.validate_model(requested_model):  # Use original requested_model, not internal ID
+                    error_message = ErrorMessages.MODEL_NOT_FOUND.format(model=requested_model)
+                    logger.error(f"Invalid model requested for switch: {requested_model}")
+                    err = Error(code=f"{HttpStatusCodes.BAD_REQUEST}",
+                               message=error_message,
+                               param="model",
+                               type="invalid_request_error")
+                    return err, None, None, None
+
+                logger.info(f"Model validation passed for switch to: {requested_model}")
+
+                try:
+                    # Check if we already have a handle for this model for this user
+                    existing_model_handle = map_obj.find_handle_by_user_and_model(safety_identifier, model_str)
+
+                    if existing_model_handle:
+                        # Scenario 1: Use existing handle for this model
+                        logger.info(f"Found existing handle for model {model_str}, reusing it")
+                        existing_key, existing_handle_obj = existing_model_handle
+
+                        # Reset the existing handle before reuse
+                        llm_service.lib.llm_reset_object(existing_handle_obj.handle_object)
+                        time.sleep(1)  # Wait for reset to complete
+
+                        # Use the existing handle
+                        handle = existing_handle_obj.handle_object
+                        completion_id = existing_handle_obj.completion_id
+
+                        # Update handle object with model switch info
+                        existing_handle_obj.model_switch_count += 1
+                        existing_handle_obj.previous_model_id = old_model
+
+                        # Update the composite key to use
+                        composite_key = existing_key
+                        handle_obj = existing_handle_obj
+                    else:
+                        # Scenario 2: Create new handle for this model
+                        logger.info(f"Creating new handle for model {model_str}")
+
+                        # Create new LLM handle for the new model
+                        config_path = CommonUtils.get_model_config_path(model_str)
+                        model_input = llm_service.ffi.new("char[]", model_str.encode('utf-8'))
+                        if model_input == llm_service.ffi.NULL:
+                            logger.error("Failed to allocate Model pointer for model switch")
+                            err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                                      message=ErrorMessages.MODEL_SWITCH_ERROR.format(
+                                          old_model=old_model,
+                                          new_model=model_str,
+                                          error=ErrorMessages.MEM_ALLOCATION_ERR),
+                                      param=Parameters.INTERNAL_TYPE,
+                                      type=Parameters.INTERNAL_TYPE)
+                            return err, None, None, None
+
+                        config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
+                        if config_path_input == llm_service.ffi.NULL:
+                            logger.error("Failed to allocate config path pointer for model switch")
+                            err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                                      message=ErrorMessages.MODEL_SWITCH_ERROR.format(
+                                          old_model=old_model,
+                                          new_model=model_str,
+                                          error=ErrorMessages.MEM_ALLOCATION_ERR),
+                                      param=Parameters.INTERNAL_TYPE,
+                                      type=Parameters.INTERNAL_TYPE)
+                            return err, None, None, None
+
+                        try:
+                            new_handle = llm_service.lib.llm_create_object(model_input, config_path_input, request_data.stream)
+                            if new_handle == llm_service.ffi.NULL:
+                                logger.error("Failed to create LLM object for model switch: received NULL pointer")
+                                err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                                          message=ErrorMessages.MODEL_SWITCH_ERROR.format(
+                                              old_model=old_model,
+                                              new_model=model_str,
+                                              error=ErrorMessages.OBJ_CREATION_FAILED),
+                                          param=Parameters.LLM_OBJECT,
+                                          type=Parameters.INTERNAL_TYPE)
+                                return err, None, None, None
+                        except Exception as e:
+                            logger.error(f"Exception during model initialization for model switch from {old_model} to {model_str}: {str(e)}")
+                            err = Error(code=f"{HttpStatusCodes.SERVICE_UNAVAILABLE}",
+                                      message=ErrorMessages.MODEL_SWITCH_ERROR.format(
+                                          old_model=old_model,
+                                          new_model=model_str,
+                                          error=ErrorMessages.MODEL_INIT_FAILED.format(model=model_str)),
+                                      param=Parameters.LLM_OBJECT,
+                                      type=Parameters.INTERNAL_TYPE)
+                            return err, None, None, None
+
+                        # Create a new thread number for this model
+                        thread_number = map_obj.get_next_thread_number(safety_identifier)
+                        new_composite_key = f"{safety_identifier}:thread_{thread_number}"
+
+                        # Generate new OpenAI-style UUID for completion_id
+                        new_openai_uuid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+                        # Create new HandleObject with thread information
+                        new_handle_obj = HandleObject(
+                            new_handle,
+                            msg_count=1,
+                            model_id=model_str,
+                            safety_identifier=safety_identifier,
+                            thread_number=thread_number
+                        )
+                        new_handle_obj.conversation_hash = handle_obj.conversation_hash  # Preserve conversation tracking
+                        logger.info(f"Preserved conversation hash during model switch: {handle_obj.conversation_hash}")
+                        new_handle_obj.completion_id = new_openai_uuid
+                        new_handle_obj.model_switch_count = 1
+                        new_handle_obj.previous_model_id = old_model
+
+                        # Store with composite key, but use UUID in API
+                        map_obj.set_handle(new_handle_obj, new_composite_key)
+
+                        # Update references
+                        handle = new_handle
+                        completion_id = new_openai_uuid
+                        composite_key = new_composite_key
+                        handle_obj = new_handle_obj
+
+                        logger.info(f"New handle created for model switch: {composite_key} with completion_id: {completion_id}")
+
+                    # Prepare context for model switch
+                    # Extract last 2 conversation turns (if available) and current query
+                    context_messages = []
+
+                    # Get system prompt if available
+                    from openapi_server.impl.conversation_tracker import ConversationTracker
+                    tracker = ConversationTracker()
+                    system_prompt = tracker.get_system_prompt(safety_identifier)
+
+                    # Extract last assistant message and last user message (if available)
+                    if len(conversation_messages) >= 3:
+                        # Get last assistant message (second-to-last in conversation)
+                        last_assistant_msg = conversation_messages[-2]
+                        if last_assistant_msg.role == "assistant":
+                            context_messages.append(last_assistant_msg)
+
+                        # Get last user message (third-to-last in conversation)
+                        last_user_msg = conversation_messages[-3]
+                        if last_user_msg.role == "user":
+                            context_messages.append(last_user_msg)
+
+                    # Add current user message
+                    context_messages.append(last_msg)
+
+                    # Calculate token count for the context-aware prompt
+                    context_prompt_tokens = 0
+
+                    # Add system prompt tokens (if present)
+                    if system_prompt:
+                        context_prompt_tokens += TokenCounter.estimate_tokens(system_prompt)
+
+                    # Add context message tokens
+                    for msg in context_messages:
+                        context_prompt_tokens += TokenCounter.estimate_tokens(msg.content)
+
+                    # Apply 1.3 multiplier for formatting/overhead
+                    total_tokens = int(context_prompt_tokens * 1.3)
+
+                    # Reset token tracking for the handle
+                    handle_obj.total_conversation_tokens = total_tokens
+                    handle_obj.summary_token_count = 0
+                    handle_obj.last_summarization_index = -1
+
+                    logger.info(f"Model switch complete. New token count: {total_tokens}")
+
+                except Exception as e:
+                    logger.error(f"Error during model switch: {e}")
+                    err = Error(code=f"{HttpStatusCodes.INTERNAL_SERVER_ERROR}",
+                               message=ErrorMessages.MODEL_SWITCH_ERROR.format(
+                                   old_model=old_model,
+                                   new_model=model_str,
+                                   error=str(e)),
+                               param=Parameters.INTERNAL_TYPE,
+                               type=Parameters.INTERNAL_TYPE)
+                    return err, None, None, None
+
+            # Now it's safe to update the hash - either no model switch was needed or it succeeded
+            handle_obj.conversation_hash = new_hash
+            logger.info(f"Updated thread hash from {lookup_hash} to {new_hash}")
 
             # Reuse existing handle
             handle = handle_obj.handle_object

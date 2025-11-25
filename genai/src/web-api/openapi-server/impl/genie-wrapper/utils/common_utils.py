@@ -215,14 +215,14 @@ class CommonUtils:
             return ""
 
     @staticmethod
-    def format_message_with_template(model_id: str, role: str, content: str) -> str:
+    def format_message_with_template(model_id: str, role: str, content) -> str:
         """
         Format a message with the appropriate prompt template for the model.
 
         Args:
             model_id: The model identifier
             role: The message role (system, user, assistant)
-            content: The message content
+            content: The message content (can be string or object)
 
         Returns:
             str: The formatted message content
@@ -231,12 +231,15 @@ class CommonUtils:
         logger.info(f"Formatting message with template for model: {model_id}, role: {role}")
 
         try:
+            # Handle both string and object content
+            content_str = str(content) if not isinstance(content, str) else content
+
             # Replace placeholders in template
-            formatted = template.replace("{role}", role).replace("{content}", content)
+            formatted = template.replace("{role}", role).replace("{content}", content_str)
             logger.debug(f"Successfully formatted message for role '{role}' using model '{model_id}'")
             return formatted
         except Exception as e:
             logger.error(f"Error formatting message with template: {e}")
             # Return original content as fallback
             logger.warning("Returning original content without template formatting")
-            return content
+            return str(content) if not isinstance(content, str) else content

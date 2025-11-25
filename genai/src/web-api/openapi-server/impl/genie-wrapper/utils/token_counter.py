@@ -19,18 +19,22 @@ class TokenCounter:
     TOKENS_PER_WORD = 1.3
 
     @staticmethod
-    def estimate_tokens(text: str) -> int:
+    def estimate_tokens(text) -> int:
         """
-        Estimate the number of tokens in a text string.
+        Estimate the number of tokens in a text string or object.
 
         Args:
-            text: Input text
+            text: Input text (can be string or object)
 
         Returns:
             Estimated token count
         """
         if not text:
             return 0
+
+        if not isinstance(text, str):
+            # Convert object to string representation
+            text = str(text)
 
         # Simple word count estimation
         word_count = len(text.split())
@@ -59,7 +63,9 @@ class TokenCounter:
             # Count tokens for content
             content = message.get('content', '')
             if content:
-                total_tokens += TokenCounter.estimate_tokens(content)
+                # Handle both string and object content
+                content_str = str(content) if not isinstance(content, str) else content
+                total_tokens += TokenCounter.estimate_tokens(content_str)
 
         logger.debug(f"Estimated {total_tokens} tokens for {len(messages)} messages")
         return total_tokens

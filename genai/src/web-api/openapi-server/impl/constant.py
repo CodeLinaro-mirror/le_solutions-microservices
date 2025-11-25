@@ -104,7 +104,7 @@ class LLMServiceQueryConstant:
     MAX_MESSAGE_COUNT = 12
     # Session and token management constants
     MAX_MESSAGE_PAIRS = 50  # Maximum conversation pairs (100 messages total)
-    DEFAULT_MAX_COMPLETION_TOKENS = 300  # Default if not provided by user
+    DEFAULT_MAX_COMPLETION_TOKENS = 1024  # Default if not provided by user
     CONTEXT_THRESHOLD_PERCENTAGE = 0.8  # 80% threshold for summarization
 
 class ErrorMessages:
@@ -118,6 +118,9 @@ class ErrorMessages:
     MEM_ALLOCATION_ERR = "Memory allocation error"
     CHAT_ID_EXISTS = "Converstaion already in progress with chat id: "
     MAX_MSG_LIMIT_REACHED = "You've hit the maximum message count for this chat. Start a new conversation to proceed."
+    MODEL_NOT_FOUND = "Model '{model}' not found in configuration. Use GET /v1/models to see available models."
+    MODEL_SWITCH_ERROR = "Error switching from model '{old_model}' to '{new_model}': {error}"
+    MODEL_INIT_FAILED = "Failed to initialize model '{model}'. The model may be unavailable or incompatible with the current system."
 
 class LLMServiceKeys:
     """ LLM Service Keys. """

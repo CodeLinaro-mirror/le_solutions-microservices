@@ -8,6 +8,7 @@ from openapi_server.impl.genie_wrapper.completions.genie_wrapper_completion impo
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
 from openapi_server.models.error import Error
+from openapi_server.impl.model_config_manager import ModelConfigManager
 
 from fastapi import (
     HTTPException
@@ -23,6 +24,15 @@ class CompletionApiImpl(BaseCompletionsApi):
     ) -> CreateCompletionResponse:
         """Creates a completion for the provided prompt and parameters."""
         try:
+            # Validate the model if provided in the request
+            if create_completion_request.model:
+                config_manager = ModelConfigManager()
+                if not config_manager.validate_model(create_completion_request.model):
+                    error_message = ErrorMessages.MODEL_NOT_FOUND.format(model=create_completion_request.model)
+                    logger.error(f"Invalid model requested: {create_completion_request.model}")
+                    raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=error_message)
+                logger.info(f"Model validation passed for: {create_completion_request.model}")
+
             result = GenieWrapperCreateCompletion.create_completion(create_completion_request)
             if isinstance(result, Error):
                 logger.error(f"Expected CreateCompletionResponse, got {type(result)}")

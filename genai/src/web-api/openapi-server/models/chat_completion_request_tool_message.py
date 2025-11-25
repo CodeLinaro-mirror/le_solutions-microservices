@@ -24,7 +24,7 @@ import json
 
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
-from typing import Any, ClassVar, Dict, List
+from typing import Any, ClassVar, Dict, List, Union
 from openapi_server.models.chat_completion_request_tool_message_content import ChatCompletionRequestToolMessageContent
 try:
     from typing import Self
@@ -36,7 +36,7 @@ class ChatCompletionRequestToolMessage(BaseModel):
     ChatCompletionRequestToolMessage
     """ # noqa: E501
     role: StrictStr = Field(description="The role of the messages author, in this case `tool`.")
-    content: ChatCompletionRequestToolMessageContent
+    content: Union[StrictStr, ChatCompletionRequestToolMessageContent]
     tool_call_id: StrictStr = Field(description="Tool call that this message is responding to.")
     __properties: ClassVar[List[str]] = ["role", "content", "tool_call_id"]
 
@@ -46,6 +46,9 @@ class ChatCompletionRequestToolMessage(BaseModel):
         if value not in ('tool',):
             raise ValueError("must be one of enum values ('tool')")
         return value
+
+    # Removed content validator to allow strings to remain as strings
+    # This fixes the "'ChatCompletionRequestToolMessageContent' object has no attribute 'strip'" error
 
     model_config = {
         "populate_by_name": True,
@@ -86,7 +89,10 @@ class ChatCompletionRequestToolMessage(BaseModel):
         )
         # override the default output from pydantic by calling `to_dict()` of content
         if self.content:
-            _dict['content'] = self.content.to_dict()
+            if isinstance(self.content, str):
+                _dict['content'] = self.content
+            else:
+                _dict['content'] = self.content.to_dict()
         return _dict
 
     @classmethod
@@ -98,11 +104,16 @@ class ChatCompletionRequestToolMessage(BaseModel):
         if not isinstance(obj, dict):
             return cls.model_validate(obj)
 
+        content = obj.get("content")
+        # Handle string content directly
+        if content is not None and isinstance(content, str):
+            content_obj = content
+        else:
+            content_obj = ChatCompletionRequestToolMessageContent.from_dict(content) if content is not None else None
+
         _obj = cls.model_validate({
             "role": obj.get("role"),
-            "content": ChatCompletionRequestToolMessageContent.from_dict(obj.get("content")) if obj.get("content") is not None else None,
+            "content": content_obj,
             "tool_call_id": obj.get("tool_call_id")
         })
         return _obj
-
-

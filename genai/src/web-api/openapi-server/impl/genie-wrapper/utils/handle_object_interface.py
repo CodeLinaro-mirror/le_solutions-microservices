@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 import threading
-from typing import Any
+from typing import Any, List, Optional, Tuple
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.genie_wrapper.gen_ai_service_singleton import LLMService
 
@@ -25,6 +25,8 @@ class HandleObject:
     completion_id = ""
     last_summarization_index = -1
     summary_token_count = 0
+    model_switch_count = 0
+    previous_model_id = None
 
     def __init__(self, handle_obj:Any, msg_count: int = 1, model_id: str = None,
                  safety_identifier: str = None, thread_number: int = 0):
@@ -50,6 +52,8 @@ class HandleObject:
         self.completion_id = ""  # The composite key returned to client
         self.last_summarization_index = -1  # Track last message index that was summarized
         self.summary_token_count = 0  # Token count of current summary
+        self.model_switch_count = 0  # Track number of model switches
+        self.previous_model_id = None  # Track previous model
 
 
 class HandleIdObjectMap:
@@ -63,7 +67,7 @@ class HandleIdObjectMap:
     the oldest entry is removed to make space.
     """
     _instance = None
-    _lock = threading.Lock()
+    _lock = threading.RLock()
 
     MAX_ELEMENTS = 50
     MAX_ID_LENGTH = 256
@@ -83,7 +87,7 @@ class HandleIdObjectMap:
         if not hasattr(self, '_initialized'):
             self._handle_mapping: dict[str, Any] = {}
             self._user_thread_counters: dict[str, int] = {}  # Track next thread number per user
-            self._lock = threading.Lock()
+            self._lock = threading.RLock()
             self._initialized = True
 
     def set_handle(self, handle: Any, id: str) -> None:
@@ -211,3 +215,45 @@ class HandleIdObjectMap:
                            if k.startswith(prefix)]
             logger.debug(f"Found {len(user_threads)} threads for user {safety_identifier}")
             return user_threads
+
+    def find_handle_by_user_and_model(self, safety_identifier: str, model_id: str) -> Optional[Tuple[str, HandleObject]]:
+        """
+        Find handle for specific user and model combination.
+
+        Args:
+            safety_identifier: User identifier
+            model_id: Model identifier
+
+        Returns:
+            Tuple of (composite_key, handle_object) if found, None otherwise
+        """
+        with self._lock:
+            user_threads = self.get_user_threads(safety_identifier)
+            for key, handle_obj in user_threads:
+                if handle_obj.model_id == model_id:
+                    logger.debug(f"Found existing handle for user {safety_identifier} with model {model_id}")
+                    return key, handle_obj
+            logger.debug(f"No handle found for user {safety_identifier} with model {model_id}")
+            return None
+
+    def get_user_handles_by_model(self, safety_identifier: str) -> dict[str, List[Tuple[str, HandleObject]]]:
+        """
+        Get all handles for a user grouped by model.
+
+        Args:
+            safety_identifier: User identifier
+
+        Returns:
+            Dictionary mapping model_id to list of (composite_key, handle_object) tuples
+        """
+        with self._lock:
+            user_threads = self.get_user_threads(safety_identifier)
+            result = {}
+
+            for key, handle_obj in user_threads:
+                model_id = handle_obj.model_id
+                if model_id not in result:
+                    result[model_id] = []
+                result[model_id].append((key, handle_obj))
+
+            return result
