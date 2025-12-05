@@ -64,7 +64,7 @@ class CommonUtils:
         3. Hardcoded fallback
 
         Returns:
-            str: The internal model ID (e.g., LLAMA3_1_8B)
+            str: The external model ID (e.g., llama3-8b, qwen2.5-7b)
         """
         from openapi_server.impl.model_config_manager import ModelConfigManager
         from openapi_server.logger.logger_config import LoggerConfig
@@ -78,21 +78,15 @@ class CommonUtils:
             logger.info(f"Using model from GENAI_MODEL_NAME env var: {env_model}")
             return env_model
 
-        # Try to get from configuration
+        # Get default model from configuration (returns external ID)
         try:
             config_manager = ModelConfigManager()
             default_model_id = config_manager.get_default_model()
-            internal_id = config_manager.get_internal_id(default_model_id)
-
-            if internal_id:
-                logger.info(f"Using default model from config: {default_model_id} (internal: {internal_id})")
-                return internal_id
-            else:
-                logger.warning(f"No internal_id found for model {default_model_id}, using fallback")
-                return QUERY_CONST.DEFAULT_MODEL
+            logger.info(f"Using default model from config: {default_model_id}")
+            return default_model_id
         except Exception as e:
             logger.error(f"Error getting model from config: {e}, using fallback")
-            return QUERY_CONST.DEFAULT_MODEL
+            return "qwen2.5-7b"  # External ID fallback
 
     @staticmethod
     def get_model_config_path(model_id: str) -> str:
@@ -100,7 +94,8 @@ class CommonUtils:
         Get the configuration file path for a given model.
 
         Args:
-            model_id: The model identifier (can be internal ID or external ID)
+            model_id: The external model identifier (e.g., "qwen2.5-7b", "llama3-8b")
+                     Also supports internal IDs for backward compatibility
 
         Returns:
             str: Path to the model's Genie configuration file

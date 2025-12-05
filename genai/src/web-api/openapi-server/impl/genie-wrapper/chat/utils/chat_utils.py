@@ -382,25 +382,18 @@ class ChatQueryUtils:
         if system_context:
             logger.info(f"System context present: {len(system_context)} chars (will be sent as separate system role)")
 
-        # Get model from request or fall back to environment variable/config
+        # Get model from request or fall back to default from config
         requested_model = getattr(request_data, 'model', None)
 
         # Check if model is provided and not empty
         if requested_model and requested_model.strip():
             logger.info(f"Model requested from API: {requested_model}")
-            # Map external model ID to internal ID
-            config_manager = ModelConfigManager()
-            internal_model_id = config_manager.get_internal_id(requested_model)
-
-            if not internal_model_id:
-                # Try using the requested model as-is (might already be internal ID)
-                internal_model_id = requested_model
-                logger.warning(f"Could not map model {requested_model}, using as-is")
-
-            model_str = internal_model_id
+            # Use external model ID directly (no internal ID mapping needed)
+            model_str = requested_model
         else:
-            # Fall back to environment variable or default
-            model_str = str(CommonUtils.get_model_name())
+            # Fall back to default model from config (returns external ID)
+            config_manager = ModelConfigManager()
+            model_str = config_manager.get_default_model()
             logger.info(f"No model in request, using default: {model_str}")
 
         logger.info(f"Using model: {model_str}")
