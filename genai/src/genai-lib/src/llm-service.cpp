@@ -177,6 +177,7 @@ void Dialog::queryCallback(const char* responseStr,
           strlcpy(message.content, qmtx->responseStr->c_str(), sizeof(message.content));
 
           response->choices[0].message = message;
+          strlcpy(response->choices[0].finish_reason, "stop", sizeof(response->choices[0].finish_reason));
 
           if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
             qmtx->llmObj->responseCallback(response.get());

@@ -5,7 +5,7 @@
 
 from openapi_server.apis.models_api_base import BaseModelsApi
 from openapi_server.models.model import Model, ModelListResponse
-from openapi_server.impl.model_config_manager import ModelConfigManager
+from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.logger.logger_config import LoggerConfig
 import time
 

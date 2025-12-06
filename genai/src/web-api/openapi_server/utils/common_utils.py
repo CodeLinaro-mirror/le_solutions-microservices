@@ -3,7 +3,7 @@
 
 import os
 from openapi_server.impl.constant import LLMServiceQueryConstant as QUERY_CONST
-from openapi_server.impl.model_config_manager import get_config_manager
+from openapi_server.managers.model_config_manager import get_config_manager
 from openapi_server.logger.logger_config import LoggerConfig
 
 LoggerConfig.initialize()
@@ -66,7 +66,7 @@ class CommonUtils:
         Returns:
             str: The external model ID (e.g., llama3-8b, qwen2.5-7b)
         """
-        from openapi_server.impl.model_config_manager import ModelConfigManager
+        from openapi_server.managers.model_config_manager import ModelConfigManager
         from openapi_server.logger.logger_config import LoggerConfig
 
         LoggerConfig.initialize()
@@ -100,7 +100,7 @@ class CommonUtils:
         Returns:
             str: Path to the model's Genie configuration file
         """
-        from openapi_server.impl.model_config_manager import ModelConfigManager
+        from openapi_server.managers.model_config_manager import ModelConfigManager
         from openapi_server.logger.logger_config import LoggerConfig
 
         LoggerConfig.initialize()

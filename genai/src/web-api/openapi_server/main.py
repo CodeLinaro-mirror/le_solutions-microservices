@@ -24,7 +24,7 @@ from openapi_server.apis.models_api import router as ModelApiRouter
 import logging
 from openapi_server.version import __version__
 from openapi_server.logger.logger_config import LoggerConfig
-from openapi_server.impl.model_config_manager import ModelConfigManager
+from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.thread_pool import (
     initialize_vlm_thread_pool,
     shutdown_vlm_thread_pool,

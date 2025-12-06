@@ -172,3 +172,5 @@ ENV LLM_LIBRARY_PATH=/root/app/site-packages/libllmservice.so
 ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h
 
 ENV VLM_SITE_PACKAGES_PATH=/root/app/site-packages/
+
+WORKDIR /mnt/work/models

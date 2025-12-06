@@ -3,11 +3,11 @@
 
 from openapi_server.models.create_chat_completion_request import CreateChatCompletionRequest
 from openapi_server.models.error import Error
-from openapi_server.impl.model_config_manager import ModelConfigManager
+from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.logger.logger_config import LoggerConfig
-from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
-from openapi_server.impl.genie_wrapper.utils.image_validator import extract_and_decode_images, has_image_content
-from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
+from openapi_server.utils.common_utils import CommonUtils
+from openapi_server.utils.image_validator import extract_and_decode_images, has_image_content
+from openapi_server.utils.image_preprocessor import preprocess_from_decoded
 from openapi_server.impl.constant import HttpStatusCodes
 from openapi_server.impl.constant import ErrorMessages, Parameters, LLMServiceKeys, LLMServiceQueryConstant as QUERY_CONST
 import logging

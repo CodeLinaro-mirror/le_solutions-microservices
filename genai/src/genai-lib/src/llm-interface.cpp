@@ -45,6 +45,8 @@ void llm_chat_completion_create(LLMHandle handle, const Query* query, bool strea
             LLMObject* obj = static_cast<LLMObject*>(handle);
             // Set the Response callback
             obj->responseCallback = cb;
+            // Update streaming mode
+            obj->stream = streaming;
             //First populate Query struct in LLM Object with the input struct from REST API side
             *(obj->query) = *query;
             // Call chat completion create to run query

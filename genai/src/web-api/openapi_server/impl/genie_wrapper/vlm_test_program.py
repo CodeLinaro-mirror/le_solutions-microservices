@@ -61,9 +61,9 @@ except ImportError:
 
 # Try to import project utilities
 try:
-    from openapi_server.impl.genie_wrapper.utils.image_validator import decode_image
-    from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
-    from openapi_server.impl.model_config_manager import ModelConfigManager
+    from openapi_server.utils.image_validator import decode_image
+    from openapi_server.utils.image_preprocessor import preprocess_from_decoded
+    from openapi_server.managers.model_config_manager import ModelConfigManager
     HAVE_PROJECT_UTILS = True
 except ImportError:
     logger.warning("Project utilities not available. Using simplified implementations.")

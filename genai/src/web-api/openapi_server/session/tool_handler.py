@@ -30,7 +30,14 @@ class ToolHandler:
         if not tools:
             return ""
 
-        tools_text = "\n\n--- AVAILABLE TOOLS ---\n\n"
+        tools_text = "\n\n--- TOOL USAGE GUIDELINES ---\n\n"
+        tools_text += "IMPORTANT: You can ONLY use the tools explicitly listed below. "
+        tools_text += "If no relevant tool is available for the user's request, respond with text instead of calling any function. "
+        tools_text += "Do NOT output a JSON object with empty tool_calls. If no tool is needed, simply output the plain text response. "
+        tools_text += "Never invent or hallucinate function names that are not in the tools list. "
+        tools_text += "If the available tools cannot directly help with the user request, do not call any tool and reply with plain text instead.\n"
+
+        tools_text += "\n--- AVAILABLE TOOLS ---\n\n"
         tools_text += (
             "You have access to the following tools. To use a tool, respond with a JSON object in this exact format:\n\n"
         )
@@ -56,12 +63,6 @@ class ToolHandler:
                     tools_text += f"   Parameters: {func.parameters}\n"
 
             tools_text += "\n"
-
-        tools_text += "\n--- TOOL USAGE GUIDELINES ---\n\n"
-        tools_text += "IMPORTANT: You can ONLY use the tools explicitly listed above. "
-        tools_text += "If no relevant tool is available for the user's request, respond with text instead of calling any function. "
-        tools_text += "Never invent or hallucinate function names that are not in the tools list. "
-        tools_text += "If the available tools cannot directly help with the user request, do not call any tool and reply with plain text instead.\n"
 
         return tools_text
 

@@ -10,13 +10,16 @@ logger = LoggerConfig.get_logger(__name__)
 
 class TokenCounter:
     """
-    Utility class to estimate token counts from text.
+    Utility class to estimate token counts from text and multi-modal content.
     Uses a simple word-based approximation (word count * 1.3).
     For production, consider integrating a proper tokenizer like tiktoken.
     """
 
     # Approximate ratio of tokens to words (conservative estimate)
     TOKENS_PER_WORD = 1.3
+
+    # Image token cost (similar to OpenAI's 1024x1024 image cost)
+    IMAGE_TOKEN_COST = 765
 
     @staticmethod
     def estimate_tokens(text) -> int:
@@ -84,3 +87,34 @@ class TokenCounter:
         """
         base_tokens = TokenCounter.estimate_tokens(text)
         return base_tokens + overhead_tokens
+
+    @staticmethod
+    def estimate_tokens_for_multimodal_content(content) -> int:
+        """
+        Estimate tokens for multi-modal content (text + images).
+
+        Args:
+            content: Message content (string or list of content items)
+
+        Returns:
+            Estimated token count including images
+        """
+        if isinstance(content, str):
+            # Simple text content
+            return TokenCounter.estimate_tokens(content)
+        elif isinstance(content, list):
+            # Multi-modal content with text and images
+            total_tokens = 0
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text':
+                        text_content = item.get('text', '')
+                        total_tokens += TokenCounter.estimate_tokens(text_content)
+                    elif item.get('type') == 'image_url':
+                        # Add image token cost
+                        total_tokens += TokenCounter.IMAGE_TOKEN_COST
+                        logger.debug(f"Added {TokenCounter.IMAGE_TOKEN_COST} tokens for image")
+            return total_tokens
+        else:
+            # Fallback to string conversion
+            return TokenCounter.estimate_tokens(str(content))

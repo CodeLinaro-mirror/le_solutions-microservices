@@ -60,10 +60,10 @@ logger = logging.getLogger("vlm_standalone_test")
 # Try to import from openapi_server
 # If that fails, adjust sys.path to include the repo path
 try:
-    from openapi_server.impl.genie_wrapper.utils.image_validator import decode_image
-    from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
-    from openapi_server.impl.model_config_manager import ModelConfigManager
-    from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
+    from openapi_server.utils.image_validator import decode_image
+    from openapi_server.utils.image_preprocessor import preprocess_from_decoded
+    from openapi_server.managers.model_config_manager import ModelConfigManager
+    from openapi_server.utils.common_utils import CommonUtils
 except ImportError:
     logger.info("Failed to import directly, adjusting sys.path...")
     # Add the repo path to sys.path
@@ -71,10 +71,10 @@ except ImportError:
     sys.path.insert(0, repo_path)
 
     try:
-        from openapi_server.impl.genie_wrapper.utils.image_validator import decode_image
-        from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
-        from openapi_server.impl.model_config_manager import ModelConfigManager
-        from openapi_server.impl.genie_wrapper.utils.common_utils import CommonUtils
+        from openapi_server.utils.image_validator import decode_image
+        from openapi_server.utils.image_preprocessor import preprocess_from_decoded
+        from openapi_server.managers.model_config_manager import ModelConfigManager
+        from openapi_server.utils.common_utils import CommonUtils
     except ImportError as e:
         logger.error(f"Failed to import required modules: {e}")
         logger.error("Make sure you're running from the correct directory or inside the container")
@@ -230,7 +230,7 @@ def decode_base64_image(image_base64: str) -> bytes:
             raise ValueError(f"Invalid image data: {e}")
 
         # Preprocess the image using existing pipeline
-        from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_image
+        from openapi_server.utils.image_preprocessor import preprocess_image
         preprocessed = preprocess_image(img)
         logger.info(f"Image preprocessed: {preprocessed.num_patches} patches, {preprocessed.patch_dim} dims per patch")
         logger.info(f"Image dimensions: {preprocessed.resized_width}x{preprocessed.resized_height} (from original {preprocessed.original_width}x{preprocessed.original_height})")

@@ -35,11 +35,11 @@ from openapi_server.models.create_chat_completion_response_choices_inner import 
 from openapi_server.models.error import Error
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import LLMServiceKeys, Parameters
-from openapi_server.impl.genie_wrapper.chat.utils.chat_utils import ChatQueryUtils
-from openapi_server.impl.genie_wrapper.utils.vlm_image_cache import get_vlm_image_cache
-from openapi_server.impl.genie_wrapper.utils.image_validator import decode_image
-from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_from_decoded
-from openapi_server.impl.genie_wrapper.chat.vlm_sse_generator import create_vlm_sse_generator
+from openapi_server.session.conversation_utils import ConversationUtils
+from openapi_server.utils.image_cache import get_image_cache
+from openapi_server.utils.image_validator import decode_image
+from openapi_server.utils.image_preprocessor import preprocess_from_decoded
+from openapi_server.impl.genie_wrapper.vlm_sse_generator import create_vlm_sse_generator
 
 # Initialize logger
 LoggerConfig.initialize()
@@ -198,7 +198,7 @@ class GenieWrapperCreateVLMChatCompletion:
                 img = Image.open(io.BytesIO(image_data))
 
                 # Preprocess using existing pipeline
-                from openapi_server.impl.genie_wrapper.utils.image_preprocessor import preprocess_image
+                from openapi_server.utils.image_preprocessor import preprocess_image
                 preprocessed = preprocess_image(img)
 
             else:
@@ -377,7 +377,7 @@ class GenieWrapperCreateVLMChatCompletion:
 
         try:
             # Calculate conversation hash for caching (session identification)
-            conversation_hash = ChatQueryUtils.calculate_conversation_hash(
+            conversation_hash = ConversationUtils.calculate_conversation_hash(
                 request_data.messages,
                 exclude_last_pair=False
             )
@@ -397,7 +397,7 @@ class GenieWrapperCreateVLMChatCompletion:
                 )
 
             # Get image cache
-            image_cache = get_vlm_image_cache()
+            image_cache = get_image_cache()
 
             # Determine image source and handle caching
             if image_input:
