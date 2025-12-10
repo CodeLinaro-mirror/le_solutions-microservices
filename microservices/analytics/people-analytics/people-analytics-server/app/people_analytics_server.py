@@ -327,6 +327,7 @@ async def connect_to_redis(r):
     ping_retval = await r.ping()
     logger.info(f'Ping: {ping_retval}')
 
+
 async def connect_to_db():
     '''
     Create a connection to the database if it is not already connected.
@@ -521,7 +522,7 @@ async def update_count_statistics(recent_history):
 
     logger.debug(f"update_count_statistics()")
 
-    def count_people_in_frames_by_channel(recent_frames: Dict[str, Deque]) -> Dict[str, Deque[int]]:
+    def count_people_in_frames_by_channel(recent_frames: Dict[str, Deque]) -> Dict[str, Deque[Tuple[int, Any]]]:
         # Extracts people counts from frames for each channel
         count_in_frames: Dict[str, Deque[Tuple[int, Any]]] = defaultdict(deque)
 
@@ -542,7 +543,7 @@ async def update_count_statistics(recent_history):
 
         return count_in_frames
 
-    def get_majority_vote(counts_by_channel: Dict[str, Deque[int]]) -> Dict[str, Optional[int]]:
+    def get_majority_vote(counts_by_channel: Dict[str, Deque[Tuple[int, Any]]]) -> Dict[str, Optional[Tuple[int, Any]]]:
         '''
         Returns the most common people count per channel
         '''
@@ -644,7 +645,7 @@ def visualize_heatmap(heatmap):
         return
 
     # Define the intensity levels using Unicode block characters
-    intensity_levels = " ����"
+    intensity_levels = " ░▒▓█"
 
     # Function to map the matrix values to intensity levels
     def map_to_intensity(matrix):
@@ -1058,7 +1059,6 @@ def apply_triggers(triggers, recent_history):
             trigger_channel = DETECTION_CHANNEL_PREFIX + monitor_id
 
             if not count_statistics or monitor_id not in count_statistics:
-                logger.info("UH OH")
                 if not count_statistics:
                     logger.info("no monitor")
                 else:
@@ -1325,6 +1325,7 @@ async def run_count_query(r : redis.Redis, token, monitor_id, start_time, end_ti
             avg_of_avg_counts = float(0 if not result[2] else result[2])
 
         cursor.close()
+
 
         # Post results
         #{

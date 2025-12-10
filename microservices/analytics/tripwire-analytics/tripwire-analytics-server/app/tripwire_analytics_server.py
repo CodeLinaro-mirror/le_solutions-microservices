@@ -10,7 +10,7 @@ import sys
 import json
 from mysql.connector.constants import _obsolete_option
 from types import SimpleNamespace
-from tripwire_analytics import TripwireAnalytics, ANALYTICS_CHANNEL, DETECTION_CHANNEL_PREFIX
+from tripwire_analytics import TripwireAnalytics, TRIPWIRE_KEY, TRIGGER_KEY, ANALYTICS_CHANNEL, DETECTION_CHANNEL_PREFIX
 
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 logger = logging.getLogger(__file__)
@@ -18,8 +18,6 @@ LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
 
 REDIS_PORT = os.environ.get('REDIS_PORT', 6379)
 LOG_LEVEL = int(os.environ.get('LOG_LEVEL', logging.INFO))
-
-# e.g., monitor 0 would be "detection.rz:0"
 
 message_list = [] # list of (loop.time(), message)
 
@@ -47,6 +45,18 @@ async def register_pubsub_listener(r: redis.Redis, ta: TripwireAnalytics):
             logger.debug(f'Received message on ch "{message["channel"]}" >> "{data_str}"')
         else:
             logger.debug('No message from get_message')
+
+    def tripwires_update_handler(message):
+        logger.info(f'Subscribed to region updates on key: {TRIPWIRE_KEY}')
+        if message['type'] == 'pmessage':
+            logger.info(f'Tripwires update detected: {message}')
+            asyncio.create_task(ta.update_tripwires())
+
+    def trigger_update_handler(message):
+        logger.info(f'Subscribed to triggers updates on key: {TRIGGER_KEY}')
+        if message['type'] == 'pmessage':
+            logger.info(f'Triggers update detected: {message}')
+            asyncio.create_task(ta.update_triggers())
 
     def analytics_request_handler(message):
         logger.debug(f'Received message on analytics channel')
@@ -92,10 +102,13 @@ async def register_pubsub_listener(r: redis.Redis, ta: TripwireAnalytics):
         else:
             logger.debug('No message for analytics')
 
+
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
     channel_pattern = DETECTION_CHANNEL_PREFIX + '*'
     await pubsub.psubscribe(**{channel_pattern: detection_message_handler})
+    await pubsub.psubscribe(**{'__keyspace@0__:' + TRIPWIRE_KEY: tripwires_update_handler})
+    await pubsub.psubscribe(**{'__keyspace@0__:' + TRIGGER_KEY: trigger_update_handler})
 
     await pubsub.subscribe(**{ANALYTICS_CHANNEL: analytics_request_handler})
     logger.debug(f'subscribed to {ANALYTICS_CHANNEL} channel')
@@ -105,6 +118,8 @@ async def register_pubsub_listener(r: redis.Redis, ta: TripwireAnalytics):
 
 async def async_main():
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    await r.config_set('notify-keyspace-events', 'KEA')
+    logger.info(f'{await r.config_get("notify-keyspace-events")}')
     ta = TripwireAnalytics(r)
     channel_listener_task = None
     statistics_process_task = None
