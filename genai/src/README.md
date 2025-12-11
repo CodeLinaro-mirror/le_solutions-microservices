@@ -32,34 +32,6 @@ docker compose --env-file tests/.env_device build
 
 ## Simple steps to create docker environment for device
 
-### Docker compose
-
-```bash
-# Only if occures the following error:
-# ERROR [genai internal] load metadata for docker.io/library/ubuntu:24.04
-docker buildx use default
-
-# Build docker-compose
-docker compose --env-file tests/.env build
-
-# Save the image
-docker save -o genai-service.tar genai-service
-
-# Deploy the image, yaml file and .env files
-adb shell "mkdir -p /opt/docker"
-adb push genai-service.tar /opt/docker
-adb push docker-compose.yaml /opt/docker
-adb push tests/.env /opt/docker
-
-# Load the image
-adb shell "docker load -i /opt/docker/genai-service.tar"
-
-# Run the docker compose service inside the device
-adb shell
-cd /opt/docker/
-docker-compose -f docker-compose.yaml --env-file .env up genai
-```
-
 ### Docker compose (chatcompletion)
 
 ```bash
@@ -116,27 +88,27 @@ docker compose -f docker-compose.chatcompletion.yaml --env-file tests/.env exec 
 
 #### Incremental Build (inside genai-builder-chatcompletion container (C/C++))
 ````bash
-VLM-build
+chatcompletions-build
 ````
 
 #### Clean Build (inside genai-builder-chatcompletion container (C/C++))
 ````bash
-VLM-clean && VLM-build
+chatcompletions-clean && chatcompletions-build
 ````
 
 #### Push artifacts to device (inside genai-builder-chatcompletion container (C/C++))
 ````bash
-VLM-push-artifacts
+chatcompletions-push-artifacts
 ````
 
 #### Incremental Build (inside genai-builder-chatcompletion container (Python))
 ```bash
-VLM-install-openapi-server
+chatcompletions-install-openapi-server
 ```
 
 #### Push venv to device (inside genai-builder-chatcompletion container (Python))
 ```bash
-VLM-push-venv
+chatcompletions-push-venv
 ```
 
 #### Copy venv from genai-builder-chatcompletion to genai_chatcompletion_service (inside device)

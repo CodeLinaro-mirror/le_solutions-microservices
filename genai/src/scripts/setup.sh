@@ -35,8 +35,8 @@ function print-blue() {
     SCRIPTS="${LLM_SCRIPTS_DIR}"
 }
 
-[ -n "${VLM_SCRIPTS_DIR}" ] && [ -d "${VLM_SCRIPTS_DIR}" ]                                      && {
-    SCRIPTS="${VLM_SCRIPTS_DIR}"
+[ -n "${CHATCOMPLETIONS_SCRIPTS_DIR}" ] && [ -d "${CHATCOMPLETIONS_SCRIPTS_DIR}" ]              && {
+    SCRIPTS="${CHATCOMPLETIONS_SCRIPTS_DIR}"
 }
 
 [ -z "${SCRIPTS}" ]                                                                             && {

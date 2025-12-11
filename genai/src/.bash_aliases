@@ -13,4 +13,4 @@ alias l='ls -CF'
 [ -f /etc/bash_completion ] && . /etc/bash_completion
 
 [ -f ${LLM_SCRIPTS_DIR}/setup.sh ] && source ${LLM_SCRIPTS_DIR}/setup.sh
-[ -f ${VLM_SCRIPTS_DIR}/setup.sh ] && source ${VLM_SCRIPTS_DIR}/setup.sh
+[ -f ${CHATCOMPLETIONS_SCRIPTS_DIR}/setup.sh ] && source ${CHATCOMPLETIONS_SCRIPTS_DIR}/setup.sh

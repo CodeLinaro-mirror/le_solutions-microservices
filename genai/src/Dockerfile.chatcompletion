@@ -45,40 +45,40 @@ RUN pip install --upgrade pip
 
 # Add needed environment variables
 ENV TARGET_SYSROOT="/"
-ENV VLM_SRC_DIR="/mnt/work/src"
-ENV VLM_BUILD_DIR="/mnt/work/build"
-ENV VLM_DEPLOY_DIR="/mnt/work/deploy"
-ENV VLM_DOWNLOAD_DIR="/mnt/work/downloads"
-ENV VLM_SCRIPTS_DIR="/mnt/work/scripts"
-ENV VLM_ADSP_DIR=${VLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
-RUN mkdir -p ${VLM_BUILD_DIR} ${TARGET_SYSROOT}/usr/include ${TARGET_SYSROOT}/usr/lib
+ENV CHATCOMPLETIONS_SRC_DIR="/mnt/work/src"
+ENV CHATCOMPLETIONS_BUILD_DIR="/mnt/work/build"
+ENV CHATCOMPLETIONS_DEPLOY_DIR="/mnt/work/deploy"
+ENV CHATCOMPLETIONS_DOWNLOAD_DIR="/mnt/work/downloads"
+ENV CHATCOMPLETIONS_SCRIPTS_DIR="/mnt/work/scripts"
+ENV CHATCOMPLETIONS_ADSP_DIR=${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/rfsa/adsp
+RUN mkdir -p ${CHATCOMPLETIONS_BUILD_DIR} ${TARGET_SYSROOT}/usr/include ${TARGET_SYSROOT}/usr/lib
 
 # qnp-sdk: fetch and copy the needed headers and libraries
-ENV VLM_QNP_VER=2.40.0.251030
-ENV VLM_QNN_LIB_PATH=${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/lib
+ENV CHATCOMPLETIONS_QNP_DIR=2.40.0.251030
+ENV CHATCOMPLETIONS_QNN_LIB_PATH=${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/lib
 
-ENV VLM_QNP_SDK=v${VLM_QNP_VER}.zip
-RUN wget -t 2 -T 30 -P ${VLM_DOWNLOAD_DIR}                                                         \
-        https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${VLM_QNP_VER}/${VLM_QNP_SDK} && \
-    cd ${VLM_DOWNLOAD_DIR}                                                                      && \
-    unzip ${VLM_QNP_SDK}                                                                        && \
-    rm -f ${VLM_QNP_SDK}                                                                        && \
-    cp -r ${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/lib/aarch64-oe-linux-gcc11.2/libGenie.so        \
+ENV CHATCOMPLETIONS_QNP_SDK=v${CHATCOMPLETIONS_QNP_DIR}.zip
+RUN wget -t 2 -T 30 -P ${CHATCOMPLETIONS_DOWNLOAD_DIR}                                             \
+        https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${CHATCOMPLETIONS_QNP_DIR}/${CHATCOMPLETIONS_QNP_SDK} && \
+    cd ${CHATCOMPLETIONS_DOWNLOAD_DIR}                                                          && \
+    unzip ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
+    rm -f ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
+    cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/lib/aarch64-oe-linux-gcc11.2/libGenie.so \
           /usr/lib/                                                                             && \
-    cp -r ${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/include/Genie/*                                 \
+    cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/include/Genie/*         \
           /usr/include/                                                                         && \
-    mkdir -p ${VLM_ADSP_DIR}                                                                    && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v66/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v68/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v69/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v73/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v75/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/hexagon-v79/unsigned/* ${VLM_ADSP_DIR}/                              && \
-    cp ${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                                    \
-        ${VLM_DEPLOY_DIR}/usr/lib/                                                              && \
-    cp ${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*                                              \
-        ${VLM_DEPLOY_DIR}/usr/lib/                                                              && \
-    rm -rf ${VLM_DOWNLOAD_DIR}/qairt
+    mkdir -p ${CHATCOMPLETIONS_ADSP_DIR}                                                        && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v66/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v68/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v69/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v73/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v75/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v79/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                        \
+        ${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/                                                  && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*                                  \
+        ${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/                                                  && \
+    rm -rf ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt
 
 # Specific ubuntu packages
 RUN apt-get update                                                                              && \
@@ -94,25 +94,25 @@ RUN useradd -m -s /bin/bash iot-user
 RUN usermod -aG plugdev iot-user
 
 # Copy web-api source code
-COPY setup.cfg ${VLM_SRC_DIR}/setup.cfg
-COPY pyproject.toml ${VLM_SRC_DIR}/pyproject.toml
-COPY web-api ${VLM_SRC_DIR}/web-api
+COPY setup.cfg ${CHATCOMPLETIONS_SRC_DIR}/setup.cfg
+COPY pyproject.toml ${CHATCOMPLETIONS_SRC_DIR}/pyproject.toml
+COPY web-api ${CHATCOMPLETIONS_SRC_DIR}/web-api
 
 # Install web-api server as python package
-RUN pip install ${VLM_SRC_DIR}
-RUN pip install ${VLM_SRC_DIR} requests Pillow numpy
+RUN pip install ${CHATCOMPLETIONS_SRC_DIR}
+RUN pip install ${CHATCOMPLETIONS_SRC_DIR} requests Pillow numpy
 
 # Copy helper scripts
-COPY scripts ${VLM_SCRIPTS_DIR}
+COPY scripts ${CHATCOMPLETIONS_SCRIPTS_DIR}
 
 # Copy genai-lib source code
-COPY genai-lib ${VLM_SRC_DIR}/genai-lib
+COPY genai-lib ${CHATCOMPLETIONS_SRC_DIR}/genai-lib
 
 # Add bash aliases file
 COPY .bash_aliases /iot-user/.bash_aliases
 
-# Build the VLM project
-RUN bash -c "source ${VLM_SCRIPTS_DIR}/setup.sh && VLM-build"
+# Build the chatcompletions project
+RUN bash -c "source ${CHATCOMPLETIONS_SCRIPTS_DIR}/setup.sh && chatcompletions-build"
 
 RUN chown -R iot-user:iot-user /mnt/work /usr/lib/
 
