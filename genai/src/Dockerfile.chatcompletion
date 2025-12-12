@@ -63,17 +63,16 @@ RUN wget -t 2 -T 30 -P ${CHATCOMPLETIONS_DOWNLOAD_DIR}                          
     cd ${CHATCOMPLETIONS_DOWNLOAD_DIR}                                                          && \
     unzip ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
     rm -f ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
+    find ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/                                 \
+        -type f -iname "*snpe*" -exec rm {} \;                                                  && \
     cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/lib/aarch64-oe-linux-gcc11.2/libGenie.so \
-          /usr/lib/                                                                             && \
+        /usr/lib/                                                                               && \
     cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/include/Genie/*         \
-          /usr/include/                                                                         && \
+        /usr/include/                                                                           && \
     mkdir -p ${CHATCOMPLETIONS_ADSP_DIR}                                                        && \
-    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v66/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
     cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v68/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
-    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v69/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
     cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v73/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
     cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v75/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
-    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v79/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
     cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                        \
         ${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/                                                  && \
     cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*                                  \
