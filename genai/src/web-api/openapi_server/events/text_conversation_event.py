@@ -349,6 +349,7 @@ class TextConversationEvent(ConversationEvent):
 
         # Start LLM in background thread
         worker_thread = threading.Thread(target=run_llm, daemon=True)
+        start_time = time.time()
         worker_thread.start()
 
         # Create async generator to consume queue
@@ -356,6 +357,9 @@ class TextConversationEvent(ConversationEvent):
             accumulated_content = ""
             completion_tokens = 0
             created_time = int(time.time())
+
+            # Metrics tracking
+            first_token_time = None
 
             # Buffering logic for tool detection
             # We buffer initial tokens to check if it's a JSON response (potential tool call)
@@ -401,6 +405,11 @@ class TextConversationEvent(ConversationEvent):
                         error_msg = token.replace("__ERROR__", "")
                         yield f"data: {json.dumps({'error': error_msg})}\n\n"
                         break
+
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        ttft = first_token_time - start_time
+                        logger.info(f"Event {self.event_id}: Time to First Token (TTFT): {ttft:.4f}s")
 
                     accumulated_content += token
                     completion_tokens += 1
@@ -593,7 +602,11 @@ class TextConversationEvent(ConversationEvent):
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
+                end_time = time.time()
+                generation_time = end_time - (first_token_time if first_token_time else start_time)
+                tps = completion_tokens / generation_time if generation_time > 0 else 0
                 logger.info(f"Event {self.event_id}: Streaming completed, {completion_tokens} tokens (finish_reason: {finish_reason})")
+                logger.info(f"Event {self.event_id}: Tokens Per Second (TPS): {tps:.2f} tokens/s")
 
         # Set SSE/blocking headers
         response_headers = {
@@ -800,9 +813,21 @@ class TextConversationEvent(ConversationEvent):
         import threading
         completion_event = threading.Event()
 
+        # Metrics tracking
+        timing_stats = {
+            "start_time": time.time(),
+            "first_token_time": None,
+            "token_count": 0
+        }
+
         @llm_service.ffi.callback("void(const Response *)")
         def callback(response_ptr):
             try:
+                if timing_stats["first_token_time"] is None:
+                    timing_stats["first_token_time"] = time.time()
+                    ttft = timing_stats["first_token_time"] - timing_stats["start_time"]
+                    logger.info(f"Event {self.event_id}: Time to First Token (TTFT): {ttft:.4f}s")
+
                 resp = response_ptr[0]
                 choice = resp.choices[0]
                 msg = choice.message
@@ -811,6 +836,7 @@ class TextConversationEvent(ConversationEvent):
 
                 if content:
                     accumulated_tokens.append(content)
+                    timing_stats["token_count"] += 1
 
                 if finish_reason == "stop":
                     completion_event.set()
@@ -829,7 +855,12 @@ class TextConversationEvent(ConversationEvent):
 
         response_content = "".join(accumulated_tokens)
 
+        end_time = time.time()
+        generation_time = end_time - (timing_stats["first_token_time"] if timing_stats["first_token_time"] else timing_stats["start_time"])
+        tps = timing_stats["token_count"] / generation_time if generation_time > 0 else 0
+
         logger.debug(f"Event {self.event_id}: Inference completed, {len(response_content)} chars")
+        logger.info(f"Event {self.event_id}: Tokens Per Second (TPS): {tps:.2f} tokens/s")
 
         return response_content
 
@@ -915,9 +946,21 @@ class TextConversationEvent(ConversationEvent):
         import threading
         completion_event = threading.Event()
 
+        # Metrics tracking
+        timing_stats = {
+            "start_time": time.time(),
+            "first_token_time": None,
+            "token_count": 0
+        }
+
         @llm_service.ffi.callback("void(const Response *)")
         def callback(response_ptr):
             try:
+                if timing_stats["first_token_time"] is None:
+                    timing_stats["first_token_time"] = time.time()
+                    ttft = timing_stats["first_token_time"] - timing_stats["start_time"]
+                    logger.info(f"Event {self.event_id}: Time to First Token (TTFT): {ttft:.4f}s")
+
                 resp = response_ptr[0]
                 choice = resp.choices[0]
                 msg = choice.message
@@ -926,6 +969,7 @@ class TextConversationEvent(ConversationEvent):
 
                 if content:
                     accumulated_tokens.append(content)
+                    timing_stats["token_count"] += 1
 
                 if finish_reason == "stop":
                     completion_event.set()
@@ -941,7 +985,16 @@ class TextConversationEvent(ConversationEvent):
         if not completion_event.wait(timeout=60):
             logger.error(f"Event {self.event_id}: Tool follow-up inference timed out")
 
-        return "".join(accumulated_tokens)
+        response_content = "".join(accumulated_tokens)
+
+        end_time = time.time()
+        generation_time = end_time - (timing_stats["first_token_time"] if timing_stats["first_token_time"] else timing_stats["start_time"])
+        tps = timing_stats["token_count"] / generation_time if generation_time > 0 else 0
+
+        logger.debug(f"Event {self.event_id}: Tool follow-up completed, {len(response_content)} chars")
+        logger.info(f"Event {self.event_id}: Tokens Per Second (TPS): {tps:.2f} tokens/s")
+
+        return response_content
 
     def _handle_error(self, error: Exception, request_data) -> dict:
         """Handle error with retry logic."""
