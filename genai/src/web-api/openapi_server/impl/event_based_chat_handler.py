@@ -75,7 +75,11 @@ class EventBasedChatHandler:
             Chat completion response or streaming response
         """
         try:
+            from openapi_server.impl.constant import ADHOC_MODE
+
             logger.info("=== EVENT-BASED CHAT COMPLETION (HASH-BASED) ===")
+            if ADHOC_MODE:
+                logger.info("⚠️  ADHOC_MODE ENABLED - Handles will be created/destroyed per conversation turn")
 
             # Extract user ID
             user_id = getattr(request_data, 'user', None) or "default_user"

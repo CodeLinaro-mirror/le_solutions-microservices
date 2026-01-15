@@ -12,6 +12,29 @@ class LLMService:
     _instance = None
     _lock = threading.Lock()
 
+    @classmethod
+    def reset_singleton(cls):
+        """
+        Reset the singleton instance to force reinitialization.
+        This releases the loaded library and allows fresh initialization.
+        Used in ADHOC_MODE to ensure clean QAIRT resource management.
+        """
+        with cls._lock:
+            if cls._instance is not None:
+                # Try to close the library (CFFI may not support dlclose on all platforms)
+                if hasattr(cls._instance, 'lib') and hasattr(cls._instance, 'ffi'):
+                    try:
+                        # Note: dlclose is not always available in CFFI
+                        # This is a best-effort cleanup
+                        if hasattr(cls._instance.ffi, 'dlclose'):
+                            cls._instance.ffi.dlclose(cls._instance.lib)
+                    except Exception:
+                        # Log but don't fail - library will be garbage collected eventually
+                        pass
+
+                # Clear the instance - this will trigger reinitialization on next access
+                cls._instance = None
+
     @staticmethod
     def get_library_path():
         lib_path = os.getenv(EnvVariableKeys.ENV_LIBRARY_PATH_KEY)

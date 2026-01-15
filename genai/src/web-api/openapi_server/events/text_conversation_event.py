@@ -103,6 +103,114 @@ class TextConversationEvent(ConversationEvent):
         # Estimate tokens
         return TokenCounter.estimate_tokens_for_multimodal_content(content)
 
+    def _build_context_for_adhoc_mode(self, current_turn_messages: list) -> list:
+        """
+        Build conversation context for ADHOC_MODE by including recent complete turns
+        that fit within the 60% context budget.
+
+        Strategy:
+        - Work backwards through completed events
+        - Include complete user-assistant pairs only
+        - Skip tool calling messages
+        - Stop when budget is exhausted
+
+        Args:
+            current_turn_messages: Messages for the current turn
+
+        Returns:
+            List of messages including historical context + current turn
+        """
+        from openapi_server.impl.constant import ADHOC_MODE
+
+        if not ADHOC_MODE:
+            return current_turn_messages
+
+        # Skip context building during tool calling continuation
+        if self._is_tool_calling and self._tool_response_received:
+            logger.info(f"Event {self.event_id}: Skipping context building (tool continuation)")
+            return current_turn_messages
+
+        # Calculate context budget: 60% for input, 40% for output
+        max_input_tokens = int(self.context_size * 0.6)
+
+        # Estimate tokens for current turn
+        current_turn_tokens = sum(
+            TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+            for msg in current_turn_messages
+        )
+
+        # Calculate remaining budget for history
+        history_budget = max_input_tokens - current_turn_tokens
+
+        if history_budget <= 0:
+            logger.warning(f"Event {self.event_id}: Current turn uses all context budget")
+            return current_turn_messages
+
+        logger.info(f"Event {self.event_id}: ADHOC_MODE context building - "
+                   f"max_input: {max_input_tokens}, "
+                   f"current_turn: {current_turn_tokens}, "
+                   f"history_budget: {history_budget} tokens")
+
+        # Build context from completed events (work backwards)
+        context_messages = []
+        accumulated_tokens = 0
+        events_included = 0
+
+        for event in reversed(self.session.events):
+            # Get messages for this event
+            event_messages = self.session.get_event_messages(event)
+
+            # Filter out tool messages - only keep user and assistant messages
+            filtered_messages = []
+            for msg in event_messages:
+                role = msg.get('role', '')
+                if role in ['user', 'assistant']:
+                    # Skip assistant messages that only have tool_calls (no content)
+                    if role == 'assistant':
+                        has_content = msg.get('content') is not None and msg.get('content') != ''
+                        has_only_tool_calls = msg.get('tool_calls') and not has_content
+                        if has_only_tool_calls:
+                            continue  # Skip tool call request messages
+                    filtered_messages.append(msg)
+
+            # Skip events that don't have complete pairs
+            if not filtered_messages:
+                continue
+
+            # Estimate tokens for this event (use actual token count if available)
+            if hasattr(event, 'total_turn_tokens') and event.total_turn_tokens > 0:
+                event_tokens = event.total_turn_tokens
+            else:
+                # Fallback: estimate from messages
+                event_tokens = sum(
+                    TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+                    for msg in filtered_messages
+                )
+
+            # Check if adding this event would exceed budget
+            if accumulated_tokens + event_tokens > history_budget:
+                logger.info(f"Event {self.event_id}: Stopping context building - "
+                           f"would exceed budget ({accumulated_tokens + event_tokens} > {history_budget})")
+                break
+
+            # Add event messages to context (prepend since we're going backwards)
+            context_messages = filtered_messages + context_messages
+            accumulated_tokens += event_tokens
+            events_included += 1
+
+            logger.debug(f"Event {self.event_id}: Added event {event.event_id} to context - "
+                        f"{len(filtered_messages)} messages, {event_tokens} tokens")
+
+        # Combine historical context + current turn
+        full_context = context_messages + current_turn_messages
+
+        logger.info(f"Event {self.event_id}: ADHOC_MODE context built - "
+                   f"{len(context_messages)} historical messages from {events_included} events, "
+                   f"{accumulated_tokens} history tokens, "
+                   f"{len(full_context)} total messages")
+
+        return full_context
+
     async def execute_turn(self, request_data) -> dict:
         """
         Execute this turn (async) with summarization support.
@@ -197,6 +305,7 @@ class TextConversationEvent(ConversationEvent):
         Execute streaming inference using thread-safe queue.
         Returns a dictionary with a StreamingResponse.
         """
+        from openapi_server.impl.constant import ADHOC_MODE
         import threading
         import queue
 
@@ -212,7 +321,7 @@ class TextConversationEvent(ConversationEvent):
         # Build the complete formatted prompt
         formatted_parts = []
 
-        # Check if we need to inject summary
+        # Check if we need to inject summary (not used in ADHOC_MODE)
         if self.inject_summary and hasattr(self.session, 'summary_content') and self.session.summary_content:
             summary = self.session.summary_content
             formatted_summary = CommonUtils.format_message_with_template(
@@ -224,7 +333,7 @@ class TextConversationEvent(ConversationEvent):
 
         previous_context = ""
         # Check if we need to inject previous assistant response (if previous event involved tool calling)
-        # This reinforces context even if KV cache is present
+        # This reinforces context even if KV cache is present (not applicable in ADHOC_MODE)
         if self.handle_borrowed and self.session.events:
             try:
                 last_event = self.session.events[-1]
@@ -261,13 +370,18 @@ class TextConversationEvent(ConversationEvent):
                 "content": getattr(msg_obj, "content", "")
             })
 
+        # Build context for ADHOC_MODE (includes historical messages)
+        if ADHOC_MODE:
+            messages_to_format = self._build_context_for_adhoc_mode(messages_to_format)
+            logger.info(f"Event {self.event_id}: ADHOC_MODE - using {len(messages_to_format)} messages in streaming prompt")
+
         # Inject tools
         if hasattr(request_data, 'tools') and request_data.tools:
             messages_to_format = ToolHandler.inject_tool_instructions(
                 messages_to_format, request_data.tools
             )
 
-        # Prepend previous context to the first user message
+        # Prepend previous context to the first user message (not applicable in ADHOC_MODE)
         if previous_context:
             for msg in messages_to_format:
                 if isinstance(msg, dict) and msg.get('role') == 'user':
@@ -671,6 +785,8 @@ class TextConversationEvent(ConversationEvent):
 
     def _execute_inference(self, request_data) -> str:
         """Execute inference for this turn."""
+        from openapi_server.impl.constant import ADHOC_MODE
+
         llm_service = LLMService()
         query = llm_service.ffi.new(LLMServiceKeys.QUERY)
 
@@ -682,7 +798,7 @@ class TextConversationEvent(ConversationEvent):
         # Build the complete formatted prompt with system + user messages
         formatted_parts = []
 
-        # Check if we need to inject summary
+        # Check if we need to inject summary (not used in ADHOC_MODE)
         if self.inject_summary and hasattr(self.session, 'summary_content') and self.session.summary_content:
             summary = self.session.summary_content
             # Format summary as a system message
@@ -696,7 +812,7 @@ class TextConversationEvent(ConversationEvent):
 
         previous_context = ""
         # Check if we need to inject previous assistant response (if previous event involved tool calling)
-        # This reinforces context even if KV cache is present
+        # This reinforces context even if KV cache is present (not applicable in ADHOC_MODE)
         if self.handle_borrowed and self.session.events:
             try:
                 last_event = self.session.events[-1]
@@ -737,6 +853,11 @@ class TextConversationEvent(ConversationEvent):
                 "content": getattr(msg_obj, "content", "")
             })
 
+        # Build context for ADHOC_MODE (includes historical messages)
+        if ADHOC_MODE:
+            messages_to_format = self._build_context_for_adhoc_mode(messages_to_format)
+            logger.info(f"Event {self.event_id}: ADHOC_MODE - using {len(messages_to_format)} messages in prompt")
+
         # Always inject tools via a system message for consistency.
         if hasattr(request_data, 'tools') and request_data.tools:
             tools_count = len(request_data.tools)
@@ -745,7 +866,7 @@ class TextConversationEvent(ConversationEvent):
                 messages_to_format, request_data.tools
             )
 
-        # Prepend previous context to the first user message
+        # Prepend previous context to the first user message (not applicable in ADHOC_MODE)
         if previous_context:
             for msg in messages_to_format:
                 if isinstance(msg, dict) and msg.get('role') == 'user':
@@ -1104,6 +1225,8 @@ class TextConversationEvent(ConversationEvent):
 
     def terminate_handle(self):
         """Forcefully destroy the handle, regardless of ownership."""
+        from openapi_server.impl.constant import ADHOC_MODE
+
         if self.llm_handle:
             llm_service = LLMService()
             # We are terminating, so we destroy the handle even if borrowed
@@ -1112,6 +1235,11 @@ class TextConversationEvent(ConversationEvent):
             self.llm_handle = None
             self.handle_owned = False
             self.handle_borrowed = False
+
+            # In ADHOC_MODE, also reset the singleton to unload the library
+            if ADHOC_MODE:
+                logger.info(f"Event {self.event_id}: ADHOC_MODE - Resetting LLMService singleton to unload library")
+                LLMService.reset_singleton()
 
     def _reset_handle(self):
         """Reset handle to clear KV cache."""

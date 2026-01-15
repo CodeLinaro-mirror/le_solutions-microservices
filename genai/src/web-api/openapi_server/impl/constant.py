@@ -1,6 +1,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
+import os
 
 # GENAI interface file path
 # This path is mounted path of container. Check docker-compose volume section for path in host machine.
@@ -145,3 +146,8 @@ class ModelConfigConstants:
     DEFAULT_CONFIG_PATH = "/root/app/openapi_server/configs/models_config.json"
     DEFAULT_CONFIGS_DIR = "/root/app/openapi_server/configs"
     ENV_CONFIG_PATH_KEY = "GENAI_MODELS_CONFIG_PATH"
+
+# ADHOC Mode Configuration
+# When enabled, LLM handles are created and destroyed for each conversation turn
+# This prevents QAIRT handle conflicts when multiple containers access the same NSP
+ADHOC_MODE = os.getenv("ADHOC_MODE", "false").lower() in ("true", "1", "yes", "on")

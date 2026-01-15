@@ -36,6 +36,7 @@ services:
       - LLM_LIBRARY_PATH=${LLM_LIBRARY_PATH:-/root/app/site-packages/libllmservice.so}
       - GENAI_INTERFACE_FILE=${GENAI_INTERFACE_FILE:-/usr/include/genai_interface.h}
       - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/root/app/site-packages/models_config.json}
+      - ADHOC_MODE=${ADHOC_MODE:-false}
     # Memory and resource limits for VLM model loading
     deploy:
       resources:

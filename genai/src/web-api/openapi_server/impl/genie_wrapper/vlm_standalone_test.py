@@ -102,6 +102,7 @@ def parse_args():
     parser.add_argument("--frequency-penalty", type=float, default=0.0, help="Frequency penalty")
     parser.add_argument("--stream", action="store_true", help="Enable streaming mode")
     parser.add_argument("--config-path", help="Path to models_config.json")
+    parser.add_argument("--output-pipe", help="Named pipe path for structured output")
 
     return parser.parse_args()
 
@@ -526,6 +527,16 @@ def main():
     CommonUtils.copy_py_float_to_c_field(ffi, query, 'presence_penalty', args.presence_penalty)
     CommonUtils.copy_py_float_to_c_field(ffi, query, 'frequency_penalty', args.frequency_penalty)
 
+    # Open output pipe if provided
+    pipe_handle = None
+    if args.output_pipe:
+        try:
+            pipe_handle = open(args.output_pipe, 'w', buffering=1)  # Line buffered
+            logger.info(f"Opened output pipe: {args.output_pipe}")
+        except Exception as e:
+            logger.error(f"Failed to open output pipe: {e}")
+            sys.exit(1)
+
     # Define callback
     streaming_output = []
 
@@ -537,6 +548,26 @@ def main():
 
         content = ffi.string(msg.content).decode("utf-8")
         finish_reason = ffi.string(choice.finish_reason).decode("utf-8")
+
+        # Write to pipe if provided
+        if pipe_handle:
+            try:
+                # Send token
+                pipe_handle.write(json.dumps({
+                    "type": "token",
+                    "content": content
+                }) + '\n')
+                pipe_handle.flush()
+
+                # Send done if finished
+                if finish_reason == "stop":
+                    pipe_handle.write(json.dumps({
+                        "type": "done",
+                        "finish_reason": finish_reason
+                    }) + '\n')
+                    pipe_handle.flush()
+            except Exception as e:
+                logger.error(f"Error writing to pipe: {e}")
 
         if args.stream:
             # Print streaming output
@@ -570,24 +601,43 @@ def main():
         # Wait for completion
         result = executor.wait_for_completion()
 
-        # Log result with uniform markers
-        if not args.stream:
-            logger.info("=== VLM_RESPONSE_START ===")
-            logger.info(result['choices'][0]['message']['content'])
-            logger.info("=== VLM_RESPONSE_END ===")
-        else:
-            # For streaming mode, log the accumulated output
-            if streaming_output:
+        # Log result with uniform markers (only if not using pipe)
+        if not pipe_handle:
+            if not args.stream:
                 logger.info("=== VLM_RESPONSE_START ===")
-                logger.info(''.join(streaming_output))
+                logger.info(result['choices'][0]['message']['content'])
                 logger.info("=== VLM_RESPONSE_END ===")
+            else:
+                # For streaming mode, log the accumulated output
+                if streaming_output:
+                    logger.info("=== VLM_RESPONSE_START ===")
+                    logger.info(''.join(streaming_output))
+                    logger.info("=== VLM_RESPONSE_END ===")
 
         logger.info(f"Finish reason: {result['choices'][0]['finish_reason']}")
 
     except Exception as e:
         logger.error(f"Error: {e}")
+        # Write error to pipe if available
+        if pipe_handle:
+            try:
+                pipe_handle.write(json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                }) + '\n')
+                pipe_handle.flush()
+            except:
+                pass
         sys.exit(1)
     finally:
+        # Close pipe if opened
+        if pipe_handle:
+            try:
+                pipe_handle.close()
+                logger.info("Closed output pipe")
+            except Exception as e:
+                logger.warning(f"Error closing pipe: {e}")
+
         # Shutdown executor
         executor.shutdown()
 
