@@ -3,8 +3,8 @@
 
 openapi: 3.0.3
 info:
-  title: IOT Solutions - Gen-AI Microservice APIs
-  description: These REST APIs provide the capability to run inference on Qualcomm 9100 devices.
+  title: LLM-VLM GenAI Microservice APIs
+  description: These REST APIs provide the capability to run inference on Qualcomm Dragonwing devices.
   version: '1.0.0'
 servers:
   - url: /
@@ -87,10 +87,26 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/ChatCompletionRequestMessage"
+          example:
+            - role: "system"
+              content: "You are a helpful assistant."
+            - role: "user"
+              content: [
+                {
+                  "type": "text",
+                  "text": "What is in this image?"
+                },
+                {
+                  "type": "image_url",
+                  "image_url": {
+                    "url": "https://bit.ly/4obmTP8"
+                  }
+                }
+              ]
         model:
           type: string
-          description: Model ID used to generate the response, like gpt-4o or o3. OpenAI offers a wide range of models with different capabilities, performance characteristics, and price points.
-          example: "gpt-4o"
+          description: Model ID used to generate the response.
+          example: "qwen2.5-vl-3b"
         frequency_penalty:
           type: number
           default: 0
@@ -239,6 +255,12 @@ components:
               items:
                 $ref: "#/components/schemas/ChatCompletionRequestMessageContentPart"
               minItems: 1
+              example:
+                - type: "text"
+                  text: "What is in this image?"
+                - type: "image_url"
+                  image_url:
+                    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
         role:
           type: string
           enum:
@@ -250,6 +272,20 @@ components:
       required:
         - content
         - role
+      example:
+        role: "user"
+        content: [
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+            }
+          }
+        ]
 
     ChatCompletionRequestAssistantMessage:
       type: object

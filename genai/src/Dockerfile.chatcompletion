@@ -2,7 +2,7 @@
 # Stage 1: Build Stage
 #######################
 
-FROM ubuntu:24.04 AS genai-builder-chatcompletion
+FROM ubuntu:24.04 AS genai-llm-vlm-service-builder
 
 # Enable color prompt
 RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /root/.bashrc
@@ -118,7 +118,7 @@ RUN bash -c "source ${VLM_SCRIPTS_DIR}/setup.sh && VLM-build"
 # Stage 2: Runtime Stage
 #########################
 
-FROM ubuntu:24.04 AS genai-service-chatcompletion
+FROM ubuntu:24.04 AS genai-llm-vlm-service
 
 # Common ubuntu packages
 # Install Python 3.12 and runtime image processing libraries
@@ -139,28 +139,28 @@ RUN apt-get update                                                              
 RUN mkdir -p /root/app/site-packages
 
 # Copy the virtual environment with web-api package installed with dependencies
-COPY --from=genai-builder-chatcompletion /mnt/work/venv /mnt/work/venv
+COPY --from=genai-llm-vlm-service-builder /mnt/work/venv /mnt/work/venv
 ENV PATH=/mnt/work/venv/bin:$PATH
 
 # copy interface file
-COPY --from=genai-builder-chatcompletion                                                           \
+COPY --from=genai-llm-vlm-service-builder                                                          \
     /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/include/genai_interface.h              \
     /usr/include/
 
 # Copy openapi.yaml as a dependency of FastAPI's openapi schema
-COPY --from=genai-builder-chatcompletion /mnt/work/src/web-api/openapi_server/openapi.yaml         \
+COPY --from=genai-llm-vlm-service-builder /mnt/work/src/web-api/openapi_server/openapi.yaml         \
     /root/app/site-packages/
 
-COPY --from=genai-builder-chatcompletion                                                           \
+COPY --from=genai-llm-vlm-service-builder                                                           \
     /mnt/work/src/web-api/openapi_server/configs/models_config.json                                \
     /root/app/site-packages/
 
-COPY --from=genai-builder-chatcompletion                                                           \
+COPY --from=genai-llm-vlm-service-builder                                                           \
     /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/vlm_standalone_test.py                 \
     /root/app/site-packages/
 
 # copy all libraries
-COPY --from=genai-builder-chatcompletion /mnt/work/deploy/usr /usr
+COPY --from=genai-llm-vlm-service-builder /mnt/work/deploy/usr /usr
 
 # create symlink of libvlmservice library
 RUN ln -s /usr/lib/libvlmservice.so /root/app/site-packages/libvlmservice.so
