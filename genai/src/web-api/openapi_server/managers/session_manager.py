@@ -216,7 +216,13 @@ class SessionManager:
 
     def delete_session(self, session_id: str) -> bool:
         """
-        Delete a session.
+        Delete a session and cleanup all associated resources.
+
+        This includes:
+        - Terminating handle from the most recent event only (to prevent double-free)
+        - Resetting LLM singleton in ADHOC_MODE
+        - Removing hash mappings
+        - Removing tool calling mappings
 
         Args:
             session_id: Session identifier (chat completion ID)
@@ -228,27 +234,56 @@ class SessionManager:
             if session_id in self._sessions:
                 session = self._sessions[session_id]
 
-                # Cleanup current event's handle if exists
-                if session.current_event:
-                    try:
-                        session.current_event.release_handle()
-                    except Exception as e:
-                        logger.error(f"Error releasing handle during session deletion: {e}")
+                # IMPORTANT: Only cleanup handle from the most recent event
+                # In ADHOC_MODE=false, handles are borrowed forward through the event chain,
+                # so all events share the same handle pointer. Destroying it multiple times
+                # causes "double free or corruption" errors.
+                # We only need to destroy the handle once from the latest event.
 
-                # Remove from hash mapping (deprecated method, use stored map)
+                # Try current_event first (most common case - active session)
+                if session.current_event and session.current_event.llm_handle:
+                    try:
+                        logger.info(f"Terminating handle from current event {session.current_event.event_id}")
+                        session.current_event.terminate_handle()
+                    except Exception as e:
+                        logger.error(f"Error terminating current event handle: {e}")
+
+                # If no current_event, try the last completed event
+                elif session.events:
+                    last_event = session.events[-1]
+                    if last_event.llm_handle:
+                        try:
+                            logger.info(f"Terminating handle from last event {last_event.event_id}")
+                            last_event.terminate_handle()
+                        except Exception as e:
+                            logger.error(f"Error terminating last event handle: {e}")
+
+                # In ADHOC_MODE, reset the LLM singleton
+                from openapi_server.impl.constant import ADHOC_MODE
+                if ADHOC_MODE:
+                    try:
+                        from openapi_server.impl.genie_wrapper.gen_ai_service_singleton import LLMService
+                        logger.info(f"ADHOC_MODE: Resetting LLMService singleton during session deletion")
+                        LLMService.reset_singleton()
+                    except Exception as e:
+                        logger.error(f"Error resetting LLM singleton: {e}")
+
+                # Remove from hash mapping
                 # We iterate to remove all entries pointing to this session
-                # This is less efficient but safer than recalculating
                 keys_to_remove = [k for k, v in self._hash_to_session.items() if v == session_id]
                 for k in keys_to_remove:
                     del self._hash_to_session[k]
+                logger.debug(f"Removed {len(keys_to_remove)} hash mappings for session {session_id}")
 
                 # Remove from tool calling map
                 tool_keys_to_remove = [k for k, v in self._tool_calling_map.items() if v == session_id]
                 for k in tool_keys_to_remove:
                     del self._tool_calling_map[k]
+                logger.debug(f"Removed {len(tool_keys_to_remove)} tool calling mappings for session {session_id}")
 
+                # Delete the session
                 del self._sessions[session_id]
-                logger.info(f"Deleted session {session_id}")
+                logger.info(f"Successfully deleted session {session_id} with complete resource cleanup")
                 return True
 
         logger.warning(f"Session {session_id} not found for deletion")

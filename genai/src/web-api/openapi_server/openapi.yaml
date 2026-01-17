@@ -29,6 +29,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/CreateChatCompletionResponse"
 
+  /v1/chat/completions/{completion_id}:
+    delete:
+      operationId: deleteChatCompletion
+      tags:
+        - Chat
+      summary: Delete a stored chat completion
+      description: Deletes a chat completion by ID, cleaning up all associated resources.
+      parameters:
+        - name: completion_id
+          in: path
+          required: true
+          description: The ID of the chat completion to delete
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The chat completion was deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionDeleted"
+        "404":
+          description: The chat completion with the specified ID was not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                    description: Error message describing why the completion was not found
+
   /v1/health:
     get:
       tags:
@@ -496,3 +528,24 @@ components:
         - id
         - type
         - function
+
+    ChatCompletionDeleted:
+      type: object
+      title: Chat completion deleted
+      description: Represents the deletion confirmation of a chat completion.
+      properties:
+        id:
+          type: string
+          description: The ID of the deleted chat completion.
+        object:
+          type: string
+          description: The object type, which is always "chat.completion.deleted".
+          enum:
+            - chat.completion.deleted
+        deleted:
+          type: boolean
+          description: Whether the chat completion was successfully deleted.
+      required:
+        - id
+        - object
+        - deleted
