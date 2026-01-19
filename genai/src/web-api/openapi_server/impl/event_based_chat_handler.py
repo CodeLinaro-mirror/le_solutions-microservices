@@ -62,7 +62,9 @@ class EventBasedChatHandler:
     @staticmethod
     async def handle_chat_completion(
         request_data: CreateChatCompletionRequest,
-        raw_json: dict = None
+        raw_json: dict = None,
+        session = None,
+        completion_callback = None
     ) -> Union[StreamingResponse, CreateChatCompletionResponse]:
         """
         Main entry point for event-based chat completion with hash-based session lookup.
@@ -70,6 +72,8 @@ class EventBasedChatHandler:
         Args:
             request_data: The chat completion request
             raw_json: Optional raw JSON to bypass Pydantic issues
+            session: Pre-resolved ConversationSession (REQUIRED - provided by API layer)
+            completion_callback: Optional callback to register on event before execution
 
         Returns:
             Chat completion response or streaming response
@@ -81,8 +85,12 @@ class EventBasedChatHandler:
             if ADHOC_MODE:
                 logger.info("⚠️  ADHOC_MODE ENABLED - Handles will be created/destroyed per conversation turn")
 
-            # Extract user ID
-            user_id = getattr(request_data, 'user', None) or "default_user"
+            # Session must be provided by API layer
+            if session is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Internal error: session not provided by API layer"
+                )
 
             # Extract messages
             messages = EventBasedChatHandler.extract_messages_from_request(request_data, raw_json)
@@ -106,35 +114,45 @@ class EventBasedChatHandler:
                     detail=f"Model '{requested_model}' not found"
                 )
 
-            # Get or create session using hash-based lookup
-            session_manager = SessionManager.get_instance()
-            session, is_new = session_manager.find_or_create_session(user_id, messages)
-
             # Get chat completion ID from session
             chat_completion_id = session.session_id
 
-            logger.info(f"Session: {chat_completion_id} (new={is_new})")
+            # Determine if this is a new session (no messages yet)
+            is_new = len(session.messages) == 0
 
-            # Determine what messages to add to session
-            if is_new:
-                # New session - add all messages
-                new_messages = messages
-            else:
-                # Existing session - only add new messages not in session history
-                existing_count = len(session.messages)
-                new_messages = messages[existing_count:]
+            logger.info(f"Session: {chat_completion_id} (new={is_new}, existing_messages={len(session.messages)})")
 
-            if not new_messages:
-                raise HTTPException(400, "No new messages to process")
-
-            # Check if we're continuing a tool calling event
+            # STEP 1: Check if we're continuing a tool calling event FIRST
+            # This must be checked before calculating new_messages to handle tool continuations correctly
             current_event = session.get_current_event()
             is_tool_continuation = (
                 current_event and
                 current_event.is_active() and
                 current_event._is_tool_calling and
-                new_messages[-1].get('role') == 'tool'
+                messages[-1].get('role') == 'tool'
             )
+
+            # STEP 2: Determine new messages based on whether this is a tool continuation
+            if is_tool_continuation:
+                # Tool continuation - only process the tool message (last message)
+                # This is robust against any session state issues
+                new_messages = [messages[-1]]
+                logger.info(f"Tool continuation detected - processing tool message only")
+            else:
+                # New turn - calculate new messages based on session state
+                if is_new:
+                    # New session - add all messages
+                    new_messages = messages
+                else:
+                    # Existing session - only add new messages not in session history
+                    existing_count = len(session.messages)
+                    new_messages = messages[existing_count:]
+
+            # Validate we have messages to process
+            if not new_messages:
+                raise HTTPException(400, "No new messages to process")
+
+            logger.info(f"Processing {len(new_messages)} new message(s)")
 
             if is_tool_continuation:
                 logger.info("=== CONTINUING TOOL CALLING ===")
@@ -168,7 +186,8 @@ class EventBasedChatHandler:
                                            if session.messages[idx].get('role') == 'user']
                     user_messages = [session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
-                    session_manager.unregister_tool_calling_event(event_hash)
+                    session_mgr = SessionManager.get_instance()
+                    session_mgr.unregister_tool_calling_event(event_hash)
 
                     # Complete the event state
                     current_event.complete_turn()
@@ -198,6 +217,12 @@ class EventBasedChatHandler:
                 if user_msgs:
                     event.user_message = user_msgs[-1]['content']
 
+                # CRITICAL: Register completion callback BEFORE execute_turn()
+                # This ensures the callback is available when VLM/LLM handlers need it
+                if completion_callback:
+                    event.register_completion_callback(completion_callback)
+                    logger.info(f"✓ Registered completion callback on event {event.event_id} BEFORE execution")
+
                 # Handle tool instructions if tools provided
                 if request_data.tools and len(request_data.tools) > 0:
                     logger.info(f"Function calling enabled with {len(request_data.tools)} tools")
@@ -208,8 +233,29 @@ class EventBasedChatHandler:
                     )
                     request_data = modified_request
 
-                # Execute turn (now async)
-                result = await event.execute_turn(request_data)
+                # Execute turn (now async) with error handling
+                try:
+                    result = await event.execute_turn(request_data)
+                except RuntimeError as e:
+                    # Handle model loading failures and resource unavailability
+                    error_msg = str(e)
+                    logger.error(f"Event execution failed: {error_msg}")
+
+                    # Determine appropriate HTTP status code based on error message
+                    if "circuit breaker" in error_msg.lower() or "temporarily unavailable" in error_msg.lower():
+                        status_code = HttpStatusCodes.SERVICE_UNAVAILABLE  # 503
+                        error_type = "service_unavailable"
+                    elif "initialization failed" in error_msg.lower() or "failed to create" in error_msg.lower():
+                        status_code = HttpStatusCodes.INTERNAL_SERVER_ERROR  # 500
+                        error_type = "model_initialization_error"
+                    else:
+                        status_code = HttpStatusCodes.INTERNAL_SERVER_ERROR  # 500
+                        error_type = "internal_error"
+
+                    raise HTTPException(
+                        status_code=status_code,
+                        detail=error_msg
+                    )
 
                 # Handle streaming response
                 if result.get('is_streaming', False):
@@ -233,7 +279,8 @@ class EventBasedChatHandler:
                                            if session.messages[idx].get('role') == 'user']
                     user_messages = [session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
-                    session_manager.register_tool_calling_event(event_hash, session.session_id)
+                    session_mgr = SessionManager.get_instance()
+                    session_mgr.register_tool_calling_event(event_hash, session.session_id)
 
                 elif result['turn_complete']:
                     # Regular response - add assistant message

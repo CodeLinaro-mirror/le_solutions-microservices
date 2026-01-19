@@ -722,6 +722,15 @@ class TextConversationEvent(ConversationEvent):
                 logger.info(f"Event {self.event_id}: Streaming completed, {completion_tokens} tokens (finish_reason: {finish_reason})")
                 logger.info(f"Event {self.event_id}: Tokens Per Second (TPS): {tps:.2f} tokens/s")
 
+                # CRITICAL: Trigger completion callback to release DSP lock
+                # This must happen after streaming completes to ensure proper lock management
+                if self._completion_callback:
+                    logger.info(f"Event {self.event_id}: Triggering completion callback from streaming generator")
+                    try:
+                        await self._completion_callback(self.event_id, self.state)
+                    except Exception as e:
+                        logger.error(f"Event {self.event_id}: Error in streaming completion callback: {e}", exc_info=True)
+
         # Set SSE/blocking headers
         response_headers = {
             "Cache-Control": "no-cache",
@@ -1193,24 +1202,49 @@ class TextConversationEvent(ConversationEvent):
         logger.info(f"Event {self.event_id}: Took over handle from {previous_event.event_id}")
 
     def create_new_handle(self):
-        """Create new handle for this event."""
-        llm_service = LLMService()
-        config_path = CommonUtils.get_model_config_path(self.model_id)
+        """Create new handle for this event with simplified error handling."""
+        from openapi_server.impl.constant import ADHOC_MODE
 
-        model_input = llm_service.ffi.new("char[]", self.model_id.encode('utf-8'))
-        config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
+        # Check circuit breaker
+        if LLMService.is_circuit_breaker_open():
+            error_msg = LLMService.get_initialization_error()
+            if not error_msg:
+                error_msg = "Service temporarily unavailable due to repeated model loading failures"
+            logger.error(f"Event {self.event_id}: {error_msg}")
+            raise RuntimeError(error_msg)
 
-        self.llm_handle = llm_service.lib.llm_create_object(
-            model_input, config_path_input, True
-        )
+        try:
+            llm_service = LLMService()
+            config_path = CommonUtils.get_model_config_path(self.model_id)
 
-        if self.llm_handle == llm_service.ffi.NULL:
-            raise RuntimeError("Failed to create LLM handle")
+            model_input = llm_service.ffi.new("char[]", self.model_id.encode('utf-8'))
+            config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
 
-        self.handle_owned = True
-        self.handle_borrowed = False
+            self.llm_handle = llm_service.lib.llm_create_object(
+                model_input, config_path_input, True
+            )
 
-        logger.info(f"Event {self.event_id}: Created new handle for model {self.model_id} (streaming mode)")
+            # Simple NULL check - no function calls to undefined C functions
+            if self.llm_handle == llm_service.ffi.NULL:
+                error_msg = f"Failed to create LLM handle for model {self.model_id} (NULL handle returned)"
+                logger.error(f"Event {self.event_id}: {error_msg}")
+                LLMService.record_failure(error_msg)
+                raise RuntimeError(error_msg)
+
+            # Success - reset failure count
+            LLMService.record_success()
+            self.handle_owned = True
+            self.handle_borrowed = False
+
+            logger.info(f"Event {self.event_id}: Created new handle for model {self.model_id} (streaming mode)")
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            error_msg = f"Failed to create LLM handle: {str(e)}"
+            logger.error(f"Event {self.event_id}: Unexpected error creating handle: {e}", exc_info=True)
+            LLMService.record_failure(error_msg)
+            raise RuntimeError(error_msg)
 
     def release_handle(self):
         """Release handle."""

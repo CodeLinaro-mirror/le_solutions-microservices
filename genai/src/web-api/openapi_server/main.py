@@ -42,10 +42,12 @@ logger = LoggerConfig.get_logger(__name__)
 async def lifespan(app: FastAPI):
     """
     Lifespan context manager for FastAPI application.
-    Manages the lifecycle of VLM resources including:
+    Manages the lifecycle of application resources including:
     - VLM thread pool for blocking operations
     - VLM execution thread for thread-affinity operations
     - VLM operation lock for serializing requests
+    - RequestQueueManager for ADHOC_MODE DSP serialization
+    - ModelConfigManager for model configuration
 
     VLM initialization is controlled by the ENABLE_VLM environment variable.
     Set ENABLE_VLM=true to enable VLM support, or ENABLE_VLM=false to disable it.
@@ -55,6 +57,22 @@ async def lifespan(app: FastAPI):
     enable_vlm = os.getenv("ENABLE_VLM", "true").lower() in ("true", "1", "yes", "on")
 
     vlm_initialized = False
+    queue_manager_started = False
+
+    # ========== STARTUP ==========
+
+    logger.info(f"Starting Gen-AI Microservice - Version {__version__}")
+
+    # Initialize ModelConfigManager to load configuration
+    try:
+        config_manager = ModelConfigManager()
+        models = config_manager.get_available_models()
+        logger.info(f"Loaded {len(models)} models from configuration")
+        for model in models:
+            logger.info(f"  - {model['id']}: {model.get('display_name', 'N/A')}")
+    except Exception as e:
+        logger.error(f"Failed to initialize ModelConfigManager: {e}", exc_info=True)
+        logger.warning("Service will continue with fallback configuration")
 
     if enable_vlm:
         # Startup - Initialize VLM Resources
@@ -75,9 +93,31 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("=== VLM Disabled - Skipping VLM initialization (ENABLE_VLM=false) ===")
 
+    # Initialize RequestQueueManager for ADHOC_MODE
+    from openapi_server.impl.constant import ADHOC_MODE
+    if ADHOC_MODE:
+        from openapi_server.managers.request_queue_manager import RequestQueueManager
+        queue_manager = RequestQueueManager.get_instance()
+        await queue_manager.start_worker()
+        queue_manager_started = True
+        logger.info("✓ RequestQueueManager started for ADHOC_MODE")
+    else:
+        logger.info("RequestQueueManager disabled (ADHOC_MODE=false)")
+
     yield
 
-    # Shutdown - Only if VLM was initialized
+    # ========== SHUTDOWN ==========
+
+    logger.info("Shutting down Gen-AI Microservice")
+
+    # Shutdown RequestQueueManager if enabled
+    if queue_manager_started:
+        from openapi_server.managers.request_queue_manager import RequestQueueManager
+        queue_manager = RequestQueueManager.get_instance()
+        await queue_manager.shutdown()
+        logger.info("✓ RequestQueueManager shut down")
+
+    # Shutdown VLM resources - Only if VLM was initialized
     if vlm_initialized:
         logger.info("=== Shutting Down VLM Resources ===")
 
@@ -121,25 +161,6 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 app.add_middleware(LoggingMiddleware)
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info(f"Starting Gen-AI Microservice - Version {__version__}")
-
-    # Initialize ModelConfigManager to load configuration
-    try:
-        config_manager = ModelConfigManager()
-        models = config_manager.get_available_models()
-        logger.info(f"Loaded {len(models)} models from configuration")
-        for model in models:
-            logger.info(f"  - {model['id']}: {model.get('display_name', 'N/A')}")
-    except Exception as e:
-        logger.error(f"Failed to initialize ModelConfigManager: {e}", exc_info=True)
-        logger.warning("Service will continue with fallback configuration")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down Gen-AI Microservice")
 
 app.include_router(ModelApiRouter)
 app.include_router(ChatApiRouter)

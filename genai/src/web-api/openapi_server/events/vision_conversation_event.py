@@ -76,17 +76,39 @@ class VisionConversationEvent(ConversationEvent):
             logger.info(f"Event {self.event_id}: Executing VLM turn with {len(self.session.messages)} messages in history")
 
             # Delegate to existing VLM handler (already async)
+            # Pass completion callback for streaming lock release
+            # Pass event object so VLM handler can complete the event before triggering callback
             result = await GenieWrapperCreateVLMChatCompletion.create_vlm_chat_completion(
-                request_data, raw_json
+                request_data,
+                raw_json,
+                completion_callback=self._completion_callback,
+                event_id=self.event_id,
+                event_state=self.state,
+                event_object=self  # Pass event object for proper completion
             )
 
             # Handle different result types
             if isinstance(result, Error):
                 raise Exception(result.message)
 
+            # Check if it's a tuple (streaming with content)
+            if isinstance(result, tuple):
+                streaming_response, content = result
+                self.assistant_message = content  # Store content for session
+
+                logger.info(f"Event {self.event_id}: Returning streaming response with {len(content)} chars")
+
+                return {
+                    "response": streaming_response,
+                    "finish_reason": "stop",
+                    "needs_tool_response": False,
+                    "turn_complete": True,
+                    "is_streaming": True
+                }
+
+            # Check if it's a StreamingResponse (shouldn't happen now, but handle it)
             if isinstance(result, StreamingResponse):
-                # Streaming response - return as-is for handler to pass through
-                logger.info(f"Event {self.event_id}: Returning streaming response")
+                logger.warning(f"Event {self.event_id}: Got StreamingResponse without content tuple")
                 return {
                     "response": result,  # StreamingResponse object
                     "finish_reason": "stop",
@@ -94,22 +116,22 @@ class VisionConversationEvent(ConversationEvent):
                     "turn_complete": True,
                     "is_streaming": True
                 }
-            else:
-                # Non-streaming response
-                content = result.choices[0].message.content
-                self.assistant_message = content
-                # Note: complete_turn() will be called by the handler after adding assistant message index
-                # This ensures the event hash includes all messages in the turn
 
-                logger.info(f"Event {self.event_id}: Turn completed, {len(content)} chars")
+            # Non-streaming response
+            content = result.choices[0].message.content
+            self.assistant_message = content
+            # Note: complete_turn() will be called by the handler after adding assistant message index
+            # This ensures the event hash includes all messages in the turn
 
-                return {
-                    "response": content,
-                    "finish_reason": "stop",
-                    "needs_tool_response": False,
-                    "turn_complete": True,
-                    "is_streaming": False
-                }
+            logger.info(f"Event {self.event_id}: Turn completed, {len(content)} chars")
+
+            return {
+                "response": content,
+                "finish_reason": "stop",
+                "needs_tool_response": False,
+                "turn_complete": True,
+                "is_streaming": False
+            }
 
         except Exception as e:
             logger.error(f"Event {self.event_id}: VLM execution failed: {e}")

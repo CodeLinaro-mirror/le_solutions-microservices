@@ -8,9 +8,10 @@ Each event handles one user message → assistant response cycle.
 
 import time
 import hashlib
+import asyncio
 from enum import Enum
 from abc import ABC, abstractmethod
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Callable
 from queue import Queue
 
 from openapi_server.logger.logger_config import LoggerConfig
@@ -130,6 +131,9 @@ class ConversationEvent(ABC):
         self._pending_tool_calls: List[dict] = []
         self._tool_response_received = False
 
+        # Completion callback (for ADHOC_MODE lock management)
+        self._completion_callback: Optional[Callable] = None
+
     @abstractmethod
     async def execute_turn(self, request_data) -> dict:
         """
@@ -237,6 +241,10 @@ class ConversationEvent(ABC):
                 except Exception as e:
                     logger.error(f"Event {self.event_id}: Error cleaning up handle in ADHOC_MODE: {e}")
 
+            # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
+            if self._completion_callback:
+                asyncio.create_task(self._trigger_completion_callback())
+
     def fail_turn(self, error: Exception):
         """Mark turn as failed."""
         if self.state == EventState.ACTIVE:
@@ -289,6 +297,29 @@ class ConversationEvent(ABC):
 
         logger.info(f"Event {self.event_id}: Calculated event hash = {self.event_hash}")
         return self.event_hash
+
+    def register_completion_callback(self, callback: Callable):
+        """
+        Register a callback to be called when this event completes.
+        Used by RequestQueueManager in ADHOC_MODE for lock management.
+
+        Args:
+            callback: Async function(event_id, event_state) to call on completion
+        """
+        self._completion_callback = callback
+        logger.debug(f"Event {self.event_id}: Registered completion callback")
+
+    async def _trigger_completion_callback(self):
+        """
+        Trigger the completion callback if registered.
+        Called automatically by complete_turn().
+        """
+        if self._completion_callback:
+            try:
+                logger.debug(f"Event {self.event_id}: Triggering completion callback (state={self.state.value})")
+                await self._completion_callback(self.event_id, self.state)
+            except Exception as e:
+                logger.error(f"Event {self.event_id}: Error in completion callback: {e}", exc_info=True)
 
     def is_active(self) -> bool:
         """Check if event is active."""

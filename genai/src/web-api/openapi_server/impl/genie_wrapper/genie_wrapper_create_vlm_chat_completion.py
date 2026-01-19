@@ -362,13 +362,21 @@ class GenieWrapperCreateVLMChatCompletion:
 
     @staticmethod
     async def create_vlm_chat_completion(request_data: CreateChatCompletionRequest,
-                                       raw_json: dict = None) -> Union[CreateChatCompletionResponse, StreamingResponse, Error]:
+                                       raw_json: dict = None,
+                                       completion_callback=None,
+                                       event_id: Optional[str] = None,
+                                       event_state: Optional[str] = None,
+                                       event_object=None) -> Union[CreateChatCompletionResponse, StreamingResponse, Error]:
         """
         Main entry point for VLM chat completion with named pipe IPC.
 
         Args:
             request_data: The chat completion request
             raw_json: Optional raw JSON to bypass Pydantic issues (should include 'session_id')
+            completion_callback: Optional async callback to trigger when streaming completes
+            event_id: Optional event ID for callback
+            event_state: Optional event state for callback
+            event_object: Optional event object for proper completion before callback
 
         Returns:
             Chat completion response, streaming response, or error
@@ -515,11 +523,13 @@ class GenieWrapperCreateVLMChatCompletion:
             # Handle streaming vs non-streaming
             if getattr(request_data, "stream", False):
                 return await GenieWrapperCreateVLMChatCompletion._handle_streaming_response(
-                    pipe_path, process, request_data, conversation_hash, temp_file_path
+                    pipe_path, process, request_data, conversation_hash, temp_file_path,
+                    completion_callback, event_id, event_state, event_object
                 )
             else:
                 return await GenieWrapperCreateVLMChatCompletion._handle_non_streaming_response(
-                    pipe_path, process, request_data, conversation_hash, temp_file_path
+                    pipe_path, process, request_data, conversation_hash, temp_file_path,
+                    completion_callback, event_id, event_state, event_object
                 )
 
         except Exception as e:
@@ -536,7 +546,10 @@ class GenieWrapperCreateVLMChatCompletion:
     @staticmethod
     async def _handle_streaming_response(pipe_path: str, process: subprocess.Popen,
                                         request_data: CreateChatCompletionRequest,
-                                        session_id: str, temp_file_path: Optional[str]) -> StreamingResponse:
+                                        session_id: str, temp_file_path: Optional[str],
+                                        completion_callback=None, event_id: Optional[str] = None,
+                                        event_state: Optional[str] = None,
+                                        event_object=None) -> StreamingResponse:
         """Handle streaming response via named pipe."""
         created = int(time.time())
         model = request_data.model
@@ -617,8 +630,36 @@ class GenieWrapperCreateVLMChatCompletion:
                 yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                # Cleanup
+                # Cleanup resources
                 GenieWrapperCreateVLMChatCompletion._cleanup_resources(pipe_path, temp_file_path, process)
+
+                # CRITICAL: Complete the event BEFORE triggering callback
+                # This ensures event state is COMPLETED when request queue manager checks it
+                if event_object:
+                    try:
+                        logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
+
+                        # Complete the turn (sets state to COMPLETED)
+                        event_object.complete_turn()
+
+                        # Calculate event hash (includes all messages in turn)
+                        event_object.calculate_event_hash()
+
+                        # Mark session's current event as complete
+                        if hasattr(event_object, 'session') and event_object.session:
+                            event_object.session.complete_current_event()
+
+                        logger.info(f"VLM Event {event_id}: Event completed successfully, state={event_object.state.value}")
+                    except Exception as e:
+                        logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
+
+                # NOW trigger completion callback - event is already COMPLETED
+                if completion_callback:
+                    logger.info(f"VLM Event {event_id}: Triggering completion callback (event already completed)")
+                    try:
+                        await completion_callback(event_id, event_state)
+                    except Exception as e:
+                        logger.error(f"VLM Event {event_id}: Error in streaming completion callback: {e}", exc_info=True)
 
         # Set SSE headers
         response_headers = {
@@ -635,7 +676,10 @@ class GenieWrapperCreateVLMChatCompletion:
     @staticmethod
     async def _handle_non_streaming_response(pipe_path: str, process: subprocess.Popen,
                                             request_data: CreateChatCompletionRequest,
-                                            session_id: str, temp_file_path: Optional[str]) -> Union[CreateChatCompletionResponse, Error]:
+                                            session_id: str, temp_file_path: Optional[str],
+                                            completion_callback=None, event_id: Optional[str] = None,
+                                            event_state: Optional[str] = None,
+                                            event_object=None) -> Union[CreateChatCompletionResponse, Error]:
         """Handle non-streaming response via named pipe."""
         accumulated_content = []
         finish_reason = "stop"
@@ -690,8 +734,36 @@ class GenieWrapperCreateVLMChatCompletion:
                 type=Parameters.INTERNAL_TYPE
             )
         finally:
-            # Cleanup
+            # Cleanup resources
             GenieWrapperCreateVLMChatCompletion._cleanup_resources(pipe_path, temp_file_path, process)
+
+            # CRITICAL: Complete the event BEFORE triggering callback
+            # This ensures event state is COMPLETED when request queue manager checks it
+            if event_object:
+                try:
+                    logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
+
+                    # Complete the turn (sets state to COMPLETED)
+                    event_object.complete_turn()
+
+                    # Calculate event hash (includes all messages in turn)
+                    event_object.calculate_event_hash()
+
+                    # Mark session's current event as complete
+                    if hasattr(event_object, 'session') and event_object.session:
+                        event_object.session.complete_current_event()
+
+                    logger.info(f"VLM Event {event_id}: Event completed successfully, state={event_object.state.value}")
+                except Exception as e:
+                    logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
+
+            # NOW trigger completion callback - event is already COMPLETED
+            if completion_callback:
+                logger.info(f"VLM Event {event_id}: Triggering completion callback (event already completed)")
+                try:
+                    await completion_callback(event_id, event_state)
+                except Exception as e:
+                    logger.error(f"VLM Event {event_id}: Error in non-streaming completion callback: {e}", exc_info=True)
 
     @staticmethod
     def _cleanup_resources(pipe_path: Optional[str], temp_file_path: Optional[str], process: Optional[subprocess.Popen]):

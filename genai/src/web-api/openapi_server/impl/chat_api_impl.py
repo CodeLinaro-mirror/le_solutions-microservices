@@ -11,6 +11,7 @@ from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.managers.session_manager import SessionManager
+from openapi_server.managers.request_queue_manager import RequestQueueManager
 
 from fastapi import (
     HTTPException
@@ -54,9 +55,33 @@ class ChatApiImpl(BaseChatApi):
             else:
                 logger.debug("No raw JSON provided - may encounter Pydantic OneOf deserialization issues")
 
-            # Use new event-based handler for conversation management
-            logger.info("Using EventBasedChatHandler for request processing")
-            result = await EventBasedChatHandler.handle_chat_completion(create_chat_completion_request, raw_json)
+            # Resolve session at API layer (both ADHOC and normal modes)
+            user_id = getattr(create_chat_completion_request, 'user', 'default_user')
+            messages = EventBasedChatHandler.extract_messages_from_request(
+                create_chat_completion_request, raw_json
+            )
+
+            session_manager = SessionManager.get_instance()
+            session, is_new = session_manager.find_or_create_session(user_id, messages)
+
+            logger.info(f"Resolved session: {session.session_id} (new={is_new})")
+
+            # Route based on mode
+            from openapi_server.impl.constant import ADHOC_MODE
+
+            if ADHOC_MODE:
+                # ADHOC_MODE: Use queue manager with pre-resolved session
+                logger.info("Using RequestQueueManager for ADHOC_MODE")
+                queue_manager = RequestQueueManager.get_instance()
+                result = await queue_manager.enqueue_request(
+                    create_chat_completion_request, raw_json, session
+                )
+            else:
+                # Normal mode: Direct execution with pre-resolved session
+                logger.info("Using EventBasedChatHandler directly (normal mode)")
+                result = await EventBasedChatHandler.handle_chat_completion(
+                    create_chat_completion_request, raw_json, session
+                )
 
             if isinstance(result, Error):
                 logger.error(f"Expected CreateChatCompletionResponse, got {type(result)}")

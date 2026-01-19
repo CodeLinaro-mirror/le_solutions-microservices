@@ -372,7 +372,7 @@ class VLMExecutor:
         logger.info("VLM executor thread exiting")
 
     def _handle_execute(self, request):
-        """Handle an execute request."""
+        """Handle an execute request with simplified error checking."""
         try:
             model_str = request['model_str']
             config_file = request['config_file']
@@ -387,8 +387,9 @@ class VLMExecutor:
 
             handle = self.lib.vlm_create_object(model_input, config_path, streaming)
 
+            # Simple NULL check - no function calls to undefined C functions
             if handle == self.ffi.NULL:
-                error_msg = f"Failed to create VLM handle for model: {model_str}"
+                error_msg = f"Failed to create VLM handle for model: {model_str} (NULL handle returned)"
                 logger.error(error_msg)
                 self.error = error_msg
                 self.completion_event.set()
@@ -407,7 +408,7 @@ class VLMExecutor:
                 self.lib.vlm_destroy_object(handle)
 
         except Exception as e:
-            logger.error(f"Error executing VLM: {e}")
+            logger.error(f"Error executing VLM: {e}", exc_info=True)
             self.error = str(e)
             self.completion_event.set()
 
