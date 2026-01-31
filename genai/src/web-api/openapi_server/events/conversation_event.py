@@ -195,6 +195,17 @@ class ConversationEvent(ABC):
         # Update legacy field for backward compatibility
         self.turn_tokens = self.total_turn_tokens
 
+    def should_cleanup_handle_after_turn(self) -> bool:
+        """
+        Determine if handle should be cleaned up after turn completion.
+        Returns True in ADHOC_MODE, False otherwise.
+
+        In ADHOC_MODE, handles are created and destroyed for each conversation turn
+        to prevent QAIRT handle conflicts when multiple containers access the same NSP.
+        """
+        from openapi_server.impl.constant import ADHOC_MODE
+        return ADHOC_MODE
+
     def complete_turn(self):
         """Mark turn as completed with enhanced token tracking."""
         if self.state == EventState.ACTIVE:
@@ -215,6 +226,16 @@ class ConversationEvent(ABC):
                        f"prompt: {self.prompt_tokens}, "
                        f"completion: {self.completion_tokens}, "
                        f"total: {self.total_turn_tokens} tokens")
+
+            # ADHOC_MODE: Cleanup handle after turn completion
+            # This ensures the handle stays alive during tool calling (when event is ACTIVE)
+            # and only gets destroyed when the entire conversation turn is complete
+            if self.should_cleanup_handle_after_turn():
+                logger.info(f"Event {self.event_id}: ADHOC_MODE enabled - cleaning up handle after turn completion")
+                try:
+                    self.terminate_handle()
+                except Exception as e:
+                    logger.error(f"Event {self.event_id}: Error cleaning up handle in ADHOC_MODE: {e}")
 
     def fail_turn(self, error: Exception):
         """Mark turn as failed."""

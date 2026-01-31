@@ -155,10 +155,26 @@ class ConversationSession:
 
         # Handle management
         if not is_tool_continuation:
+            from openapi_server.impl.constant import ADHOC_MODE
+
             previous_event = self.get_last_completed_event()
             model_switched = previous_event and previous_event.model_id != model_id
 
-            if model_switched:
+            if ADHOC_MODE:
+                # ADHOC_MODE: Always create new handle, never take over
+                logger.info(f"Session {self.session_id}: ADHOC_MODE enabled - creating new handle for each request")
+
+                # Ensure previous handle is cleaned up (should already be done in complete_turn)
+                if previous_event and previous_event.llm_handle:
+                    logger.warning(f"Session {self.session_id}: Previous handle still exists in ADHOC_MODE, cleaning up")
+                    try:
+                        previous_event.terminate_handle()
+                    except Exception as e:
+                        logger.error(f"Failed to cleanup previous handle: {e}")
+
+                event.create_new_handle()
+
+            elif model_switched:
                 logger.info(f"Session {self.session_id}: Model switch detected from {previous_event.model_id} to {model_id}")
 
                 # Prepare messages for summarization (exclude the new messages just added)
@@ -218,7 +234,7 @@ class ConversationSession:
                 if not event.llm_handle:
                     event.create_new_handle()
 
-            elif previous_event: # Same model
+            elif previous_event: # Same model, not ADHOC_MODE
                 try:
                     event.take_over_handle(previous_event)
                 except Exception as e:
