@@ -60,6 +60,7 @@ class VisionConversationEvent(ConversationEvent):
         try:
             # Build raw_json from session messages for VLM handler
             # The VLM handler needs this to extract images and text
+            # IMPORTANT: Pass session_id so VLM responses use the correct chat completion ID
             raw_json = {
                 'messages': self.session.messages,
                 'model': self.model_id,
@@ -68,7 +69,8 @@ class VisionConversationEvent(ConversationEvent):
                 'temperature': getattr(request_data, 'temperature', None),
                 'top_p': getattr(request_data, 'top_p', None),
                 'presence_penalty': getattr(request_data, 'presence_penalty', None),
-                'frequency_penalty': getattr(request_data, 'frequency_penalty', None)
+                'frequency_penalty': getattr(request_data, 'frequency_penalty', None),
+                'session_id': self.session.session_id  # Pass session ID for response consistency
             }
 
             logger.info(f"Event {self.event_id}: Executing VLM turn with {len(self.session.messages)} messages in history")

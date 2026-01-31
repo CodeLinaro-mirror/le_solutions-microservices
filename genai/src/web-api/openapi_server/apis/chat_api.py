@@ -86,3 +86,31 @@ async def create_chat_completion(
         logger.debug("Raw JSON extraction resulted in empty dict")
 
     return await BaseChatApi.subclasses[0]().create_chat_completion(create_chat_completion_request, raw_json)
+
+
+@router.delete(
+    "/v1/chat/completions/{completion_id}",
+    responses={
+        HttpStatusCodes.OK: {APIResponseKeys.MODEL: ChatCompletionDeleted, APIResponseKeys.DESCRIPTION: APIDescription.DELETE_CHAT_SUCCESS},
+        HttpStatusCodes.NOT_FOUND: {APIResponseKeys.DESCRIPTION: APIDescription.DELETE_CHAT_COMPLETION_ID},
+    },
+    tags=[APITags.CHAT],
+    summary="Delete a stored chat completion",
+    response_model_by_alias=True,
+)
+async def delete_chat_completion(
+    completion_id: Annotated[StrictStr, Path(description=APIDescription.DELETE_CHAT_COMPLETION_ID)],
+) -> ChatCompletionDeleted:
+    """
+    Delete a stored chat completion.
+
+    This will cleanup all resources associated with the session including:
+    - All conversation events and their handles
+    - Message history
+    - Hash mappings
+    - LLM singleton (in ADHOC_MODE)
+    """
+    if not BaseChatApi.subclasses:
+        raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.NOT_IMPELEMENTED)
+
+    return await BaseChatApi.subclasses[0]().delete_chat_completion(completion_id)

@@ -64,8 +64,8 @@ class APIDescription:
     OK = "OK"
     SUCCESS = "Success"
     COMPELETION_ID = "id of conversation"
-    DELETE_CHAT_COMPLETION_ID = "The ID of the chat completion to delete."
-    DELETE_CHAT_SUCCESS = "The chat completion was deleted successfully."
+    DELETE_CHAT_COMPLETION_ID = "The ID of the chat completion to delete"
+    DELETE_CHAT_SUCCESS = "The chat completion was deleted successfully"
 
 class APITags:
     """ API Tags """

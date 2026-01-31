@@ -325,13 +325,14 @@ class GenieWrapperCreateVLMChatCompletion:
         return extracted_content
 
     @staticmethod
-    def build_chat_completion_response(content: str, model: str) -> CreateChatCompletionResponse:
+    def build_chat_completion_response(content: str, model: str, session_id: str) -> CreateChatCompletionResponse:
         """
         Build a ChatCompletionResponse from VLM content.
 
         Args:
             content: VLM response content
             model: Model name
+            session_id: Session/chat completion ID to use in response
 
         Returns:
             CreateChatCompletionResponse object
@@ -350,7 +351,7 @@ class GenieWrapperCreateVLMChatCompletion:
         )
 
         response = CreateChatCompletionResponse(
-            id=f"vlm-{uuid.uuid4().hex[:24]}",
+            id=session_id,  # Use session_id instead of generating new ID
             object="chat.completion",
             created=int(time.time()),
             model=model,
@@ -367,7 +368,7 @@ class GenieWrapperCreateVLMChatCompletion:
 
         Args:
             request_data: The chat completion request
-            raw_json: Optional raw JSON to bypass Pydantic issues
+            raw_json: Optional raw JSON to bypass Pydantic issues (should include 'session_id')
 
         Returns:
             Chat completion response, streaming response, or error
@@ -379,6 +380,16 @@ class GenieWrapperCreateVLMChatCompletion:
         process = None
 
         try:
+            # Extract session_id from raw_json (passed from VisionConversationEvent)
+            # This ensures VLM responses use the same ID as the chat completion session
+            session_id = raw_json.get('session_id') if raw_json else None
+            if not session_id:
+                # Fallback: generate a chat completion ID if not provided
+                session_id = f"chat-{uuid.uuid4()}"
+                logger.warning(f"No session_id provided in raw_json, generated: {session_id}")
+            else:
+                logger.info(f"Using session_id from raw_json: {session_id}")
+
             # Calculate conversation hash for caching (session identification)
             conversation_hash = ConversationUtils.calculate_conversation_hash(
                 request_data.messages,

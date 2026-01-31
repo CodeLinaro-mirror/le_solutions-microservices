@@ -24,3 +24,10 @@ class BaseChatApi:
         create_chat_completion_request: CreateChatCompletionRequest,
     ) -> CreateChatCompletionResponse:
         ...
+
+    async def delete_chat_completion(
+        self,
+        completion_id: StrictStr,
+    ) -> ChatCompletionDeleted:
+        """Delete a stored chat completion by ID."""
+        ...
