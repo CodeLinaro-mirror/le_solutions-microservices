@@ -5,6 +5,7 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass
 import logging
+import time
 
 logger = logging.getLogger(__file__)
 
@@ -33,6 +34,17 @@ class Tripwire:
         self.tripwire_id = tripwire_id
         self.name = name if name else f"Tripwire {tripwire_id}"
 
+
+def is_valid_timestamp(ts, max_age_ms=60000):
+    try:
+        ts_val = float(ts)
+        now_ms = time.time() * 1000
+        # Check if timestamp is within the last `max_age_ms` milliseconds
+        return 0 <= now_ms - ts_val <= max_age_ms
+    except (ValueError, TypeError):
+        return False
+
+
 def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
     """
     1) Applies ankle-average temporal smoothing.
@@ -46,10 +58,10 @@ def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
     smoothing_queues = {}
 
     # 1) Build frames with ankle-average smoothing
-    for entry in raw_data:
+    for timestamp, entry in raw_data:
         # Safely get timestamp (could be None, skip if missing)
         parameters = entry.get("parameters", {})
-        timestamp = parameters.get("timestamp")
+        #timestamp = parameters.get("timestamp")
         if timestamp is None:
             continue
 
@@ -111,7 +123,7 @@ def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
         return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
 
     def intersect(p1, q1, p2, q2):
-        return (ccw(p1, p2, q2) != ccw(q1, p2, q2) and 
+        return (ccw(p1, p2, q2) != ccw(q1, p2, q2) and
                 ccw(p1, q1, p2) != ccw(p1, q1, q2))
 
     def crosses_tripwire(trajectory, twire):
@@ -124,8 +136,10 @@ def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
             w_start, w_end = twire.wire[i], twire.wire[i + 1]
             for j in range(len(trajectory) - 1):
                 p1, p2 = trajectory[j], trajectory[j + 1]
+                logger.debug(f'Checking segment {p1} -> {p2} against wire {w_start} -> {w_end}')
                 if intersect(p1, p2, w_start, w_end):
                     angle = angle_between(vector(p1, p2), d_vec)
+                    logger.debug(f'Intersection found. Angle with direction: {angle}')
                     return 1 if angle < 90 else -1
         return 0
 
@@ -133,7 +147,7 @@ def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
     if len(frames) < window_size:
         return [(0, 0) for _ in tripwires]
 
-    # Use all the frames 
+    # Use all the frames
     obj_trajectories = {}
 
     frame_idx = -1
@@ -162,18 +176,38 @@ def calculate_tripwire_crossings(raw_data, filter_size, window_size, tripwires):
                 trajectory.append(pos)
 
     # Count crossing events
+
     results = []
     for twire in tripwires:
         entries = exits = 0
-        for traj in obj_trajectories.values():
+        entry_times = []
+        exit_times = []
+        entry_ids = []
+        exit_ids = []
+
+        for traj_id, traj in obj_trajectories.items():
             if len(traj) < 2:
-                # Need at least 2 points to form a segment
                 continue
             outcome = crosses_tripwire(traj, twire)
             if outcome == 1:
+                logger.debug(f'Entry crossing detected for object {traj_id}')
                 entries += 1
+                entry_times.append(frames[-1].timestamp)
+                entry_ids.append(traj_id)
             elif outcome == -1:
+                logger.debug(f'Exit crossing detected for object {traj_id}')
                 exits += 1
-        results.append((entries, exits))
+                exit_times.append(frames[-1].timestamp)
+                exit_ids.append(traj_id)
+
+        results.append({
+            "entries": entries,
+            "exits": exits,
+            "entry_times": entry_times,
+            "exit_times": exit_times,
+            "entry_ids": entry_ids,
+            "exit_ids": exit_ids
+        })
+
 
     return results

@@ -15,13 +15,14 @@ import numpy as np
 import sys
 import time
 from types import SimpleNamespace
-from math import ceil
 
 ALERT_CHANNEL = os.environ.get('ALERT_CHANNEL', 'tripwire-analytics.alerts')
 ALERT_PERIOD = os.environ.get('ALERT_PERIOD', 1.0)
-TRIPWIRES_KEY = os.environ.get('TRIPWIRE_KEY', 'TATripwires')
+TRIPWIRE_KEY = os.environ.get('TRIPWIRE_KEY', 'TATripwires')
 TRIGGER_KEY = os.environ.get('TRIGGER_KEY', 'TATriggers')
 ANALYTICS_CHANNEL = os.environ.get('ANALYTICS_CHANNEL', 'trjipwire-analytics.analytics')
+
+# e.g., monitor 0 would be "detection.rz:0"
 DETECTION_CHANNEL_PREFIX = os.environ.get('REDIS_DETECTION_CHANNEL_PREFIX', 'detection.rz') + ':'
 
 MARIADB_PASSWORD = os.environ.get('MARIADB_PASSWORD')
@@ -249,7 +250,7 @@ def get_people_count(frame) -> int:
     '''
     #logger.info(f'get_people_count - {frame}')
     if not 'object_detection' in frame:
-        logger.info("no object detection")
+        logger.debug("no object detection")
         return 0
     else:
         return sum(1 for obj in frame['object_detection'] if obj['label'].startswith("person"))
@@ -321,7 +322,7 @@ async def update_count_statistics(recent_history):
         count, frame = result
 
         monitor_id = channel.replace(DETECTION_CHANNEL_PREFIX, "")
-        logger.info(f'[{monitor_id}]: {count} people')
+        logger.info(f'camera[{monitor_id}]: {count} people')
 
         async with count_lock:
             # Update the stats for the channel
@@ -792,96 +793,25 @@ async def run_heatmap_query(r : redis.Redis, token, monitor_id, start_time, end_
     except Exception as e:
         logger.error(f"An error occurred: {e}")
 
-class _FrameMetadataBuffer:
-    '''
-    This private class allows appending of (timestamp, frame_metadata) tuples, and then can pop
-    "buffers" of data at a time, enough to calculate crossings in 1-second-aligned chunks.
 
-    "append" adds an individual (timestamp, metadata) sample.
-    "pop_buffer" returns (buffer, window_len), where:
-     - buffer is all data the crossing algorithm needs in a list of (timestamp, metadata) samples.
-       The buffer is sequential in time, starting with the pre-roll (see below) and ending with
-       the window of observation, or "window". The window is always at the end of the buffer.
-     - window_len tells how many samples at the end of the buffer crossings should be calculated over.
-       This includes the window of observation, *plus* the overlap with the prior frame for crossings
-       at the edge of observation (typically overlap_len = 1)
-
-    The logic is such that these windows will "march forward" in successive calls on integer 1-second
-    intervals. That is, if it currently holds frames bewteen T=0.3 and T=3.2, the
-    first "pop_buffer" call returns a buffer needed to calculate crossings between T=1.0 and T=2.0.
-
-    The crossing calculation also needs a "filter" (len = filter_len) *before* the window of observation
-    to smooth the input data, referred to in code as "pre-roll".
-
-    This class's outputs can be used to keep a record of wire crossings per second by accumulating counts
-    on 1-second boundaries, which can then be used in flow-rate calculations.
-    '''
-    def __init__(self, filter_len, overlap_len):
-        self._filter_len = filter_len
-        self._overlap_len = overlap_len
-        self._next_window_start_ts = -1
-        self._dq = deque()
-
-    def append(self, data: tuple[float, Any] ):
-        # expect data to be tuples of (timestamp, frame_metadata)
-        self._dq.append(data)
-
-
-    def pop_buffer(self) -> tuple[ list[(float, Any)], int ]:
-        # Early return for degenerate cases: not enough samples, not enough time
-        if len(self._dq) < self._filter_len:
-            logger.debug(f'Not enough samples in dq, len: {len(self._dq)}')
-            return [], 0 # no buffer no window
-
-        # Update next window start if needed, expected on first call
-        if self._next_window_start_ts == -1:
-            # set "next window" to next whole timstamp after the first sample in the buffer;
-            # means the first buffer might be odd-shaped (shorter or longer than usual)
-            self._next_window_start_ts = ceil(self._dq[0][0])
-
-        # Check if at least 1 second worth of data after this boundary by peeking at last
-        # element in dq:
-        last_ts = self._dq[-1][0]
-        if last_ts - self._next_window_start_ts < 1.0:
-            logger.debug(f'Not enough time in dq, next_window_start_ts: {self._next_window_start_ts:.3f}, last timestamp : {last_ts:.3f}')
-            return [], 0 # no buffer, no window
-
-        # At least one second of data + filter is ready, proceed:
-        # Extract from front of buffer until there's one full second of data after the filter.
-        end_boundary = self._next_window_start_ts + 1.0
-        buffer = [s for s in self._dq if s[0] < end_boundary] # buffer is list of (ts, frame_metadata)
-
-        # The window should be all the samples with timestamps between start_boundary and end_boundary,
-        # plus the overlap.
-        window_len = len([s for s in buffer if s[0] >= self._next_window_start_ts]) + self._overlap_len
-
-        # The next call to this function should pick up the next "1-second block".
-        self._next_window_start_ts += 1.0
-
-        # Prior to this timestamp, we need to keep the overlap_len of the prior buffer,
-        # plus the filter_len for algo smoothing, as a "pre-roll".
-        # Can pop everything prior to this "pre-roll"
-        preroll_len = self._filter_len + self._overlap_len
-        while len(self._dq) > preroll_len and self._dq[preroll_len][0] < self._next_window_start_ts:
-            _ = self._dq.popleft()
-
-        return buffer, window_len
-
-    def __iter__(self):
-        return iter(self._dq)
+def normalize_ts(ts):
+    ts = float(ts)
+    # If ts is in milliseconds, convert to seconds
+    return ts / 1000 if ts > 1e10 else ts
 
 class TripwireAnalytics():
-    # TODO: filter_size & overlap_size overridden in env
+    # TODO: filter_size, overlap_size, max_len overridden in env
     def __init__(self, r: redis.Redis, filter_len = 8):
         self._r = r
         self._message_list = []
+        self._frame_metadata_by_monitor = defaultdict(deque) # deque of messages by monitor, in received order
         self._filter_len = filter_len
         self._overlap_len = 1
-        def new_frame_buffer_generator():
-            return _FrameMetadataBuffer(filter_len=self._filter_len, overlap_len=self._overlap_len)
-        self._frame_metadata_by_monitor = defaultdict(new_frame_buffer_generator)
         self._calculate_tripwires_impl = calculate_tripwire_crossings
-
+        self._tripwires = []
+        self._triggers = []
+        self.recent_crossings = defaultdict(list)
+        self.recent_ids = defaultdict(dict)  # tripwire_id ? {tracking_id: timestamp}
 
     def enqueue_message(self, timestamp, message):
         self._message_list.append((timestamp, message))
@@ -891,6 +821,16 @@ class TripwireAnalytics():
         oldest_message_time, _ = self._message_list[0]
         if timestamp - oldest_message_time >= ALERT_PERIOD:
             asyncio.ensure_future(self.check_for_alerts())
+
+    async def get_tripwires(self):
+        if not self._tripwires:
+            await self.update_tripwires()
+        return self._tripwires
+
+    async def get_triggers(self):
+        if not self._triggers:
+            await self.update_triggers()
+        return self._triggers
 
     async def check_for_alerts(self):
         try:
@@ -927,9 +867,9 @@ class TripwireAnalytics():
             logger.error('Database or received messages likely corrupted, will keep trying..')
 
 
-    async def get_tripwires(self):
+    async def update_tripwires(self):
         # Get tripwires from Redis
-        raw_tripwires = await self._r.hgetall(TRIPWIRES_KEY)
+        raw_tripwires = await self._r.hgetall(TRIPWIRE_KEY)
         logger.debug(f'Raw tripwires from redis: {raw_tripwires}')
 
         # redis HGETALL returns in format {k : v} where k = region_id, v = full region in JSON string
@@ -937,10 +877,11 @@ class TripwireAnalytics():
         tripwires = {id: json.loads(tripwire_str) for id, tripwire_str in raw_tripwires.items()}
 
         logger.debug(f'Parsed & validated tripwires: {tripwires}')
+        self._tripwires = tripwires
         return tripwires
 
 
-    async def get_triggers(self):
+    async def update_triggers(self):
         # Get triggers from Redis
         raw_triggers = await self._r.hgetall(TRIGGER_KEY)
         logger.debug(f'Raw triggers from redis: {raw_triggers}')
@@ -953,11 +894,13 @@ class TripwireAnalytics():
         triggers = [t for t in triggers if t['trigger_condition'] in supported_trigger_conditions]
 
         logger.debug(f'Parsed & validated triggers: {triggers}')
+        self._triggers = triggers
         return triggers
 
 
+
     def calculate_crossings(self, ts_frame_tuples, filter_len, window_len, tripwires):
-        # convert to implementation's tripwire objects in item order
+        # Helper to flatten direction data
         def flatten_direction(d):
             entry = d['entry']
             exit = d['exit']
@@ -965,48 +908,83 @@ class TripwireAnalytics():
                 [entry['x'], entry['y']],
                 [exit['x'], exit['y']]
             ]
-        def flatten_wire(wire):
-            return [ [coord['x'], coord['y']] for coord in wire]
 
+        # Helper to flatten wire coordinates
+        def flatten_wire(wire):
+            return [[coord['x'], coord['y']] for coord in wire]
+
+        # Convert tripwire definitions to Tripwire objects
         tripwire_objs = [
             Tripwire(
                 tripwire_id=t['tripwire_id'],
                 name=t['tripwire_name'],
                 direction=flatten_direction(t['direction']),
                 wire=flatten_wire(t['wire'])
-            ) for t in tripwires.values()]
+            ) for t in tripwires.values()
+        ]
 
-        # extract frame metadata, drop timestamps
-        _, frames = zip(*ts_frame_tuples)
-
-        # call algorithm
+        # Run the crossing detection algorithm
         try:
             logger.debug(
-                f'Calling calculate_tripwires_impl: raw_data={frames!r}, '
+                f'Calling calculate_tripwires_impl: raw_data={ts_frame_tuples!r}, '
                 f'filter_size={filter_len!r}, '
                 f'window_size={window_len!r}, '
                 f'tripwires={tripwire_objs!r}'
-                )
+            )
             counts = self._calculate_tripwires_impl(
-                raw_data=frames,
+                raw_data=ts_frame_tuples,
                 filter_size=filter_len,
-                window_size = window_len,
-                tripwires=tripwire_objs)
+                window_size=window_len,
+                tripwires=tripwire_objs
+            )
             logger.debug(f'Result of calculate_tripwires_impl: {counts}')
         except Exception:
             logger.exception('Exception in crossing calculation algorithm')
             counts = [(0, 0)] * len(tripwire_objs)
 
-        # counts is list of (entries, exits) tuples for each tripwire in item order
+        # Build results with direction-specific timestamps
         results = {}
-        for counts, id in zip(counts, tripwires.keys()):
-            results[id] = {
-                'entries': counts[0],
-                'exits': counts[1]
+
+        for idx, result in enumerate(counts):
+            tripwire_id = list(tripwires.keys())[idx]
+
+            entry_count = result['entries']
+            exit_count = result['exits']
+            entry_times = result['entry_times']
+            exit_times = result['exit_times']
+            entry_ids = result['entry_ids']
+            exit_ids = result['exit_ids']
+
+            logger.debug(f'Tripwire {tripwire_id}: entries={entry_count}, exits={exit_count}')
+            logger.debug(f'Tripwire {tripwire_id}: entry_times={entry_times}, exit_times={exit_times}')
+            logger.debug(f'Tripwire {tripwire_id}: entry_ids={entry_ids}, exit_ids={exit_ids}')
+
+            results[tripwire_id] = {
+                'entries': entry_count,
+                'exits': exit_count,
+                'entry_timestamps': entry_times,
+                'exit_timestamps': exit_times,
+                'entry_ids': entry_ids,
+                'exit_ids': exit_ids
             }
 
         return results
 
+
+    def has_crossings_within_window(self, ref_time, timestamps, threshold, duration):
+        """
+        Returns (True, count) if at least `threshold` timestamps occur within the window [ref_time - duration, ref_time].
+        """
+        window_start = ref_time - duration
+
+        # Filter timestamps within the window
+        recent = [float(ts) for ts in timestamps if window_start <= float(ts) <= ref_time]
+        count = len(recent)
+
+        logger.debug(f'Window check: now={ref_time}, duration={duration}, window_start={window_start}, count={count}, threshold={threshold}')
+        logger.debug(f'Timestamps in window: {recent}')
+
+        return (count > threshold, count)
 
     def make_alerts(self, triggers, tripwires, crossings, alert_time):
         alerts = []
@@ -1018,8 +996,63 @@ class TripwireAnalytics():
                 cross_key = 'entries' if trigger['trigger_direction'] == 'entry' else 'exits'
                 cross_count = crossing[cross_key]
 
-                # TODO: calculate for limit and duration of trigger; just trigger on anything for now
-                if cross_count > 0:
+                ts_key = 'entry_timestamps' if trigger['trigger_direction'] == 'entry' else 'exit_timestamps'
+                #new_timestamps = crossing.get(ts_key, [])
+                threshold = float(self.get_trigger_param(trigger, 'threshold'))
+                duration = float(self.get_trigger_param(trigger, 'duration'))
+                new_timestamps = []
+                new_ids = crossing.get('entry_ids' if trigger['trigger_direction'] == 'entry' else 'exit_ids', [])
+                raw_timestamps = crossing.get(ts_key, [])
+
+
+                direction = trigger['trigger_direction']
+
+
+                cooldown = 3.0  # seconds
+                now = alert_time
+
+                # Prune old tracking_ids from recent_ids
+                for tripwire_id in self.recent_ids:
+                    self.recent_ids[tripwire_id] = {
+                        tid: ts for tid, ts in self.recent_ids[tripwire_id].items()
+                        if now - ts <= cooldown
+                    }
+
+                # Filter to avoid duplicate count, e.g. same person crossed slowly, ankles across multiple frames
+                for ts, tid in zip(raw_timestamps, new_ids):
+                    ts_norm = normalize_ts(ts)
+                    last_seen = self.recent_ids[tripwire_id].get(tid)
+
+                    # Only count if this ID hasn't been seen recently
+                    if last_seen is None or now - last_seen > duration:
+                        new_timestamps.append(ts)
+
+
+                # Skip alert logic if no new crossings
+                if not new_timestamps:
+                    continue
+
+                # Update rolling buffer
+                buffer = self.recent_crossings[tripwire_id]
+                buffer.extend(new_timestamps)
+
+                logger.debug(f'New timestamps: {new_timestamps}')
+                logger.debug(f'Updated buffer: {buffer}')
+                logger.info(f'Crossing data: {crossing}')
+
+                # Remove old timestamps outside the duration window
+                now = alert_time #time.time()
+                buffer = [ts for ts in buffer if now - normalize_ts(ts) <= duration]
+                self.recent_crossings[tripwire_id] = buffer
+
+                # Check for alert condition
+                should_alert, observed_count = self.has_crossings_within_window(now, [normalize_ts(ts) for ts in buffer], threshold, duration)
+
+                logger.info(f'{tripwire_id}: cross_count={crossing[cross_key]} observed_count={observed_count} direction={direction} threshold={threshold} duration={duration}')
+                logger.debug(f'Rolling buffer for {tripwire_id}: {buffer}')
+
+
+                if should_alert:
                     tripwire = tripwires[tripwire_id]
                     monitor_id = tripwire['monitor_id']
                     alert = {
@@ -1027,11 +1060,13 @@ class TripwireAnalytics():
                         'source_trigger': trigger,
                         'time': alert_time,
                         'crossings': {
-                            'count': cross_count,
-                            'duration': 1 # TODO: make it a real window
+                            'count': observed_count,
+                            'duration': duration
                         }
                     }
                     alerts.append(alert)
+
+                    logger.info(f'\n\n** ALERT: {observed_count} / {duration:.2f}\n')
 
         return alerts
 
@@ -1039,7 +1074,7 @@ class TripwireAnalytics():
         try:
              # sort messages into frame history by monitor
             for recv_time, message in messages:
-                channel = message['channel'][len(DETECTION_CHANNEL_PREFIX):] # monitor follows prefix
+                channel = message['channel'][len(DETECTION_CHANNEL_PREFIX):]
                 # first element is time message arrived, second element is Redis payload containing frame metadata
                 msg_obj = json.loads(message['data'])
                 self._frame_metadata_by_monitor[channel].append( (recv_time, msg_obj) )
@@ -1064,34 +1099,35 @@ class TripwireAnalytics():
         #    return
 
         crossings = {}
-        for monitor, frame_metadata_buffer in self._frame_metadata_by_monitor.items():
+        for monitor, frame_metadata in self._frame_metadata_by_monitor.items():
             # send only wires for this monitor
             monitor_wires = {wire_id: wire for wire_id, wire in tripwires.items()
                              if wire['monitor_id'] == monitor}
 
             # calculate the window length to calculate crossings over;
             # need to overlap some number, and expect filter_len samples left over from last call
-            while True:
-                buffer, window_len = frame_metadata_buffer.pop_buffer()
-                if not buffer or window_len == 0:
-                    break # no more full-seconds worth of data
+            window_len = len(frame_metadata) - self._filter_len + self._overlap_len
 
-                logger.info(
-                    f'Calculating crossings for {len(buffer)} frames in monitor {monitor} '
-                    f'from t={buffer[0][0]:.3f} to t={buffer[-1][0]:.3f}; window_len = {window_len}')
+            # for very first call or long filter length (=negative window size), send all samples
+            if window_len < 2:
+                window_len = len(frame_metadata)
 
-                monitor_crossings = self.calculate_crossings(buffer, self._filter_len, window_len, monitor_wires)
-                crossings.update(monitor_crossings) # add to overall record
+            logger.debug(f'Calculating crossings for {len(frame_metadata)} frames in monitor {monitor} from t={frame_metadata[0][0]} to t={frame_metadata[-1][0]}; window_len = {window_len}')
 
-            # TODO: accumulate crossing counts into per-monitor deque to be checked for flow by trigger
+            monitor_crossings = self.calculate_crossings(frame_metadata, self._filter_len, window_len, monitor_wires)
+            crossings.update(monitor_crossings) # add to overall record
+
+            frames_to_drop = len(frame_metadata) - self._filter_len
+            for _ in range(frames_to_drop):
+                frame_metadata.popleft()
 
         last_ts = ts_frames[-1][0] # TODO: last timestamp per monitor, pass dict to make_alerts
         alerts = self.make_alerts(triggers, tripwires, crossings, last_ts)
 
-        logger.info(f'Filtered {len(ts_frames)} Detection messages through {len(triggers)} trigger(s), generating {len(alerts)} alert(s)')
+        logger.debug(f'Filtered {len(ts_frames)} Detection messages through {len(triggers)} trigger(s), generating {len(alerts)} alert(s)')
         return alerts
 
-    def get_trigger_param(trigger, name):
+    def get_trigger_param(self, trigger, name):
         for param in trigger['params']:
             if param['name'] == name:
                 return param['value']
