@@ -56,14 +56,30 @@ class ModelConfigManager:
                     "llama3-8b": {
                         "config_file": "genie_config_llama3_1_8B.json",
                         "display_name": "Llama 3.1 8B",
-                        "prompt_template": "llama3",
+                        "chat_template": {
+                            "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+                            "system_suffix": "<|eot_id|>",
+                            "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+                            "user_suffix": "<|eot_id|>",
+                            "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                            "assistant_suffix": "<|eot_id|>",
+                            "default_system_prompt": "You are a helpful assistant."
+                        },
                         "max_tokens": 4096,
                         "supports_streaming": True,
                         "internal_id": "LLAMA3_1_8B"
                     }
                 },
                 "default_model": "llama3-8b",
-                "fallback_template": "llama3"
+                "fallback_chat_template": {
+                    "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+                    "system_suffix": "<|eot_id|>",
+                    "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+                    "user_suffix": "<|eot_id|>",
+                    "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                    "assistant_suffix": "<|eot_id|>",
+                    "default_system_prompt": "You are a helpful assistant."
+                }
             }
 
             # Create directory if it doesn't exist
@@ -154,20 +170,20 @@ class ModelConfigManager:
             return model_config.get("config_file")
         return None
 
-    def get_prompt_template(self, model_id: str) -> str:
+    def get_chat_template(self, model_id: str) -> Optional[Dict]:
         """
-        Get the prompt template type for a specific model.
+        Get the chat template configuration for a specific model.
 
         Args:
             model_id: The model identifier
 
         Returns:
-            str: The prompt template type (e.g., 'llama3', 'qwen2')
+            Dict containing chat template components or None if not found
         """
         model_config = self.get_model_config(model_id)
         if model_config:
-            return model_config.get("prompt_template", self.models_config.get("fallback_template", "llama3"))
-        return self.models_config.get("fallback_template", "llama3")
+            return model_config.get('chat_template')
+        return None
 
     def get_internal_id(self, model_id: str) -> Optional[str]:
         """

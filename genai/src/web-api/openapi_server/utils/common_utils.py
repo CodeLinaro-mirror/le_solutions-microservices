@@ -137,104 +137,180 @@ class CommonUtils:
             return "genie_config_llama3_1_8B.json"
 
     @staticmethod
-    def get_model_prompt_template(model_id: str) -> str:
+    def get_chat_template(model_id: str) -> dict:
         """
-        Get the prompt template for a given model.
-
-        Args:
-            model_id: The model identifier (can be internal ID or external ID)
-
-        Returns:
-            str: The model's prompt template string with {role} and {content} placeholders
-        """
-        try:
-            config_manager = get_config_manager()
-
-            # Try as external model ID first
-            prompt_template = config_manager.get_prompt_template(model_id)
-            if prompt_template:
-                logger.info(f"Found prompt template for model {model_id}")
-                return prompt_template
-
-            # Try to find by internal ID
-            external_id = config_manager.get_model_by_internal_id(model_id)
-            if external_id:
-                prompt_template = config_manager.get_prompt_template(external_id)
-                if prompt_template:
-                    logger.info(f"Found prompt template for internal model {model_id} (external: {external_id})")
-                    return prompt_template
-
-            # Fallback to default template from config
-            logger.warning(f"No prompt template found for model {model_id}, using fallback")
-            fallback_template = config_manager.models_config.get("fallback_template",
-                "<|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>")
-            return fallback_template
-
-        except Exception as e:
-            logger.error(f"Error getting prompt template for model {model_id}: {e}")
-            # Hardcoded fallback
-            return "<|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
-
-    @staticmethod
-    def get_assistant_prompt(model_id: str) -> str:
-        """
-        Get the assistant prompt suffix for a given model.
-
-        Args:
-            model_id: The model identifier (can be internal ID or external ID)
-
-        Returns:
-            str: The assistant prompt string to append at the end
-        """
-        try:
-            config_manager = get_config_manager()
-
-            # Try as external model ID first
-            model_config = config_manager.get_model_config(model_id)
-            if model_config and 'assistant_prompt' in model_config:
-                return model_config['assistant_prompt']
-
-            # Try to find by internal ID
-            external_id = config_manager.get_model_by_internal_id(model_id)
-            if external_id:
-                model_config = config_manager.get_model_config(external_id)
-                if model_config and 'assistant_prompt' in model_config:
-                    return model_config['assistant_prompt']
-
-            # Fallback - return empty string
-            logger.warning(f"No assistant prompt found for model {model_id}, using empty string")
-            return ""
-
-        except Exception as e:
-            logger.error(f"Error getting assistant prompt for model {model_id}: {e}")
-            return ""
-
-    @staticmethod
-    def format_message_with_template(model_id: str, role: str, content) -> str:
-        """
-        Format a message with the appropriate prompt template for the model.
+        Get chat template from config with fallback support.
 
         Args:
             model_id: The model identifier
-            role: The message role (system, user, assistant)
-            content: The message content (can be string or object)
 
         Returns:
-            str: The formatted message content
+            Dict containing chat template components
         """
-        template = CommonUtils.get_model_prompt_template(model_id)
-        logger.info(f"Formatting message with template for model: {model_id}, role: {role}")
+        config_manager = get_config_manager()
 
-        try:
-            # Handle both string and object content
-            content_str = str(content) if not isinstance(content, str) else content
+        # Try to get model-specific template
+        chat_template = config_manager.get_chat_template(model_id)
 
-            # Replace placeholders in template
-            formatted = template.replace("{role}", role).replace("{content}", content_str)
-            logger.debug(f"Successfully formatted message for role '{role}' using model '{model_id}'")
-            return formatted
-        except Exception as e:
-            logger.error(f"Error formatting message with template: {e}")
-            # Return original content as fallback
-            logger.warning("Returning original content without template formatting")
-            return str(content) if not isinstance(content, str) else content
+        if chat_template:
+            return chat_template
+
+        # Try internal ID
+        external_id = config_manager.get_model_by_internal_id(model_id)
+        if external_id:
+            chat_template = config_manager.get_chat_template(external_id)
+            if chat_template:
+                return chat_template
+
+        # Fall back to global fallback_chat_template
+        fallback = config_manager.models_config.get('fallback_chat_template')
+
+        if fallback:
+            logger.warning(f"No chat_template for model {model_id}, using fallback")
+            return fallback
+
+        # Ultimate fallback (should never reach here if config is valid)
+        logger.error(f"No chat_template or fallback found for model {model_id}, using hardcoded default")
+        return {
+            'system_prefix': '<|im_start|>system\n',
+            'system_suffix': '<|im_end|>\n',
+            'user_prefix': '<|im_start|>user\n',
+            'user_suffix': '<|im_end|>\n',
+            'assistant_prefix': '<|im_start|>assistant\n',
+            'assistant_suffix': '<|im_end|>\n',
+            'default_system_prompt': 'You are a helpful assistant.'
+        }
+
+    @staticmethod
+    def format_system_message(model_id: str, content: str) -> str:
+        """Format system message using chat template."""
+        template = CommonUtils.get_chat_template(model_id)
+        return f"{template['system_prefix']}{content}{template['system_suffix']}"
+
+    @staticmethod
+    def format_user_message(model_id: str, content: str, has_vision: bool = False) -> str:
+        """Format user message using chat template."""
+        template = CommonUtils.get_chat_template(model_id)
+
+        if has_vision and 'vision_start' in template and 'vision_end' in template:
+            vision_tokens = f"{template['vision_start']}{template['vision_end']}"
+            formatted_content = f"{vision_tokens} {content}"
+        else:
+            formatted_content = content
+
+        return f"{template['user_prefix']}{formatted_content}{template['user_suffix']}"
+
+    @staticmethod
+    def format_assistant_message(model_id: str, content: str = None) -> str:
+        """Format assistant message using chat template."""
+        template = CommonUtils.get_chat_template(model_id)
+
+        if content:
+            # Use assistant_suffix if present, otherwise assume it's included or handled elsewhere
+            suffix = template.get('assistant_suffix', '<|im_end|>\n') # Fallback for safety
+            return f"{template['assistant_prefix']}{content}{suffix}"
+        else:
+            # Just the prefix (for prompting)
+            return template['assistant_prefix']
+
+    @staticmethod
+    def build_chat_prompt(
+        model_id: str,
+        messages: list,
+        include_assistant_prefix: bool = True,
+        has_vision: bool = False
+    ) -> str:
+        """
+        Build complete chat prompt from messages using unified template.
+
+        Args:
+            model_id: Model identifier
+            messages: List of message dicts with 'role' and 'content'
+            include_assistant_prefix: Whether to add assistant prefix at end
+            has_vision: Whether this is a vision request (adds vision tokens to last user message)
+
+        Returns:
+            Complete formatted prompt string
+        """
+        template = CommonUtils.get_chat_template(model_id)
+        formatted_parts = []
+
+        # Extract or use default system prompt
+        system_prompt = template.get('default_system_prompt', 'You are a helpful assistant.')
+        has_explicit_system = False
+
+        for msg in messages:
+            # Handle both dict and object (e.g. from Pydantic model)
+            if isinstance(msg, dict):
+                role = msg.get('role', '')
+                content = msg.get('content', '')
+            else:
+                role = getattr(msg, 'role', '')
+                content = getattr(msg, 'content', '')
+
+            if role == 'system':
+                system_prompt = content
+                has_explicit_system = True
+                break
+
+        # Always add system message first
+        formatted_parts.append(CommonUtils.format_system_message(model_id, system_prompt))
+
+        # Track last user message index for vision token placement
+        last_user_idx = -1
+        processed_messages = []
+
+        # Convert all to dicts first to simplify processing
+        for msg in messages:
+            if isinstance(msg, dict):
+                processed_messages.append(msg)
+            else:
+                processed_messages.append({
+                    'role': getattr(msg, 'role', ''),
+                    'content': getattr(msg, 'content', ''),
+                    'tool_calls': getattr(msg, 'tool_calls', None)
+                })
+
+        for i, msg in enumerate(processed_messages):
+            if msg.get('role') == 'user':
+                last_user_idx = i
+
+        # Format remaining messages
+        for i, msg in enumerate(processed_messages):
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+
+            if role == 'system':
+                continue  # Already processed
+
+            if role == 'tool':
+                continue  # Skip tool messages (handled separately in tool calling logic, or should be?)
+                # NOTE: In text_conversation_event.py, _execute_inference_with_tool specifically handles tool messages.
+                # If we are using this builder there, we need to handle 'tool' role if it's passed.
+                # For now, following the plan to skip, assuming tool handling logic builds prompt differently or injects into context.
+                # Actually, wait. `_execute_inference_with_tool` constructs a prompt with tool results.
+                # If we want this to be truly unified, we should probably handle 'tool' messages too if they are passed in.
+                # But the standard chat completion flow separates tool handling.
+                # Let's stick to the plan for now.
+
+            if role == 'user':
+                is_last_user = (i == last_user_idx)
+                formatted_parts.append(
+                    CommonUtils.format_user_message(model_id, content, has_vision and is_last_user)
+                )
+            elif role == 'assistant':
+                tool_calls = msg.get('tool_calls')
+                if tool_calls:
+                    # Assistant message with tool calls (typically no content)
+                    # Use suffix from template or fallback
+                    suffix = template.get('assistant_suffix', '<|im_end|>\n')
+                    formatted_parts.append(template['assistant_prefix'] + suffix)
+                else:
+                    # Regular assistant message
+                    formatted_parts.append(CommonUtils.format_assistant_message(model_id, content))
+
+        # Add assistant prefix for prompting
+        if include_assistant_prefix:
+            formatted_parts.append(template['assistant_prefix'])
+
+        return ''.join(formatted_parts)

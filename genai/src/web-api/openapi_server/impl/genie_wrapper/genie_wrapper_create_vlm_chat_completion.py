@@ -49,6 +49,56 @@ class GenieWrapperCreateVLMChatCompletion:
     """Enhanced VLM chat completion handler with caching and subprocess execution."""
 
     @staticmethod
+    def build_vlm_prompt_for_turn(messages: List, text_prompt: str, has_image: bool, model_id: str) -> str:
+        """
+        Build complete VLM prompt for a single turn with proper chat template.
+        Supports custom system prompts from the messages array.
+
+        Args:
+            messages: Full message history (to extract system prompt if present)
+            text_prompt: The user's text from current message
+            has_image: Whether this turn includes an image
+            model_id: Model identifier for template retrieval
+
+        Returns:
+            Complete formatted prompt ready for C++ layer
+        """
+        from openapi_server.utils.common_utils import CommonUtils
+
+        # Prepare messages for prompt builder
+        prompt_messages = []
+
+        # Extract system message if present
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = msg.get('role')
+                content = msg.get('content')
+            else:
+                role = getattr(msg, 'role', None)
+                content = getattr(msg, 'content', None)
+
+            if role == 'system':
+                prompt_messages.append({'role': 'system', 'content': content})
+                break
+
+        # Add user message
+        prompt_messages.append({
+            'role': 'user',
+            'content': text_prompt
+        })
+
+        # Use unified builder
+        complete_prompt = CommonUtils.build_chat_prompt(
+            model_id=model_id,
+            messages=prompt_messages,
+            include_assistant_prefix=True,
+            has_vision=has_image
+        )
+
+        logger.info(f"Built VLM prompt: {len(complete_prompt)} chars")
+        return complete_prompt
+
+    @staticmethod
     def extract_image_and_text_from_messages(messages: List, raw_json: dict = None) -> Tuple[Optional[str], str]:
         """
         Extract image URL/base64 and text content from the last message.
@@ -498,9 +548,18 @@ class GenieWrapperCreateVLMChatCompletion:
             os.mkfifo(pipe_path)
             logger.info(f"Created named pipe: {pipe_path}")
 
+            # Build COMPLETE formatted prompt (includes system prompt extraction)
+            complete_prompt = GenieWrapperCreateVLMChatCompletion.build_vlm_prompt_for_turn(
+                messages=request_data.messages,
+                text_prompt=text_prompt,
+                has_image=(preprocessed_image_bytes is not None or subprocess_image_input is not None),
+                model_id=request_data.model
+            )
+
             # Build subprocess command with pipe
+            # Note: We pass complete_prompt as text_prompt
             cmd, temp_file_path = GenieWrapperCreateVLMChatCompletion.build_subprocess_command(
-                request_data.model, subprocess_image_input, text_prompt, request_data,
+                request_data.model, subprocess_image_input, complete_prompt, request_data,
                 preprocessed_image_bytes=preprocessed_image_bytes
             )
 

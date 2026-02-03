@@ -199,6 +199,7 @@ public:
     LLMResponseCallback responseCallback = nullptr;
 
     void vlm_chat_completion_create();   // Execute a VLM request
+    void resetPipeline();   // Explicitly reset pipeline state
 
 private:
     std::shared_ptr<Pipeline> pipeline;
@@ -239,7 +240,6 @@ private:
     void createPipelineAndNodes();
     void connectNodes();
     void loadStaticCustomInputs();
-    void setSystemPrompt();
 
     /* Callback for text output from the text generator node */
     static Genie_Status_t textOutputCallback(const char* responseStr,
