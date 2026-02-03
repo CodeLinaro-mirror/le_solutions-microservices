@@ -1,0 +1,25 @@
+services:
+  genai_t2e:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai_service_t2e
+    container_name: genai_service_t2e
+    hostname: genai_t2e
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: service
+    ports:
+      - "${GENAI_T2E_PORT:-9090}:${GENAI_T2E_PORT:-9090}"
+    environment:
+      - GENAI_T2E_PORT=${GENAI_T2E_PORT:-9090}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/opt/embed_gen/models_config.json}
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
+    volumes:
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${MODELS_PATH:-/opt/embed_gen}:/opt/embed_gen/
+    command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2E_PORT} --reload"
