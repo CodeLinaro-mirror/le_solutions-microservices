@@ -1184,12 +1184,20 @@ class TextConversationEvent(ConversationEvent):
             llm_service = LLMService()
             config_path = CommonUtils.get_model_config_path(self.model_id)
 
-            model_input = llm_service.ffi.new("char[]", self.model_id.encode('utf-8'))
-            config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
+            if ADHOC_MODE:
+                # Use caching wrapper for ADHOC mode
+                self.llm_handle = LLMService.get_or_create_handle(
+                    self.model_id, config_path, streaming=True
+                )
+                logger.info(f"Event {self.event_id}: Got handle from ADHOC cache for model {self.model_id}")
+            else:
+                # Direct creation for normal mode
+                model_input = llm_service.ffi.new("char[]", self.model_id.encode('utf-8'))
+                config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
 
-            self.llm_handle = llm_service.lib.llm_create_object(
-                model_input, config_path_input, True
-            )
+                self.llm_handle = llm_service.lib.llm_create_object(
+                    model_input, config_path_input, True
+                )
 
             # Simple NULL check - no function calls to undefined C functions
             if self.llm_handle == llm_service.ffi.NULL:
@@ -1215,6 +1223,14 @@ class TextConversationEvent(ConversationEvent):
 
     def release_handle(self):
         """Release handle."""
+        from openapi_server.impl.constant import ADHOC_MODE
+
+        if ADHOC_MODE:
+            # In ADHOC mode, we don't destroy handles on release (they are cached)
+            logger.info(f"Event {self.event_id}: Released handle (kept in ADHOC cache)")
+            self.llm_handle = None
+            return
+
         if self.llm_handle and self.handle_owned:
             llm_service = LLMService()
             llm_service.lib.llm_destroy_object(self.llm_handle)
@@ -1228,6 +1244,13 @@ class TextConversationEvent(ConversationEvent):
         """Forcefully destroy the handle, regardless of ownership."""
         from openapi_server.impl.constant import ADHOC_MODE
 
+        if ADHOC_MODE:
+            # In ADHOC mode, we specifically destroy the cached handle for this model
+            logger.info(f"Event {self.event_id}: Terminating cached handle for model {self.model_id}")
+            LLMService.destroy_cached_handle(self.model_id)
+            self.llm_handle = None
+            return
+
         if self.llm_handle:
             llm_service = LLMService()
             # We are terminating, so we destroy the handle even if borrowed
@@ -1236,11 +1259,6 @@ class TextConversationEvent(ConversationEvent):
             self.llm_handle = None
             self.handle_owned = False
             self.handle_borrowed = False
-
-            # In ADHOC_MODE, also reset the singleton to unload the library
-            if ADHOC_MODE:
-                logger.info(f"Event {self.event_id}: ADHOC_MODE - Resetting LLMService singleton to unload library")
-                LLMService.reset_singleton()
 
     def _reset_handle(self):
         """Reset handle to clear KV cache."""
@@ -1503,3 +1521,37 @@ class TextConversationEvent(ConversationEvent):
         logger.info(f"Generated summary: {len(summary_text)} chars, {summary_tokens} tokens")
 
         return summary_text, summary_tokens
+
+    def complete_turn(self):
+        """
+        Override complete_turn to prevent automatic handle termination in ADHOC_MODE.
+
+        LLM handles should stay cached and only be destroyed when:
+        1. Switching to a different LLM model (handled in LLMService.get_or_create_handle)
+        2. Explicit cleanup is requested
+
+        This is similar to VLM handle management for consistency.
+        """
+        if self.state == EventState.ACTIVE:
+            self.state = EventState.COMPLETED
+            self.completed_at = time.time()
+
+            # Calculate detailed token breakdown
+            self.calculate_token_usage()
+
+            # Calculate hash for this turn
+            self.calculate_turn_hash()
+
+            logger.info(f"Event {self.event_id}: Turn COMPLETED, "
+                       f"prompt: {self.prompt_tokens}, "
+                       f"completion: {self.completion_tokens}, "
+                       f"total: {self.total_turn_tokens} tokens")
+
+            # IMPORTANT: Do NOT terminate LLM handle in ADHOC_MODE
+            # LLM handles are cached and reused across requests
+            # They are only destroyed when switching to a different LLM model
+            logger.debug(f"Event {self.event_id}: LLM handle kept alive for reuse (ADHOC_MODE)")
+
+            # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
+            if self._completion_callback:
+                asyncio.create_task(self._trigger_completion_callback())

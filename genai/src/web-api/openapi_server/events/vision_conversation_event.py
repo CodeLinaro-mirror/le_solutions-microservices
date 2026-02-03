@@ -3,9 +3,10 @@
 
 """
 VisionConversationEvent: Concrete implementation for VLM (Vision Language Model) events.
-Handles one complete turn with image support via subprocess execution.
+Handles one complete turn with image support via optimized direct CFFI execution with pipeline reuse.
 """
 
+import time
 from typing import Optional, Dict, Any
 from fastapi.responses import StreamingResponse
 
@@ -75,7 +76,7 @@ class VisionConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Executing VLM turn with {len(self.session.messages)} messages in history")
 
-            # Delegate to existing VLM handler (already async)
+            # Delegate to optimized VLM handler with direct CFFI and pipeline reuse
             # Pass completion callback for streaming lock release
             # Pass event object so VLM handler can complete the event before triggering callback
             result = await GenieWrapperCreateVLMChatCompletion.create_vlm_chat_completion(
@@ -179,10 +180,12 @@ class VisionConversationEvent(ConversationEvent):
 
     def terminate_handle(self):
         """
-        No-op: VLM doesn't use handles (subprocess execution).
+        Terminate VLM handle.
+        Explicitly destroys the cached handle for this model to free resources.
         """
-        logger.debug(f"Event {self.event_id}: terminate_handle called (no-op for VLM)")
-        pass
+        from openapi_server.impl.genie_wrapper.vlm_wrapper import VLMWrapper
+        logger.info(f"Event {self.event_id}: Terminating VLM handle for model {self.model_id}")
+        VLMWrapper.destroy_handle(self.model_id)
 
     def _calculate_prompt_tokens(self) -> int:
         """Calculate prompt tokens including image costs for this turn."""
@@ -214,3 +217,38 @@ class VisionConversationEvent(ConversationEvent):
 
         logger.debug(f"Event {self.event_id}: Calculated {tokens} completion tokens")
         return tokens
+
+    def complete_turn(self):
+        """
+        Override complete_turn to prevent automatic handle termination in ADHOC_MODE.
+
+        VLM handles should stay cached and only be destroyed when:
+        1. Switching to a different VLM model (handled in conversation_session.py)
+        2. Explicit cleanup is requested
+
+        This is different from LLM handles which are destroyed after each turn in ADHOC_MODE.
+        """
+        if self.state == EventState.ACTIVE:
+            self.state = EventState.COMPLETED
+            self.completed_at = time.time()
+
+            # Calculate detailed token breakdown
+            self.calculate_token_usage()
+
+            # Calculate hash for this turn
+            self.calculate_turn_hash()
+
+            logger.info(f"Event {self.event_id}: Turn COMPLETED, "
+                       f"prompt: {self.prompt_tokens}, "
+                       f"completion: {self.completion_tokens}, "
+                       f"total: {self.total_turn_tokens} tokens")
+
+            # IMPORTANT: Do NOT terminate VLM handle in ADHOC_MODE
+            # VLM handles are cached and reused across requests
+            # They are only destroyed when switching to a different VLM model
+            logger.debug(f"Event {self.event_id}: VLM handle kept alive for reuse (ADHOC_MODE)")
+
+            # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
+            if self._completion_callback:
+                import asyncio
+                asyncio.create_task(self._trigger_completion_callback())

@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <json/json.h>
 #include <cstddef> // Explicitly included for size_t
+#include <thread>   // For std::this_thread::sleep_for
+#include <chrono>   // For std::chrono::seconds
 
 Profile::Profile() {
     const int32_t status = GenieProfile_create(nullptr, &m_handle);
@@ -431,7 +433,7 @@ void VLMObject::createPipelineAndNodes() {
     auto pipelineCfg = std::make_shared<Pipeline::Config>("", profiler);
     pipeline = std::make_shared<Pipeline>(std::move(*pipelineCfg));
 
-    // Image encoder node
+    // Create image encoder node
     std::string imgCfgStr;
     {
         std::ifstream f(modelConfig.imageEncoderConfig);
@@ -441,6 +443,7 @@ void VLMObject::createPipelineAndNodes() {
     auto imgNodeCfg = std::make_shared<Node::Config>(imgCfgStr, profiler);
     imageEncoderNode = std::make_shared<Node>(std::move(*imgNodeCfg));
     pipeline->addNode(imageEncoderNode);
+    std::cerr << "Created image encoder node" << std::endl;
 
     // LUT encoder node
     std::string lutCfgStr;
@@ -453,7 +456,7 @@ void VLMObject::createPipelineAndNodes() {
     lutEncoderNode = std::make_shared<Node>(std::move(*lutNodeCfg));
     pipeline->addNode(lutEncoderNode);
 
-    // Text generator node
+    // Create text generator node
     std::string txtGenCfgStr;
     {
         std::ifstream f(modelConfig.textGeneratorConfig);
@@ -463,6 +466,7 @@ void VLMObject::createPipelineAndNodes() {
     auto txtGenNodeCfg = std::make_shared<Node::Config>(txtGenCfgStr, profiler);
     textGeneratorNode = std::make_shared<Node>(std::move(*txtGenNodeCfg));
     pipeline->addNode(textGeneratorNode);
+    std::cerr << "Created text generator node" << std::endl;
 }
 
 /*--------------------------------------------------------------
@@ -546,6 +550,11 @@ void VLMObject::vlm_chat_completion_create() {
         throw std::runtime_error("VLMObject query not initialized.");
     }
 
+    // Clear previous image data to ensure fresh state for each request
+    // This prevents stale image data from previous requests
+    currentImageData.clear();
+    std::cerr << "Cleared previous image data buffer" << std::endl;
+
     //Check if Sampling Parameters are used
     if (query->temperature != 1 || query->top_p != 1 || query->presence_penalty != 0.0 || query->frequency_penalty != 0.0){
         SamplerConfig sc;
@@ -571,7 +580,6 @@ void VLMObject::vlm_chat_completion_create() {
     // 1. Extract user text prompt and image buffer from the query
     // -----------------------------------------------------------------
     std::string userPrompt;
-    std::shared_ptr<void> managedImageBuffer;
 
     if (query->message.use_content_items) {
         for (int i = 0; i < query->message.content_items_count; ++i) {
@@ -579,20 +587,24 @@ void VLMObject::vlm_chat_completion_create() {
             if (item.type == CONTENT_TYPE_TEXT) {
                 userPrompt = item.text;
             } else if (item.type == CONTENT_TYPE_IMAGE_BUFFER) {
-                // Copy the user's buffer into a managed buffer to ensure it stays alive
+                // Copy the user's buffer into the member variable currentImageData
+                // This ensures the buffer stays alive throughout pipeline execution
                 const void* userBuffer = item.image.buffer;
                 size_t bufferSize = item.image.size;
 
                 if (userBuffer != nullptr && bufferSize > 0) {
-                    managedImageBuffer = std::shared_ptr<void>(new int8_t[bufferSize], [](void* p) { delete[] static_cast<int8_t*>(p); });
-                    std::copy(static_cast<const int8_t*>(userBuffer),
-                              static_cast<const int8_t*>(userBuffer) + bufferSize,
-                              static_cast<int8_t*>(managedImageBuffer.get()));
+                    // Resize and copy image data into member variable
+                    currentImageData.resize(bufferSize);
+                    std::copy(static_cast<const uint8_t*>(userBuffer),
+                              static_cast<const uint8_t*>(userBuffer) + bufferSize,
+                              currentImageData.begin());
+
+                    std::cerr << "Copied " << bufferSize << " bytes of image data to member buffer" << std::endl;
 
                     imageEncoderNode->setData(
                         GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
-                        managedImageBuffer.get(),
-                        bufferSize);
+                        currentImageData.data(),
+                        currentImageData.size());
                 }
             }
         }
@@ -609,6 +621,15 @@ void VLMObject::vlm_chat_completion_create() {
     std::string completePrompt = userPrompt;
 
     lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, completePrompt);
+
+    // Reload static inputs (Pos IDs, Masks) for every request
+    // This is required because ImageEncoder clears its input buffer after each encoding
+    try {
+        loadStaticCustomInputs();
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Failed to reload static custom inputs: " << e.what() << std::endl;
+        throw;
+    }
 
     // -----------------------------------------------------------------
     // 4. Execute the pipeline
@@ -634,6 +655,11 @@ void VLMObject::vlm_chat_completion_create() {
 
         execution_succeeded = true;
 
+        // CRITICAL: Add delay here to ensure SDK's callback threads have fully completed
+        // The callback signals us, but the SDK may still be cleaning up internally
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cerr << "Callback completed, SDK cleanup delay finished" << std::endl;
+
     } catch (const std::exception& e) {
         std::cerr << "ERROR: Pipeline execution failed: " << e.what() << std::endl;
         request_in_progress = false;
@@ -647,11 +673,15 @@ void VLMObject::vlm_chat_completion_create() {
     // Always attempt to reset pipeline state, even on error
     try {
         pipeline->reset();
+        std::cerr << "Pipeline reset completed successfully" << std::endl;
+
+        // Add delay to ensure hardware resources (DSP/NPU) are fully released
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cerr << "Hardware stabilization delay completed, ready for next request" << std::endl;
 
         if (!execution_succeeded) {
             std::cerr << "Pipeline reset completed after execution failure" << std::endl;
         }
-
     } catch (const std::exception& e) {
         std::cerr << "ERROR: Failed to reset pipeline: " << e.what() << std::endl;
 
@@ -689,8 +719,10 @@ Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
 
         bool isStreaming = *udata->stream;
         bool isEndOfSentence = (sentenceCode == GENIE_NODE_SENTENCE_END);
-        // Assume any code other than CONTINUE is a form of termination.
-        bool isEndOfStream = (sentenceCode != GENIE_NODE_SENTENCE_CONTINUE);
+        // Enhanced end-of-stream detection: explicitly check for END, ABORT, or COMPLETE
+        bool isEndOfStream = (sentenceCode == GENIE_NODE_SENTENCE_END ||
+                              sentenceCode == GENIE_NODE_SENTENCE_ABORT ||
+                              sentenceCode == GENIE_NODE_SENTENCE_COMPLETE);
 
         if (isStreaming) {
             // Streaming mode: send each token immediately.

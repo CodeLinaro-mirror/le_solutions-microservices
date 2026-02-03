@@ -161,18 +161,23 @@ class ConversationSession:
             model_switched = previous_event and previous_event.model_id != model_id
 
             if ADHOC_MODE:
-                # ADHOC_MODE: Always create new handle, never take over
-                logger.info(f"Session {self.session_id}: ADHOC_MODE enabled - creating new handle for each request")
+                # ADHOC_MODE: Always request a new handle (which will use the cache)
+                logger.info(f"Session {self.session_id}: ADHOC_MODE enabled - requesting handle from cache")
 
-                # Ensure previous handle is cleaned up (should already be done in complete_turn)
-                if previous_event and previous_event.llm_handle:
-                    logger.warning(f"Session {self.session_id}: Previous handle still exists in ADHOC_MODE, cleaning up")
-                    try:
-                        previous_event.terminate_handle()
-                    except Exception as e:
-                        logger.error(f"Failed to cleanup previous handle: {e}")
+                # Handle VLM model switching: Only terminate VLM handle when switching to a different VLM model
+                # Keep VLM handle alive when switching to LLM (user requirement)
+                if (previous_event and
+                    isinstance(previous_event, VisionConversationEvent) and
+                    isinstance(event, VisionConversationEvent) and
+                    previous_event.model_id != model_id):
+                    logger.info(f"Session {self.session_id}: VLM model switch detected ({previous_event.model_id} -> {model_id}), terminating old VLM handle")
+                    previous_event.terminate_handle()
 
-                event.create_new_handle()
+                # For LLM: LLMService.get_or_create_handle automatically manages single-model constraint
+                # For VLM: VLMWrapper caches handles automatically during execution via _get_or_create_handle()
+                # Only call create_new_handle for LLM events (VLM's create_new_handle is a no-op)
+                if isinstance(event, TextConversationEvent):
+                    event.create_new_handle()
 
             elif model_switched:
                 logger.info(f"Session {self.session_id}: Model switch detected from {previous_event.model_id} to {model_id}")

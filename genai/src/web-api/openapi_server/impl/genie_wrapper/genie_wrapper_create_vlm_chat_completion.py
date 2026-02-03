@@ -2,29 +2,29 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 """
-Enhanced VLM Chat Completion Handler with Image Caching
+Direct VLM Chat Completion Handler with CFFI Wrapper
 
-This module provides the main entry point for VLM (Vision Language Model) requests
-with intelligent image caching capabilities. It replaces the previous complex
-CFFI thread-based approach with a simpler subprocess-based execution model.
+This module provides VLM (Vision Language Model) request handling using
+direct CFFI calls instead of subprocess execution, enabling pipeline reuse
+and significantly improved performance.
 
 Key features:
+- Direct CFFI-based VLM execution (no subprocess overhead)
+- Pipeline reuse across requests via handle caching
 - Image caching using conversation hash as session identifier
 - Support for both URL and base64 encoded images
-- Subprocess-based VLM execution for isolation and simplicity
-- Streaming support via SSE generator simulation
+- Streaming support via SSE generator
 - Fallback logic for follow-up questions without images
 - Integration with existing chat_utils session management
 """
 
-import subprocess
 import os
 import time
 import uuid
 import json
 import base64
 import asyncio
-import tempfile
+import threading
 from typing import Union, Optional, Tuple, List, Dict, Any
 
 from fastapi.responses import StreamingResponse
@@ -39,6 +39,10 @@ from openapi_server.session.conversation_utils import ConversationUtils
 from openapi_server.utils.image_cache import get_image_cache
 from openapi_server.utils.image_validator import decode_image
 from openapi_server.utils.image_preprocessor import preprocess_from_decoded
+from openapi_server.impl.genie_wrapper.vlm_wrapper import VLMWrapper
+from openapi_server.impl.genie_wrapper.vlm_service_singleton import VLMService
+from openapi_server.utils.common_utils import CommonUtils
+from openapi_server.managers.model_config_manager import ModelConfigManager
 
 # Initialize logger
 LoggerConfig.initialize()
@@ -46,7 +50,7 @@ logger = LoggerConfig.get_logger(__name__)
 
 
 class GenieWrapperCreateVLMChatCompletion:
-    """Enhanced VLM chat completion handler with caching and subprocess execution."""
+    """Direct VLM chat completion handler using CFFI wrapper."""
 
     @staticmethod
     def build_vlm_prompt_for_turn(messages: List, text_prompt: str, has_image: bool, model_id: str) -> str:
@@ -63,8 +67,6 @@ class GenieWrapperCreateVLMChatCompletion:
         Returns:
             Complete formatted prompt ready for C++ layer
         """
-        from openapi_server.utils.common_utils import CommonUtils
-
         # Prepare messages for prompt builder
         prompt_messages = []
 
@@ -266,151 +268,6 @@ class GenieWrapperCreateVLMChatCompletion:
             raise
 
     @staticmethod
-    def build_subprocess_command(model: str, image_input: Optional[str], text_prompt: str,
-                               request_data: CreateChatCompletionRequest,
-                               preprocessed_image_bytes: Optional[bytes] = None) -> Tuple[List[str], Optional[str]]:
-        """
-        Build the subprocess command for VLM execution.
-
-        Args:
-            model: Model name
-            image_input: Image URL or base64 string (can be None for cached images)
-            text_prompt: Text prompt
-            request_data: Request parameters
-            preprocessed_image_bytes: Optional preprocessed image bytes to pass directly
-
-        Returns:
-            Tuple of (command_list, temp_file_path)
-            temp_file_path will be None if no temp file was created
-        """
-        vlm_script_path = os.path.join("/iot-user", "app", "site-packages", "vlm_standalone_test.py")
-
-        cmd = [
-            "python3",
-            vlm_script_path,
-            "--model", model,
-            "--prompt", text_prompt,
-            "--max-tokens", str(request_data.max_completion_tokens or 300),
-            "--temperature", str(request_data.temperature or 0.7),
-            "--top-p", str(request_data.top_p or 0.9),
-            "--presence-penalty", str(request_data.presence_penalty or 0.0),
-            "--frequency-penalty", str(request_data.frequency_penalty or 0.0)
-        ]
-
-        temp_file_path = None
-
-        # Add image parameter - prefer preprocessed bytes over URL/base64
-        if preprocessed_image_bytes:
-            # Write preprocessed image bytes to a temporary file
-            try:
-                # Create a temporary file with a unique name
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as temp_file:
-                    temp_file_path = temp_file.name
-                    # Write raw bytes directly to the file
-                    temp_file.write(preprocessed_image_bytes)
-
-                # Pass the temp file path to the subprocess
-                cmd.extend(["--image-file", temp_file_path])
-                logger.info(f"Wrote {len(preprocessed_image_bytes)} bytes to temp file: {temp_file_path}")
-            except Exception as e:
-                logger.error(f"Failed to create temp file for image bytes: {e}")
-                # Fall back to URL/base64 if temp file creation fails
-                if image_input:
-                    if image_input.startswith('http'):
-                        cmd.extend(["--image-url", image_input])
-                    else:
-                        cmd.extend(["--image-base64", image_input])
-        elif image_input:
-            # No preprocessed bytes available, use URL/base64
-            if image_input.startswith('http'):
-                cmd.extend(["--image-url", image_input])
-            else:
-                cmd.extend(["--image-base64", image_input])
-
-        # Add streaming flag if requested
-        if getattr(request_data, "stream", False):
-            cmd.append("--stream")
-
-        return cmd, temp_file_path
-
-    @staticmethod
-    def parse_vlm_subprocess_output(stdout: str) -> str:
-        """
-        Parse VLM response from subprocess stdout using uniform markers.
-
-        Args:
-            stdout: Raw stdout from subprocess
-
-        Returns:
-            Extracted VLM response content
-        """
-        stdout_lines = stdout.splitlines()
-
-        # Parse VLM response using new uniform markers
-        capture_response = False
-        response_lines = []
-
-        for line in stdout_lines:
-            stripped_line = line.strip()
-
-            if "=== VLM_RESPONSE_START ===" in stripped_line:
-                capture_response = True
-                continue
-
-            if "=== VLM_RESPONSE_END ===" in stripped_line:
-                capture_response = False
-                break
-
-            if capture_response:
-                # Extract content after logger prefix if present
-                if " - INFO - " in stripped_line:
-                    content = stripped_line.split(" - INFO - ", 1)[1]
-                    response_lines.append(content)
-                else:
-                    # Handle cases where content might not have logger prefix
-                    response_lines.append(stripped_line)
-
-        extracted_content = "\n".join(response_lines).strip()
-        logger.info(f"Extracted VLM response: {len(extracted_content)} characters")
-        return extracted_content
-
-    @staticmethod
-    def build_chat_completion_response(content: str, model: str, session_id: str) -> CreateChatCompletionResponse:
-        """
-        Build a ChatCompletionResponse from VLM content.
-
-        Args:
-            content: VLM response content
-            model: Model name
-            session_id: Session/chat completion ID to use in response
-
-        Returns:
-            CreateChatCompletionResponse object
-        """
-        message = ChatCompletionResponseMessage(
-            role="assistant",
-            content=content,
-            refusal=LLMServiceKeys.REFUSE
-        )
-
-        choices_inner = CreateChatCompletionResponseChoicesInner(
-            finish_reason="stop",
-            index=0,
-            message=message,
-            logprobs=None
-        )
-
-        response = CreateChatCompletionResponse(
-            id=session_id,  # Use session_id instead of generating new ID
-            object="chat.completion",
-            created=int(time.time()),
-            model=model,
-            choices=[choices_inner]
-        )
-
-        return response
-
-    @staticmethod
     async def create_vlm_chat_completion(request_data: CreateChatCompletionRequest,
                                        raw_json: dict = None,
                                        completion_callback=None,
@@ -418,7 +275,7 @@ class GenieWrapperCreateVLMChatCompletion:
                                        event_state: Optional[str] = None,
                                        event_object=None) -> Union[CreateChatCompletionResponse, StreamingResponse, Error]:
         """
-        Main entry point for VLM chat completion with named pipe IPC.
+        Main entry point for VLM chat completion using direct CFFI wrapper.
 
         Args:
             request_data: The chat completion request
@@ -431,24 +288,18 @@ class GenieWrapperCreateVLMChatCompletion:
         Returns:
             Chat completion response, streaming response, or error
         """
-        logger.info(f"=== VLM Chat Completion Request (Streaming={getattr(request_data, 'stream', False)}) ===")
-
-        pipe_path = None
-        temp_file_path = None
-        process = None
+        logger.info(f"=== VLM Chat Completion Request (Direct CFFI, Streaming={getattr(request_data, 'stream', False)}) ===")
 
         try:
-            # Extract session_id from raw_json (passed from VisionConversationEvent)
-            # This ensures VLM responses use the same ID as the chat completion session
+            # Extract session_id from raw_json
             session_id = raw_json.get('session_id') if raw_json else None
             if not session_id:
-                # Fallback: generate a chat completion ID if not provided
                 session_id = f"chat-{uuid.uuid4()}"
                 logger.warning(f"No session_id provided in raw_json, generated: {session_id}")
             else:
                 logger.info(f"Using session_id from raw_json: {session_id}")
 
-            # Calculate conversation hash for caching (session identification)
+            # Calculate conversation hash for caching
             conversation_hash = ConversationUtils.calculate_conversation_hash(
                 request_data.messages,
                 exclude_last_pair=False
@@ -468,133 +319,121 @@ class GenieWrapperCreateVLMChatCompletion:
                     type=Parameters.INTERNAL_TYPE
                 )
 
-            # Get image cache
-            image_cache = get_image_cache()
-
-            # Determine image source and handle caching
+            # Always process new image from current request (no caching)
             preprocessed_image_bytes = None
-            subprocess_image_input = None
 
-            if image_input:
-                # New image provided in current message
-                logger.info("New image provided, preprocessing and caching...")
-                try:
-                    image_bytes = await GenieWrapperCreateVLMChatCompletion.preprocess_image_from_input(image_input)
+            if not image_input:
+                # No image in current message - this is an error for VLM
+                return Error(
+                    code="400",
+                    message="No image found in current message. Each VLM request must include an image.",
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
 
-                    # Cache the preprocessed image if we have a conversation hash
-                    if conversation_hash:
-                        source_desc = image_input[:50] + "..." if len(image_input) > 50 else image_input
-                        image_cache.set(conversation_hash, image_bytes, source_desc)
+            # Process the image from current request
+            logger.info("Processing new image from current request (no caching)...")
+            try:
+                preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletion.preprocess_image_from_input(image_input)
+                logger.info(f"Image preprocessed successfully: {len(preprocessed_image_bytes)} bytes")
 
-                    # Use the preprocessed image bytes directly
-                    subprocess_image_input = image_input  # Keep original for fallback
-                    preprocessed_image_bytes = image_bytes
+            except Exception as e:
+                logger.error(f"Failed to preprocess image: {e}")
+                return Error(
+                    code="400",
+                    message=f"Failed to process image: {str(e)}",
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
 
-                except Exception as e:
-                    logger.error(f"Failed to preprocess new image: {e}")
-                    return Error(
-                        code="400",
-                        message=f"Failed to process image: {str(e)}",
-                        param=Parameters.INTERNAL_TYPE,
-                        type=Parameters.INTERNAL_TYPE
-                    )
-            else:
-                # No image in current message - try cache first
-                cached_image_bytes = None
-                if conversation_hash:
-                    cached_image_bytes = image_cache.get(conversation_hash)
-
-                if cached_image_bytes:
-                    # Use cached preprocessed image
-                    logger.info(f"Using cached image for conversation {conversation_hash}")
-                    preprocessed_image_bytes = cached_image_bytes
-                    # Set fallback
-                    cached_base64 = base64.b64encode(cached_image_bytes).decode('utf-8')
-                    subprocess_image_input = f"data:image/preprocessed;base64,{cached_base64}"
-
-                else:
-                    # No cached image - search all messages for image
-                    logger.info("No cached image found, searching all messages...")
-                    found_image = GenieWrapperCreateVLMChatCompletion.search_all_messages_for_image(
-                        request_data.messages, raw_json
-                    )
-
-                    if found_image:
-                        # Found image in conversation history
-                        logger.info("Found image in conversation history, preprocessing...")
-                        try:
-                            image_bytes = await GenieWrapperCreateVLMChatCompletion.preprocess_image_from_input(found_image)
-
-                            # Cache for future use
-                            if conversation_hash:
-                                source_desc = found_image[:50] + "..." if len(found_image) > 50 else found_image
-                                image_cache.set(conversation_hash, image_bytes, source_desc)
-
-                            # Use the preprocessed image bytes directly
-                            subprocess_image_input = found_image  # Keep original for fallback
-                            preprocessed_image_bytes = image_bytes
-
-                        except Exception as e:
-                            logger.error(f"Failed to preprocess found image: {e}")
-                            return Error(
-                                code="400",
-                                message=f"Failed to process image from conversation: {str(e)}",
-                                param=Parameters.INTERNAL_TYPE,
-                                type=Parameters.INTERNAL_TYPE
-                            )
-                    else:
-                        # No image found anywhere
-                        return Error(
-                            code="400",
-                            message="No image found in current message, cache, or conversation history",
-                            param=Parameters.INTERNAL_TYPE,
-                            type=Parameters.INTERNAL_TYPE
-                        )
-
-            # Create named pipe
-            pipe_path = tempfile.mktemp(suffix='.fifo', prefix='vlm_')
-            os.mkfifo(pipe_path)
-            logger.info(f"Created named pipe: {pipe_path}")
-
-            # Build COMPLETE formatted prompt (includes system prompt extraction)
+            # Build complete formatted prompt
             complete_prompt = GenieWrapperCreateVLMChatCompletion.build_vlm_prompt_for_turn(
                 messages=request_data.messages,
                 text_prompt=text_prompt,
-                has_image=(preprocessed_image_bytes is not None or subprocess_image_input is not None),
+                has_image=(preprocessed_image_bytes is not None),
                 model_id=request_data.model
             )
 
-            # Build subprocess command with pipe
-            # Note: We pass complete_prompt as text_prompt
-            cmd, temp_file_path = GenieWrapperCreateVLMChatCompletion.build_subprocess_command(
-                request_data.model, subprocess_image_input, complete_prompt, request_data,
-                preprocessed_image_bytes=preprocessed_image_bytes
+            # Resolve model configuration
+            model_config_manager = ModelConfigManager()
+            internal_model_id = model_config_manager.get_internal_id(request_data.model)
+            if not internal_model_id:
+                internal_model_id = request_data.model
+
+            config_file_path = model_config_manager.get_config_file_path(request_data.model)
+            if not config_file_path:
+                config_file_path = ""
+
+            logger.info(f"Resolved model: {request_data.model} -> {internal_model_id}, config: {config_file_path}")
+
+            # Get VLM service and create query structure
+            vlm_service = VLMService()
+            ffi = vlm_service.ffi
+            lib = vlm_service.lib
+
+            # Create query structure
+            query = ffi.new("Query *")
+            if query == ffi.NULL:
+                return Error(
+                    code="500",
+                    message="Failed to allocate Query structure",
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
+
+            # Populate query fields
+            CommonUtils.copy_py_string_to_c_array(ffi, query.model, internal_model_id, 256)
+            CommonUtils.copy_py_string_to_c_array(ffi, query.message.role, "user", 256)
+
+            # Set multimodal mode
+            query.message.use_content_items = True
+            query.message.content_items_count = 0
+
+            # Add text content item
+            query.message.content_items[0].type = 0  # CONTENT_TYPE_TEXT
+            CommonUtils.copy_py_string_to_c_array(
+                ffi,
+                query.message.content_items[0].text,
+                complete_prompt,
+                12300  # MAX_CONTENT_LENGTH
             )
+            query.message.content_items_count = 1
+            logger.info(f"Added text content item: {len(complete_prompt)} chars")
 
-            # Add pipe to command
-            cmd.extend(["--output-pipe", pipe_path])
+            # Add image buffer
+            buffer = ffi.new("char[]", len(preprocessed_image_bytes))
+            ffi.memmove(buffer, preprocessed_image_bytes, len(preprocessed_image_bytes))
 
-            logger.info(f"Executing VLM subprocess with pipe: {' '.join(cmd[:5])}... (truncated)")
+            idx = query.message.content_items_count
+            query.message.content_items[idx].type = 1  # CONTENT_TYPE_IMAGE_BUFFER
+            query.message.content_items[idx].image.buffer = buffer
+            query.message.content_items[idx].image.size = len(preprocessed_image_bytes)
+            query.message.content_items_count += 1
+            logger.info(f"Added image content item: {len(preprocessed_image_bytes)} bytes")
 
-            # Launch subprocess (non-blocking)
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # Set numeric parameters
+            CommonUtils.copy_py_int_to_c_field(ffi, query, 'max_completion_tokens', request_data.max_completion_tokens or 300)
+            CommonUtils.copy_py_float_to_c_field(ffi, query, 'temperature', request_data.temperature or 0.7)
+            CommonUtils.copy_py_float_to_c_field(ffi, query, 'top_p', request_data.top_p or 0.9)
+            CommonUtils.copy_py_float_to_c_field(ffi, query, 'presence_penalty', request_data.presence_penalty or 0.0)
+            CommonUtils.copy_py_float_to_c_field(ffi, query, 'frequency_penalty', request_data.frequency_penalty or 0.0)
 
             # Handle streaming vs non-streaming
-            if getattr(request_data, "stream", False):
+            streaming = getattr(request_data, "stream", False)
+
+            if streaming:
                 return await GenieWrapperCreateVLMChatCompletion._handle_streaming_response(
-                    pipe_path, process, request_data, conversation_hash, temp_file_path,
-                    completion_callback, event_id, event_state, event_object
+                    internal_model_id, config_file_path, query, session_id, request_data,
+                    ffi, lib, completion_callback, event_id, event_state, event_object
                 )
             else:
                 return await GenieWrapperCreateVLMChatCompletion._handle_non_streaming_response(
-                    pipe_path, process, request_data, conversation_hash, temp_file_path,
-                    completion_callback, event_id, event_state, event_object
+                    internal_model_id, config_file_path, query, session_id, request_data,
+                    ffi, lib, completion_callback, event_id, event_state, event_object
                 )
 
         except Exception as e:
             logger.error(f"Unexpected error in VLM chat completion: {e}", exc_info=True)
-            # Cleanup
-            GenieWrapperCreateVLMChatCompletion._cleanup_resources(pipe_path, temp_file_path, process)
             return Error(
                 code="500",
                 message=f"VLM request failed: {str(e)}",
@@ -603,74 +442,104 @@ class GenieWrapperCreateVLMChatCompletion:
             )
 
     @staticmethod
-    async def _handle_streaming_response(pipe_path: str, process: subprocess.Popen,
-                                        request_data: CreateChatCompletionRequest,
-                                        session_id: str, temp_file_path: Optional[str],
-                                        completion_callback=None, event_id: Optional[str] = None,
-                                        event_state: Optional[str] = None,
-                                        event_object=None) -> StreamingResponse:
-        """Handle streaming response via named pipe."""
+    async def _handle_streaming_response(
+        model_id: str, config_path: str, query, session_id: str, request_data,
+        ffi, lib, completion_callback=None, event_id: Optional[str] = None,
+        event_state: Optional[str] = None, event_object=None
+    ) -> StreamingResponse:
+        """Handle streaming response using direct CFFI."""
         created = int(time.time())
         model = request_data.model
 
+        # Streaming output container
+        streaming_output = []
+        streaming_complete = threading.Event()
+
+        # Define callback
+        @ffi.callback("void(const Response *)")
+        def callback(response_ptr):
+            resp = response_ptr[0]
+            choice = resp.choices[0]
+            msg = choice.message
+
+            content = ffi.string(msg.content).decode("utf-8")
+            finish_reason = ffi.string(choice.finish_reason).decode("utf-8")
+
+            streaming_output.append({
+                'content': content,
+                'finish_reason': finish_reason
+            })
+
+            if finish_reason == "stop":
+                streaming_complete.set()
+
         async def stream_generator():
             try:
-                with open(pipe_path, 'r') as pipe:
-                    # First chunk: role
-                    first_chunk = {
-                        "id": session_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": None},
-                            "finish_reason": None,
-                            "logprobs": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(first_chunk)}\n\n"
+                # Execute VLM in background
+                result = VLMWrapper.execute_vlm_completion(
+                    model_id=model_id,
+                    config_path=config_path,
+                    query=query,
+                    streaming=True,
+                    callback=callback,
+                    timeout=300.0
+                )
 
-                    # Read tokens from pipe
-                    for line in pipe:
-                        data = json.loads(line.strip())
+                if result and result.get('error'):
+                    raise Exception(result['error'])
 
-                        if data['type'] == 'token':
-                            # Content delta chunk
-                            content_chunk = {
-                                "id": session_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": data['content']},
-                                    "finish_reason": None,
-                                    "logprobs": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(content_chunk)}\n\n"
+                # Wait for completion
+                streaming_complete.wait(timeout=300)
 
-                        elif data['type'] == 'done':
-                            # Final chunk
-                            final_chunk = {
-                                "id": session_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": data['finish_reason'],
-                                    "logprobs": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(final_chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            break
+                # First chunk: role
+                first_chunk = {
+                    "id": session_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": None},
+                        "finish_reason": None,
+                        "logprobs": None
+                    }]
+                }
+                yield f"data: {json.dumps(first_chunk)}\n\n"
 
-                        elif data['type'] == 'error':
-                            raise Exception(data['message'])
+                # Stream tokens
+                for item in streaming_output:
+                    if item['finish_reason'] == "stop":
+                        # Final chunk
+                        final_chunk = {
+                            "id": session_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                                "logprobs": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(final_chunk)}\n\n"
+                    else:
+                        # Content chunk
+                        content_chunk = {
+                            "id": session_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": item['content']},
+                                "finish_reason": None,
+                                "logprobs": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+
+                yield "data: [DONE]\n\n"
 
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
@@ -689,38 +558,26 @@ class GenieWrapperCreateVLMChatCompletion:
                 yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                # Cleanup resources
-                GenieWrapperCreateVLMChatCompletion._cleanup_resources(pipe_path, temp_file_path, process)
-
-                # CRITICAL: Complete the event BEFORE triggering callback
-                # This ensures event state is COMPLETED when request queue manager checks it
+                # Complete event before callback
                 if event_object:
                     try:
                         logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
-
-                        # Complete the turn (sets state to COMPLETED)
                         event_object.complete_turn()
-
-                        # Calculate event hash (includes all messages in turn)
                         event_object.calculate_event_hash()
-
-                        # Mark session's current event as complete
                         if hasattr(event_object, 'session') and event_object.session:
                             event_object.session.complete_current_event()
-
-                        logger.info(f"VLM Event {event_id}: Event completed successfully, state={event_object.state.value}")
+                        logger.info(f"VLM Event {event_id}: Event completed successfully")
                     except Exception as e:
                         logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
 
-                # NOW trigger completion callback - event is already COMPLETED
+                # Trigger completion callback
                 if completion_callback:
-                    logger.info(f"VLM Event {event_id}: Triggering completion callback (event already completed)")
+                    logger.info(f"VLM Event {event_id}: Triggering completion callback")
                     try:
                         await completion_callback(event_id, event_state)
                     except Exception as e:
                         logger.error(f"VLM Event {event_id}: Error in streaming completion callback: {e}", exc_info=True)
 
-        # Set SSE headers
         response_headers = {
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no"
@@ -733,32 +590,56 @@ class GenieWrapperCreateVLMChatCompletion:
         )
 
     @staticmethod
-    async def _handle_non_streaming_response(pipe_path: str, process: subprocess.Popen,
-                                            request_data: CreateChatCompletionRequest,
-                                            session_id: str, temp_file_path: Optional[str],
-                                            completion_callback=None, event_id: Optional[str] = None,
-                                            event_state: Optional[str] = None,
-                                            event_object=None) -> Union[CreateChatCompletionResponse, Error]:
-        """Handle non-streaming response via named pipe."""
+    async def _handle_non_streaming_response(
+        model_id: str, config_path: str, query, session_id: str, request_data,
+        ffi, lib, completion_callback=None, event_id: Optional[str] = None,
+        event_state: Optional[str] = None, event_object=None
+    ) -> Union[CreateChatCompletionResponse, Error]:
+        """Handle non-streaming response using direct CFFI."""
         accumulated_content = []
         finish_reason = "stop"
+        completion_event = threading.Event()
+
+        # Define callback
+        @ffi.callback("void(const Response *)")
+        def callback(response_ptr):
+            resp = response_ptr[0]
+            choice = resp.choices[0]
+            msg = choice.message
+
+            content = ffi.string(msg.content).decode("utf-8")
+            finish_reason_str = ffi.string(choice.finish_reason).decode("utf-8")
+
+            accumulated_content.append(content)
+
+            if finish_reason_str == "stop":
+                nonlocal finish_reason
+                finish_reason = finish_reason_str
+                completion_event.set()
 
         try:
-            with open(pipe_path, 'r') as pipe:
-                for line in pipe:
-                    data = json.loads(line.strip())
+            # Execute VLM
+            result = VLMWrapper.execute_vlm_completion(
+                model_id=model_id,
+                config_path=config_path,
+                query=query,
+                streaming=False,
+                callback=callback,
+                timeout=300.0
+            )
 
-                    if data['type'] == 'token':
-                        accumulated_content.append(data['content'])
+            if result and result.get('error'):
+                return Error(
+                    code="500",
+                    message=f"VLM execution failed: {result['error']}",
+                    param=Parameters.INTERNAL_TYPE,
+                    type=Parameters.INTERNAL_TYPE
+                )
 
-                    elif data['type'] == 'done':
-                        finish_reason = data['finish_reason']
-                        break
+            # Wait for completion
+            completion_event.wait(timeout=300)
 
-                    elif data['type'] == 'error':
-                        raise Exception(data['message'])
-
-            # Build complete response
+            # Build response
             full_content = ''.join(accumulated_content)
 
             message = ChatCompletionResponseMessage(
@@ -793,66 +674,22 @@ class GenieWrapperCreateVLMChatCompletion:
                 type=Parameters.INTERNAL_TYPE
             )
         finally:
-            # Cleanup resources
-            GenieWrapperCreateVLMChatCompletion._cleanup_resources(pipe_path, temp_file_path, process)
-
-            # CRITICAL: Complete the event BEFORE triggering callback
-            # This ensures event state is COMPLETED when request queue manager checks it
+            # Complete event before callback
             if event_object:
                 try:
                     logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
-
-                    # Complete the turn (sets state to COMPLETED)
                     event_object.complete_turn()
-
-                    # Calculate event hash (includes all messages in turn)
                     event_object.calculate_event_hash()
-
-                    # Mark session's current event as complete
                     if hasattr(event_object, 'session') and event_object.session:
                         event_object.session.complete_current_event()
-
-                    logger.info(f"VLM Event {event_id}: Event completed successfully, state={event_object.state.value}")
+                    logger.info(f"VLM Event {event_id}: Event completed successfully")
                 except Exception as e:
                     logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
 
-            # NOW trigger completion callback - event is already COMPLETED
+            # Trigger completion callback
             if completion_callback:
-                logger.info(f"VLM Event {event_id}: Triggering completion callback (event already completed)")
+                logger.info(f"VLM Event {event_id}: Triggering completion callback")
                 try:
                     await completion_callback(event_id, event_state)
                 except Exception as e:
                     logger.error(f"VLM Event {event_id}: Error in non-streaming completion callback: {e}", exc_info=True)
-
-    @staticmethod
-    def _cleanup_resources(pipe_path: Optional[str], temp_file_path: Optional[str], process: Optional[subprocess.Popen]):
-        """Clean up pipe, temp file, and process."""
-        # Clean up pipe
-        if pipe_path and os.path.exists(pipe_path):
-            try:
-                os.unlink(pipe_path)
-                logger.info(f"Cleaned up pipe: {pipe_path}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up pipe {pipe_path}: {e}")
-
-        # Clean up temp file
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.unlink(temp_file_path)
-                logger.info(f"Cleaned up temp file: {temp_file_path}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp file {temp_file_path}: {e}")
-
-        # Wait for process
-        if process:
-            try:
-                process.wait(timeout=5)
-                logger.info(f"Process exited with code: {process.returncode}")
-            except subprocess.TimeoutExpired:
-                logger.warning("Process did not exit within timeout, terminating")
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    logger.warning("Process did not terminate, killing")
-                    process.kill()
