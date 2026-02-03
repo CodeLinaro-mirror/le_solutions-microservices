@@ -4,9 +4,6 @@
 
 FROM ubuntu:24.04 AS genai-llm-vlm-service-builder
 
-# Enable color prompt
-RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /root/.bashrc
-
 # Enable multiarch
 RUN dpkg --add-architecture arm64
 
@@ -90,8 +87,11 @@ RUN apt-get update                                                              
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
-# Add root to plugdev group
-RUN usermod -aG plugdev root
+# Create iot-user account
+RUN useradd -m -s /bin/bash iot-user
+
+# Add iot-user to plugdev group
+RUN usermod -aG plugdev iot-user
 
 # Copy web-api source code
 COPY setup.cfg ${VLM_SRC_DIR}/setup.cfg
@@ -109,10 +109,12 @@ COPY scripts ${VLM_SCRIPTS_DIR}
 COPY genai-lib ${VLM_SRC_DIR}/genai-lib
 
 # Add bash aliases file
-COPY .bash_aliases /root/.bash_aliases
+COPY .bash_aliases /iot-user/.bash_aliases
 
 # Build the VLM project
 RUN bash -c "source ${VLM_SCRIPTS_DIR}/setup.sh && VLM-build"
+
+RUN chown -R iot-user:iot-user /mnt/work /usr/lib/
 
 #########################
 # Stage 2: Runtime Stage
@@ -135,8 +137,14 @@ RUN apt-get update                                                              
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
+# Create iot-user account in runtime stage
+RUN groupadd -g 989 dma_heap || true && \
+    useradd -m -s /bin/bash iot-user && \
+    usermod -aG plugdev iot-user && \
+    usermod -aG dma_heap iot-user
+
 # create directory
-RUN mkdir -p /root/app/site-packages
+RUN mkdir -p /iot-user/app/site-packages
 
 # Copy the virtual environment with web-api package installed with dependencies
 COPY --from=genai-llm-vlm-service-builder /mnt/work/venv /mnt/work/venv
@@ -149,28 +157,32 @@ COPY --from=genai-llm-vlm-service-builder                                       
 
 # Copy openapi.yaml as a dependency of FastAPI's openapi schema
 COPY --from=genai-llm-vlm-service-builder /mnt/work/src/web-api/openapi_server/openapi.yaml         \
-    /root/app/site-packages/
+    /iot-user/app/site-packages/
 
 COPY --from=genai-llm-vlm-service-builder                                                           \
     /mnt/work/src/web-api/openapi_server/configs/models_config.json                                \
-    /root/app/site-packages/
+    /iot-user/app/site-packages/
 
 COPY --from=genai-llm-vlm-service-builder                                                           \
     /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/vlm_standalone_test.py                 \
-    /root/app/site-packages/
+    /iot-user/app/site-packages/
 
 # copy all libraries
 COPY --from=genai-llm-vlm-service-builder /mnt/work/deploy/usr /usr
 
 # create symlink of libvlmservice library
-RUN ln -s /usr/lib/libvlmservice.so /root/app/site-packages/libvlmservice.so
+RUN ln -s /usr/lib/libvlmservice.so /iot-user/app/site-packages/libvlmservice.so
 # create symlink of libllmservice library
-RUN ln -s /usr/lib/libllmservice.so /root/app/site-packages/libllmservice.so
+RUN ln -s /usr/lib/libllmservice.so /iot-user/app/site-packages/libllmservice.so
 
-ENV VLM_LIBRARY_PATH=/root/app/site-packages/libvlmservice.so
-ENV LLM_LIBRARY_PATH=/root/app/site-packages/libllmservice.so
+ENV VLM_LIBRARY_PATH=/iot-user/app/site-packages/libvlmservice.so
+ENV LLM_LIBRARY_PATH=/iot-user/app/site-packages/libllmservice.so
 ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h
 
-ENV VLM_SITE_PACKAGES_PATH=/root/app/site-packages/
+ENV VLM_SITE_PACKAGES_PATH=/iot-user/app/site-packages/
+
+RUN chown -R iot-user:iot-user /mnt/work /iot-user/app /usr/lib/
+
+USER iot-user
 
 WORKDIR /mnt/work/models

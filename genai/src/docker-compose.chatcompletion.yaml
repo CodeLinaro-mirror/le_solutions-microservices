@@ -28,12 +28,11 @@ services:
       - "${GENAI_PORT:-9001}:${GENAI_PORT:-9001}"
     environment:
       - LOG_LEVEL=ERROR
-      - GENAI_PORT=${GENAI_PORT:-8081}
-      - VLM_LIBRARY_PATH=${VLM_LIBRARY_PATH:-/root/app/site-packages/libvlmservice.so}
-      - LLM_LIBRARY_PATH=${LLM_LIBRARY_PATH:-/root/app/site-packages/libllmservice.so}
+      - GENAI_PORT=${GENAI_PORT:-9001}
+      - VLM_LIBRARY_PATH=${VLM_LIBRARY_PATH:-/iot-user/app/site-packages/libvlmservice.so}
+      - LLM_LIBRARY_PATH=${LLM_LIBRARY_PATH:-/iot-user/app/site-packages/libllmservice.so}
       - GENAI_INTERFACE_FILE=${GENAI_INTERFACE_FILE:-/usr/include/genai_interface.h}
-      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/root/app/site-packages/models_config.json}
-      - ADHOC_MODE=${ADHOC_MODE:-false}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/iot-user/app/site-packages/models_config.json}
     # Memory and resource limits for VLM model loading
     deploy:
       resources:

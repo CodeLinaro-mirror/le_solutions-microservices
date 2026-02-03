@@ -5,7 +5,7 @@ import os
 
 # GENAI interface file path
 # This path is mounted path of container. Check docker-compose volume section for path in host machine.
-GENAI_INTERFACE_FILE = '/root/app/site-packages/genai_interface.h'
+GENAI_INTERFACE_FILE = '/iot-user/app/site-packages/genai_interface.h'
 
 class HttpStatusCodes:
     """
@@ -143,8 +143,8 @@ class Parameters:
 
 class ModelConfigConstants:
     """ Model Configuration Constants """
-    DEFAULT_CONFIG_PATH = "/root/app/openapi_server/configs/models_config.json"
-    DEFAULT_CONFIGS_DIR = "/root/app/openapi_server/configs"
+    DEFAULT_CONFIG_PATH = "/iot-user/app/openapi_server/configs/models_config.json"
+    DEFAULT_CONFIGS_DIR = "/iot-user/app/openapi_server/configs"
     ENV_CONFIG_PATH_KEY = "GENAI_MODELS_CONFIG_PATH"
 
 # ADHOC Mode Configuration

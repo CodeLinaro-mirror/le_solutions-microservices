@@ -283,7 +283,7 @@ class GenieWrapperCreateVLMChatCompletion:
             Tuple of (command_list, temp_file_path)
             temp_file_path will be None if no temp file was created
         """
-        vlm_script_path = os.path.join("/root", "app", "site-packages", "vlm_standalone_test.py")
+        vlm_script_path = os.path.join("/iot-user", "app", "site-packages", "vlm_standalone_test.py")
 
         cmd = [
             "python3",

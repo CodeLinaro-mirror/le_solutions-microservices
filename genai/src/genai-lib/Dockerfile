@@ -9,7 +9,7 @@
 FROM --platform=arm64 ubuntu:24.04 AS llm_dev_image
 
 # Enable color prompt
-RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /root/.bashrc
+RUN sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/g' /iot-user/.bashrc
 
 ENV LLM_BUILD_DIR="/mnt/work/build"
 ENV LLM_DEPLOY_DIR="/mnt/work/deploy"
