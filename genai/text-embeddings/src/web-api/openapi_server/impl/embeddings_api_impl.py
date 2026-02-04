@@ -1,9 +1,12 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
+from __future__ import annotations
+
 import os
-from typing import List
+from typing import List, Optional, Union, Any
 from fastapi import HTTPException
+import asyncio
 
 from openapi_server.apis.embeddings_api_base import BaseEmbeddingsApi
 from openapi_server.models.create_embeddings_request import CreateEmbeddingsRequest
@@ -14,6 +17,11 @@ from openapi_server.models.embedding_usage import EmbeddingUsage
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
 from openapi_server.managers.model_config_manager import model_config_manager
+
+from openapi_server.impl.litert_backend.backend import (
+    normalize_encoding_format,
+    call_worker_embed_sync
+)
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -113,35 +121,17 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         self,
         inputs: List[str],
         model: str,
-        dimensions: int = None,
-        encoding_format: str = "float"
-    ) -> List[List[float]]:
-        """
-        TODO: Replace this method with actual call to embeddings component.
+        dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = "float",
+    ) -> List[Union[List[float], str]]:
+        ef = normalize_encoding_format(encoding_format)
 
-        This is a placeholder that returns dummy embeddings.
-        When the actual embeddings component is ready, replace this method
-        to make HTTP/gRPC calls to that component.
-
-        Args:
-            inputs: List of input texts to embed
-            model: Model name to use for embeddings
-            dimensions: Optional dimension size for embeddings
-            encoding_format: Format for embeddings (float or base64)
-
-        Returns:
-            List of embedding vectors (each vector is a list of floats)
-        """
-        logger.warning("Using dummy embeddings - replace with actual component call")
-
-        # Return dummy embeddings (768-dimensional vectors of zeros)
-        # Typical embedding dimensions: 768 (BERT), 1536 (OpenAI), etc.
-        embedding_dim = dimensions if dimensions else 768
-
-        dummy_embeddings = []
-        for _ in inputs:
-            # Create a dummy embedding vector
-            dummy_vector = [0.0] * embedding_dim
-            dummy_embeddings.append(dummy_vector)
-
-        return dummy_embeddings
+        # call worker in a thread (keeps event loop responsive)
+        return await asyncio.to_thread(
+            call_worker_embed_sync,
+            model,
+            inputs,
+            dimensions,
+            ef,
+            120,
+        )
