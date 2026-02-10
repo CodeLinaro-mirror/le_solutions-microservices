@@ -328,9 +328,6 @@ VLMObject::VLMObject(const std::string& model, const std::string& config_path, b
     // Connect nodes
     connectNodes();
 
-    // Set the static system prompt on the LUT encoder
-    setSystemPrompt();
-
     // Load static custom inputs (position ids, masks, etc.)
     loadStaticCustomInputs();
 
@@ -526,13 +523,19 @@ void VLMObject::loadStaticCustomInputs() {
 }
 
 /*--------------------------------------------------------------
- * Set the static system prompt on the LUT encoder node
+ * Explicitly reset the VLM pipeline state
  *--------------------------------------------------------------*/
-void VLMObject::setSystemPrompt() {
-    std::string systemPrompt =
-        "<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n"
-        "<|im_start|>user\\n<|vision_start|>";
-    lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, systemPrompt);
+void VLMObject::resetPipeline() {
+    if (!pipeline) {
+        throw std::runtime_error("Pipeline not initialized - cannot reset");
+    }
+
+    try {
+        pipeline->reset();
+    } catch (const std::exception& e) {
+        std::cerr << "Error resetting pipeline: " << e.what() << std::endl;
+        throw;
+    }
 }
 
 /*--------------------------------------------------------------
@@ -601,10 +604,11 @@ void VLMObject::vlm_chat_completion_create() {
     // -----------------------------------------------------------------
     // 3. Build the final prompt that will be fed to the LUT encoder
     // -----------------------------------------------------------------
-    std::string finalPrompt =
-        "<|vision_end|> " + userPrompt + " <|im_end|>\\n<|im_start|>assistant";
+    // The prompt is now fully constructed in the Python layer, including
+    // chat template markers and system prompt. We pass it as-is.
+    std::string completePrompt = userPrompt;
 
-    lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, finalPrompt);
+    lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, completePrompt);
 
     // -----------------------------------------------------------------
     // 4. Execute the pipeline
@@ -618,12 +622,55 @@ void VLMObject::vlm_chat_completion_create() {
     userData.request_in_progress = &request_in_progress;
 
     request_in_progress = true;
+    bool execution_succeeded = false;
+    std::exception_ptr execution_error = nullptr;
 
-    pipeline->execute(&userData);
+    try {
+        pipeline->execute(&userData);
 
-    // Wait for the callback to signal completion
-    std::unique_lock<std::mutex> lock(mtx);
-    cv.wait(lock, [this]{ return !request_in_progress; });
+        // Wait for the callback to signal completion
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]{ return !request_in_progress; });
+
+        execution_succeeded = true;
+
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Pipeline execution failed: " << e.what() << std::endl;
+        request_in_progress = false;
+        execution_error = std::current_exception();
+    } catch (...) {
+        std::cerr << "ERROR: Pipeline execution failed with unknown exception" << std::endl;
+        request_in_progress = false;
+        execution_error = std::current_exception();
+    }
+
+    // Always attempt to reset pipeline state, even on error
+    try {
+        pipeline->reset();
+
+        if (!execution_succeeded) {
+            std::cerr << "Pipeline reset completed after execution failure" << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Failed to reset pipeline: " << e.what() << std::endl;
+
+        if (!execution_succeeded) {
+            // Both execution and reset failed - critical state
+            throw std::runtime_error(
+                "Pipeline in inconsistent state: execution failed and reset failed. "
+                "Pipeline may need to be recreated.");
+        } else {
+            // Execution succeeded but reset failed - warn but don't fail the request
+            std::cerr << "WARNING: Request completed but pipeline reset failed. "
+                      << "Next request may encounter issues." << std::endl;
+        }
+    }
+
+    // Re-throw execution error if one occurred
+    if (execution_error) {
+        std::rethrow_exception(execution_error);
+    }
 }
 
 /*--------------------------------------------------------------

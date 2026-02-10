@@ -390,26 +390,13 @@ class TextConversationEvent(ConversationEvent):
                     logger.info(f"Event {self.event_id}: Prepended previous context to user message")
                     break
 
-        # Format messages
-        for msg in messages_to_format:
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-            else:
-                role = getattr(msg, "role", None)
-                content = getattr(msg, "content", None)
-
-            formatted_msg = CommonUtils.format_message_with_template(
-                self.model_id, role, content
-            )
-            formatted_parts.append(formatted_msg)
-
-        # Add assistant prompt
-        assistant_prompt = CommonUtils.get_assistant_prompt(self.model_id)
-        if assistant_prompt:
-            formatted_parts.append(assistant_prompt)
-
-        formatted_content = "".join(formatted_parts)
+        # Format messages using unified builder
+        formatted_content = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=messages_to_format,
+            include_assistant_prefix=True,
+            has_vision=False
+        )
         logger.info(f"Event {self.event_id}: Formatted content for Streaming LLM:\n{formatted_content}")
 
         CommonUtils.copy_py_string_to_c_array(llm_service.ffi, query.message.role, "user", QUERY_CONST.ROLE_MAX_SIZE)
@@ -884,28 +871,13 @@ class TextConversationEvent(ConversationEvent):
                     logger.info(f"Event {self.event_id}: Prepended previous context to user message")
                     break
 
-        # Format all messages for this turn
-        for msg in messages_to_format:
-            # Handle both dicts and Pydantic models (from tool injection)
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-            else:
-                role = getattr(msg, "role", None)
-                content = getattr(msg, "content", None)
-
-            formatted_msg = CommonUtils.format_message_with_template(
-                self.model_id, role, content
-            )
-            formatted_parts.append(formatted_msg)
-
-        # Add assistant prompt at the end
-        assistant_prompt = CommonUtils.get_assistant_prompt(self.model_id)
-        if assistant_prompt:
-            formatted_parts.append(assistant_prompt)
-
-        # Combine all parts
-        formatted_content = "".join(formatted_parts)
+        # Format all messages for this turn using unified builder
+        formatted_content = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=messages_to_format,
+            include_assistant_prefix=True,
+            has_vision=False
+        )
 
         logger.info(f"Event {self.event_id}: Formatted content for LLM:\n{formatted_content}")
 
@@ -1021,38 +993,33 @@ class TextConversationEvent(ConversationEvent):
                     context_messages, request_data.tools
                 )
 
-        # Format previous messages
-        for msg in context_messages:
-            # Handle both dicts and Pydantic models
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-            else:
-                role = getattr(msg, "role", None)
-                content = getattr(msg, "content", None)
-
-            if role == "tool": # The tool result is passed separately
-                continue
-            # Format other messages (user, assistant tool_calls)
-            formatted_parts.append(CommonUtils.format_message_with_template(
-                self.model_id, role, content
-            ))
-
-        # Add tool response with explicit instruction to generate a response
+        # Add tool response as a user message for context
         tool_response_with_instruction = (
             f"{tool_result}\n\n"
             "Based on the tool result above, please provide a helpful response to the user's question."
         )
-        formatted_parts.append(CommonUtils.format_message_with_template(
-            self.model_id, "tool", tool_response_with_instruction
-        ))
 
-        # Add assistant prompt at the end
-        assistant_prompt = CommonUtils.get_assistant_prompt(self.model_id)
-        if assistant_prompt:
-            formatted_parts.append(assistant_prompt)
+        # Create a list of messages for the prompt builder
+        # Filter out existing 'tool' messages from context as we only want the current result
+        prompt_messages = [
+            msg for msg in context_messages
+            if (isinstance(msg, dict) and msg.get('role') != 'tool') or
+               (not isinstance(msg, dict) and getattr(msg, 'role', '') != 'tool')
+        ]
 
-        formatted_content = "".join(formatted_parts)
+        # Append the tool result as a user message
+        prompt_messages.append({
+            "role": "user",
+            "content": tool_response_with_instruction
+        })
+
+        # Use unified builder
+        formatted_content = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=prompt_messages,
+            include_assistant_prefix=True,
+            has_vision=False
+        )
 
         logger.info(f"Event {self.event_id}: Formatted content for LLM (with tool response):\n{formatted_content}")
 
@@ -1475,15 +1442,13 @@ class TextConversationEvent(ConversationEvent):
             llm_service.ffi, query.model, self.model_id, QUERY_CONST.MODEL_STR_MAX_SIZE
         )
 
-        # Format the prompt using the model's template, similar to _execute_inference
-        formatted_prompt = CommonUtils.format_message_with_template(
-            self.model_id, "user", summary_prompt
+        # Format the prompt using the unified builder
+        formatted_prompt = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=[{"role": "user", "content": summary_prompt}],
+            include_assistant_prefix=True,
+            has_vision=False
         )
-
-        # Add assistant prompt to cue the generation
-        assistant_prompt = CommonUtils.get_assistant_prompt(self.model_id)
-        if assistant_prompt:
-            formatted_prompt += assistant_prompt
 
         logger.info(f"Formatted summary prompt for LLM:\n{formatted_prompt}")
 

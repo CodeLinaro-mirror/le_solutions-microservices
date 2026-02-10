@@ -3,8 +3,15 @@
       "qwen2.5-7b": {
         "config_file": "/mnt/work/models/genie_bundle_qwen2_5_7B/genie_config_qwen2_5_7B.json",
         "display_name": "Qwen 2.5 7B",
-        "prompt_template": "<|im_start|>{role}\n{content}<|im_end|>\n",
-        "assistant_prompt": "<|im_start|>assistant\n",
+        "chat_template": {
+          "system_prefix": "<|im_start|>system\n",
+          "system_suffix": "<|im_end|>\n",
+          "user_prefix": "<|im_start|>user\n",
+          "user_suffix": "<|im_end|>\n",
+          "assistant_prefix": "<|im_start|>assistant\n",
+          "assistant_suffix": "<|im_end|>\n",
+          "default_system_prompt": "You are a helpful assistant."
+        },
         "max_tokens": 4096,
         "supports_streaming": true,
         "supports_vision": false,
@@ -16,7 +23,17 @@
       "qwen2.5-vl-3b": {
         "config_file": "/mnt/work/models/genie_bundle_qwen2_5_VL_3B/genie_config_qwen2_5_vl_3b.json",
         "display_name": "Qwen 2.5 VL 3B",
-        "prompt_template": "qwen2",
+        "chat_template": {
+          "system_prefix": "<|im_start|>system\n",
+          "system_suffix": "<|im_end|>\n",
+          "user_prefix": "<|im_start|>user\n",
+          "user_suffix": "<|im_end|>\n",
+          "assistant_prefix": "<|im_start|>assistant\n",
+          "assistant_suffix": "<|im_end|>\n",
+          "vision_start": "<|vision_start|>",
+          "vision_end": "<|vision_end|>",
+          "default_system_prompt": "You are a helpful assistant."
+        },
         "max_tokens": 4096,
         "supports_streaming": true,
         "supports_vision": true,
@@ -28,7 +45,17 @@
       "qwen2.5-vl-7b": {
         "config_file": "/mnt/work/models/genie_bundle_qwen2_5_VL_7B/genie_config_qwen2_5_vl_7b.json",
         "display_name": "Qwen 2.5 VL 7B",
-        "prompt_template": "qwen2",
+        "chat_template": {
+          "system_prefix": "<|im_start|>system\n",
+          "system_suffix": "<|im_end|>\n",
+          "user_prefix": "<|im_start|>user\n",
+          "user_suffix": "<|im_end|>\n",
+          "assistant_prefix": "<|im_start|>assistant\n",
+          "assistant_suffix": "<|im_end|>\n",
+          "vision_start": "<|vision_start|>",
+          "vision_end": "<|vision_end|>",
+          "default_system_prompt": "You are a helpful assistant."
+        },
         "max_tokens": 4096,
         "supports_streaming": true,
         "supports_vision": true,
@@ -40,8 +67,15 @@
       "qwen2.5-1.5b": {
         "config_file": "/mnt/work/models/genie_bundle_qwen2_5_1_5B/genie_config_qwen2_5_1_5B.json",
         "display_name": "Qwen 2.5 1.5B",
-        "prompt_template": "<|im_start|>{role}\n{content}<|im_end|>\n",
-        "assistant_prompt": "<|im_start|>assistant\n",
+        "chat_template": {
+          "system_prefix": "<|im_start|>system\n",
+          "system_suffix": "<|im_end|>\n",
+          "user_prefix": "<|im_start|>user\n",
+          "user_suffix": "<|im_end|>\n",
+          "assistant_prefix": "<|im_start|>assistant\n",
+          "assistant_suffix": "<|im_end|>\n",
+          "default_system_prompt": "You are a helpful assistant."
+        },
         "max_tokens": 200,
         "supports_streaming": true,
         "supports_vision": false,
@@ -52,5 +86,13 @@
       }
     },
     "default_model": "qwen2.5-7b",
-    "fallback_template": "<|im_start|>{role}\n{content}<|im_end|>\n"
+    "fallback_chat_template": {
+      "system_prefix": "<|im_start|>system\n",
+      "system_suffix": "<|im_end|>\n",
+      "user_prefix": "<|im_start|>user\n",
+      "user_suffix": "<|im_end|>\n",
+      "assistant_prefix": "<|im_start|>assistant\n",
+      "assistant_suffix": "<|im_end|>\n",
+      "default_system_prompt": "You are a helpful assistant."
+    }
   }
