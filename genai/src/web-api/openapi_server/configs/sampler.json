@@ -1,0 +1,18 @@
+{
+  "sampler" : {
+    "type"  : "basic",
+    "version" : 1,
+    "seed" : 100,
+    "temp" : 1,
+    "top-k" : 40,
+    "top-p" : 1,
+    "greedy" : false,
+    "token-penalty": {
+        "version": 1,
+        "penalize-last-n" : 64,
+        "repetition-penalty" : 2.3,
+        "presence-penalty" : 0.7,
+        "frequency-penalty" : 0.8
+      }
+  }
+}

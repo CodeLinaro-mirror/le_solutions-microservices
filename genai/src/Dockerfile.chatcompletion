@@ -167,6 +167,10 @@ COPY --from=genai-llm-vlm-service-builder                                       
     /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/vlm_standalone_test.py                 \
     /iot-user/app/site-packages/
 
+COPY --from=genai-llm-vlm-service-builder                                                           \
+    /mnt/work/src/web-api/openapi_server/configs/sampler.json                                      \
+    /iot-user/app/site-packages/
+
 # copy all libraries
 COPY --from=genai-llm-vlm-service-builder /mnt/work/deploy/usr /usr
 
