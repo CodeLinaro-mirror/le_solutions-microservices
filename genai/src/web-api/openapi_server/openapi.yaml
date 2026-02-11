@@ -131,7 +131,7 @@ components:
                 {
                   "type": "image_url",
                   "image_url": {
-                    "url": "https://bit.ly/4obmTP8"
+                    "url": "https://images.pexels.com/photos/210186/pexels-photo-210186.jpeg?cs=srgb&dl=cascade-clouds-cool-wallpaper-210186.jpg&fm=jpg%22"
                   }
                 }
               ]
@@ -163,9 +163,10 @@ components:
           description: A stable identifier used to help detect users of your application that may be violating OpenAI's usage policies. The IDs should be a string that uniquely identifies each user.
         seed:
           type: integer
-          minimum: -9223372036854776000
-          maximum: 9223372036854776000
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
           nullable: true
+          example: 42
           description: If specified, our system will make a best effort to sample deterministically, such that repeated requests with the same seed and parameters should return the same result.
         stream:
           type: boolean
