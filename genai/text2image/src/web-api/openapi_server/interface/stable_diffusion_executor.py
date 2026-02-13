@@ -130,6 +130,28 @@ class StableDiffusionExecutor:
         print(f"Using steps: {self.steps}")
         print(f"Using guidance scale: {self.guidance_scale}")
 
+        self.app_opts = AppOptions(
+            retrieve_context=self.models_path,            # directory with the 3 .bin files
+            backend_path="/usr/lib/libQnnHtp.so",
+            system_library="/usr/lib/libQnnSystem.so",
+            input_list_paths="",                          # will be set per run
+            output_dir=os.path.join(os.getcwd(), "tmp"),  # will be overridden per run
+            log_level=4,                                  # 0=ERROR,1=WARN,2=INFO,3=DEBUG,4=VERBOSE
+            profiling_level="off",
+        )
+
+        # Start a single persistent app
+        self.app = QnnSampleApp(self.app_opts)
+        self.app.start()
+
+    def __del__(self):
+        # Ensure the QNN app is stopped when executor is destroyed
+        try:
+            if hasattr(self, "app") and self.app:
+                self.app.stop()
+        except Exception:
+            pass
+
     def _init_tokenizer(self):
         """Initialize the tokenizer."""
         print("Loading tokenizer")
@@ -194,20 +216,14 @@ class StableDiffusionExecutor:
         with open(input_list_filepath, 'w') as f:
             f.write(input_list_text.strip())
 
-        opts = AppOptions(
-            retrieve_context=model_context,
-            backend_path="/usr/lib/libQnnHtp.so",
-            system_library="/usr/lib/libQnnSystem.so",
-            input_list_paths=input_list_filepath,
-            output_dir=tmp_dirpath,
+        # ---- Update dynamic AppOptions for this invocation (no restart) ----
+        self.app.opts.input_list_paths = input_list_filepath
+        self.app.opts.output_dir = tmp_dirpath
 
-            # Logging / profiling
-            log_level=4, # 0=ERROR,1=WARN,2=INFO,3=DEBUG,4=VERBOSE
-            profiling_level="off",
-        )
+        # Execute only the manager corresponding to `type`
+        # (Substring match on the manager's retrieve_context basename)
+        exit_code = self.app.execute_graphs(type)
 
-        app = QnnSampleApp(opts)
-        exit_code = app.run()
         if exit_code != 0:
             # Cleanup before raising, to keep behavior neat
             try:
@@ -216,6 +232,7 @@ class StableDiffusionExecutor:
                 pass
             raise RuntimeError(f"QnnSampleApp failed with exit code {exit_code}")
 
+        # Collect output
         if type == "textencoder":
             output_file_path = os.path.join(tmp_dirpath, 'Result_0', 'text_embedding.raw')
         elif type == "unet":
@@ -224,6 +241,7 @@ class StableDiffusionExecutor:
             output_file_path = os.path.join(tmp_dirpath, 'Result_0', 'image.raw')
 
         output_data = np.fromfile(output_file_path, dtype=np.float32)
+
         shutil.rmtree(tmp_dirpath)
 
         return output_data

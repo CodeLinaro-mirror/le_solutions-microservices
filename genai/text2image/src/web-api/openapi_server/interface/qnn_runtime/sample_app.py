@@ -3,8 +3,11 @@
 
 import os
 import ctypes
+import re
+from copy import deepcopy
 from ctypes import c_void_p, c_uint32
-from typing import Optional
+from typing import Optional, List
+
 from .options import AppOptions
 from .lib_provider import QnnLibrary, QnnProvider, SystemProvider, CORE_LOG_CB, ErrorHelper
 from .qnn_types import QNN_PROPERTY_GRAPH_SUPPORT_FINALIZE_DESERIALIZED_GRAPH, Qnn_Tensor_t
@@ -13,6 +16,7 @@ from .model_interop import QnnModelInterop
 from .io_tensor import IOTensor, tv_view
 from .system_structs import QnnSystemContext_BinaryInfo_t
 from .utils_dump import print
+from .graph_context_manager import GraphContextManager
 
 
 class QnnSampleApp:
@@ -21,9 +25,10 @@ class QnnSampleApp:
         os.makedirs(self.opts.output_dir, exist_ok=True)
 
         backend_name = os.path.basename(
-            opts.backend_path) if opts.backend_path else "libQnnHtp.so"
+            opts.backend_path) if getattr(opts, "backend_path", None) else "libQnnHtp.so"
         system_name = os.path.basename(
-            opts.system_library) if opts.system_library else "libQnnSystem.so"
+            opts.system_library) if getattr(opts, "system_library", None) else "libQnnSystem.so"
+
         self.libs = QnnLibrary(backend_name=backend_name,
                                system_name=system_name)
 
@@ -37,15 +42,12 @@ class QnnSampleApp:
         self.context = c_void_p()
         self.profile = c_void_p()
 
-        # Graphs
+        # Legacy single-manager fields (kept for compatibility)
         self._graphs_ppp = None
         self._graphs_count = 0
 
-        # Model interop
-        self._model_interop: Optional[QnnModelInterop] = None
-
-        # Keep system context alive in context-binary path
-        self._sys_ctx = None
+        # Multi-manager support
+        self._graph_mgrs: List[GraphContextManager] = []
 
         if autoload_libs:
             self._load_libs()
@@ -98,17 +100,15 @@ class QnnSampleApp:
 
     def _init_backend(self):
         configs = ctypes.POINTER(ctypes.POINTER(c_void_p))()
-
         rc = self.qnn_provider.backendCreate(
             self.logger, configs, ctypes.byref(self.backend))
-
         print(f"[CALL] backendCreate rc={rc} "
               f"backend=0x{(self.backend.value or 0):016x}")
         if rc != 0:
             raise RuntimeError(f"backendCreate failed rc={rc}")
 
     def _register_op_packages(self):
-        if not self.opts.op_packages:
+        if not getattr(self.opts, "op_packages", None):
             return
         for item in self.opts.op_packages.split(','):
             parts = item.split(':')
@@ -120,9 +120,7 @@ class QnnSampleApp:
                 self.backend, path.encode(), provider.encode(), (target or '').encode()
             )
             print(f"[CALL] backendRegisterOpPackage rc={rc} "
-                  f"path={path} "
-                  f"provider={provider} "
-                  f"target={target}")
+                  f"path={path} provider={provider} target={target}")
             if rc != 0:
                 raise RuntimeError(f"backendRegisterOpPackage failed rc={rc}")
 
@@ -135,7 +133,7 @@ class QnnSampleApp:
             raise RuntimeError(f"deviceCreate failed rc={rc}")
 
     def _init_profiling(self):
-        if self.opts.profiling_level == "off":
+        if getattr(self.opts, "profiling_level", "off") == "off":
             return
         lvl_map = {"basic": 1, "detailed": 2}
         lvl = lvl_map.get(self.opts.profiling_level, 1)
@@ -145,265 +143,128 @@ class QnnSampleApp:
         if rc != 0:
             raise RuntimeError(f"profileCreate failed rc={rc}")
 
-    def _create_context(self):
-        if self.opts.retrieve_context:
-            with open(self.opts.retrieve_context, 'rb') as f:
-                blob = f.read()
-            if not blob:
-                raise RuntimeError(f"Empty context binary: {self.opts.retrieve_context}")
+    def _resolve_retrieve_context_paths(self) -> List[str]:
+        """
+        Returns a list of context-binary paths to load.
 
-            # Build raw uint8_t buffer and keep it alive on self
-            BufT = ctypes.c_uint8 * len(blob)
-            self._ctx_bin_buf = BufT.from_buffer_copy(blob)     # keep ref
-            bin_ptr = ctypes.cast(self._ctx_bin_buf, c_void_p)
+        Priority:
+          1) opts.retrieve_contexts (list or comma/semicolon-separated string)
+          2) opts.retrieve_context:
+             - if directory: look for the 3 Stable Diffusion component bins
+             - if string with commas/semicolons: split
+             - else: single path
+        """
+        candidates = [
+            "stable_diffusion_v2_1-vae-qualcomm_sa8775p.bin",
+            "stable_diffusion_v2_1-text_encoder-qualcomm_sa8775p.bin",
+            "stable_diffusion_v2_1-unet-qualcomm_sa8775p.bin",
+        ]
 
-            rc = self.qnn_provider.contextCreateFromBinary(
-                self.backend,
-                self.device,
-                ctypes.POINTER(ctypes.POINTER(c_void_p))(),  # configs = NULL
-                bin_ptr,
-                ctypes.c_size_t(len(blob)),
-                ctypes.byref(self.context),
-                self.profile,
-            )
+        paths: List[str] = []
 
-            print(f"[CALL] contextCreateFromBinary rc={rc} "
-                  f"context=0x{(self.context.value or 0):016x}")
-            if rc != 0:
-                raise RuntimeError(f"contextCreateFromBinary failed rc={rc}")
-        else:
-            rc = self.qnn_provider.contextCreate(
-                self.backend,
-                self.device,
-                ctypes.POINTER(ctypes.POINTER(c_void_p))(),  # configs = NULL
-                ctypes.byref(self.context)
-            )
-            print(f"[CALL] contextCreate rc={rc} "
-                  f"context=0x{(self.context.value or 0):016x}")
-            if rc != 0:
-                raise RuntimeError(f"contextCreate failed rc={rc}")
+        # 1) Explicit list param (if AppOptions exposes it)
+        rc_list = getattr(self.opts, "retrieve_contexts", None)
+        if rc_list:
+            if isinstance(rc_list, (list, tuple)):
+                paths.extend([str(p) for p in rc_list])
+            elif isinstance(rc_list, str):
+                parts = [p.strip() for p in rc_list.replace(";", ",").split(",") if p.strip()]
+                paths.extend(parts)
 
-    def _load_graphs_from_context_binary(self):
-        if not self.opts.retrieve_context:
-            raise RuntimeError("retrieve_context not set")
-        if self.system_provider is None:
-            raise RuntimeError(
-                "System provider not loaded; set system_library in AppOptions")
+        # 2) Fallback to retrieve_context
+        if not paths:
+            rc = getattr(self.opts, "retrieve_context", None)
+            if rc:
+                if os.path.isdir(rc):
+                    for name in candidates:
+                        p = os.path.join(rc, name)
+                        if os.path.exists(p):
+                            paths.append(p)
+                else:
+                    if any(sep in rc for sep in [",", ";"]):
+                        parts = [p.strip() for p in rc.replace(";", ",").split(",") if p.strip()]
+                        paths.extend(parts)
+                    else:
+                        paths.append(rc)
 
-        # ---- read blob ----
-        with open(self.opts.retrieve_context, "rb") as f:
-            blob = f.read()
-        if not blob:
-            raise RuntimeError(f"Empty context binary: {self.opts.retrieve_context}")
+        # Deduplicate while preserving order
+        dedup, seen = [], set()
+        for p in paths:
+            if p not in seen:
+                dedup.append(p)
+                seen.add(p)
 
-        BufT = ctypes.c_uint8 * len(blob)
-        buf_arr = BufT.from_buffer_copy(blob)
-        buf_ptr = ctypes.cast(buf_arr, c_void_p)
-
-        # ---- create system context ----
-        sys_ctx = c_void_p()
-
-        rc = self.system_provider.systemContextCreate(ctypes.byref(sys_ctx))
-        if rc != 0 or not sys_ctx:
-            raise RuntimeError(f"systemContextCreate failed rc={rc}")
-
-        self._sys_ctx = sys_ctx
-
-        # ---- prefer getMetadata (modern), fall back to getBinaryInfo if needed ----
-        bi_pp = ctypes.POINTER(QnnSystemContext_BinaryInfo_t)()
-
-        bi_size = ctypes.c_size_t(0)
-        rc_bi = 0
-
-        rc_bi = self.system_provider.systemContextGetBinaryInfo(
-            self._sys_ctx, buf_ptr, ctypes.c_uint64(len(blob)),
-            ctypes.byref(bi_pp), ctypes.byref(bi_size)
-        )
-
-        have_bi = (rc_bi == 0) and bool(bi_pp)
-
-        if not have_bi:
-            # ensure clean free
-            try:
-                self.system_provider.systemContextFree(self._sys_ctx)
-            except Exception:
-                pass
-            raise RuntimeError(f"Neither metadata (rc={rc_md}) "
-                               f"nor binary info (rc={rc_bi}) available")
-
-        BI = bi_pp.contents  # typed; safe
-        v = int(BI.version)
-        print(f"[DEBUG] BinaryInfo.version={v}")
-
-        # ---- select graphs pointer and count from the correct union member ----
-        if v == 1:
-            graphs_ptr = BI.u.contextBinaryInfoV1.graphs
-            num_graphs = int(BI.u.contextBinaryInfoV1.numGraphs)
-        elif v == 2:
-            graphs_ptr = BI.u.contextBinaryInfoV2.graphs
-            num_graphs = int(BI.u.contextBinaryInfoV2.numGraphs)
-        elif v == 3:
-            graphs_ptr = BI.u.contextBinaryInfoV3.graphs
-            num_graphs = int(BI.u.contextBinaryInfoV3.numGraphs)
-        else:
-            raise RuntimeError(f"Unsupported BinaryInfo version: {v}")
-
-        if num_graphs <= 0 or not bool(graphs_ptr):
-            try:
-                self.system_provider.systemContextFree(self._sys_ctx)
-            except Exception:
-                pass
-            raise RuntimeError(
-                "No graphs found in BinaryInfo; check SDK/layout compatibility.")
-
-        print(f"[INFO] Using BinaryInfo: num_graphs={num_graphs}")
-
-        # ---- iterate by-value array QnnSystemContext_GraphInfo_t* ----
-        graphinfo_instances, graph_ptrs = [], []
-        for i in range(num_graphs):
-            gi_src = graphs_ptr[i]  # by-value struct
-            vgi = int(gi_src.version)
-            if vgi == 1:
-                gi_in = gi_src.u.graphInfoV1
-            elif vgi == 2:
-                gi_in = gi_src.u.graphInfoV2
-            elif vgi == 3:
-                gi_in = gi_src.u.graphInfoV3
-            else:
-                raise RuntimeError(
-                    f"Graph[{i}] unsupported info version: {vgi}")
-
-            name = gi_in.graphName or b""
-            graph_handle = c_void_p()
-
-            rc = self.qnn_provider.graphRetrieve(
-                self.context, name, ctypes.byref(graph_handle))
-
-            if rc != 0 or not graph_handle:
-                try:
-                    gname = name.decode() if name else ""
-                except Exception:
-                    gname = "<decode error>"
-                raise RuntimeError(
-                    f"graphRetrieve failed rc={rc} name={gname}")
-
-            gi_local                  = GraphInfo()
-            gi_local.graph            = graph_handle
-            gi_local.graphName        = name
-            gi_local.inputTensors     = gi_in.graphInputs
-            gi_local.numInputTensors  = gi_in.numGraphInputs
-            gi_local.outputTensors    = gi_in.graphOutputs
-            gi_local.numOutputTensors = gi_in.numGraphOutputs
-
-            graphinfo_instances.append(gi_local)
-            graph_ptrs.append(ctypes.pointer(gi_local))
-
-            try:
-                gname = name.decode() if name else ""
-            except Exception:
-                gname = "<decode error>"
-            print(f"[INFO] Graph[{i}] name='{gname}' "
-                  f"inputs={int(gi_in.numGraphInputs)} "
-                  f"outputs={int(gi_in.numGraphOutputs)}")
-
-        # ---- build GraphInfo*** and finalize ----
-        PP_GraphInfo = ctypes.POINTER(GraphInfo)
-        pp_array = (PP_GraphInfo * num_graphs)()
-
-        for i in range(num_graphs):
-            pp_array[i] = graph_ptrs[i]
-
-        pp_ptr = ctypes.cast(pp_array, ctypes.POINTER(PP_GraphInfo))
-        self._graphs_ppp = ctypes.pointer(pp_ptr)
-        self._graphs_count = num_graphs
-
-        self._gi_instances = graphinfo_instances
-        self._gi_ptrs      = graph_ptrs
-        self._gi_pp_array  = pp_array
-        self._gi_pp_ptr    = pp_ptr
-
-        self._finalize_graph_list()
-
-    def _check_finalize_capability(self) -> int:
-        support_finalize_deserialized_graph = int(
-            QNN_PROPERTY_GRAPH_SUPPORT_FINALIZE_DESERIALIZED_GRAPH)
-        return int(self.qnn_provider.propertyHasCapability(support_finalize_deserialized_graph))
-
-    def _finalize_graph_list(self) -> None:
-        # 1) Capability gate
-        rc = self._check_finalize_capability()
-        if rc != 0:
-            print("[INFO] Backend does not support finalizing deserialized graphs")
-            return
-
-        # 2) Finalize loop
-        base_pp = self._graphs_ppp.contents
-        arr = ctypes.cast(base_pp, ctypes.POINTER(ctypes.POINTER(GraphInfo)))
-        for i in range(self._graphs_count):
-            gi = arr[i].contents
-            rc_f = self.qnn_provider.graphFinalize(
-                gi.graph, self.profile, c_void_p())
-            name = gi.graphName.decode() if gi.graphName else ''
-            print(f'[CALL] graphFinalize[{i}] rc={rc_f} name={name}')
-            if rc_f != 0:
-                raise RuntimeError(f'graphFinalize[{i}] failed rc={rc_f}')
+        return dedup
 
     # --- lifecycle ---
-
     def start(self) -> None:
         if self.qnn_provider is None:
             self._load_libs()
-
         self._init_logging()
         self._init_backend()
         self._register_op_packages()
         self._create_device()
         self._init_profiling()
-        self._create_context()
-        self._compose_and_finalize_graphs()
 
-    def run_once(self) -> None:
-        self.execute_graphs()
+        multi_paths = self._resolve_retrieve_context_paths()
 
-        if self.opts.save_context:
-            size = ctypes.c_size_t(0)
-            rc = self.qnn_provider.contextGetBinarySize(
-                self.context, ctypes.byref(size))
-            print(f"[CALL] contextGetBinarySize rc={rc} size={size.value}")
-            if rc != 0:
-                raise RuntimeError(f"contextGetBinarySize failed rc={rc}")
+        if len(multi_paths) > 1:
+            print(f"[INFO] Detected {len(multi_paths)} context binaries; creating one GraphContextManager per file.")
+            self._graph_mgrs = []
+            for p in multi_paths:
+                o = deepcopy(self.opts)
+                if hasattr(o, "model_path"):
+                    o.model_path = None
+                o.retrieve_context = p
+                mgr = GraphContextManager(
+                    opts=o,
+                    qnn_provider=self.qnn_provider,
+                    system_provider=self.system_provider,
+                    backend=self.backend,
+                    device=self.device,
+                    profile=self.profile
+                )
+                _ = mgr.create_context()
+                _ = mgr.compose_and_finalize_graphs()
+                self._graph_mgrs.append(mgr)
 
-            buf = (ctypes.c_uint8 * size.value)()
-            written = ctypes.c_size_t(0)
-            rc = self.qnn_provider.contextGetBinary(self.context, ctypes.cast(
-                buf, c_void_p), size.value, ctypes.byref(written))
-            print(f"[CALL] contextGetBinary rc={rc} written={written.value}")
-            if rc != 0:
-                raise RuntimeError(f"contextGetBinary failed rc={rc}")
+            # Clear legacy single-manager fields
+            self.context = c_void_p()
+            self._graphs_ppp = None
+            self._graphs_count = 0
 
-            out_path = os.path.join(
-                self.opts.output_dir, f"{self.opts.save_context}.bin")
-            with open(out_path, "wb") as f:
-                f.write(bytes(buf)[: written.value])
-
-            print(f"[INFO] Saved context binary to {out_path}")
+        else:
+            # Single-manager (legacy behavior)
+            self._graph_mgrs = []
+            mgr = GraphContextManager(
+                opts=self.opts,
+                qnn_provider=self.qnn_provider,
+                system_provider=self.system_provider,
+                backend=self.backend,
+                device=self.device,
+                profile=self.profile
+            )
+            self.context = mgr.create_context()
+            self._graphs_ppp, self._graphs_count = mgr.compose_and_finalize_graphs()
+            self._graph_mgrs.append(mgr)
 
     def stop(self) -> None:
-        # free system context (context-binary path)
+        # Free system contexts held by managers
         try:
-            if getattr(self, "_sys_ctx", None):
-                rc = self.system_provider.systemContextFree(self._sys_ctx)
-                print(f"[CALL] systemContextFree rc={rc}")
+            for mgr in self._graph_mgrs:
+                mgr.cleanup()
         except Exception:
             pass
-        self._sys_ctx = None
 
+        # Free each manager's QNN context
         try:
-            if self.context and self.context.value:
-                rc = self.qnn_provider.contextFree(self.context, self.profile)
-                print(f"[CALL] contextFree rc={rc}")
+            for mgr in self._graph_mgrs:
+                if mgr.context and mgr.context.value:
+                    rc = self.qnn_provider.contextFree(mgr.context, self.profile)
+                    print(f"[CALL] contextFree rc={rc}")
         except Exception:
             pass
+
         self.context = c_void_p()
 
         try:
@@ -430,213 +291,164 @@ class QnnSampleApp:
             pass
         self.logger = c_void_p()
 
-    def run(self) -> int:
-        try:
-            self.start()
-            for _ in range(max(1, int(self.opts.num_inferences))):
-                self.run_once()
-            return 0
-        except Exception as e:
-            print("[FATAL]", e)
-            return 2
-        finally:
-            self.stop()
+        self._graph_mgrs = []
 
-    # --- compose or context-loader selector ---
-    def _compose_and_finalize_graphs(self) -> None:
-        self._ensure_system_interface_is_sane()
-        if self.opts.model_path:
-            if self._model_interop is None:
-                self._model_interop = QnnModelInterop(self.opts.model_path)
-                self._model_interop.load()
+    # --- execution helpers ---
+    def _execute_graphs_for_manager(self, mgr: GraphContextManager) -> int:
+        """
+        Executes all graphs owned by a given manager. Mirrors the legacy execute_graphs() loop.
+        """
+        import ctypes
 
-            graphs_ppp, graphs_count = self.qnn_provider.compose_graphs(
-                backend_handle=self.backend,
-                context_handle=self.context,
-                model_interop=self._model_interop,
-                debug=self.opts.debug,
-                log_level=self.opts.log_level,
+        if not mgr._graphs_ppp or not bool(mgr._graphs_ppp):
+            raise RuntimeError(
+                "No graphs loaded (graphs_ppp is null). "
+                "Ensure compose/context loader ran."
             )
 
-            self._graphs_ppp = graphs_ppp
-            self._graphs_count = graphs_count
+        base_pp = mgr._graphs_ppp.contents
+        arr = ctypes.cast(base_pp, ctypes.POINTER(ctypes.POINTER(GraphInfo)))
 
-            print(f"self._graphs_ppp::{self._graphs_ppp}")
-            print(f"self._graphs_count::{self._graphs_count}")
+        io = IOTensor()
+        for i in range(mgr._graphs_count):
+            gi = arr[i].contents
+            graph_name = gi.graphName.decode() if gi.graphName else ""
 
-            print(
-                f"[INFO] composeGraphs produced {self._graphs_count} graph(s).")
+            inputs, outputs, in_buf_refs, out_buf_refs = io.setup_input_output(
+                gi, system_provider=self.system_provider
+            )
 
-            self._finalize_graph_list()
+            # Guard: input population
+            try:
+                if getattr(self.opts, "input_list_paths", None):
+                    io.populate_inputs(
+                        inputs, gi, self.opts.input_list_paths,
+                        input_data_type=self.opts.input_data_type
+                    )
+            except Exception as e:
+                print("[ERR] populate_inputs failed:", e)
+                raise
 
-            return
+            def _assert_non_null_buffers(gi, inputs, outputs):
+                for ii in range(gi.numInputTensors):
+                    _, tv = tv_view(inputs[ii])
+                    ptr = ctypes.cast(tv.clientBuf.data, c_void_p).value or 0
+                    if ptr == 0:
+                        name = tv.name.decode() if tv.name else f"Input_{ii}"
+                        raise RuntimeError(f"NULL input buffer at {ii} ({name})")
+                    tv.memType = c_uint32(0)
 
-        if self.opts.retrieve_context:
-            print(
-                "[INFO] No model .so provided; loading graphs from context binary via System API")
-            self._load_graphs_from_context_binary()
-            print(
-                f"[INFO] Loaded {self._graphs_count} graph(s) from context binary.")
-            return
+                for oi in range(gi.numOutputTensors):
+                    _, tv = tv_view(outputs[oi])
+                    ptr = ctypes.cast(tv.clientBuf.data, c_void_p).value or 0
+                    if ptr == 0:
+                        name = tv.name.decode() if tv.name else f"Output_{oi}"
+                        raise RuntimeError(f"NULL output buffer at {oi} ({name})")
+                    tv.memType = c_uint32(0)
 
-        print(
-            "[FATAL] Neither --model_path nor --retrieve_context was provided; cannot build graphs.")
+            _assert_non_null_buffers(gi, inputs, outputs)
 
+            def _as_tensor_array(objs, n):
+                if hasattr(objs, "_length_") and isinstance(objs, ctypes.Array):
+                    return objs
+                if isinstance(objs, list):
+                    ArrT = Qnn_Tensor_t * int(n)
+                    return ArrT(*objs)
+                ArrT = Qnn_Tensor_t * int(n)
+                return ArrT(*[objs])
+
+            inputs_arr = _as_tensor_array(inputs, gi.numInputTensors)
+            outputs_arr = _as_tensor_array(outputs, gi.numOutputTensors)
+
+            # Cast arrays to POINTER(Qnn_Tensor_t) as the CFUNCTYPE expects
+            inputs_ptr = ctypes.cast(inputs_arr, ctypes.POINTER(Qnn_Tensor_t))
+            outputs_ptr = ctypes.cast(outputs_arr, ctypes.POINTER(Qnn_Tensor_t))
+
+            from .utils_dump import dump_tensors
+            # Dump all inputs/outputs for a graph
+            dump_tensors(inputs, gi.numInputTensors, kind="INPUTS")
+            dump_tensors(outputs, gi.numOutputTensors, kind="OUTPUTS")
+
+            rc = self.qnn_provider.graphExecute(
+                gi.graph,
+                inputs_ptr, c_uint32(int(gi.numInputTensors)),
+                outputs_ptr, c_uint32(int(gi.numOutputTensors)),
+                self.profile, c_void_p()
+            )
+            if rc != 0:
+                # Optional: decode backend error
+                sm, vm = ErrorHelper.describe(
+                    self.qnn_provider.qnn_err_handler, rc)
+                ErrorHelper.print("graphExecute", rc, sm, vm)
+                raise RuntimeError(f"graphExecute failed rc={rc}")
+
+            print(f"[CALL] graphExecute[{i}] rc={rc} name={graph_name}")
+            if rc != 0:
+                return rc
+
+            # Guard: output writing
+            try:
+                io.write_outputs(
+                    outputs, gi, graph_name, self.opts.output_dir,
+                    output_data_type=self.opts.output_data_type,
+                    batch_size=1, num_inputs_populated=1
+                )
+            except Exception as e:
+                print("[ERR] write_outputs failed:", e)
+                raise
+
+            io.teardown(inputs, outputs, gi)
+
+        return 0
+
+    def _select_manager_for_model(self, model: Optional[str]) -> GraphContextManager:
+        """
+        Pick exactly one manager that matches the requested 'model'.
+        Matching rule:
+          1) Normalize both sides: lowercase and remove all non-alphanumeric chars.
+          2) Use substring match on the normalized strings.
+        Examples accepted: 'textencoder', 'text_encoder', 'unet', 'vae', full filename, etc.
+        """
+        if not self._graph_mgrs:
+            raise RuntimeError("No GraphContextManager initialized; did start() run?")
+
+        # If no model given and only one manager exists, use it (backward compat).
+        if not model:
+            if len(self._graph_mgrs) == 1:
+                return self._graph_mgrs[0]
+            raise ValueError(
+                "Multiple models available; please specify model "
+                "(e.g., 'vae', 'text_encoder' / 'textencoder', 'unet')."
+            )
+
+        def _norm(s: str) -> str:
+            return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+        key_norm = _norm(model)
+        candidates = []
+        for mgr in self._graph_mgrs:
+            src = getattr(mgr.opts, "retrieve_context", "") or ""
+            base = os.path.basename(src)
+            base_norm = _norm(base)
+            if key_norm and key_norm in base_norm:
+                candidates.append(mgr)
+
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) == 0:
+            raise RuntimeError(
+                f"No manager found for model '{model}'. "
+                f"Available: {[os.path.basename(getattr(m.opts,'retrieve_context','')) for m in self._graph_mgrs]}"
+            )
         raise RuntimeError(
-            "No model_path (.so) or retrieve_context (.bin) specified. "
-            "Provide one of them in AppOptions to build graphs."
+            f"Ambiguous model '{model}'. Matches: "
+            f"{[os.path.basename(getattr(m.opts,'retrieve_context','')) for m in candidates]}"
         )
 
-    def _ensure_system_interface_is_sane(self):
-        # Check that systemProvider exists and function pointers look plausible.
-        if self.system_provider is None:
-            raise RuntimeError(
-                "System provider not loaded; set system_library in AppOptions")
-
-        iface = self.system_provider._SystemProvider__interface()
-        ptrs = [
-            iface.systemContextCreate,
-            iface.systemContextGetBinaryInfo,
-            getattr(iface, "systemContextGetMetaData", 0),
-            iface.systemContextFree,
-        ]
-        # Basic sanity: all pointers should be non-zero and “reasonable”
-        for name, p in zip(
-            ["systemContextCreate", "systemContextGetBinaryInfo",
-                "systemContextGetMetaData", "systemContextFree"],
-            ptrs
-        ):
-            if isinstance(p, int):
-                addr = p
-            else:
-                addr = int(p)
-            if addr < 0x1000:
-                raise RuntimeError(
-                    f"System interface pointer for {name} looks invalid: 0x{addr:016x}. "
-                    "This usually indicates a QNN_SYSTEM_INTERFACE_VER_TYPE layout mismatch.\n"
-                    "Please ensure lib_provider.py's QNN_SYSTEM_INTERFACE_VER_TYPE "
-                    "fields match SDK exactly."
-                )
-
-    # --- execute using prepared GraphInfo*** ---
-
-    def execute_graphs(self) -> int:
-        import ctypes
-        try:
-            if not self._graphs_ppp or not bool(self._graphs_ppp):
-                raise RuntimeError(
-                    "No graphs loaded (self._graphs_ppp is null). "
-                    "Ensure compose/context loader ran.")
-
-            base_pp = self._graphs_ppp.contents
-            arr = ctypes.cast(base_pp, ctypes.POINTER(
-                ctypes.POINTER(GraphInfo)))
-
-            io = IOTensor()
-            for i in range(self._graphs_count):
-                gi = arr[i].contents
-                graph_name = gi.graphName.decode() if gi.graphName else ""
-
-                inputs, outputs, in_buf_refs, out_buf_refs = io.setup_input_output(
-                    gi, system_provider=self.system_provider
-                )
-
-                # Guard: input population
-                try:
-                    if self.opts.input_list_paths:
-                        io.populate_inputs(inputs, gi, self.opts.input_list_paths,
-                                           input_data_type=self.opts.input_data_type)
-                except Exception as e:
-                    print("[ERR] populate_inputs failed:", e)
-                    raise
-
-                def _assert_non_null_buffers(gi, inputs, outputs):
-                    for i in range(gi.numInputTensors):
-                        _, tv = tv_view(inputs[i])
-                        ptr = ctypes.cast(tv.clientBuf.data,c_void_p).value or 0
-
-                        if ptr == 0:
-                            name = tv.name.decode() if tv.name else f"Input_{i}"
-                            raise RuntimeError(f"NULL input buffer at {i} ({name})")
-                        tv.memType = c_uint32(0)
-
-                    for i in range(gi.numOutputTensors):
-                        _, tv = tv_view(outputs[i])
-                        ptr = ctypes.cast(tv.clientBuf.data,c_void_p).value or 0
-                        if ptr == 0:
-                            name = tv.name.decode() if tv.name else f"Output_{i}"
-                            raise RuntimeError(f"NULL output buffer at {i} ({name})")
-                        tv.memType = c_uint32(0)
-
-                _assert_non_null_buffers(gi, inputs, outputs)
-
-                def _as_tensor_array(objs, n):
-                    if hasattr(objs, "_length_") and isinstance(objs, ctypes.Array):
-                        return objs
-                    if isinstance(objs, list):
-                        ArrT = Qnn_Tensor_t * int(n)
-                        return ArrT(*objs)
-                    ArrT = Qnn_Tensor_t * int(n)
-
-                    return ArrT(*[objs])
-
-                inputs_arr = _as_tensor_array(inputs,  gi.numInputTensors)
-                outputs_arr = _as_tensor_array(outputs, gi.numOutputTensors)
-
-                # Cast arrays to POINTER(Qnn_Tensor_t) as the CFUNCTYPE expects
-                inputs_ptr = ctypes.cast(
-                    inputs_arr,  ctypes.POINTER(Qnn_Tensor_t))
-                outputs_ptr = ctypes.cast(
-                    outputs_arr, ctypes.POINTER(Qnn_Tensor_t))
-
-
-                from .utils_dump import dump_tensor, dump_tensors
-
-                # Dump all inputs/outputs for a graph
-                dump_tensors(inputs, gi.numInputTensors, kind="INPUTS")
-                dump_tensors(outputs, gi.numOutputTensors, kind="OUTPUTS")
-
-
-                print("rc = self.qnn_provider.graphExecute(")
-                print(f"\tgi.graph::{gi.graph}")
-                print(f"\tinputs_ptr::{inputs_ptr}")
-                print(f"\tc_uint32(int(gi.numInputTensors))::{c_uint32(int(gi.numInputTensors))}")
-                print(f"\toutputs_ptr::{outputs_ptr}")
-                print(f"\tc_uint32(int(gi.numOutputTensors))::{c_uint32(int(gi.numOutputTensors))}")
-                print(f"\tself.profile::{self.profile}")
-                print(f"\tc_void_p()::{c_void_p()}")
-                print(")")
-
-                rc = self.qnn_provider.graphExecute(
-                    gi.graph,
-                    inputs_ptr,   c_uint32(int(gi.numInputTensors)),
-                    outputs_ptr,  c_uint32(int(gi.numOutputTensors)),
-                    self.profile, c_void_p()
-                )
-
-                if rc != 0:
-                    # Optional: decode backend error
-                    sm, vm = ErrorHelper.describe(
-                        self.qnn_provider.qnn_err_handler, rc)
-                    ErrorHelper.print("graphExecute", rc, sm, vm)
-                    raise RuntimeError(f"graphExecute failed rc={rc}")
-
-                print(f"[CALL] graphExecute[{i}] rc={rc} name={graph_name}")
-                if rc != 0:
-                    return rc
-
-                # Guard: output writing
-                try:
-                    io.write_outputs(
-                        outputs, gi, graph_name, self.opts.output_dir,
-                        output_data_type=self.opts.output_data_type,
-                        batch_size=1, num_inputs_populated=1
-                    )
-                except Exception as e:
-                    print("[ERR] write_outputs failed:", e)
-                    raise
-
-                io.teardown(inputs, outputs, gi)
-        except Exception as e:
-            raise RuntimeError("[ERR] graphExecute loop failed:", e)
-        return 0
+    def execute_graphs(self, model: Optional[str] = None) -> int:
+        """
+        Execute graphs only for the manager that corresponds to the given model.
+        Example models: 'vae', 'text_encoder', 'unet', or a full filename.
+        """
+        mgr = self._select_manager_for_model(model)
+        return self._execute_graphs_for_manager(mgr)
