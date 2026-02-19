@@ -5,6 +5,8 @@ import json
 import os
 import pathlib
 import threading
+import glob
+import shutil
 from typing import Dict, List, Optional
 from openapi_server.logger.logger_config import LoggerConfig
 
@@ -14,8 +16,8 @@ logger = LoggerConfig.get_logger(__name__)
 
 class ModelConfigManager:
     """
-    Singleton class to manage model configurations from a JSON file.
-    Provides methods to access model properties, validate models, and get available models.
+    Singleton class to manage model configurations from bundle files.
+    Scans model bundles, updates configuration paths, and provides model access.
     """
     _instance = None
     _lock = threading.Lock()
@@ -31,77 +33,163 @@ class ModelConfigManager:
     def __init__(self):
         """Initialize the ModelConfigManager singleton."""
         if not self._initialized:
-            # Default path is relative to this file's location
-            default_config_path = pathlib.Path(__file__).parent.parent / "configs" / "models_config.json"
-            self.config_path = os.getenv(
-                "GENAI_MODELS_CONFIG_PATH",
-                str(default_config_path)
-            )
-            self.models_config = self._load_models_config()
+            self.models_dir = os.getenv("GENAI_MODELS_DIR", "/mnt/work/models")
+            self.tmp_config_dir = "/tmp/configs"
+            self.models_config = self._scan_model_bundles()
             self._initialized = True
-            logger.info(f"ModelConfigManager initialized with config from: {self.config_path}")
+            logger.info(f"ModelConfigManager initialized with models from: {self.models_dir}")
 
-    def _load_models_config(self) -> Dict:
+    def _scan_model_bundles(self) -> Dict:
         """
-        Load model configuration from JSON file.
-        Creates a default configuration if file doesn't exist.
+        Scan model bundles in the models directory.
+        Copies and modifies configuration files to support absolute paths.
 
         Returns:
-            Dict: The loaded or default model configuration
+            Dict: The aggregated model configuration
         """
-        if not os.path.exists(self.config_path):
-            logger.warning(f"Model config file not found at {self.config_path}, creating default config")
-            default_config = {
-                "models": {
-                    "llama3-8b": {
-                        "config_file": "genie_config_llama3_1_8B.json",
-                        "display_name": "Llama 3.1 8B",
-                        "chat_template": {
-                            "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
-                            "system_suffix": "<|eot_id|>",
-                            "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
-                            "user_suffix": "<|eot_id|>",
-                            "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
-                            "assistant_suffix": "<|eot_id|>",
-                            "default_system_prompt": "You are a helpful assistant."
-                        },
-                        "max_tokens": 4096,
-                        "supports_streaming": True,
-                        "internal_id": "LLAMA3_1_8B"
-                    }
-                },
-                "default_model": "llama3-8b",
-                "fallback_chat_template": {
-                    "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
-                    "system_suffix": "<|eot_id|>",
-                    "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
-                    "user_suffix": "<|eot_id|>",
-                    "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
-                    "assistant_suffix": "<|eot_id|>",
-                    "default_system_prompt": "You are a helpful assistant."
-                }
+        aggregated_config = {
+            "models": {},
+            "default_model": None,
+            "fallback_chat_template": {
+                "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+                "system_suffix": "<|eot_id|>",
+                "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+                "user_suffix": "<|eot_id|>",
+                "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "assistant_suffix": "<|eot_id|>",
+                "default_system_prompt": "You are a helpful assistant."
             }
+        }
 
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        if not os.path.exists(self.models_dir):
+            logger.warning(f"Models directory not found: {self.models_dir}")
+            return aggregated_config
+
+        # Clean up tmp config dir if it exists
+        if os.path.exists(self.tmp_config_dir):
+            shutil.rmtree(self.tmp_config_dir)
+        os.makedirs(self.tmp_config_dir, exist_ok=True)
+
+        bundle_pattern = os.path.join(self.models_dir, "genie_bundle_*")
+        bundles = glob.glob(bundle_pattern)
+
+        for bundle_path in bundles:
+            if not os.path.isdir(bundle_path):
+                continue
+
+            bundle_name = os.path.basename(bundle_path)
+            model_config_path = os.path.join(bundle_path, "model_config.json")
+
+            if not os.path.exists(model_config_path):
+                logger.warning(f"No model_config.json found in bundle: {bundle_name}")
+                continue
 
             try:
-                with open(self.config_path, 'w') as f:
-                    json.dump(default_config, f, indent=2)
-                logger.info(f"Created default model configuration at: {self.config_path}")
+                # Process the bundle (copy configs, update paths)
+                processed_config_dir = self._process_bundle(bundle_path, bundle_name)
+
+                # Load the model metadata
+                with open(model_config_path, 'r') as f:
+                    model_config_data = json.load(f)
+
+                for model_id, model_info in model_config_data.get("models", {}).items():
+                    # Update config_file to point to the processed copy in /tmp/configs
+                    original_config_file = model_info.get("config_file")
+                    if original_config_file:
+                        model_info["config_file"] = os.path.join(processed_config_dir, original_config_file)
+
+                    aggregated_config["models"][model_id] = model_info
+
+                    # Set default model if not set
+                    if aggregated_config["default_model"] is None:
+                        aggregated_config["default_model"] = model_id
+
+                logger.info(f"Loaded models from bundle: {bundle_name}")
+
             except Exception as e:
-                logger.error(f"Failed to create default config file: {e}")
+                logger.error(f"Error processing bundle {bundle_name}: {e}")
 
-            return default_config
+        return aggregated_config
 
-        try:
-            with open(self.config_path, 'r') as f:
-                config = json.load(f)
-                logger.info(f"Successfully loaded model config with {len(config.get('models', {}))} models")
-                return config
-        except Exception as e:
-            logger.error(f"Error loading model config from {self.config_path}: {e}")
-            raise
+    def _process_bundle(self, bundle_path: str, bundle_name: str) -> str:
+        """
+        Process a single bundle: copy JSON configs to tmp dir and update paths.
+
+        Args:
+            bundle_path: Path to the original bundle
+            bundle_name: Name of the bundle
+
+        Returns:
+            str: Path to the directory containing processed configs
+        """
+        output_dir = os.path.join(self.tmp_config_dir, bundle_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Find all JSON files in the bundle
+        json_files = glob.glob(os.path.join(bundle_path, "*.json"))
+
+        for json_file in json_files:
+            filename = os.path.basename(json_file)
+
+            # Skip tokenizer.json as per requirement
+            if filename == "tokenizer.json":
+                continue
+
+            # Read original JSON
+            with open(json_file, 'r') as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse JSON file: {json_file}")
+                    continue
+
+            # Update paths in the JSON data
+            updated_data = self._update_paths(data, bundle_path, output_dir)
+
+            # Write to output directory
+            output_path = os.path.join(output_dir, filename)
+            with open(output_path, 'w') as f:
+                json.dump(updated_data, f, indent=4)
+
+        return output_dir
+
+    def _update_paths(self, data, bundle_path: str, output_dir: str):
+        """
+        Recursively update paths in JSON data.
+
+        Args:
+            data: The JSON data (dict, list, or value)
+            bundle_path: Path to the original bundle (for binaries/tokenizer)
+            output_dir: Path to the processed config directory (for other JSONs)
+
+        Returns:
+            The data with updated paths
+        """
+        if isinstance(data, dict):
+            return {k: self._update_paths(v, bundle_path, output_dir) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._update_paths(item, bundle_path, output_dir) for item in data]
+        elif isinstance(data, str):
+            # Check if the string matches a file in the bundle
+            potential_path = os.path.join(bundle_path, data)
+            if os.path.isfile(potential_path):
+                filename = os.path.basename(data)
+
+                # If it's tokenizer.json, point to the original bundle path (since we didn't copy it)
+                if filename == "tokenizer.json":
+                    return potential_path
+
+                # If it's a JSON file (and not tokenizer), point to the copy in output_dir
+                if filename.endswith(".json"):
+                    # We can use the absolute path to the copy
+                    return os.path.join(output_dir, filename)
+
+                # If it's any other file (binary, raw, etc.), point to the original bundle path
+                return potential_path
+
+            return data
+        else:
+            return data
 
     def get_model_config(self, model_id: str) -> Optional[Dict]:
         """
@@ -185,36 +273,6 @@ class ModelConfigManager:
             return model_config.get('chat_template')
         return None
 
-    def get_internal_id(self, model_id: str) -> Optional[str]:
-        """
-        Get the internal model ID (used for C++ layer) for a given model.
-
-        Args:
-            model_id: The model identifier
-
-        Returns:
-            str: The internal model ID or None if not found
-        """
-        model_config = self.get_model_config(model_id)
-        if model_config:
-            return model_config.get("internal_id")
-        return None
-
-    def get_model_by_internal_id(self, internal_id: str) -> Optional[str]:
-        """
-        Get the model ID from an internal ID.
-
-        Args:
-            internal_id: The internal model identifier (e.g., LLAMA3_1_8B)
-
-        Returns:
-            str: The model ID or None if not found
-        """
-        for model_id, config in self.models_config.get("models", {}).items():
-            if config.get("internal_id") == internal_id:
-                return model_id
-        return None
-
     def get_context_size(self, model_id: str) -> int:
         """
         Get the context window size for a specific model.
@@ -263,7 +321,7 @@ class ModelConfigManager:
     def reload_config(self):
         """Reload the configuration from file."""
         logger.info("Reloading model configuration")
-        self.models_config = self._load_models_config()
+        self.models_config = self._scan_model_bundles()
 
     def has_vision_models(self) -> bool:
         """

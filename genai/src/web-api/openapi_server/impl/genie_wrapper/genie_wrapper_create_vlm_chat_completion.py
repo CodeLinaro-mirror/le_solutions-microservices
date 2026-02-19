@@ -356,15 +356,14 @@ class GenieWrapperCreateVLMChatCompletion:
 
             # Resolve model configuration
             model_config_manager = ModelConfigManager()
-            internal_model_id = model_config_manager.get_internal_id(request_data.model)
-            if not internal_model_id:
-                internal_model_id = request_data.model
+            # Use model ID directly as internal ID is deprecated
+            internal_model_id = request_data.model
 
             config_file_path = model_config_manager.get_config_file_path(request_data.model)
             if not config_file_path:
                 config_file_path = ""
 
-            logger.info(f"Resolved model: {request_data.model} -> {internal_model_id}, config: {config_file_path}")
+            logger.info(f"Resolved model: {request_data.model}, config: {config_file_path}")
 
             # Get VLM service and create query structure
             vlm_service = VLMService()

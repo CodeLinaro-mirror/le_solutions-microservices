@@ -161,11 +161,8 @@ def resolve_model_config(model_id: str, config_path: Optional[str] = None) -> Tu
             logger.warning(f"Model {model_id} not found in config, using as-is")
             return model_id, ""
 
-        # Get internal ID
-        internal_id = config_manager.get_internal_id(model_id)
-        if not internal_id:
-            logger.warning(f"No internal ID found for {model_id}, using as-is")
-            internal_id = model_id
+        # Use model ID directly
+        internal_id = model_id
 
         # Get config file
         config_file = config_manager.get_config_file_path(model_id)

@@ -95,7 +95,6 @@ class CommonUtils:
 
         Args:
             model_id: The external model identifier (e.g., "qwen2.5-7b", "llama3-8b")
-                     Also supports internal IDs for backward compatibility
 
         Returns:
             str: Path to the model's Genie configuration file
@@ -115,22 +114,8 @@ class CommonUtils:
                 logger.info(f"Found config path for model {model_id}: {config_path}")
                 return config_path
 
-            # Try to find by internal ID
-            external_id = config_manager.get_model_by_internal_id(model_id)
-            if external_id:
-                config_path = config_manager.get_config_file_path(external_id)
-                if config_path:
-                    logger.info(f"Found config path for internal model {model_id}: {config_path}")
-                    return config_path
-
-            # Fallback to hardcoded mapping
-            logger.warning(f"No config path found for model {model_id}, using hardcoded fallback")
-            fallback_map = {
-                "LLAMA3_1_8B": "genie_config_llama3_1_8B.json",
-                "LLAMA3_2_3B": "genie_config_llama3_2_3B.json",
-                "QWEN2_5_7B": "genie_config_qwen2_5_7B.json"
-            }
-            return fallback_map.get(model_id, "genie_config_llama3_1_8B.json")
+            logger.warning(f"No config path found for model {model_id}")
+            return "genie_config_llama3_1_8B.json"
 
         except Exception as e:
             logger.error(f"Error getting config path for model {model_id}: {e}")
@@ -154,13 +139,6 @@ class CommonUtils:
 
         if chat_template:
             return chat_template
-
-        # Try internal ID
-        external_id = config_manager.get_model_by_internal_id(model_id)
-        if external_id:
-            chat_template = config_manager.get_chat_template(external_id)
-            if chat_template:
-                return chat_template
 
         # Fall back to global fallback_chat_template
         fallback = config_manager.models_config.get('fallback_chat_template')

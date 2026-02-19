@@ -52,12 +52,8 @@ class VLMChatQueryUtils:
                     detail=f"Model {requested_model} does not support vision/image inputs"
                 )
 
-            internal_model_id = config_manager.get_internal_id(requested_model)
-            if not internal_model_id:
-                internal_model_id = requested_model
-                logger.warning(f"Could not map model {requested_model}, using as-is")
-
-            model_str = internal_model_id
+            # Use requested model ID directly
+            model_str = requested_model
         else:
             raise HTTPException(
                 status_code=HttpStatusCodes.BAD_REQUEST,
