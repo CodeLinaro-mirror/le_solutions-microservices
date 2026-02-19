@@ -22,7 +22,7 @@ typedef void* VLMHandle;
  * @param streaming Enable streaming mode (true) or non‑streaming (false).
  * @return Opaque handle to the created VLMObject.
  */
-VLMHandle vlm_create_object(const char* model, const char* config_path, bool streaming);
+VLMHandle vlm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming);
 
 /**
  * @brief Destroy a VLMObject.

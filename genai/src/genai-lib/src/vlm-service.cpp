@@ -308,7 +308,7 @@ void Node::applyConfig(GenieSamplerConfig_Handle_t samplerConfigHandle) {
 /*--------------------------------------------------------------
  * VLMObject implementation
  *--------------------------------------------------------------*/
-VLMObject::VLMObject(const std::string& model, const std::string& config_path, bool streaming) {
+VLMObject::VLMObject(const std::string& model, const std::string& config_path, const std::string& sampler_config_path, bool streaming) {
     stream = streaming;
     query = std::make_unique<Query>();
     strlcpy(modelSelected, model.c_str(), sizeof(modelSelected));
@@ -333,7 +333,7 @@ VLMObject::VLMObject(const std::string& model, const std::string& config_path, b
     // Load static custom inputs (position ids, masks, etc.)
     loadStaticCustomInputs();
 
-    sc_configPath = "sampler.json";
+    sc_configPath = sampler_config_path.empty() ? "sampler.json" : sampler_config_path;
 }
 
 VLMObject::~VLMObject() {

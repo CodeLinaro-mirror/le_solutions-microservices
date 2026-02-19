@@ -381,8 +381,10 @@ class VLMExecutor:
             logger.info(f"Creating VLM object with model={model_str}, config={config_file}")
             model_input = self.ffi.new("char[]", model_str.encode('utf-8'))
             config_path = self.ffi.new("char[]", config_file.encode('utf-8'))
+            sampler_path = "/iot-user/app/site-packages/sampler.json"
+            sampler_input = self.ffi.new("char[]", sampler_path.encode('utf-8'))
 
-            handle = self.lib.vlm_create_object(model_input, config_path, streaming)
+            handle = self.lib.vlm_create_object(model_input, config_path, sampler_input, streaming)
 
             # Simple NULL check - no function calls to undefined C functions
             if handle == self.ffi.NULL:

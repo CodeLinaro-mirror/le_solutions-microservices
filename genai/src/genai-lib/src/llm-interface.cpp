@@ -9,9 +9,10 @@
 
 extern "C" {
 
-LLMHandle llm_create_object(const char* model, const char* config_path, bool streaming) { //Creates LLM Object
+LLMHandle llm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming) { //Creates LLM Object
     try {
-        return new LLMObject(std::string(model), std::string(config_path), streaming);
+        const char* sampler_str = sampler_config_path ? sampler_config_path : "sampler.json";
+        return new LLMObject(std::string(model), std::string(config_path), std::string(sampler_str), streaming);
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Failed to create LLM object: " << e.what() << std::endl;
         return nullptr;

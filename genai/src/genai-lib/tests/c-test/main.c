@@ -75,7 +75,7 @@ int main() {
             break;
     }
 
-    LLMHandle llm = llm_create_object(model, config_path, stream);
+    LLMHandle llm = llm_create_object(model, config_path, "sampler.json", stream);
 
     while (1) {
         Message message;

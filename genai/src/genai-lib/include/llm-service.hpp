@@ -111,7 +111,7 @@ class LLMObject
 {
     public:
 
-        LLMObject(std::string model, std::string config_path, bool streaming);
+        LLMObject(std::string model, std::string config_path, std::string sampler_config_path, bool streaming);
         ~LLMObject() {delete diag;}
         // Disable both copying and moving
         LLMObject(const LLMObject&) = delete;

@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::endl;
 
-    LLMObject obj(model, config_path, stream);
+    LLMObject obj(model, config_path, "sampler.json", stream);
 
     while (1)
     {

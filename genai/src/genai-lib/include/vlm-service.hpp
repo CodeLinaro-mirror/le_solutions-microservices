@@ -185,7 +185,7 @@ public:
         UNKNOWN = -1
     };
 
-    VLMObject(const std::string& model = "", const std::string& config_path = "", bool streaming = false);
+    VLMObject(const std::string& model = "", const std::string& config_path = "", const std::string& sampler_config_path = "sampler.json", bool streaming = false);
     ~VLMObject();
 
     /* OpenAI‑compatible query */

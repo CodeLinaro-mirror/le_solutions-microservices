@@ -175,11 +175,14 @@ class VLMWrapper:
             # Properly encode strings with null termination
             model_bytes = model_id.encode('utf-8') + b'\0'
             config_bytes = config_path.encode('utf-8') + b'\0'
+            sampler_path = "/iot-user/app/site-packages/sampler.json"
+            sampler_bytes = sampler_path.encode('utf-8') + b'\0'
 
             model_str = ffi.new("char[]", model_bytes)
             config_str = ffi.new("char[]", config_bytes)
+            sampler_str = ffi.new("char[]", sampler_bytes)
 
-            handle = lib.vlm_create_object(model_str, config_str, streaming)
+            handle = lib.vlm_create_object(model_str, config_str, sampler_str, streaming)
 
             if handle != ffi.NULL:
                 # Cache the handle

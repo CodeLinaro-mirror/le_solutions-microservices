@@ -43,7 +43,7 @@ int main() {
     }
     bool stream = atoi(choiceStr) == 1;
 
-    VLMHandle vlm = vlm_create_object(model, config_path, stream);
+    VLMHandle vlm = vlm_create_object(model, config_path, "sampler.json", stream);
     if (!vlm) {
         fprintf(stderr, "Failed to create VLM object.\n");
         return 1;

@@ -23,7 +23,7 @@ from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.session.token_counter import TokenCounter
 from openapi_server.session.tool_handler import ToolHandler
 from openapi_server.managers.model_config_manager import ModelConfigManager
-from openapi_server.impl.constant import LLMServiceKeys, LLMServiceQueryConstant as QUERY_CONST
+from openapi_server.impl.constant import LLMServiceKeys, LLMServiceQueryConstant as QUERY_CONST, SAMPLER_CONFIG_PATH
 from openapi_server.logger.logger_config import LoggerConfig
 
 LoggerConfig.initialize()
@@ -1194,9 +1194,11 @@ class TextConversationEvent(ConversationEvent):
                 # Direct creation for normal mode
                 model_input = llm_service.ffi.new("char[]", self.model_id.encode('utf-8'))
                 config_path_input = llm_service.ffi.new("char[]", config_path.encode('utf-8'))
+                sampler_path = SAMPLER_CONFIG_PATH
+                sampler_input = llm_service.ffi.new("char[]", sampler_path.encode('utf-8'))
 
                 self.llm_handle = llm_service.lib.llm_create_object(
-                    model_input, config_path_input, True
+                    model_input, config_path_input, sampler_input, True
                 )
 
             # Simple NULL check - no function calls to undefined C functions

@@ -7,7 +7,7 @@ import pathlib
 import threading
 import time
 from cffi import FFI
-from openapi_server.impl.constant import EnvVariableValues, EnvVariableKeys
+from openapi_server.impl.constant import EnvVariableValues, EnvVariableKeys, SAMPLER_CONFIG_PATH
 
 class LLMService:
     _instance = None
@@ -52,7 +52,9 @@ class LLMService:
             # Create new handle
             model_input = instance.ffi.new("char[]", model_id.encode('utf-8'))
             config_path_input = instance.ffi.new("char[]", config_path.encode('utf-8'))
-            handle = instance.lib.llm_create_object(model_input, config_path_input, streaming)
+            sampler_path = SAMPLER_CONFIG_PATH
+            sampler_input = instance.ffi.new("char[]", sampler_path.encode('utf-8'))
+            handle = instance.lib.llm_create_object(model_input, config_path_input, sampler_input, streaming)
 
             # Cache it
             if handle != instance.ffi.NULL:
@@ -142,9 +144,16 @@ class LLMService:
                       self.genai_interfaces = f.read()
                 self.ffi = FFI()
                 # Update the interface definition to include config_path parameter and error checking functions
+                # Note: The on-disk header might already be updated, but this handles the old case if present
                 updated_interface = self.genai_interfaces.replace(
                     'LLMHandle llm_create_object(const char* model, bool streaming);',
-                    'LLMHandle llm_create_object(const char* model, const char* config_path, bool streaming);'
+                    'LLMHandle llm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming);'
+                )
+                # If the header on disk is already updated to have config_path but NOT sampler_config_path (intermediate state),
+                # we might need to replace THAT.
+                updated_interface = updated_interface.replace(
+                    'LLMHandle llm_create_object(const char* model, char* config_path, bool streaming);',
+                    'LLMHandle llm_create_object(const char* model, char* config_path, const char* sampler_config_path, bool streaming);'
                 )
                 # Add error checking functions to interface
                 if 'bool llm_is_initialized' not in updated_interface:

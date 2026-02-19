@@ -11,14 +11,15 @@
 
 extern "C" {
 
-VLMHandle vlm_create_object(const char* model, const char* config_path, bool streaming) {
+VLMHandle vlm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming) {
     try {
         // Create a new VLMObject with safe string construction
         const std::string model_str = model ? model : "";
         const std::string config_str = config_path ? config_path : "";
+        const std::string sampler_str = sampler_config_path ? sampler_config_path : "sampler.json";
 
         // Create a new VLMObject and return it as an opaque handle
-        return new VLMObject(model_str, config_str, streaming);
+        return new VLMObject(model_str, config_str, sampler_str, streaming);
     } catch (const std::exception& e) {
         std::cerr << "ERROR: Exception caught in vlm_create_object: " << e.what() << std::endl;
         return nullptr;

@@ -7,6 +7,9 @@ import os
 # This path is mounted path of container. Check docker-compose volume section for path in host machine.
 GENAI_INTERFACE_FILE = '/iot-user/app/site-packages/genai_interface.h'
 
+# Sampler config file path
+SAMPLER_CONFIG_PATH = '/iot-user/app/site-packages/sampler.json'
+
 class HttpStatusCodes:
     """
     Constants for HTTP status codes.

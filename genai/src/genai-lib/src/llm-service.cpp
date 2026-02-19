@@ -217,7 +217,7 @@ void Dialog::queryCallback(const char* responseStr,
     }
 }
 
-LLMObject::LLMObject(std::string model, std::string config_path, bool streaming) {
+LLMObject::LLMObject(std::string model, std::string config_path, std::string sampler_config_path, bool streaming) {
     query = std::make_unique<Query>();
     profiler = std::make_shared<Profile>();
     stream = streaming;
@@ -237,7 +237,7 @@ LLMObject::LLMObject(std::string model, std::string config_path, bool streaming)
 
     std::cout << "Successfully loaded config for model: " << model << std::endl;
 
-    sc_configPath = "sampler.json";
+    sc_configPath = sampler_config_path.empty() ? "sampler.json" : sampler_config_path;
     diag = new Dialog(Dialog::Config(config, profiler));
 }
 

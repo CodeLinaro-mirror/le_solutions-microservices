@@ -98,6 +98,7 @@ typedef void (*LLMResponseCallback)(const Response* response);
 LLMHandle llm_create_object(
     const char* model,
     char* config_path,
+    const char* sampler_config_path,
     bool streaming);
 
 void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
@@ -120,10 +121,11 @@ typedef void* VLMHandle;
  *
  * @param model    Model identifier string (e.g., "QWEN2_5_VL_3B").
  * @param config_path Path to the model configuration file.
+ * @param sampler_config_path Path to the sampler configuration file.
  * @param streaming Enable streaming mode (true) or non‑streaming (false).
  * @return Opaque handle to the created VLMObject.
  */
-VLMHandle vlm_create_object(const char* model, const char* config_path, bool streaming);
+VLMHandle vlm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming);
 
 /**
  * @brief Destroy a VLMObject.
