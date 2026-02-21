@@ -103,12 +103,36 @@ class TextConversationEvent(ConversationEvent):
         # Estimate tokens
         return TokenCounter.estimate_tokens_for_multimodal_content(content)
 
+    def _find_system_prompt(self) -> Optional[Dict[str, Any]]:
+        """
+        Find the most recent system prompt from the conversation history.
+        It scans backwards from the latest event to find a 'system' role message.
+
+        Returns:
+            The system message dict or None if not found.
+        """
+        if not self.session.events:
+            return None
+
+        # Iterate backwards through events
+        for event in reversed(self.session.events):
+            event_msgs = self.session.get_event_messages(event)
+            # Check messages in this event (usually system prompt is at start of event)
+            for msg in event_msgs:
+                if msg.get('role') == 'system':
+                    return msg
+        return None
+
     def _build_context_for_adhoc_mode(self, current_turn_messages: list) -> list:
         """
-        Build conversation context for ADHOC_MODE by including recent complete turns
-        that fit within the 60% context budget.
+        Build conversation context for ADHOC_MODE by including:
+        1. The most recent system prompt (priority)
+        2. The session summary (priority)
+        3. Recent complete turns that fit within the remaining context budget.
 
         Strategy:
+        - Identify priority components (System, Summary, Current Turn)
+        - Calculate remaining budget for history
         - Work backwards through completed events
         - Include complete user-assistant pairs only
         - Skip tool calling messages
@@ -133,26 +157,47 @@ class TextConversationEvent(ConversationEvent):
         # Calculate context budget: 60% for input, 40% for output
         max_input_tokens = int(self.context_size * 0.6)
 
-        # Estimate tokens for current turn
-        current_turn_tokens = sum(
+        # 1. Identify Priority Components
+        priority_messages = []
+
+        # System Prompt
+        system_message = self._find_system_prompt()
+        if system_message:
+            priority_messages.append(system_message)
+            logger.debug(f"Event {self.event_id}: Found system prompt for context")
+
+        # Summary (injected as system message)
+        if self.session.summary_content:
+            summary_msg = {
+                "role": "system",
+                "content": f"Here is a summary of the conversation so far:\n{self.session.summary_content}"
+            }
+            priority_messages.append(summary_msg)
+            logger.debug(f"Event {self.event_id}: Included summary in context")
+
+        # Current Turn
+        priority_messages.extend(current_turn_messages)
+
+        # Estimate tokens for priority components
+        priority_tokens = sum(
             TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
-            for msg in current_turn_messages
+            for msg in priority_messages
         )
 
         # Calculate remaining budget for history
-        history_budget = max_input_tokens - current_turn_tokens
+        history_budget = max_input_tokens - priority_tokens
 
         if history_budget <= 0:
-            logger.warning(f"Event {self.event_id}: Current turn uses all context budget")
-            return current_turn_messages
+            logger.warning(f"Event {self.event_id}: Priority components use all context budget ({priority_tokens} > {max_input_tokens}). Dropping history.")
+            return priority_messages
 
         logger.info(f"Event {self.event_id}: ADHOC_MODE context building - "
                    f"max_input: {max_input_tokens}, "
-                   f"current_turn: {current_turn_tokens}, "
+                   f"priority_tokens: {priority_tokens}, "
                    f"history_budget: {history_budget} tokens")
 
         # Build context from completed events (work backwards)
-        context_messages = []
+        history_messages = []
         accumulated_tokens = 0
         events_included = 0
 
@@ -160,7 +205,7 @@ class TextConversationEvent(ConversationEvent):
             # Get messages for this event
             event_messages = self.session.get_event_messages(event)
 
-            # Filter out tool messages - only keep user and assistant messages
+            # Filter messages - keep user/assistant, EXCLUDE system (already handled)
             filtered_messages = []
             for msg in event_messages:
                 role = msg.get('role', '')
@@ -173,15 +218,16 @@ class TextConversationEvent(ConversationEvent):
                             continue  # Skip tool call request messages
                     filtered_messages.append(msg)
 
-            # Skip events that don't have complete pairs
+            # Skip events that don't have relevant messages
             if not filtered_messages:
                 continue
 
-            # Estimate tokens for this event (use actual token count if available)
+            # Estimate tokens for this event
+            # Use actual token count if available, otherwise estimate
             if hasattr(event, 'total_turn_tokens') and event.total_turn_tokens > 0:
+                # This count might include system tokens which we excluded, but it's a safe over-estimate
                 event_tokens = event.total_turn_tokens
             else:
-                # Fallback: estimate from messages
                 event_tokens = sum(
                     TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
                     for msg in filtered_messages
@@ -193,23 +239,34 @@ class TextConversationEvent(ConversationEvent):
                            f"would exceed budget ({accumulated_tokens + event_tokens} > {history_budget})")
                 break
 
-            # Add event messages to context (prepend since we're going backwards)
-            context_messages = filtered_messages + context_messages
+            # Add event messages to history (prepend since we're going backwards)
+            history_messages = filtered_messages + history_messages
             accumulated_tokens += event_tokens
             events_included += 1
 
-            logger.debug(f"Event {self.event_id}: Added event {event.event_id} to context - "
+            logger.debug(f"Event {self.event_id}: Added event {event.event_id} to history - "
                         f"{len(filtered_messages)} messages, {event_tokens} tokens")
 
-        # Combine historical context + current turn
-        full_context = context_messages + current_turn_messages
+        # Combine: [System] + [Summary] + [History] + [Current Turn]
+        # We need to construct this carefully based on priority_messages structure
+        final_context = []
+        if system_message:
+            final_context.append(system_message)
+        if self.session.summary_content:
+            final_context.append({
+                "role": "system",
+                "content": f"Here is a summary of the conversation so far:\n{self.session.summary_content}"
+            })
+
+        final_context.extend(history_messages)
+        final_context.extend(current_turn_messages)
 
         logger.info(f"Event {self.event_id}: ADHOC_MODE context built - "
-                   f"{len(context_messages)} historical messages from {events_included} events, "
+                   f"{len(history_messages)} historical messages from {events_included} events, "
                    f"{accumulated_tokens} history tokens, "
-                   f"{len(full_context)} total messages")
+                   f"{len(final_context)} total messages")
 
-        return full_context
+        return final_context
 
     async def execute_turn(self, request_data) -> dict:
         """
@@ -318,19 +375,6 @@ class TextConversationEvent(ConversationEvent):
             llm_service.ffi, query.model, self.model_id, QUERY_CONST.MODEL_STR_MAX_SIZE
         )
 
-        # Build the complete formatted prompt
-        formatted_parts = []
-
-        # Check if we need to inject summary (not used in ADHOC_MODE)
-        if self.inject_summary and hasattr(self.session, 'summary_content') and self.session.summary_content:
-            summary = self.session.summary_content
-            formatted_summary = CommonUtils.format_message_with_template(
-                self.model_id, "system", f"Here is a summary of the conversation so far:\n{summary}"
-            )
-            formatted_parts.append(formatted_summary)
-            logger.info(f"Event {self.event_id}: Injecting summary into prompt (streaming)")
-            self.inject_summary = False
-
         previous_context = ""
         # Check if we need to inject previous assistant response (if previous event involved tool calling)
         # This reinforces context even if KV cache is present (not applicable in ADHOC_MODE)
@@ -374,6 +418,31 @@ class TextConversationEvent(ConversationEvent):
         if ADHOC_MODE:
             messages_to_format = self._build_context_for_adhoc_mode(messages_to_format)
             logger.info(f"Event {self.event_id}: ADHOC_MODE - using {len(messages_to_format)} messages in streaming prompt")
+        elif self.inject_summary:
+            # Non-ADHOC mode but summarization occurred (reset state).
+            # Need to re-inject [System] + [Summary] + [Current Turn]
+            logger.info(f"Event {self.event_id}: Rebuilding context after summarization (streaming)")
+
+            rebuilt_messages = []
+
+            # 1. System Prompt
+            system_msg = self._find_system_prompt()
+            if system_msg:
+                rebuilt_messages.append(system_msg)
+
+            # 2. Summary
+            if hasattr(self.session, 'summary_content') and self.session.summary_content:
+                summary_msg = {
+                    "role": "system",
+                    "content": f"Here is a summary of the conversation so far:\n{self.session.summary_content}"
+                }
+                rebuilt_messages.append(summary_msg)
+
+            # 3. Current Turn
+            rebuilt_messages.extend(messages_to_format)
+
+            messages_to_format = rebuilt_messages
+            self.inject_summary = False
 
         # Inject tools
         if hasattr(request_data, 'tools') and request_data.tools:
@@ -791,21 +860,6 @@ class TextConversationEvent(ConversationEvent):
             llm_service.ffi, query.model, self.model_id, QUERY_CONST.MODEL_STR_MAX_SIZE
         )
 
-        # Build the complete formatted prompt with system + user messages
-        formatted_parts = []
-
-        # Check if we need to inject summary (not used in ADHOC_MODE)
-        if self.inject_summary and hasattr(self.session, 'summary_content') and self.session.summary_content:
-            summary = self.session.summary_content
-            # Format summary as a system message
-            formatted_summary = CommonUtils.format_message_with_template(
-                self.model_id, "system", f"Here is a summary of the conversation so far:\n{summary}"
-            )
-            formatted_parts.append(formatted_summary)
-            logger.info(f"Event {self.event_id}: Injecting summary into prompt")
-            # Reset the flag so we only inject once
-            self.inject_summary = False
-
         previous_context = ""
         # Check if we need to inject previous assistant response (if previous event involved tool calling)
         # This reinforces context even if KV cache is present (not applicable in ADHOC_MODE)
@@ -853,6 +907,31 @@ class TextConversationEvent(ConversationEvent):
         if ADHOC_MODE:
             messages_to_format = self._build_context_for_adhoc_mode(messages_to_format)
             logger.info(f"Event {self.event_id}: ADHOC_MODE - using {len(messages_to_format)} messages in prompt")
+        elif self.inject_summary:
+            # Non-ADHOC mode but summarization occurred (reset state).
+            # Need to re-inject [System] + [Summary] + [Current Turn]
+            logger.info(f"Event {self.event_id}: Rebuilding context after summarization")
+
+            rebuilt_messages = []
+
+            # 1. System Prompt
+            system_msg = self._find_system_prompt()
+            if system_msg:
+                rebuilt_messages.append(system_msg)
+
+            # 2. Summary
+            if hasattr(self.session, 'summary_content') and self.session.summary_content:
+                summary_msg = {
+                    "role": "system",
+                    "content": f"Here is a summary of the conversation so far:\n{self.session.summary_content}"
+                }
+                rebuilt_messages.append(summary_msg)
+
+            # 3. Current Turn
+            rebuilt_messages.extend(messages_to_format)
+
+            messages_to_format = rebuilt_messages
+            self.inject_summary = False
 
         # Always inject tools via a system message for consistency.
         if hasattr(request_data, 'tools') and request_data.tools:
