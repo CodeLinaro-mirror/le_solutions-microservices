@@ -86,12 +86,6 @@ RUN apt-get update                                                              
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
-# Create iot-user account
-RUN useradd -m -s /bin/bash iot-user
-
-# Add iot-user to plugdev group
-RUN usermod -aG plugdev iot-user
-
 # Copy web-api source code
 COPY setup.cfg ${CHATCOMPLETIONS_SRC_DIR}/setup.cfg
 COPY pyproject.toml ${CHATCOMPLETIONS_SRC_DIR}/pyproject.toml
@@ -108,12 +102,10 @@ COPY scripts ${CHATCOMPLETIONS_SCRIPTS_DIR}
 COPY genai-lib ${CHATCOMPLETIONS_SRC_DIR}/genai-lib
 
 # Add bash aliases file
-COPY .bash_aliases /iot-user/.bash_aliases
+COPY .bash_aliases /root/.bash_aliases
 
 # Build the chatcompletions project
 RUN bash -c "source ${CHATCOMPLETIONS_SCRIPTS_DIR}/setup.sh && chatcompletions-build"
-
-RUN chown -R iot-user:iot-user /mnt/work /usr/lib/
 
 #########################
 # Stage 2: Runtime Stage
@@ -135,12 +127,6 @@ RUN apt-get update                                                              
     apt-get install -y libjpeg8 libpng16-16 libwebp7                                            && \
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
-
-# Create iot-user account in runtime stage
-RUN groupadd -g 989 dma_heap || true && \
-    useradd -m -s /bin/bash iot-user && \
-    usermod -aG plugdev iot-user && \
-    usermod -aG dma_heap iot-user
 
 # create directory
 RUN mkdir -p /iot-user/app/site-packages
@@ -183,9 +169,5 @@ ENV LLM_LIBRARY_PATH=/iot-user/app/site-packages/libllmservice.so
 ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h
 
 ENV VLM_SITE_PACKAGES_PATH=/iot-user/app/site-packages/
-
-RUN chown -R iot-user:iot-user /mnt/work /iot-user/app /usr/lib/
-
-USER iot-user
 
 WORKDIR /mnt/work/models
