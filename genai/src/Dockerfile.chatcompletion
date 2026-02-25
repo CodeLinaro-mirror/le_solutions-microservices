@@ -1,0 +1,191 @@
+#######################
+# Stage 1: Build Stage
+#######################
+
+FROM ubuntu:24.04 AS genai-llm-vlm-service-builder
+
+# Enable multiarch
+RUN dpkg --add-architecture arm64
+
+# Adjust apt sources lists for x86 packages
+RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://archive.ubuntu.com/ubuntu/|'            \
+        /etc/apt/sources.list.d/ubuntu.sources                                                  && \
+    sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources        && \
+    sed -i '0,/http:\/\/archive.ubuntu.com\/ubuntu\//s|http://archive.ubuntu.com/ubuntu/|http://security.ubuntu.com/ubuntu/|' \
+        /etc/apt/sources.list.d/ubuntu.sources
+
+# Duplicate for arm64
+RUN cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/arm64.sources
+
+# Adjust apt sources lists for arm packages
+RUN sed -i '/^Architectures:/d' /etc/apt/sources.list.d/arm64.sources                           && \
+    sed -i '/^Types: deb$/a Architectures: arm64' /etc/apt/sources.list.d/arm64.sources         && \
+    sed -i 's|http://archive.ubuntu.com/ubuntu/|http://ports.ubuntu.com/ubuntu-ports/|g'           \
+        /etc/apt/sources.list.d/arm64.sources                                                   && \
+    sed -i 's|http://security.ubuntu.com/ubuntu/|http://ports.ubuntu.com/ubuntu-ports/|g'          \
+         /etc/apt/sources.list.d/arm64.sources
+
+# Common ubuntu packages
+# Install build dependencies for C/C++ compilation and image processing
+RUN apt-get update                                                                              && \
+    apt-get install -y                                                                             \
+        python3                                                                                    \
+        python3-pip                                                                                \
+        python3-venv                                                                               \
+        python3-dev                                                                                \
+        gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libjsoncpp-dev:arm64 pkg-config                \
+        unzip cmake wget android-tools-adb                                                      && \
+    apt-get clean                                                                               && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# Create python virtual environment
+RUN python3 -m venv /mnt/work/venv
+ENV PATH="/mnt/work/venv/bin:$PATH"
+RUN pip install --upgrade pip
+
+# Add needed environment variables
+ENV TARGET_SYSROOT="/"
+ENV CHATCOMPLETIONS_SRC_DIR="/mnt/work/src"
+ENV CHATCOMPLETIONS_BUILD_DIR="/mnt/work/build"
+ENV CHATCOMPLETIONS_DEPLOY_DIR="/mnt/work/deploy"
+ENV CHATCOMPLETIONS_DOWNLOAD_DIR="/mnt/work/downloads"
+ENV CHATCOMPLETIONS_SCRIPTS_DIR="/mnt/work/scripts"
+ENV CHATCOMPLETIONS_ADSP_DIR=${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/rfsa/adsp
+RUN mkdir -p ${CHATCOMPLETIONS_BUILD_DIR} ${TARGET_SYSROOT}/usr/include ${TARGET_SYSROOT}/usr/lib
+
+# qnp-sdk: fetch and copy the needed headers and libraries
+ENV CHATCOMPLETIONS_QNP_DIR=2.40.0.251030
+ENV CHATCOMPLETIONS_QNN_LIB_PATH=${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/lib
+
+ENV CHATCOMPLETIONS_QNP_SDK=v${CHATCOMPLETIONS_QNP_DIR}.zip
+RUN wget -t 2 -T 30 -P ${CHATCOMPLETIONS_DOWNLOAD_DIR}                                             \
+        https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${CHATCOMPLETIONS_QNP_DIR}/${CHATCOMPLETIONS_QNP_SDK} && \
+    cd ${CHATCOMPLETIONS_DOWNLOAD_DIR}                                                          && \
+    unzip ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
+    rm -f ${CHATCOMPLETIONS_QNP_SDK}                                                            && \
+    find ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/                                 \
+        -type f -iname "*snpe*" -exec rm {} \;                                                  && \
+    cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/lib/aarch64-oe-linux-gcc11.2/libGenie.so \
+        /usr/lib/                                                                               && \
+    cp -r ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt/${CHATCOMPLETIONS_QNP_DIR}/include/Genie/*         \
+        /usr/include/                                                                           && \
+    mkdir -p ${CHATCOMPLETIONS_ADSP_DIR}                                                        && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v68/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v73/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/hexagon-v75/unsigned/* ${CHATCOMPLETIONS_ADSP_DIR}/      && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so                        \
+        ${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/                                                  && \
+    cp ${CHATCOMPLETIONS_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/*                                  \
+        ${CHATCOMPLETIONS_DEPLOY_DIR}/usr/lib/                                                  && \
+    rm -rf ${CHATCOMPLETIONS_DOWNLOAD_DIR}/qairt
+
+# Specific ubuntu packages
+RUN apt-get update                                                                              && \
+    apt-get install -y                                                                             \
+        libffi-dev libjpeg-dev libpng-dev libwebp-dev                                           && \
+    apt-get clean                                                                               && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# Create iot-user account
+RUN useradd -m -s /bin/bash iot-user
+
+# Add iot-user to plugdev group
+RUN usermod -aG plugdev iot-user
+
+# Copy web-api source code
+COPY setup.cfg ${CHATCOMPLETIONS_SRC_DIR}/setup.cfg
+COPY pyproject.toml ${CHATCOMPLETIONS_SRC_DIR}/pyproject.toml
+COPY web-api ${CHATCOMPLETIONS_SRC_DIR}/web-api
+
+# Install web-api server as python package
+RUN pip install ${CHATCOMPLETIONS_SRC_DIR}
+RUN pip install ${CHATCOMPLETIONS_SRC_DIR} requests Pillow numpy
+
+# Copy helper scripts
+COPY scripts ${CHATCOMPLETIONS_SCRIPTS_DIR}
+
+# Copy genai-lib source code
+COPY genai-lib ${CHATCOMPLETIONS_SRC_DIR}/genai-lib
+
+# Add bash aliases file
+COPY .bash_aliases /iot-user/.bash_aliases
+
+# Build the chatcompletions project
+RUN bash -c "source ${CHATCOMPLETIONS_SCRIPTS_DIR}/setup.sh && chatcompletions-build"
+
+RUN chown -R iot-user:iot-user /mnt/work /usr/lib/
+
+#########################
+# Stage 2: Runtime Stage
+#########################
+
+FROM ubuntu:24.04 AS genai-llm-vlm-service
+
+# Common ubuntu packages
+# Install Python 3.12 and runtime image processing libraries
+RUN apt-get update                                                                              && \
+    apt-get install -y                                                                             \
+    python3                                                                                        \
+    libjsoncpp25 libatomic1                                                                     && \
+    apt-get clean                                                                               && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# Specific ubuntu packages
+RUN apt-get update                                                                              && \
+    apt-get install -y libjpeg8 libpng16-16 libwebp7                                            && \
+    apt-get clean                                                                               && \
+    rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# Create iot-user account in runtime stage
+RUN groupadd -g 989 dma_heap || true && \
+    useradd -m -s /bin/bash iot-user && \
+    usermod -aG plugdev iot-user && \
+    usermod -aG dma_heap iot-user
+
+# create directory
+RUN mkdir -p /iot-user/app/site-packages
+
+# Copy the virtual environment with web-api package installed with dependencies
+COPY --from=genai-llm-vlm-service-builder /mnt/work/venv /mnt/work/venv
+ENV PATH=/mnt/work/venv/bin:$PATH
+
+# copy interface file
+COPY --from=genai-llm-vlm-service-builder                                                          \
+    /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/include/genai_interface.h              \
+    /usr/include/
+
+# Copy openapi.yaml as a dependency of FastAPI's openapi schema
+COPY --from=genai-llm-vlm-service-builder /mnt/work/src/web-api/openapi_server/openapi.yaml         \
+    /iot-user/app/site-packages/
+
+COPY --from=genai-llm-vlm-service-builder                                                           \
+    /mnt/work/src/web-api/openapi_server/configs/models_config.json                                \
+    /iot-user/app/site-packages/
+
+COPY --from=genai-llm-vlm-service-builder                                                           \
+    /mnt/work/src/web-api/openapi_server/impl/genie_wrapper/vlm_standalone_test.py                 \
+    /iot-user/app/site-packages/
+
+COPY --from=genai-llm-vlm-service-builder                                                           \
+    /mnt/work/src/web-api/openapi_server/configs/sampler.json                                      \
+    /iot-user/app/site-packages/
+
+# copy all libraries
+COPY --from=genai-llm-vlm-service-builder /mnt/work/deploy/usr /usr
+
+# create symlink of libvlmservice library
+RUN ln -s /usr/lib/libvlmservice.so /iot-user/app/site-packages/libvlmservice.so
+# create symlink of libllmservice library
+RUN ln -s /usr/lib/libllmservice.so /iot-user/app/site-packages/libllmservice.so
+
+ENV VLM_LIBRARY_PATH=/iot-user/app/site-packages/libvlmservice.so
+ENV LLM_LIBRARY_PATH=/iot-user/app/site-packages/libllmservice.so
+ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h
+
+ENV VLM_SITE_PACKAGES_PATH=/iot-user/app/site-packages/
+
+RUN chown -R iot-user:iot-user /mnt/work /iot-user/app /usr/lib/
+
+USER iot-user
+
+WORKDIR /mnt/work/models

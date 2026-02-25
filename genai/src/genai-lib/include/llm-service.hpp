@@ -111,15 +111,6 @@ class LLMObject
 {
     public:
 
-        //Enum for LLM Model Selection
-        enum class LLMModel: int
-        {
-            LLAMA3_1_8B = 0,
-            LLAMA3_2_3B = 1,
-            QWEN2_5_7B = 2,
-            UNKNOWN = -1
-        };
-
         LLMObject(std::string model, std::string config_path, bool streaming);
         ~LLMObject() {delete diag;}
         // Disable both copying and moving
@@ -152,11 +143,6 @@ class LLMObject
         std::string profilePath;
         std::vector<Message> conversation;
         std::string sc_configPath;
-
-        void constructPrompt(const std::string query, LLMModel model);
-
-        LLMModel getModelFromQuery(const std::string& model);
-
 };
 
 typedef struct {

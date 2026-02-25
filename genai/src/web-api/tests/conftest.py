@@ -9,7 +9,7 @@ from openapi_server.impl.constant import EnvVariableKeys
 
 from openapi_server.main import app as application
 
-TEST_LIBRARY_PATH = "/root/app/site-packages/test/libllmservice.so"
+TEST_LIBRARY_PATH = "/iot-user/app/site-packages/test/libllmservice.so"
 
 # Set the environment variable once for all tests
 @pytest.fixture(scope="session", autouse=True)
