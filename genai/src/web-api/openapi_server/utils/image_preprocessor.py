@@ -76,12 +76,25 @@ def preprocess_image(img: Image.Image) -> PreprocessedImage:
     # REQUIRED: Downscale to 512x342 RGB as per model specifications
     TARGET_WIDTH = 512
     TARGET_HEIGHT = 342
-    logger.debug(f"[PREPROCESSING] Downscaling to target size: {TARGET_WIDTH}x{TARGET_HEIGHT}")
-    img = img.resize((TARGET_WIDTH, TARGET_HEIGHT), resample=Image.BICUBIC)
-    logger.debug("[PREPROCESSING] Bicubic resize to target size completed")
+
+    # Letterbox to target size: scale to fit preserving aspect ratio, then center-pad
+    scale = min(TARGET_WIDTH / original_width, TARGET_HEIGHT / original_height)
+    fit_w = int(original_width * scale)
+    fit_h = int(original_height * scale)
+    logger.debug(f"[PREPROCESSING] Letterbox: scale={scale:.4f}, fit={fit_w}x{fit_h}, target={TARGET_WIDTH}x{TARGET_HEIGHT}")
+
+    img = img.resize((fit_w, fit_h), resample=Image.BICUBIC)
+
+    # Create padded image
+    padded = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0))
+    offset_x = (TARGET_WIDTH - fit_w) // 2
+    offset_y = (TARGET_HEIGHT - fit_h) // 2
+    padded.paste(img, (offset_x, offset_y))
+    img = padded
+    logger.debug(f"[PREPROCESSING] Letterbox padding applied: offset=({offset_x},{offset_y})")
 
     w, h = img.size  # Now 512x342
-    logger.debug(f"[PREPROCESSING] Image after target resize: {w}x{h}")
+    logger.debug(f"[PREPROCESSING] Image after letterbox: {w}x{h}")
 
     # Floor dimensions to multiples of FACTOR
     new_w = (w // FACTOR) * FACTOR
@@ -267,7 +280,7 @@ def get_image_token_count(width: int, height: int) -> int:
     """
     Calculate the number of tokens an image will produce after preprocessing.
 
-    Note: All images are now standardized to 512x342 before processing,
+    Note: All images are now letterboxed to 512x342 before processing,
     so the input width/height parameters are ignored.
 
     Args:
