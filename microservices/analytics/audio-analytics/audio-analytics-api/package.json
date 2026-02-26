@@ -1,0 +1,33 @@
+{
+  "name": "audio-analytics-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha --require mocha-steps --exit --timeout=5000 tests/test/monza.test.js",
+    "start": "node index.js"
+  },
+  "repository": {},
+  "author": "",
+  "license": "BSD-3-Clause-Clear",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "connect": "^3.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "js-yaml": "^4.1.0",
+    "mime": "^4.0.3",
+    "node-fetch": "^3.3.2",
+    "oas3-tools": "^2.2.3",
+    "redis": "^4.6.15",
+    "uuid": "^13.0.0",
+    "ws": "^8.18.3",
+    "xml-js": "^1.6.11"
+  },
+  "overrides": {
+    "oas3-tools": {
+      "body-parser": "^1.20.3",
+      "multer": "^1.4.5-lts.1"
+    }
+  }
+}

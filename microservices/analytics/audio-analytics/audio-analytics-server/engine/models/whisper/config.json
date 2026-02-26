@@ -1,0 +1,22 @@
+{  
+  "name": "whisper-small",
+  "display_name": "Whisper Small",
+  "version": "1.0.0",
+  "description": "OpenAI Whisper small model for general speech recognition",
+  "capabilities": {
+    "streaming": true,
+    "file_based": true,
+    "real_time": true,
+    "language_detection": true,
+    "confidence_scores": false
+    },
+  "parameters": {
+    "max_file_size_mb": 25,
+    "supported_formats": ["wav"],
+    "sample_rates": [16000]
+    },
+  "model_path": "/opt/audio/models/whisper/encoder_model_htp.bin",
+  "vocab_path": "/opt/audio/models/whisper/vocab.bin",
+  "decoder_path": "/opt/audio/models/whisper/decoder_model_htp.bin",
+  "speech_path": "/opt/audio/models/whisper/speech_float.eai"
+}

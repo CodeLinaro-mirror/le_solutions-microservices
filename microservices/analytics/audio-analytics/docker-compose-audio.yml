@@ -1,0 +1,88 @@
+﻿# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+#
+# Host deployment for ARM64
+
+services:
+  audio-analytics:
+    image: audio-analytics:latest
+    platform: linux/arm64
+    container_name: audio-analytics
+    hostname: audio-analytics
+    restart: unless-stopped
+    privileged: true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/audio-analytics/v1/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-adsp-secure
+      - /dev/fastrpc-cdsp-secure
+      - /dev/snd:/dev/snd
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-20}
+      - NODE_ENV=production
+      - BLACKBOX_CONTAINER=true
+      - DEV_MODE=false
+      - MODELS_DIR=${MODELS_DIR:-/mnt/work/models}
+      - ASR_MODELS_DIR=${ASR_MODELS_DIR:-/mnt/work/models/asr}
+      - TRANSLATION_MODELS_DIR=${TRANSLATION_MODELS_DIR:-/mnt/work/models/translation}
+      - TTS_MODELS_DIR=${TTS_MODELS_DIR:-/mnt/work/models/tts}
+      - SOCKET_PATH=/tmp/audio-sockets/audio-analytics.sock
+      # VAD_LEN_HANGOVER: Voice Activity Detection length hangover (in units of 10ms)      
+      # Example: 120 = 1.2s, 200 = 2.0s, 50 = 0.5s
+      - VAD_LEN_HANGOVER=${VAD_LEN_HANGOVER:-70}
+      - ASR_TRANSCRIPTION_IN=asr.transcription.in
+      - ASR_TRANSCRIPTION_OUT=asr.transcription.out
+      - ASR_MODELS=asr.models
+      - T2T_TRANSLATION_IN=t2t.translation.in
+      - T2T_TRANSLATION_OUT=t2t.translation.out
+      - T2T_MODELS=t2t.models
+      - TTS_TEXT_IN=tts.text.in
+      - TTS_AUDIO_OUT=tts.audio.out
+      - TTS_MODELS=tts.models
+      # For pulseaudio
+      - PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native
+      - SD_ENABLE_PULSE=1
+    expose:
+      - '8085'
+    network_mode: host
+    volumes:
+      - /home/ubuntu/models/audio:/mnt/work/models:ro
+      - audio-cache:/tmp/tts
+      - audio-logs:/var/log/supervisor
+      - audio-sockets:/tmp/audio-sockets
+      # Mount system libraries from host for DSP access
+      - /usr/lib/aarch64-linux-gnu/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0:ro
+      - /usr/lib/aarch64-linux-gnu/libcdsprpc.so:/usr/lib/libcdsprpc.so:ro
+      - /usr/lib/aarch64-linux-gnu/libadsprpc.so:/usr/lib/libadsprpc.so:ro
+      - /usr/lib/aarch64-linux-gnu/libatomic.so.1.2.0:/usr/lib/libatomic.so.1:ro
+      # For pulseaudio - mount with proper permissions
+      - ${XDG_RUNTIME_DIR}/pulse:${XDG_RUNTIME_DIR}/pulse:rw
+      - ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+      # Mount /run/user for additional runtime files
+      - /run/user/${UID:-1000}:/run/user/${UID:-1000}:rw
+    # Use tmpfs for uploads to ensure proper permissions
+    tmpfs:
+      - /app/uploads:rw,size=500m,mode=777
+    # Override default command to fix device and audio permissions
+    command: >
+      bash -c "chmod 666 /dev/fastrpc* 2>/dev/null || true;
+               chmod 666 /dev/dma_heap/* 2>/dev/null || true;
+               chmod 666 /dev/snd/* 2>/dev/null || true;
+               chmod 644 /root/.config/pulse/cookie 2>/dev/null || true;
+               chmod -R 777 /var/log/supervisor;
+               exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf"
+
+# for logs and cache across container restarts
+volumes:
+  audio-uploads:
+  audio-cache:
+  audio-logs:
+  audio-sockets:
