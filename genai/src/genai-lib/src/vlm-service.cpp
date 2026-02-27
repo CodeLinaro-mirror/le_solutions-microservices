@@ -1,12 +1,12 @@
-//=============================================================================
+//===========================================================================
 //
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 //
-//=============================================================================
+//===========================================================================
 
 #include "vlm-service.hpp"
-#include <iostream> // Explicitly included for std::cerr
+#include <iostream> // Explicitly included for std::cout
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -16,32 +16,41 @@
 #include <cstddef> // Explicitly included for size_t
 #include <thread>   // For std::this_thread::sleep_for
 #include <chrono>   // For std::chrono::seconds
+#include <cstdio>   // For std::vfprintf
+#include <cstdlib>  // For std::getenv
+#include <cstdarg>  // For va_list, vsnprintf
 
 Profile::Profile() {
     const int32_t status = GenieProfile_create(nullptr, &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-      throw std::runtime_error("Failed to create the profile handle.");
+        throw std::runtime_error(
+            "Failed to create the profile handle.");
     }
 }
 
 void Profile::getJsonData() {
     const char* jsonData = nullptr;
-    const Genie_AllocCallback_t callback([](size_t size, const char** data) {
-      *data = (char*)malloc(size);
-      if (*data == nullptr) {
-        throw std::runtime_error("Cannot allocate memory for JSON data");
-      }
-  });
+    const Genie_AllocCallback_t callback(
+        [](size_t size, const char** data) {
+            *data = (char*)malloc(size);
+            if (*data == nullptr) {
+                throw std::runtime_error(
+                    "Cannot allocate memory for JSON data");
+            }
+        });
 
-    const int32_t status = GenieProfile_getJsonData(m_handle, callback, &jsonData);
+    const int32_t status = GenieProfile_getJsonData(
+        m_handle, callback, &jsonData);
     if (GENIE_STATUS_SUCCESS != status) {
-      throw std::runtime_error("Failed to get the profile data");
+        throw std::runtime_error("Failed to get the profile data");
     }
 
     std::ofstream outFile;
     outFile.open(profilePath);
     if (!outFile.good()) {
-      throw std::runtime_error("Cannot create profile output file with name:" + profilePath);
+        throw std::runtime_error(
+            "Cannot create profile output file with name:" +
+            profilePath);
     }
     outFile << jsonData;
     outFile.close();
@@ -51,23 +60,76 @@ void Profile::getJsonData() {
 Profile::~Profile() {
     const int32_t status = GenieProfile_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-      std::cerr << "Failed to free the profile handle." << std::endl;
+        std::cout << "Failed to free the profile handle."
+                  << std::endl;
     }
 }
 
-void SamplerConfig::createSamplerConfig(const std::string& configPath) {
+static void customGenieLogCallback(
+    const _GenieLog_Handle_t* handle,
+    const char* format,
+    GenieLog_Level_t level,
+    long unsigned int timestampOrSize,
+    va_list args) {
+    static std::ofstream logFile(
+        "vlm_process.log", std::ios_base::app);
+    if (logFile.is_open()) {
+        const char* levelStr = "INFO";
+        if (level == GENIE_LOG_LEVEL_ERROR) {
+            levelStr = "ERROR";
+        } else if (level == GENIE_LOG_LEVEL_WARN) {
+            levelStr = "WARN";
+        } else if (level == GENIE_LOG_LEVEL_VERBOSE) {
+            levelStr = "VERBOSE";
+        }
+
+        char buffer[4096];
+        if (format) {
+            vsnprintf(buffer, sizeof(buffer), format, args);
+        } else {
+            buffer[0] = '\0';
+        }
+
+        logFile << "[GenIE-SDK] [" << levelStr << "] "
+                << buffer << std::endl;
+    }
+}
+
+Log::Log(GenieLog_Level_t logLevel) {
+    const int32_t status = GenieLog_create(
+        nullptr, customGenieLogCallback, logLevel, &m_handle);
+    if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
+        throw std::runtime_error(
+            "Failed to create the log handle.");
+    }
+}
+
+Log::~Log() {
+    const int32_t status = GenieLog_free(m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+        std::cout << "Failed to free the log handle." << std::endl;
+    }
+}
+
+void SamplerConfig::createSamplerConfig(
+    const std::string& configPath) {
     std::ifstream confStream(configPath);
     std::string config;
     std::getline(confStream, config, '\0');
     m_config = config;
-    const int32_t status = GenieSamplerConfig_createFromJson(config.c_str(), &m_handle);
+    const int32_t status = GenieSamplerConfig_createFromJson(
+        config.c_str(), &m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to create sampler config.");
+        throw std::runtime_error(
+            "Failed to create sampler config.");
     }
 }
 
-void SamplerConfig::setParam(const std::string& keyStr, const std::string& valueStr) {
-    const int32_t status = GenieSamplerConfig_setParam(m_handle, keyStr.c_str(), valueStr.c_str());
+void SamplerConfig::setParam(
+    const std::string& keyStr,
+    const std::string& valueStr) {
+    const int32_t status = GenieSamplerConfig_setParam(
+        m_handle, keyStr.c_str(), valueStr.c_str());
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to setParam");
     }
@@ -76,59 +138,101 @@ void SamplerConfig::setParam(const std::string& keyStr, const std::string& value
 SamplerConfig::~SamplerConfig() {
     const int32_t status = GenieSamplerConfig_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        std::cerr << "Failed to free the sampler config." << std::endl;
+        std::cout << "Failed to free the sampler config."
+                  << std::endl;
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Helper: convert string to GenieNode_IOName_t
- *--------------------------------------------------------------*/
-static GenieNode_IOName_t stringToNodeIO(const std::string& nodeIOString) {
-    static const std::unordered_map<std::string, GenieNode_IOName_t> nodeIOMap = {
-        {"GENIE_NODE_TEXT_GENERATOR_TEXT_INPUT",
-         GENIE_NODE_TEXT_GENERATOR_TEXT_INPUT},
-        {"GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT",
-         GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT},
-        {"GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT",
-         GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT},
-        {"GENIE_NODE_TEXT_ENCODER_TEXT_INPUT",
-         GENIE_NODE_TEXT_ENCODER_TEXT_INPUT},
-        {"GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT",
-         GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT},
-        {"GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT",
-         GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT},
-        {"GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT",
-         GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT},
-        {"GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN",
-         GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN},
-        {"GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS",
-         GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS},
-        {"GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK",
-         GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK},
-        {"GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK",
-         GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK}
+ *--------------------------------------------------------------------*/
+static GenieNode_IOName_t stringToNodeIO(
+    const std::string& nodeIOString) {
+    static const std::unordered_map<std::string, GenieNode_IOName_t>
+        nodeIOMap = {
+            {"GENIE_NODE_TEXT_GENERATOR_TEXT_INPUT",
+             GENIE_NODE_TEXT_GENERATOR_TEXT_INPUT},
+            {"GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT",
+             GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT},
+            {"GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT",
+             GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT},
+            {"GENIE_NODE_TEXT_ENCODER_TEXT_INPUT",
+             GENIE_NODE_TEXT_ENCODER_TEXT_INPUT},
+            {"GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT",
+             GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT},
+            {"GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT",
+             GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT},
+            {"GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT",
+             GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT},
+            {"GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN",
+             GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN},
+            {"GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS",
+             GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS},
+            {"GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK",
+             GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK},
+            {"GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK",
+             GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK}
     };
     auto it = nodeIOMap.find(nodeIOString);
     if (it != nodeIOMap.end()) {
         return it->second;
     }
-    throw std::invalid_argument("Invalid Node IO value passed: " + nodeIOString);
+    throw std::invalid_argument(
+        "Invalid Node IO value passed: " + nodeIOString);
 }
 
-/*--------------------------------------------------------------
+static GenieLog_Level_t parseGenieLogLevel(const char* levelStr) {
+    if (!levelStr) {
+        return GENIE_LOG_LEVEL_INFO;
+    }
+    std::string level(levelStr);
+    std::transform(level.begin(), level.end(), level.begin(), ::tolower);
+    if (level == "error" || level == "err") {
+        return GENIE_LOG_LEVEL_ERROR;
+    }
+    if (level == "warn" || level == "warning") {
+        return GENIE_LOG_LEVEL_WARN;
+    }
+    if (level == "info") {
+        return GENIE_LOG_LEVEL_INFO;
+    }
+    if (level == "verbose" || level == "debug") {
+        return GENIE_LOG_LEVEL_VERBOSE;
+    }
+    return GENIE_LOG_LEVEL_INFO;
+}
+
+/*--------------------------------------------------------------------
  * Pipeline::Config implementation
- *--------------------------------------------------------------*/
-Pipeline::Config::Config(const std::string& jsonConfig,
-                        std::shared_ptr<Profile> profile) : m_handle(nullptr) {
-    const Genie_Status_t status = GeniePipelineConfig_createFromJson(
-        jsonConfig.c_str(), &m_handle);
+ *--------------------------------------------------------------------*/
+Pipeline::Config::Config(
+    const std::string& jsonConfig,
+    std::shared_ptr<Profile> profile,
+    std::shared_ptr<Log> log) : m_handle(nullptr) {
+    const Genie_Status_t status =
+        GeniePipelineConfig_createFromJson(
+            jsonConfig.c_str(), &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-        throw std::runtime_error("Failed to create the pipeline config");
+        throw std::runtime_error(
+            "Failed to create the pipeline config");
     }
     if (profile) {
-        const Genie_Status_t bindStatus = GeniePipelineConfig_bindProfiler(m_handle, (*profile)());
+        const Genie_Status_t bindStatus =
+            GeniePipelineConfig_bindProfiler(
+                m_handle, (*profile)());
         if (GENIE_STATUS_SUCCESS != bindStatus) {
-            throw std::runtime_error("Failed to bind the profile handle with the pipeline config");
+            throw std::runtime_error(
+                "Failed to bind the profile handle with the "
+                "pipeline config");
+        }
+    }
+    if (log) {
+        const Genie_Status_t bindStatus =
+            GeniePipelineConfig_bindLogger(m_handle, (*log)());
+        if (GENIE_STATUS_SUCCESS != bindStatus) {
+            throw std::runtime_error(
+                "Failed to bind the log handle with the "
+                "pipeline config");
         }
     }
 }
@@ -136,11 +240,13 @@ Pipeline::Config::Config(const std::string& jsonConfig,
 Pipeline::Config::~Config() {
     const Genie_Status_t status = GeniePipelineConfig_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        std::cerr << "Failed to free the pipeline config." << std::endl;
+        std::cout << "Failed to free the pipeline config."
+                  << std::endl;
     }
 }
 
-Pipeline::Config::Config(Config&& other) noexcept : m_handle(nullptr) {
+Pipeline::Config::Config(Config&& other) noexcept
+    : m_handle(nullptr) {
     *this = std::move(other);
 }
 
@@ -149,13 +255,13 @@ Pipeline::Config& Pipeline::Config::operator=(Config&& other) {
     return *this;
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Pipeline implementation
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 Pipeline::~Pipeline() {
     const Genie_Status_t status = GeniePipeline_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        std::cerr << "Failed to free the pipeline." << std::endl;
+        std::cout << "Failed to free the pipeline." << std::endl;
     }
 }
 
@@ -169,28 +275,33 @@ Pipeline& Pipeline::operator=(Pipeline&& other) {
 }
 
 inline void Pipeline::addNode(std::shared_ptr<Node> node) {
-    const Genie_Status_t status = GeniePipeline_addNode(m_handle, (*node)());
+    const Genie_Status_t status = GeniePipeline_addNode(
+        m_handle, (*node)());
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to add node");
     }
 }
 
-inline void Pipeline::connect(std::shared_ptr<Node> producerNode,
-                              GenieNode_IOName_t producerIO,
-                              std::shared_ptr<Node> consumerNode,
-                              GenieNode_IOName_t consumerIO) {
+inline void Pipeline::connect(
+    std::shared_ptr<Node> producerNode,
+    GenieNode_IOName_t producerIO,
+    std::shared_ptr<Node> consumerNode,
+    GenieNode_IOName_t consumerIO) {
     const Genie_Status_t status = GeniePipeline_connect(
-        m_handle, (*producerNode)(), producerIO, (*consumerNode)(), consumerIO);
+        m_handle, (*producerNode)(), producerIO,
+        (*consumerNode)(), consumerIO);
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to connect");
     }
 }
 
 inline void Pipeline::execute(void* userData) {
-    // Blocking call: expected to return only after the pipeline finishes and
-    // all callbacks using 'userData' have completed. If this changes to async,
-    // the VLMObject must be updated to manage 'userData' lifetime accordingly.
-    const Genie_Status_t status = GeniePipeline_execute(m_handle, userData);
+    // Non-blocking call: executes asynchronously in the C++
+    // background thread. It returns immediately. The lifetime of
+    // 'userData' must be managed by the caller (e.g., by waiting
+    // on a condition variable until all callbacks are completed).
+    const Genie_Status_t status = GeniePipeline_execute(
+        m_handle, userData);
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to execute");
     }
@@ -203,20 +314,35 @@ inline void Pipeline::reset() {
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Node::Config implementation
- *--------------------------------------------------------------*/
-Node::Config::Config(const std::string& jsonConfig,
-                     std::shared_ptr<Profile> profile) : m_handle(nullptr) {
+ *--------------------------------------------------------------------*/
+Node::Config::Config(
+    const std::string& jsonConfig,
+    std::shared_ptr<Profile> profile,
+    std::shared_ptr<Log> log) : m_handle(nullptr) {
     const Genie_Status_t status = GenieNodeConfig_createFromJson(
         jsonConfig.c_str(), &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-        throw std::runtime_error("Failed to create the node config");
+        throw std::runtime_error(
+            "Failed to create the node config");
     }
     if (profile) {
-        const Genie_Status_t bindStatus = GenieNodeConfig_bindProfiler(m_handle, (*profile)());
+        const Genie_Status_t bindStatus =
+            GenieNodeConfig_bindProfiler(m_handle, (*profile)());
         if (GENIE_STATUS_SUCCESS != bindStatus) {
-            throw std::runtime_error("Failed to bind the profile handle with the node config");
+            throw std::runtime_error(
+                "Failed to bind the profile handle with the "
+                "node config");
+        }
+    }
+    if (log) {
+        const Genie_Status_t bindStatus =
+            GenieNodeConfig_bindLogger(m_handle, (*log)());
+        if (GENIE_STATUS_SUCCESS != bindStatus) {
+            throw std::runtime_error(
+                "Failed to bind the log handle with the "
+                "node config");
         }
     }
 }
@@ -224,11 +350,12 @@ Node::Config::Config(const std::string& jsonConfig,
 Node::Config::~Config() {
     const Genie_Status_t status = GenieNodeConfig_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        std::cerr << "Failed to free the node config." << std::endl;
+        std::cout << "Failed to free the node config." << std::endl;
     }
 }
 
-Node::Config::Config(Config&& other) noexcept : m_handle(nullptr) {
+Node::Config::Config(Config&& other) noexcept
+    : m_handle(nullptr) {
     *this = std::move(other);
 }
 
@@ -237,13 +364,13 @@ Node::Config& Node::Config::operator=(Config&& other) {
     return *this;
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Node implementation
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 Node::~Node() {
     const Genie_Status_t status = GenieNode_free(m_handle);
     if (GENIE_STATUS_SUCCESS != status) {
-        std::cerr << "Failed to free the Genie Node." << std::endl;
+        std::cout << "Failed to free the Genie Node." << std::endl;
     }
 }
 
@@ -256,64 +383,86 @@ Node& Node::operator=(Node&& other) {
     return *this;
 }
 
-void Node::setData(GenieNode_IOName_t ioName, std::string text, const char* dataConfig) {
-    const Genie_Status_t status =
-        GenieNode_setData(m_handle, ioName, (void*)(text.c_str()), text.size(), dataConfig);
+void Node::setData(
+    GenieNode_IOName_t ioName,
+    const std::string& text,
+    const char* dataConfig) {
+    const Genie_Status_t status = GenieNode_setData(
+        m_handle, ioName, (void*)(text.c_str()),
+        text.size(), dataConfig);
     if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to set the text input data");
+        throw std::runtime_error(
+            "Failed to set the text input data");
     }
 }
 
-void Node::setData(GenieNode_IOName_t ioName,
-                   const void* data,
-                   const size_t dataSize,
-                   const char* dataConfig) {
-    const Genie_Status_t status =
-        GenieNode_setData(m_handle, ioName, (void*)data, dataSize, dataConfig);
+void Node::setData(
+    GenieNode_IOName_t ioName,
+    const void* data,
+    const size_t dataSize,
+    const char* dataConfig) {
+    const Genie_Status_t status = GenieNode_setData(
+        m_handle, ioName, (void*)data, dataSize, dataConfig);
     if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to set the embedding input data");
+        throw std::runtime_error(
+            "Failed to set the embedding input data");
     }
 }
 
-void Node::setTextCallback(GenieNode_IOName_t ioName,
-                           GenieNode_TextOutput_Callback_t callback) {
-    const Genie_Status_t status = GenieNode_setTextCallback(m_handle, ioName, callback);
+void Node::setTextCallback(
+    GenieNode_IOName_t ioName,
+    GenieNode_TextOutput_Callback_t callback) {
+    const Genie_Status_t status = GenieNode_setTextCallback(
+        m_handle, ioName, callback);
     if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to set the text output callback");
+        throw std::runtime_error(
+            "Failed to set the text output callback");
     }
 }
 
-void Node::setEmbeddingCallback(GenieNode_IOName_t ioName,
-                                GenieNode_EmbeddingOutputCallback_t callback) {
-    const Genie_Status_t status = GenieNode_setEmbeddingCallback(m_handle, ioName, callback);
+void Node::setEmbeddingCallback(
+    GenieNode_IOName_t ioName,
+    GenieNode_EmbeddingOutputCallback_t callback) {
+    const Genie_Status_t status = GenieNode_setEmbeddingCallback(
+        m_handle, ioName, callback);
     if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to set the embedding output callback");
+        throw std::runtime_error(
+            "Failed to set the embedding output callback");
     }
 }
 
 void Node::getSampler() {
-    const int32_t status = GenieNode_getSampler(m_handle, &m_samplerHandle);
+    const int32_t status = GenieNode_getSampler(
+        m_handle, &m_samplerHandle);
     if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to get sampler.");
     }
 }
 
-void Node::applyConfig(GenieSamplerConfig_Handle_t samplerConfigHandle) {
-    const int32_t status = GenieSampler_applyConfig(m_samplerHandle, samplerConfigHandle);
+void Node::applyConfig(
+    GenieSamplerConfig_Handle_t samplerConfigHandle) {
+    const int32_t status = GenieSampler_applyConfig(
+        m_samplerHandle, samplerConfigHandle);
     if (GENIE_STATUS_SUCCESS != status) {
-      throw std::runtime_error("Failed to apply sampler config.");
+        throw std::runtime_error(
+            "Failed to apply sampler config.");
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * VLMObject implementation
- *--------------------------------------------------------------*/
-VLMObject::VLMObject(const std::string& model, const std::string& config_path, const std::string& sampler_config_path, bool streaming) {
+ *--------------------------------------------------------------------*/
+VLMObject::VLMObject(
+    const std::string& model,
+    const std::string& config_path,
+    const std::string& sampler_config_path,
+    bool streaming) {
     stream = streaming;
     query = std::make_unique<Query>();
     strlcpy(modelSelected, model.c_str(), sizeof(modelSelected));
 
-    // Load configuration from JSON file if provided, otherwise use hard-coded defaults
+    // Load configuration from JSON file if provided, otherwise
+    // use hard-coded defaults
     if (!config_path.empty()) {
         loadConfig(config_path);
     } else {
@@ -324,6 +473,16 @@ VLMObject::VLMObject(const std::string& model, const std::string& config_path, c
     // Create profiler (shared with all configs)
     profiler = std::make_shared<Profile>();
 
+    const char* logLevelEnv = std::getenv("LOG_LEVEL");
+    GenieLog_Level_t logLevel = parseGenieLogLevel(logLevelEnv);
+    logger = std::make_shared<Log>(logLevel);
+    std::cout << "[VLMObject] Genie log level: "
+              << (logLevel == GENIE_LOG_LEVEL_ERROR ? "ERROR" :
+                  logLevel == GENIE_LOG_LEVEL_WARN ? "WARN" :
+                  logLevel == GENIE_LOG_LEVEL_INFO ? "INFO" :
+                  "VERBOSE")
+              << std::endl;
+
     // Build pipeline and nodes
     createPipelineAndNodes();
 
@@ -333,36 +492,46 @@ VLMObject::VLMObject(const std::string& model, const std::string& config_path, c
     // Load static custom inputs (position ids, masks, etc.)
     loadStaticCustomInputs();
 
-    sc_configPath = sampler_config_path.empty() ? "sampler.json" : sampler_config_path;
+    sc_configPath = sampler_config_path.empty() ?
+        "sampler.json" : sampler_config_path;
 }
 
 VLMObject::~VLMObject() {
     // All smart pointers clean up automatically
 }
 
-/*--------------------------------------------------------------
- * Load model configuration from JSON file or use hard-coded defaults
- *--------------------------------------------------------------*/
-void VLMObject::loadConfig(const std::string& configPathOrModelName) {
-    // Check if this is a file path (contains .json) or a model name
-    if (configPathOrModelName.find(".json") != std::string::npos) {
+/*--------------------------------------------------------------------
+ * Load model configuration from JSON file or use hard-coded
+ * defaults
+ *--------------------------------------------------------------------*/
+void VLMObject::loadConfig(
+    const std::string& configPathOrModelName) {
+    // Check if this is a file path (contains .json) or a model
+    // name
+    if (configPathOrModelName.find(".json") !=
+        std::string::npos) {
         // Load from JSON file
         std::ifstream configFile(configPathOrModelName);
         if (!configFile.is_open()) {
-            throw std::runtime_error("Failed to open config file: " + configPathOrModelName);
+            throw std::runtime_error(
+                "Failed to open config file: " +
+                configPathOrModelName);
         }
 
         Json::Value root;
         Json::CharReaderBuilder builder;
         std::string errs;
 
-        if (!Json::parseFromStream(builder, configFile, &root, &errs)) {
-            throw std::runtime_error("Failed to parse JSON config: " + errs);
+        if (!Json::parseFromStream(
+            builder, configFile, &root, &errs)) {
+            throw std::runtime_error(
+                "Failed to parse JSON config: " + errs);
         }
 
         // Get the first (and only) model configuration
         if (root.empty()) {
-            throw std::runtime_error("Empty JSON configuration file");
+            throw std::runtime_error(
+                "Empty JSON configuration file");
         }
 
         // Get the first model key
@@ -372,29 +541,43 @@ void VLMObject::loadConfig(const std::string& configPathOrModelName) {
         // Validate required fields
         if (!modelConfig_json.isMember("pipeline") ||
             !modelConfig_json["pipeline"].isMember("nodes")) {
-            throw std::runtime_error("Invalid JSON structure: missing 'pipeline.nodes'");
+            throw std::runtime_error(
+                "Invalid JSON structure: missing "
+                "'pipeline.nodes'");
         }
 
-        const Json::Value& nodes = modelConfig_json["pipeline"]["nodes"];
+        const Json::Value& nodes =
+            modelConfig_json["pipeline"]["nodes"];
 
         // Extract node configuration paths
-        if (!nodes.isMember("imageEncoder") || !nodes.isMember("lutEncoder") ||
+        if (!nodes.isMember("imageEncoder") ||
+            !nodes.isMember("lutEncoder") ||
             !nodes.isMember("textGenerator")) {
-            throw std::runtime_error("Invalid JSON structure: missing required node configurations");
+            throw std::runtime_error(
+                "Invalid JSON structure: missing required "
+                "node configurations");
         }
 
-        modelConfig.imageEncoderConfig = nodes["imageEncoder"].asString();
-        modelConfig.lutEncoderConfig = nodes["lutEncoder"].asString();
-        modelConfig.textGeneratorConfig = nodes["textGenerator"].asString();
+        modelConfig.imageEncoderConfig =
+            nodes["imageEncoder"].asString();
+        modelConfig.lutEncoderConfig =
+            nodes["lutEncoder"].asString();
+        modelConfig.textGeneratorConfig =
+            nodes["textGenerator"].asString();
 
         // Parse custom_inputs array
         modelConfig.custom_inputs.clear();
-        if (modelConfig_json.isMember("custom_inputs") && modelConfig_json["custom_inputs"].isArray()) {
-            const Json::Value& customInputs = modelConfig_json["custom_inputs"];
+        if (modelConfig_json.isMember("custom_inputs") &&
+            modelConfig_json["custom_inputs"].isArray()) {
+            const Json::Value& customInputs =
+                modelConfig_json["custom_inputs"];
             for (const auto& input : customInputs) {
-                if (!input.isMember("node") || !input.isMember("input_type") ||
+                if (!input.isMember("node") ||
+                    !input.isMember("input_type") ||
                     !input.isMember("file")) {
-                    throw std::runtime_error("Invalid custom_input entry: missing required fields");
+                    throw std::runtime_error(
+                        "Invalid custom_input entry: missing "
+                        "required fields");
                 }
 
                 ModelConfig::CustomInput ci;
@@ -406,53 +589,76 @@ void VLMObject::loadConfig(const std::string& configPathOrModelName) {
         }
     } else {
         // Use hard-coded configuration for backward compatibility
-        if (configPathOrModelName != "QWEN2_5_VL_3B" && configPathOrModelName != "Qwen2.5-VL-3B") {
-            throw std::invalid_argument("Unsupported VLM model: " + configPathOrModelName);
+        if (configPathOrModelName != "QWEN2_5_VL_3B" &&
+            configPathOrModelName != "Qwen2.5-VL-3B") {
+            throw std::invalid_argument(
+                "Unsupported VLM model: " +
+                configPathOrModelName);
         }
 
         // Populate modelConfig with hard-coded values
         modelConfig.imageEncoderConfig = "qwen_veg.json";
-        modelConfig.lutEncoderConfig   = "text-encoder.json";
+        modelConfig.lutEncoderConfig = "text-encoder.json";
         modelConfig.textGeneratorConfig = "qwen-htp.json";
 
         // Custom static inputs for the image encoder
         modelConfig.custom_inputs = {
-            {"imageEncoder", "GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS", "position_ids_cos.raw"},
-            {"imageEncoder", "GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN", "position_ids_sin.raw"},
-            {"imageEncoder", "GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK", "window_attention_mask.raw"},
-            {"imageEncoder", "GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK", "full_attention_mask.raw"}
+            {"imageEncoder",
+             "GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_COS",
+             "position_ids_cos.raw"},
+            {"imageEncoder",
+             "GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN",
+             "position_ids_sin.raw"},
+            {"imageEncoder",
+             "GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK",
+             "window_attention_mask.raw"},
+            {"imageEncoder",
+             "GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK",
+             "full_attention_mask.raw"}
         };
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Create pipeline and node objects
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 void VLMObject::createPipelineAndNodes() {
-    // Pipeline config (empty JSON string – we only need a handle to bind profiler)
-    auto pipelineCfg = std::make_shared<Pipeline::Config>("", profiler);
+    // Pipeline config (empty JSON string – we only need a handle
+    // to bind profiler)
+    auto pipelineCfg = std::make_shared<Pipeline::Config>(
+        "", profiler, logger);
     pipeline = std::make_shared<Pipeline>(std::move(*pipelineCfg));
 
     // Create image encoder node
     std::string imgCfgStr;
     {
         std::ifstream f(modelConfig.imageEncoderConfig);
-        if (!f) throw std::runtime_error("Failed to open " + modelConfig.imageEncoderConfig);
+        if (!f) {
+            throw std::runtime_error(
+                "Failed to open " +
+                modelConfig.imageEncoderConfig);
+        }
         std::getline(f, imgCfgStr, '\0');
     }
-    auto imgNodeCfg = std::make_shared<Node::Config>(imgCfgStr, profiler);
+    auto imgNodeCfg = std::make_shared<Node::Config>(
+        imgCfgStr, profiler, logger);
     imageEncoderNode = std::make_shared<Node>(std::move(*imgNodeCfg));
     pipeline->addNode(imageEncoderNode);
-    std::cerr << "Created image encoder node" << std::endl;
+    std::cout << "Created image encoder node" << std::endl;
 
     // LUT encoder node
     std::string lutCfgStr;
     {
         std::ifstream f(modelConfig.lutEncoderConfig);
-        if (!f) throw std::runtime_error("Failed to open " + modelConfig.lutEncoderConfig);
+        if (!f) {
+            throw std::runtime_error(
+                "Failed to open " +
+                modelConfig.lutEncoderConfig);
+        }
         std::getline(f, lutCfgStr, '\0');
     }
-    auto lutNodeCfg = std::make_shared<Node::Config>(lutCfgStr, profiler);
+    auto lutNodeCfg = std::make_shared<Node::Config>(
+        lutCfgStr, profiler, logger);
     lutEncoderNode = std::make_shared<Node>(std::move(*lutNodeCfg));
     pipeline->addNode(lutEncoderNode);
 
@@ -460,18 +666,23 @@ void VLMObject::createPipelineAndNodes() {
     std::string txtGenCfgStr;
     {
         std::ifstream f(modelConfig.textGeneratorConfig);
-        if (!f) throw std::runtime_error("Failed to open " + modelConfig.textGeneratorConfig);
+        if (!f) {
+            throw std::runtime_error(
+                "Failed to open " +
+                modelConfig.textGeneratorConfig);
+        }
         std::getline(f, txtGenCfgStr, '\0');
     }
-    auto txtGenNodeCfg = std::make_shared<Node::Config>(txtGenCfgStr, profiler);
+    auto txtGenNodeCfg = std::make_shared<Node::Config>(
+        txtGenCfgStr, profiler, logger);
     textGeneratorNode = std::make_shared<Node>(std::move(*txtGenNodeCfg));
     pipeline->addNode(textGeneratorNode);
-    std::cerr << "Created text generator node" << std::endl;
+    std::cout << "Created text generator node" << std::endl;
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Connect the three nodes inside the pipeline
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 void VLMObject::connectNodes() {
     // imageEncoder → textGenerator (embedding input)
     pipeline->connect(imageEncoderNode,
@@ -491,20 +702,55 @@ void VLMObject::connectNodes() {
         textOutputCallback);
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Load static custom inputs (position ids, masks, etc.)
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 void VLMObject::loadStaticCustomInputs() {
-    for (const auto& ci : modelConfig.custom_inputs) {
-        // Read binary file
-        std::ifstream file(ci.file, std::ios::binary | std::ios::ate);
+    std::cout << "[VLMObject::loadStaticCustomInputs] "
+              << "Loading custom inputs..." << std::endl;
+
+    bool needs_allocation = currentStaticBuffers.empty();
+
+    for (size_t i = 0; i < modelConfig.custom_inputs.size(); ++i) {
+        const auto& ci = modelConfig.custom_inputs[i];
+
+        std::ifstream file(
+            ci.file, std::ios::binary | std::ios::ate);
         if (!file) {
-            throw std::runtime_error("Failed to open custom input file: " + ci.file);
+            throw std::runtime_error(
+                "Failed to open custom input file: " + ci.file);
         }
         uint32_t fileSize = file.tellg();
-        std::shared_ptr<void> imageBuffer(new int8_t[fileSize], [](void* p) { delete[] static_cast<int8_t*>(p); });
-        std::ifstream embeddingStream(ci.file, std::ifstream::binary);
-        embeddingStream.read(static_cast<char*>(imageBuffer.get()), fileSize);
+
+        void* buffer_ptr = nullptr;
+
+        if (needs_allocation) {
+            // Allocate aligned memory for DSP (4096 bytes alignment)
+            void* raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, 4096, fileSize) != 0) {
+                // Fallback to regular malloc
+                raw_ptr = malloc(fileSize);
+            }
+            std::shared_ptr<void> imageBuffer(raw_ptr, free);
+
+            // Store the buffer so it stays alive during execution
+            currentStaticBuffers.push_back(imageBuffer);
+
+            std::ifstream embeddingStream(
+                ci.file, std::ifstream::binary);
+            embeddingStream.read(
+                static_cast<char*>(imageBuffer.get()), fileSize);
+
+            buffer_ptr = imageBuffer.get();
+        } else {
+            // Reuse existing memory buffer to avoid invalidating DSP mappings
+            buffer_ptr = currentStaticBuffers[i].get();
+        }
+
+        std::cout << "[VLMObject::loadStaticCustomInputs] "
+                  << (needs_allocation ? "Loaded " : "Reused ")
+                  << fileSize << " bytes for " << ci.input_type
+                  << " to buffer ptr: " << buffer_ptr << std::endl;
 
         // Determine target node
         std::shared_ptr<Node> targetNode;
@@ -515,48 +761,59 @@ void VLMObject::loadStaticCustomInputs() {
         } else if (ci.node == "textGenerator") {
             targetNode = textGeneratorNode;
         } else {
-            throw std::invalid_argument("Unknown node in custom_inputs: " + ci.node);
+            throw std::invalid_argument(
+                "Unknown node in custom_inputs: " + ci.node);
         }
 
         // Convert input_type string to enum
         GenieNode_IOName_t ioEnum = stringToNodeIO(ci.input_type);
 
         // Set data on the node
-        targetNode->setData(ioEnum, imageBuffer.get(), fileSize);
+        targetNode->setData(ioEnum, buffer_ptr, fileSize);
     }
+    std::cout << "[VLMObject::loadStaticCustomInputs] "
+              << "Finished loading custom inputs." << std::endl;
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Explicitly reset the VLM pipeline state
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 void VLMObject::resetPipeline() {
     if (!pipeline) {
-        throw std::runtime_error("Pipeline not initialized - cannot reset");
+        throw std::runtime_error(
+            "Pipeline not initialized - cannot reset");
     }
 
     try {
         pipeline->reset();
     } catch (const std::exception& e) {
-        std::cerr << "Error resetting pipeline: " << e.what() << std::endl;
+        std::cout << "Error resetting pipeline: " << e.what()
+                  << std::endl;
         throw;
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * VLM completion – main entry point for a request
- *--------------------------------------------------------------*/
+ *--------------------------------------------------------------------*/
 void VLMObject::vlm_chat_completion_create() {
+    std::cout << "[VLMObject::vlm_chat_completion_create] "
+              << "Entering..." << std::endl;
     if (!query) {
         throw std::runtime_error("VLMObject query not initialized.");
     }
 
-    // Clear previous image data to ensure fresh state for each request
-    // This prevents stale image data from previous requests
+    // Clear previous image data to ensure fresh state for each
+    // request. This prevents stale image data from previous
+    // requests
     currentImageData.clear();
-    std::cerr << "Cleared previous image data buffer" << std::endl;
+    std::cout << "[VLMObject::vlm_chat_completion_create] "
+              << "Cleared previous image data buffer" << std::endl;
 
-    //Check if Sampling Parameters are used
-    if (query->temperature != 1 || query->top_p != 1 || query->presence_penalty != 0.0 || query->frequency_penalty != 0.0){
+    // Check if Sampling Parameters are used
+    if (query->temperature != 1 || query->top_p != 1 ||
+        query->presence_penalty != 0.0 ||
+        query->frequency_penalty != 0.0) {
         SamplerConfig sc;
         textGeneratorNode->getSampler();
         sc.createSamplerConfig(sc_configPath);
@@ -567,18 +824,19 @@ void VLMObject::vlm_chat_completion_create() {
             sc.setParam("top-p", std::to_string(query->top_p));
         }
         if (query->presence_penalty != 0.0) {
-            sc.setParam("presence-penalty", std::to_string(query->presence_penalty));
+            sc.setParam("presence-penalty",
+                std::to_string(query->presence_penalty));
         }
         if (query->frequency_penalty != 0.0) {
-            sc.setParam("frequency-penalty", std::to_string(query->frequency_penalty));
+            sc.setParam("frequency-penalty",
+                std::to_string(query->frequency_penalty));
         }
-        //diag->getSampler();
         textGeneratorNode->applyConfig(sc());
     }
 
-    // -----------------------------------------------------------------
+    // ---------------------------------------------------------------
     // 1. Extract user text prompt and image buffer from the query
-    // -----------------------------------------------------------------
+    // ---------------------------------------------------------------
     std::string userPrompt;
 
     if (query->message.use_content_items) {
@@ -587,53 +845,87 @@ void VLMObject::vlm_chat_completion_create() {
             if (item.type == CONTENT_TYPE_TEXT) {
                 userPrompt = item.text;
             } else if (item.type == CONTENT_TYPE_IMAGE_BUFFER) {
-                // Copy the user's buffer into the member variable currentImageData
-                // This ensures the buffer stays alive throughout pipeline execution
+                // Copy the user's buffer into the member variable
+                // currentImageData. This ensures the buffer stays
+                // alive throughout pipeline execution.
                 const void* userBuffer = item.image.buffer;
                 size_t bufferSize = item.image.size;
+                std::cout << "[VLMObject::vlm_chat_completion_create] "
+                          << "Image buffer size: " << bufferSize
+                          << ", ptr: " << userBuffer << std::endl;
 
                 if (userBuffer != nullptr && bufferSize > 0) {
-                    // Resize and copy image data into member variable
+                    // Resize and copy image data into member
+                    // variable
                     currentImageData.resize(bufferSize);
-                    std::copy(static_cast<const uint8_t*>(userBuffer),
-                              static_cast<const uint8_t*>(userBuffer) + bufferSize,
-                              currentImageData.begin());
+                    std::copy(
+                        static_cast<const uint8_t*>(userBuffer),
+                        static_cast<const uint8_t*>(userBuffer) +
+                            bufferSize,
+                        currentImageData.begin());
 
-                    std::cerr << "Copied " << bufferSize << " bytes of image data to member buffer" << std::endl;
+                    std::cout
+                        << "[VLMObject::vlm_chat_completion_create] "
+                        << "Copied " << bufferSize
+                        << " bytes of image data to member buffer "
+                        << "at ptr: "
+                        << (void*)currentImageData.data()
+                        << std::endl;
 
                     imageEncoderNode->setData(
                         GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
                         currentImageData.data(),
                         currentImageData.size());
+                    std::cout
+                        << "[VLMObject::vlm_chat_completion_create] "
+                        << "Set image data on imageEncoderNode."
+                        << std::endl;
                 }
             }
         }
     } else {
-        // Backward‑compatible LLM‑only mode (should not happen for VLM)
+        // Backward‑compatible LLM‑only mode (should not happen
+        // for VLM)
         userPrompt = query->message.content;
     }
 
-    // -----------------------------------------------------------------
+    // ---------------------------------------------------------------
     // 3. Build the final prompt that will be fed to the LUT encoder
-    // -----------------------------------------------------------------
-    // The prompt is now fully constructed in the Python layer, including
-    // chat template markers and system prompt. We pass it as-is.
-    std::string completePrompt = userPrompt;
+    // ---------------------------------------------------------------
+    // The prompt is now fully constructed in the Python layer,
+    // including chat template markers and system prompt. We pass it
+    // as-is.
+    currentPromptData = userPrompt;
+    std::cout << "[VLMObject::vlm_chat_completion_create] "
+              << "Setting prompt on lutEncoderNode, length: "
+              << currentPromptData.size() << ", string ptr: "
+              << (void*)currentPromptData.c_str() << std::endl;
 
-    lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, completePrompt);
+    lutEncoderNode->setData(
+        GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPromptData);
+    std::cout << "[VLMObject::vlm_chat_completion_create] "
+              << "Prompt set successfully." << std::endl;
 
-    // Reload static inputs (Pos IDs, Masks) for every request
-    // This is required because ImageEncoder clears its input buffer after each encoding
+    // Reload static inputs (Pos IDs, Masks) for every request.
+    // This is required because ImageEncoder clears its input buffer
+    // after each encoding.
     try {
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Calling loadStaticCustomInputs..."
+                  << std::endl;
         loadStaticCustomInputs();
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "loadStaticCustomInputs completed successfully."
+                  << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: Failed to reload static custom inputs: " << e.what() << std::endl;
+        std::cout << "ERROR: Failed to reload static custom inputs: "
+                  << e.what() << std::endl;
         throw;
     }
 
-    // -----------------------------------------------------------------
+    // ---------------------------------------------------------------
     // 4. Execute the pipeline
-    // -----------------------------------------------------------------
+    // ---------------------------------------------------------------
     std::string responseText;
     VLMUserData userData;
     userData.responseStr = &responseText;
@@ -647,25 +939,47 @@ void VLMObject::vlm_chat_completion_create() {
     std::exception_ptr execution_error = nullptr;
 
     try {
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Preparing to call pipeline->execute()..."
+                  << std::endl;
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Calling pipeline->execute()..." << std::endl;
         pipeline->execute(&userData);
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "pipeline->execute() returned successfully!"
+                  << std::endl;
 
         // Wait for the callback to signal completion
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Waiting for condition variable..."
+                  << std::endl;
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock, [this]{ return !request_in_progress; });
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Condition variable wait finished."
+                  << std::endl;
 
         execution_succeeded = true;
 
-        // CRITICAL: Add delay here to ensure SDK's callback threads have fully completed
-        // The callback signals us, but the SDK may still be cleaning up internally
+        // CRITICAL: Add delay here to ensure SDK's callback
+        // threads have fully completed. The callback signals us,
+        // but the SDK may still be cleaning up internally.
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Starting 1-second SDK cleanup delay..."
+                  << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cerr << "Callback completed, SDK cleanup delay finished" << std::endl;
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Callback completed, SDK cleanup delay finished"
+                  << std::endl;
 
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: Pipeline execution failed: " << e.what() << std::endl;
+        std::cout << "ERROR: Pipeline execution failed: "
+                  << e.what() << std::endl;
         request_in_progress = false;
         execution_error = std::current_exception();
     } catch (...) {
-        std::cerr << "ERROR: Pipeline execution failed with unknown exception" << std::endl;
+        std::cout << "ERROR: Pipeline execution failed with "
+                  << "unknown exception" << std::endl;
         request_in_progress = false;
         execution_error = std::current_exception();
     }
@@ -673,27 +987,35 @@ void VLMObject::vlm_chat_completion_create() {
     // Always attempt to reset pipeline state, even on error
     try {
         pipeline->reset();
-        std::cerr << "Pipeline reset completed successfully" << std::endl;
+        std::cout << "Pipeline reset completed successfully"
+                  << std::endl;
 
-        // Add delay to ensure hardware resources (DSP/NPU) are fully released
+        // Add delay to ensure hardware resources (DSP/NPU) are
+        // fully released
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cerr << "Hardware stabilization delay completed, ready for next request" << std::endl;
+        std::cout << "Hardware stabilization delay completed, "
+                  << "ready for next request" << std::endl;
 
         if (!execution_succeeded) {
-            std::cerr << "Pipeline reset completed after execution failure" << std::endl;
+            std::cout << "Pipeline reset completed after "
+                      << "execution failure" << std::endl;
         }
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: Failed to reset pipeline: " << e.what() << std::endl;
+        std::cout << "ERROR: Failed to reset pipeline: "
+                  << e.what() << std::endl;
 
         if (!execution_succeeded) {
             // Both execution and reset failed - critical state
             throw std::runtime_error(
-                "Pipeline in inconsistent state: execution failed and reset failed. "
-                "Pipeline may need to be recreated.");
+                "Pipeline in inconsistent state: execution "
+                "failed and reset failed. Pipeline may need to "
+                "be recreated.");
         } else {
-            // Execution succeeded but reset failed - warn but don't fail the request
-            std::cerr << "WARNING: Request completed but pipeline reset failed. "
-                      << "Next request may encounter issues." << std::endl;
+            // Execution succeeded but reset failed - warn but
+            // don't fail the request
+            std::cout << "WARNING: Request completed but pipeline "
+                      << "reset failed. Next request may encounter "
+                      << "issues." << std::endl;
         }
     }
 
@@ -703,31 +1025,56 @@ void VLMObject::vlm_chat_completion_create() {
     }
 }
 
-/*--------------------------------------------------------------
+/*--------------------------------------------------------------------
  * Static callback handling text output from the text generator
- *--------------------------------------------------------------*/
-Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
-                                             GenieNode_TextOutput_SentenceCode_t sentenceCode,
-                                             const void* userData) {
-    // This callback is invoked from an external C library. It MUST NOT throw exceptions.
+ *--------------------------------------------------------------------*/
+Genie_Status_t VLMObject::textOutputCallback(
+    const char* responseStr,
+    GenieNode_TextOutput_SentenceCode_t sentenceCode,
+    const void* userData) {
+    // This callback is invoked from an external C library. It MUST
+    // NOT throw exceptions.
     try {
-        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
-        if (!udata || !udata->vlmObj || !udata->stream || !udata->cv || !udata->request_in_progress) {
-            std::cerr << "[textOutputCallback] ERROR: Critical user data is null." << std::endl;
+        std::cout << "[textOutputCallback] Invoked. sentenceCode: "
+                  << sentenceCode;
+        if (responseStr) {
+            std::cout << ", responseStr length: "
+                      << std::strlen(responseStr);
+        } else {
+            std::cout << ", responseStr: null";
+        }
+        std::cout << std::endl;
+
+        VLMUserData* udata = static_cast<VLMUserData*>(
+            const_cast<void*>(userData));
+        if (!udata || !udata->vlmObj || !udata->stream ||
+            !udata->cv || !udata->request_in_progress) {
+            std::cout << "[textOutputCallback] ERROR: Critical "
+                      << "user data is null." << std::endl;
             return GENIE_STATUS_ERROR_INVALID_ARGUMENT;
         }
 
         bool isStreaming = *udata->stream;
-        bool isEndOfSentence = (sentenceCode == GENIE_NODE_SENTENCE_END);
-        // Enhanced end-of-stream detection: explicitly check for END, ABORT, or COMPLETE
-        bool isEndOfStream = (sentenceCode == GENIE_NODE_SENTENCE_END ||
-                              sentenceCode == GENIE_NODE_SENTENCE_ABORT ||
-                              sentenceCode == GENIE_NODE_SENTENCE_COMPLETE);
+        bool isEndOfSentence =
+            (sentenceCode == GENIE_NODE_SENTENCE_END);
+        // Enhanced end-of-stream detection: explicitly check for
+        // END, ABORT, or COMPLETE.
+        bool isEndOfStream =
+            (sentenceCode == GENIE_NODE_SENTENCE_END ||
+             sentenceCode == GENIE_NODE_SENTENCE_ABORT ||
+             sentenceCode == GENIE_NODE_SENTENCE_COMPLETE);
+
+        std::cout << "[textOutputCallback] isStreaming: "
+                  << isStreaming << ", isEndOfSentence: "
+                  << isEndOfSentence << ", isEndOfStream: "
+                  << isEndOfStream << std::endl;
 
         if (isStreaming) {
             // Streaming mode: send each token immediately.
-            std::unique_ptr<Response> resp = std::make_unique<Response>();
-            strlcpy(resp->model, udata->vlmObj->modelSelected, sizeof(resp->model));
+            std::unique_ptr<Response> resp =
+                std::make_unique<Response>();
+            strlcpy(resp->model, udata->vlmObj->modelSelected,
+                sizeof(resp->model));
             Message msg;
             strlcpy(msg.role, "assistant", sizeof(msg.role));
             if (responseStr) {
@@ -736,7 +1083,8 @@ Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
             resp->choices[0].message = msg;
 
             if (isEndOfSentence) {
-                strlcpy(resp->choices[0].finish_reason, "stop", sizeof(resp->choices[0].finish_reason));
+                strlcpy(resp->choices[0].finish_reason, "stop",
+                    sizeof(resp->choices[0].finish_reason));
             }
 
             if (udata->vlmObj->responseCallback) {
@@ -750,13 +1098,17 @@ Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
 
             if (isEndOfSentence) {
                 // End of sentence: send the complete response.
-                std::unique_ptr<Response> resp = std::make_unique<Response>();
-                strlcpy(resp->model, udata->vlmObj->modelSelected, sizeof(resp->model));
+                std::unique_ptr<Response> resp =
+                    std::make_unique<Response>();
+                strlcpy(resp->model, udata->vlmObj->modelSelected,
+                    sizeof(resp->model));
                 Message msg;
                 strlcpy(msg.role, "assistant", sizeof(msg.role));
-                strlcpy(msg.content, udata->responseStr->c_str(), sizeof(msg.content));
+                strlcpy(msg.content, udata->responseStr->c_str(),
+                    sizeof(msg.content));
                 resp->choices[0].message = msg;
-                strlcpy(resp->choices[0].finish_reason, "stop", sizeof(resp->choices[0].finish_reason));
+                strlcpy(resp->choices[0].finish_reason, "stop",
+                    sizeof(resp->choices[0].finish_reason));
 
                 if (udata->vlmObj->responseCallback) {
                     udata->vlmObj->responseCallback(resp.get());
@@ -764,31 +1116,59 @@ Genie_Status_t VLMObject::textOutputCallback(const char* responseStr,
             }
         }
 
-        // If the stream has ended (for any reason), notify the waiting thread.
+        // If the stream has ended (for any reason), notify the
+        // waiting thread.
         if (isEndOfStream) {
-            *udata->request_in_progress = false;
+            std::cout << "[textOutputCallback] End of stream "
+                      << "detected. Notifying condition variable..."
+                      << std::endl;
+            // IMPORTANT: Acquire the mutex before modifying the
+            // condition variable's shared state to avoid data races
+            // and undefined behavior.
+            {
+                std::lock_guard<std::mutex> lock(udata->vlmObj->mtx);
+                *udata->request_in_progress = false;
+            }
             udata->cv->notify_one();
+            std::cout << "[textOutputCallback] Condition variable "
+                      << "notified." << std::endl;
         }
 
+        std::cout << "[textOutputCallback] Finished successfully."
+                  << std::endl;
         return GENIE_STATUS_SUCCESS;
 
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: Exception caught in textOutputCallback: " << e.what() << std::endl;
+        std::cout << "ERROR: Exception caught in "
+                  << "textOutputCallback: " << e.what() << std::endl;
         // Attempt to unblock the waiting thread even on error.
-        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
-        if (udata && udata->request_in_progress && udata->cv) {
-            *udata->request_in_progress = false;
+        VLMUserData* udata = static_cast<VLMUserData*>(
+            const_cast<void*>(userData));
+        if (udata && udata->vlmObj && udata->request_in_progress &&
+            udata->cv) {
+            {
+                std::lock_guard<std::mutex> lock(udata->vlmObj->mtx);
+                *udata->request_in_progress = false;
+            }
             udata->cv->notify_one();
         }
-        return GENIE_STATUS_ERROR_QUERY_FAILED; // Signal an error back to the SDK.
+        // Signal an error back to the SDK.
+        return GENIE_STATUS_ERROR_QUERY_FAILED;
     } catch (...) {
-        std::cerr << "ERROR: Unknown exception caught in textOutputCallback" << std::endl;
+        std::cout << "ERROR: Unknown exception caught in "
+                  << "textOutputCallback" << std::endl;
         // Attempt to unblock the waiting thread even on error.
-        VLMUserData* udata = static_cast<VLMUserData*>(const_cast<void*>(userData));
-        if (udata && udata->request_in_progress && udata->cv) {
-            *udata->request_in_progress = false;
+        VLMUserData* udata = static_cast<VLMUserData*>(
+            const_cast<void*>(userData));
+        if (udata && udata->vlmObj && udata->request_in_progress &&
+            udata->cv) {
+            {
+                std::lock_guard<std::mutex> lock(udata->vlmObj->mtx);
+                *udata->request_in_progress = false;
+            }
             udata->cv->notify_one();
         }
-        return GENIE_STATUS_ERROR_QUERY_FAILED; // Signal an error back to the SDK.
+        // Signal an error back to the SDK.
+        return GENIE_STATUS_ERROR_QUERY_FAILED;
     }
 }

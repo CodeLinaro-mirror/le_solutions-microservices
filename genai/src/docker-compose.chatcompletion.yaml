@@ -26,6 +26,27 @@ services:
       target: genai-llm-vlm-service
     ports:
       - "${GENAI_PORT:-9001}:${GENAI_PORT:-9001}"
+    # Add capability to allow process to modify resource limits
+    cap_add:
+      - SYS_RESOURCE
+    # Set ulimits for the container (inherited by all child processes)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Adjust OOM score to prevent premature killing
+    oom_score_adj: -500
+    deploy:
+      resources:
+        limits:
+          # Safety Cap: Leave 1GB for Host OS.
+          # If 'free -h' shows 7GB total, set this to 6G.
+          memory: 10G
+        reservations:
+          memory: 8G
     environment:
       - LOG_LEVEL=ERROR
       - GENAI_PORT=${GENAI_PORT:-9001}

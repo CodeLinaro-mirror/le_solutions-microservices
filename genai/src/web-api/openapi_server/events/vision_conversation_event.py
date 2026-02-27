@@ -15,7 +15,7 @@ from openapi_server.events.conversation_event import (
     EventType,
     EventState
 )
-from openapi_server.impl.genie_wrapper.genie_wrapper_create_vlm_chat_completion import GenieWrapperCreateVLMChatCompletion
+from openapi_server.impl.genie_wrapper.genie_wrapper_create_vlm_chat_completion import GenieWrapperCreateVLMChatCompletionIntegrated
 from openapi_server.session.token_counter import TokenCounter
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.models.error import Error
@@ -76,10 +76,10 @@ class VisionConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Executing VLM turn with {len(self.session.messages)} messages in history")
 
-            # Delegate to optimized VLM handler with direct CFFI and pipeline reuse
+            # Delegate to integrated VLM handler with subprocess architecture
             # Pass completion callback for streaming lock release
             # Pass event object so VLM handler can complete the event before triggering callback
-            result = await GenieWrapperCreateVLMChatCompletion.create_vlm_chat_completion(
+            result = await GenieWrapperCreateVLMChatCompletionIntegrated.create_vlm_chat_completion(
                 request_data,
                 raw_json,
                 completion_callback=self._completion_callback,
@@ -180,12 +180,15 @@ class VisionConversationEvent(ConversationEvent):
 
     def terminate_handle(self):
         """
-        Terminate VLM handle.
-        Explicitly destroys the cached handle for this model to free resources.
+        Terminate VLM subprocess.
+        Shuts down the VLM process to free resources.
         """
-        from openapi_server.impl.genie_wrapper.vlm_wrapper import VLMWrapper
-        logger.info(f"Event {self.event_id}: Terminating VLM handle for model {self.model_id}")
-        VLMWrapper.destroy_handle(self.model_id)
+        from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
+        logger.info(f"Event {self.event_id}: Terminating VLM subprocess for model {self.model_id}")
+        try:
+            VLMProcessManager.get_instance().shutdown()
+        except Exception as e:
+            logger.error(f"Event {self.event_id}: Error terminating VLM subprocess: {e}")
 
     def _calculate_prompt_tokens(self) -> int:
         """Calculate prompt tokens including image costs for this turn."""

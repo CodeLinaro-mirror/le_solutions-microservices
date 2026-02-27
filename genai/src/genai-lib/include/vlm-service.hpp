@@ -23,6 +23,7 @@
 #include "GeniePipeline.h"
 #include "GenieNode.h"
 #include "GenieProfile.h"
+#include "GenieLog.h"
 #include "GenieSampler.h"
 #include "llm-buffer.h"
 
@@ -38,6 +39,17 @@ class Profile
 
     private:
         GenieProfile_Handle_t m_handle = NULL;
+};
+
+class Log
+{
+    public:
+        explicit Log(GenieLog_Level_t logLevel = GENIE_LOG_LEVEL_VERBOSE);
+        ~Log();
+        GenieLog_Handle_t operator()() const { return m_handle; }
+
+    private:
+        GenieLog_Handle_t m_handle = NULL;
 };
 
 class SamplerConfig
@@ -57,7 +69,7 @@ class Pipeline {
 public:
     class Config {
     public:
-        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile);
+        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile, std::shared_ptr<Log> log = nullptr);
         ~Config();
         Config(const Config&) = delete;
         Config& operator=(const Config&) = delete;
@@ -99,7 +111,7 @@ class Node {
 public:
     class Config {
     public:
-        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile);
+        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile, std::shared_ptr<Log> log = nullptr);
         ~Config();
         Config(const Config&) = delete;
         Config& operator=(const Config&) = delete;
@@ -120,7 +132,7 @@ public:
     Node(Node&& other) noexcept;
     Node& operator=(Node&& other);
 
-    void setData(GenieNode_IOName_t ioName, std::string text, const char* dataConfig = nullptr);
+    void setData(GenieNode_IOName_t ioName, const std::string& text, const char* dataConfig = nullptr);
     void setData(GenieNode_IOName_t ioName, const void* data, const size_t dataSize, const char* dataConfig = nullptr);
 
     void setTextCallback(GenieNode_IOName_t ioName,
@@ -191,6 +203,7 @@ public:
     /* OpenAI‑compatible query */
     std::unique_ptr<Query> query;
     std::shared_ptr<Profile> profiler;
+    std::shared_ptr<Log> logger;
 
     char id[256];
     bool stream;
@@ -208,14 +221,18 @@ private:
     std::shared_ptr<Node> textGeneratorNode;
     std::string sc_configPath;
 
-    /* Per-request image bytes that must remain valid at least until pipeline->execute() returns.
-     * This avoids dangling pointers if the SDK reads the buffer after setData() but before/while execute(). */
+    /* Per-request image bytes that must remain valid at least until
+     * pipeline->execute() returns. This avoids dangling pointers if the SDK
+     * reads the buffer after setData() but before/while execute(). */
     std::vector<uint8_t> currentImageData;
 
-    /* Persistent storage for static custom inputs (e.g., position IDs, masks) loaded from files.
-     * These must remain valid for the life of the VLMObject because the SDK may access them
-     * during execute() or subsequent operations; we therefore keep them owned here. */
-    std::vector<std::vector<uint8_t>> staticInputBuffers;
+    /* Per-request text prompt that must remain valid during async pipeline
+     * execution. */
+    std::string currentPromptData;
+
+    /* Per-request static custom inputs that must remain valid during async pipeline
+     * execution to avoid dangling pointers. */
+    std::vector<std::shared_ptr<void>> currentStaticBuffers;
 
     /* Helper structures */
     struct ModelConfig {
