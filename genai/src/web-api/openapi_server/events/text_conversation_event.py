@@ -394,6 +394,16 @@ class TextConversationEvent(ConversationEvent):
             except Exception as e:
                 logger.error(f"Error in stream generator: {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                # Always ensure event is completed and callback triggered
+                # This prevents deadlock in ADHOC_MODE when LLM initialization fails
+                if self.state == EventState.ACTIVE:
+                    logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
+                    self.fail_turn(Exception("Stream aborted or failed"))
+
+                if self._completion_callback:
+                    logger.info(f"Event {self.event_id}: Triggering completion callback in finally block")
+                    await self._completion_callback(self.event_id, self.state)
 
         return {
             "response": StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}),

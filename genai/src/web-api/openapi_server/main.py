@@ -110,6 +110,37 @@ async def lifespan(app: FastAPI):
 
     logger.info("Shutting down Gen-AI Microservice")
 
+    # Shutdown inference process managers to free DSP/NPU resources
+    logger.info("=== Shutting Down Inference Process Managers ===")
+
+    # Shutdown LLM process manager
+    try:
+        from openapi_server.impl.genie_wrapper.llm_process_manager import LLMProcessManager
+        llm_manager = LLMProcessManager.get_instance()
+        if llm_manager.process and llm_manager.process.poll() is None:
+            logger.info("Shutting down LLM process manager...")
+            llm_manager.shutdown()
+            logger.info("✓ LLM process manager shut down")
+        else:
+            logger.info("LLM process manager not running, skipping shutdown")
+    except Exception as e:
+        logger.error(f"Error shutting down LLM process manager: {e}", exc_info=True)
+
+    # Shutdown VLM process manager
+    try:
+        from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
+        vlm_manager = VLMProcessManager.get_instance()
+        if vlm_manager.process and vlm_manager.process.poll() is None:
+            logger.info("Shutting down VLM process manager...")
+            vlm_manager.shutdown()
+            logger.info("✓ VLM process manager shut down")
+        else:
+            logger.info("VLM process manager not running, skipping shutdown")
+    except Exception as e:
+        logger.error(f"Error shutting down VLM process manager: {e}", exc_info=True)
+
+    logger.info("=== Inference Process Managers Shut Down ===")
+
     # Shutdown RequestQueueManager if enabled
     if queue_manager_started:
         from openapi_server.managers.request_queue_manager import RequestQueueManager
