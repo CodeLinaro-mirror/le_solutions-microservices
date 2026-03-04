@@ -152,12 +152,13 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         return image_input, text_content
 
     @staticmethod
-    async def preprocess_image_from_input(image_input: str) -> bytes:
+    async def preprocess_image_from_input(image_input: str, model_id: str = None) -> bytes:
         """
         Preprocess an image from URL or base64 input.
 
         Args:
             image_input: Image URL or base64 encoded string
+            model_id: Optional model identifier for model-specific preprocessing
 
         Returns:
             Preprocessed image bytes
@@ -166,6 +167,12 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             Exception: If image processing fails
         """
         try:
+            # Look up vision preprocessing config for the model
+            vision_config = None
+            if model_id:
+                config_manager = ModelConfigManager()
+                vision_config = config_manager.get_vision_preprocessing(model_id)
+
             if image_input.startswith('data:image') or (not image_input.startswith('http') and len(image_input) > 100):
                 # Likely base64 encoded image
                 logger.info("Processing base64 encoded image")
@@ -189,7 +196,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
 
                 # Preprocess using existing pipeline
                 from openapi_server.utils.image_preprocessor import preprocess_image
-                preprocessed = preprocess_image(img)
+                preprocessed = preprocess_image(img, vision_config=vision_config)
 
             else:
                 # URL-based image
@@ -197,7 +204,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 from openapi_server.utils.image_validator import decode_image
                 from openapi_server.utils.image_preprocessor import preprocess_from_decoded
                 decoded_img = decode_image(image_input)
-                preprocessed = preprocess_from_decoded(decoded_img)
+                preprocessed = preprocess_from_decoded(decoded_img, vision_config=vision_config)
 
             # Convert to bytes
             image_bytes = preprocessed.to_bytes()
@@ -272,7 +279,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             # Process the image from current request
             logger.info("Processing image from current request...")
             try:
-                preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(image_input)
+                preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(image_input, model_id=request_data.model)
                 logger.info(f"Image preprocessed successfully: {len(preprocessed_image_bytes)} bytes")
 
             except Exception as e:

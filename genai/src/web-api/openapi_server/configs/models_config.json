@@ -83,6 +83,37 @@
           "size": 2048,
           "summarization_threshold": 0.7
         }
+      },
+      "qwen3-vl-4b": {
+        "config_file": "/mnt/work/models/genie_bundle_qwen3_VL_4B/genie_config_qwen3_vl_4b.json",
+        "display_name": "Qwen 3 VL 4B",
+        "chat_template": {
+          "system_prefix": "<|im_start|>system\n",
+          "system_suffix": "<|im_end|>\n",
+          "user_prefix": "<|im_start|>user\n",
+          "user_suffix": "<|im_end|>\n",
+          "assistant_prefix": "<|im_start|>assistant\n",
+          "assistant_suffix": "<|im_end|>\n",
+          "vision_start": "<|vision_start|>",
+          "vision_end": "<|vision_end|>",
+          "default_system_prompt": "You are a helpful assistant."
+        },
+        "max_tokens": 300,
+        "supports_streaming": true,
+        "supports_vision": true,
+        "vision_preprocessing": {
+          "target_width": 448,
+          "target_height": 448,
+          "patch_size": 16,
+          "merge_size": 2,
+          "temporal_patch_size": 2,
+          "image_mean": [0.5, 0.5, 0.5],
+          "image_std": [0.5, 0.5, 0.5]
+        },
+        "context": {
+          "size": 4096,
+          "summarization_threshold": 0.7
+        }
       }
     },
     "default_model": "qwen2.5-7b",

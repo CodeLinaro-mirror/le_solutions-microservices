@@ -239,6 +239,8 @@ private:
         std::string imageEncoderConfig;
         std::string lutEncoderConfig;
         std::string textGeneratorConfig;
+        std::string visionStartToken = "<|vision_start|>";
+        std::string visionEndToken = "<|vision_end|>";
         struct CustomInput {
             std::string node;
             std::string input_type;

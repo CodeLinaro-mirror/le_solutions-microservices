@@ -303,6 +303,21 @@ class ModelConfigManager:
             return model_config['context'].get('summarization_threshold', 0.7)
         return 0.7  # Default to 70%
 
+    def get_vision_preprocessing(self, model_id: str) -> Optional[Dict]:
+        """
+        Get the vision preprocessing configuration for a specific model.
+
+        Args:
+            model_id: The model identifier
+
+        Returns:
+            Dict containing vision preprocessing parameters or None if not found
+        """
+        model_config = self.get_model_config(model_id)
+        if model_config:
+            return model_config.get('vision_preprocessing')
+        return None
+
     def supports_vision(self, model_id: str) -> bool:
         """
         Check if a model supports vision/image inputs.

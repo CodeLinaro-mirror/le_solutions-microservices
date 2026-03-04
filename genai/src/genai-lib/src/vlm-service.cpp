@@ -587,6 +587,14 @@ void VLMObject::loadConfig(
                 modelConfig.custom_inputs.push_back(ci);
             }
         }
+
+        // Optionally load vision token markers (defaults are set in ModelConfig)
+        if (modelConfig_json.isMember("vision_start_token")) {
+            modelConfig.visionStartToken = modelConfig_json["vision_start_token"].asString();
+        }
+        if (modelConfig_json.isMember("vision_end_token")) {
+            modelConfig.visionEndToken = modelConfig_json["vision_end_token"].asString();
+        }
     } else {
         // Use hard-coded configuration for backward compatibility
         if (configPathOrModelName != "QWEN2_5_VL_3B" &&
@@ -890,37 +898,41 @@ void VLMObject::vlm_chat_completion_create() {
     }
 
     // ---------------------------------------------------------------
-    // 3. Build the final prompt that will be fed to the LUT encoder
+    // 2. Split prompt at vision token boundaries and interleave setData
     // ---------------------------------------------------------------
-    // The prompt is now fully constructed in the Python layer,
-    // including chat template markers and system prompt. We pass it
-    // as-is.
-    currentPromptData = userPrompt;
-    std::cout << "[VLMObject::vlm_chat_completion_create] "
-              << "Setting prompt on lutEncoderNode, length: "
-              << currentPromptData.size() << ", string ptr: "
-              << (void*)currentPromptData.c_str() << std::endl;
+    const std::string& visionStart = modelConfig.visionStartToken;
+    const std::string& visionEnd   = modelConfig.visionEndToken;
+    size_t startPos = userPrompt.find(visionStart);
+    size_t endPos   = userPrompt.find(visionEnd);
 
-    lutEncoderNode->setData(
-        GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPromptData);
-    std::cout << "[VLMObject::vlm_chat_completion_create] "
-              << "Prompt set successfully." << std::endl;
+    if (startPos != std::string::npos && endPos != std::string::npos && endPos > startPos) {
+        // --- Interleaved path: pre-vision text → image → post-vision text ---
+        std::string preVisionText  = userPrompt.substr(0, startPos + visionStart.length());
+        std::string postVisionText = userPrompt.substr(endPos);
 
-    // Reload static inputs (Pos IDs, Masks) for every request.
-    // This is required because ImageEncoder clears its input buffer
-    // after each encoding.
-    try {
-        std::cout << "[VLMObject::vlm_chat_completion_create] "
-                  << "Calling loadStaticCustomInputs..."
-                  << std::endl;
+        // (a) Pre-vision text → LUT encoder
+        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, preVisionText);
+
+        // (b) Image data → Image encoder
+        if (!currentImageData.empty()) {
+            imageEncoderNode->setData(
+                GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
+                currentImageData.data(),
+                currentImageData.size());
+        }
+
+        // Load static custom inputs (position ids, masks, etc.)
         loadStaticCustomInputs();
-        std::cout << "[VLMObject::vlm_chat_completion_create] "
-                  << "loadStaticCustomInputs completed successfully."
-                  << std::endl;
-    } catch (const std::exception& e) {
-        std::cout << "ERROR: Failed to reload static custom inputs: "
-                  << e.what() << std::endl;
-        throw;
+
+        // (c) Post-vision text → LUT encoder
+        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, postVisionText);
+    } else {
+        // --- Non-interleaved path: set prompt as-is ---
+        currentPromptData = userPrompt;
+        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPromptData);
+
+        // Reload static inputs (Pos IDs, Masks) for every request.
+        loadStaticCustomInputs();
     }
 
     // ---------------------------------------------------------------
