@@ -196,7 +196,8 @@ class CommonUtils:
         model_id: str,
         messages: list,
         include_assistant_prefix: bool = True,
-        has_vision: bool = False
+        has_vision: bool = False,
+        add_system_prompt: bool = True
     ) -> str:
         """
         Build complete chat prompt from messages using unified template.
@@ -206,12 +207,18 @@ class CommonUtils:
             messages: List of message dicts with 'role' and 'content'
             include_assistant_prefix: Whether to add assistant prefix at end
             has_vision: Whether this is a vision request (adds vision tokens to last user message)
+            add_system_prompt: Whether to prepend the system prompt (default True)
 
         Returns:
             Complete formatted prompt string
         """
         template = CommonUtils.get_chat_template(model_id)
         formatted_parts = []
+
+        # Add global prefix if present in the template
+        global_prefix = template.get('global_prefix')
+        if global_prefix:
+            formatted_parts.append(global_prefix)
 
         # Extract or use default system prompt
         system_prompt = template.get('default_system_prompt', 'You are a helpful assistant.')
@@ -231,8 +238,9 @@ class CommonUtils:
                 has_explicit_system = True
                 break
 
-        # Always add system message first
-        formatted_parts.append(CommonUtils.format_system_message(model_id, system_prompt))
+        # Add system message if requested
+        if add_system_prompt:
+            formatted_parts.append(CommonUtils.format_system_message(model_id, system_prompt))
 
         # Track last user message index for vision token placement
         last_user_idx = -1

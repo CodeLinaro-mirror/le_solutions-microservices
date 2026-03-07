@@ -134,12 +134,24 @@ class TextEventHelpers:
                     logger.info(f"Event {event_id}: Prepended previous context to user message")
                     break
 
+        # Determine if we should add system prompt
+        # Add it if:
+        # 1. This is the first turn (no previous events)
+        # 2. We are in ADHOC_MODE (full reset every time)
+        # 3. We are injecting summary (effectively a reset)
+        is_first_turn = (not session.events)
+        should_add_system = is_first_turn or ADHOC_MODE or inject_summary
+
+        if not should_add_system:
+            logger.info(f"Event {event_id}: Suppressing system prompt (not first turn/reset)")
+
         # Format messages using unified builder
         formatted_content = CommonUtils.build_chat_prompt(
             model_id=model_id,
             messages=messages_to_format,
             include_assistant_prefix=True,
-            has_vision=False
+            has_vision=False,
+            add_system_prompt=should_add_system
         )
 
         return formatted_content

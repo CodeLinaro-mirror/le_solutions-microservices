@@ -51,6 +51,7 @@ class ModelConfigManager:
             "models": {},
             "default_model": None,
             "fallback_chat_template": {
+                "global_prefix": "",
                 "system_prefix": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
                 "system_suffix": "<|eot_id|>",
                 "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",

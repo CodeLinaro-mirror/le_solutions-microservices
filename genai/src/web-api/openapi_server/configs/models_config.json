@@ -1,7 +1,7 @@
 {
     "models": {
       "qwen2.5-7b": {
-        "config_file": "/mnt/work/models/genie_bundle_qwen2_5_7B/genie_config_qwen2_5_7B.json",
+        "config_file": "genie_config.json",
         "display_name": "Qwen 2.5 7B",
         "chat_template": {
           "system_prefix": "<|im_start|>system\n",
@@ -21,7 +21,7 @@
         }
       },
       "qwen2.5-vl-3b": {
-        "config_file": "/mnt/work/models/genie_bundle_qwen2_5_VL_3B/genie_config_qwen2_5_vl_3b.json",
+        "config_file": "genie_config.json",
         "display_name": "Qwen 2.5 VL 3B",
         "chat_template": {
           "system_prefix": "<|im_start|>system\n",
@@ -43,7 +43,7 @@
         }
       },
       "qwen2.5-vl-7b": {
-        "config_file": "/mnt/work/models/genie_bundle_qwen2_5_VL_7B/genie_config_qwen2_5_vl_7b.json",
+        "config_file": "genie_config.json",
         "display_name": "Qwen 2.5 VL 7B",
         "chat_template": {
           "system_prefix": "<|im_start|>system\n",
@@ -65,7 +65,7 @@
         }
       },
       "qwen2.5-1.5b": {
-        "config_file": "/mnt/work/models/genie_bundle_qwen2_5_1_5B/genie_config_qwen2_5_1_5B.json",
+        "config_file": "genie_config.json",
         "display_name": "Qwen 2.5 1.5B",
         "chat_template": {
           "system_prefix": "<|im_start|>system\n",
@@ -85,7 +85,7 @@
         }
       },
       "qwen3-vl-4b": {
-        "config_file": "/mnt/work/models/genie_bundle_qwen3_VL_4B/genie_config_qwen3_vl_4b.json",
+        "config_file": "genie_config.json",
         "display_name": "Qwen 3 VL 4B",
         "chat_template": {
           "system_prefix": "<|im_start|>system\n",
@@ -114,10 +114,57 @@
           "size": 4096,
           "summarization_threshold": 0.7
         }
+      },
+      "llama-3.2-1b": {
+        "config_file": "genie_config.json",
+        "display_name": "LLaMA 3.2 1B",
+        "memory_requirement_mb": 2048,
+        "chat_template": {
+          "global_prefix": "<|begin_of_text|>",
+          "system_prefix": "<|start_header_id|>system<|end_header_id|>\n\n",
+          "system_suffix": "<|eot_id|>",
+          "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+          "user_suffix": "<|eot_id|>",
+          "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+          "assistant_suffix": "<|eot_id|>",
+          "default_system_prompt": "You are a helpful assistant."
+        },
+        "max_tokens": 4096,
+        "supports_streaming": true,
+        "supports_vision": false,
+        "context": {
+          "size": 4096,
+          "summarization_threshold": 0.7
+        }
+      },
+      "llama-3.2-11b-vision": {
+        "config_file": "genie_config.json",
+        "display_name": "LLaMA 3.2 11B Vision",
+        "memory_requirement_mb": 12288,
+        "chat_template": {
+          "global_prefix": "<|begin_of_text|>",
+          "system_prefix": "<|start_header_id|>system<|end_header_id|>\n\n",
+          "system_suffix": "<|eot_id|>",
+          "user_prefix": "<|start_header_id|>user<|end_header_id|>\n\n",
+          "user_suffix": "<|eot_id|>",
+          "assistant_prefix": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+          "assistant_suffix": "<|eot_id|>",
+          "vision_start": "<|image|>",
+          "vision_end": "",
+          "default_system_prompt": "You are a helpful assistant."
+        },
+        "max_tokens": 4096,
+        "supports_streaming": true,
+        "supports_vision": true,
+        "context": {
+          "size": 4096,
+          "summarization_threshold": 0.7
+        }
       }
     },
     "default_model": "qwen2.5-7b",
     "fallback_chat_template": {
+      "global_prefix": "",
       "system_prefix": "<|im_start|>system\n",
       "system_suffix": "<|im_end|>\n",
       "user_prefix": "<|im_start|>user\n",
