@@ -154,3 +154,14 @@ class ModelConfigConstants:
 # When enabled, LLM handles are created and destroyed for each conversation turn
 # This prevents QAIRT handle conflicts when multiple containers access the same NSP
 ADHOC_MODE = os.getenv("ADHOC_MODE", "false").lower() in ("true", "1", "yes", "on")
+
+class SystemResourceConstants:
+    """
+    System Resource Management Constants
+    Configuration for memory guardrails and resource management.
+    """
+    # Memory headroom percentage to keep as buffer (default: 15%)
+    MEMORY_HEADROOM_PERCENT = 15
+
+    # Enable/disable resource guardrails (default: True)
+    ENABLE_RESOURCE_GUARDRAILS = True

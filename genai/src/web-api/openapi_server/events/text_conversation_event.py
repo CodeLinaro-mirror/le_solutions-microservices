@@ -115,6 +115,10 @@ class TextConversationEvent(ConversationEvent):
                         self.summary_tokens = summary_tokens
                         self.inject_summary = True
 
+                        # Reset the handle's state so it drops the old KV cache
+                        # and starts fresh with the summary + new prompt
+                        self._reset_handle()
+
                         logger.info(f"Event {self.event_id}: Summarization complete, {summary_tokens} tokens")
                     except Exception as e:
                         logger.error(f"Event {self.event_id}: Summarization failed: {e}")
@@ -563,10 +567,20 @@ class TextConversationEvent(ConversationEvent):
             "error": {"type": type(error).__name__, "message": str(error)}
         }
 
-    # No-op handle management (handled by process manager)
+    # Handle management
     def take_over_handle(self, previous_event: ConversationEvent): pass
     def create_new_handle(self): pass
     def release_handle(self): pass
+
+    def _reset_handle(self):
+        """Forcefully reset the handle's KV cache via process manager."""
+        try:
+            llm_manager = LLMProcessManager.get_instance()
+            if hasattr(llm_manager, '_send_reset_and_wait'):
+                logger.info(f"Event {self.event_id}: Resetting LLM handle KV cache")
+                llm_manager._send_reset_and_wait()
+        except Exception as e:
+            logger.error(f"Event {self.event_id}: Error resetting LLM handle: {e}")
 
     def terminate_handle(self):
         """Forcefully destroy the handle/process."""

@@ -349,6 +349,21 @@ class ModelConfigManager:
             logger.error(f"Error checking for vision models: {e}")
             return False
 
+    def get_memory_requirement_mb(self, model_id: str) -> int:
+        """
+        Get the memory requirement in MB for a specific model.
+
+        Args:
+            model_id: The model identifier
+
+        Returns:
+            int: Memory requirement in megabytes, or 4096 as default
+        """
+        model_config = self.get_model_config(model_id)
+        if model_config:
+            return model_config.get('memory_requirement_mb', 4096)
+        return 4096  # Default fallback
+
 
 def get_config_manager() -> ModelConfigManager:
     """

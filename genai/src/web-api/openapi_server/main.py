@@ -74,6 +74,33 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize ModelConfigManager: {e}", exc_info=True)
         logger.warning("Service will continue with fallback configuration")
 
+    # Initialize SystemResourceManager with configuration
+    try:
+        from openapi_server.managers.system_resource_manager import SystemResourceManager
+        from openapi_server.impl.constant import SystemResourceConstants
+
+        resource_manager = SystemResourceManager()
+
+        # Get system config from constants
+        memory_headroom = SystemResourceConstants.MEMORY_HEADROOM_PERCENT
+        guardrails_enabled = SystemResourceConstants.ENABLE_RESOURCE_GUARDRAILS
+
+        # Configure resource manager
+        resource_manager.configure(
+            memory_headroom_percent=memory_headroom,
+            enable_guardrails=guardrails_enabled
+        )
+
+        # Log memory statistics
+        mem_stats = resource_manager.get_memory_stats()
+        logger.info(f"System Memory: {mem_stats['total_memory_mb']}MB total, "
+                   f"{mem_stats['available_memory_mb']}MB available")
+        logger.info(f"Resource Guardrails: {'Enabled' if guardrails_enabled else 'Disabled'} "
+                   f"(headroom: {memory_headroom}%)")
+    except Exception as e:
+        logger.error(f"Failed to initialize SystemResourceManager: {e}", exc_info=True)
+        logger.warning("Service will continue without resource guardrails")
+
     if enable_vlm:
         # Startup - Initialize VLM Resources
         logger.info("=== VLM Enabled - Initializing VLM Resources ===")

@@ -24,6 +24,8 @@ from abc import ABC, abstractmethod
 
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.genie_wrapper.inference_protocol import InferenceProtocol, CommandType, ResponseType
+from openapi_server.managers.system_resource_manager import SystemResourceManager
+from openapi_server.managers.model_config_manager import get_config_manager
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -63,6 +65,12 @@ class InferenceProcessManager(ABC):
         self.startup_timeout = 10
         self.init_timeout = 60
         self.execute_timeout = 300
+
+        # Resource management
+        self._resource_manager = SystemResourceManager()
+        self._config_manager = get_config_manager()
+        self._process_id: Optional[str] = None  # Unique ID for resource tracking
+        self._is_active = False  # Whether process is actively executing
 
         logger.info(f"{self.process_type.upper()}ProcessManager initialized")
 
@@ -123,6 +131,106 @@ class InferenceProcessManager(ABC):
         """
         pass
 
+    def _check_memory_and_evict_if_needed(self, model_id: str) -> None:
+        """
+        Check if sufficient memory is available for the model.
+        If not, evict idle processes using LRU policy.
+
+        Args:
+            model_id: Model identifier
+
+        Raises:
+            RuntimeError: If insufficient memory even after evicting all idle processes
+        """
+        # Get memory requirement for the model
+        memory_mb = self._config_manager.get_memory_requirement_mb(model_id)
+
+        # Check memory availability
+        sufficient, available_mb, processes_to_evict = self._resource_manager.check_memory_availability(memory_mb)
+
+        if sufficient and not processes_to_evict:
+            # Sufficient memory, no eviction needed
+            return
+
+        if not sufficient:
+            # Insufficient memory even after evicting all idle processes
+            logger.error(f"Insufficient memory for model {model_id} ({memory_mb}MB required, "
+                        f"{available_mb}MB available). Cannot proceed even after evicting all idle processes.")
+            raise RuntimeError(
+                f"Insufficient system memory to load model {model_id}. "
+                f"Required: {memory_mb}MB (with headroom), Available: {available_mb}MB. "
+                f"Please free up memory or use a smaller model."
+            )
+
+        # Evict idle processes
+        logger.info(f"Evicting {len(processes_to_evict)} idle processes to free memory for {model_id}")
+        for process_id in processes_to_evict:
+            try:
+                # Get the process manager for this process
+                # Process IDs are in format: "llm-{model_name}" or "vlm-{model_name}"
+                if process_id.startswith("llm-"):
+                    from openapi_server.impl.genie_wrapper.llm_process_manager import LLMProcessManager
+                    manager = LLMProcessManager()
+                elif process_id.startswith("vlm-"):
+                    from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
+                    manager = VLMProcessManager()
+                else:
+                    logger.warning(f"Unknown process ID format: {process_id}")
+                    continue
+
+                # Shutdown the process
+                logger.info(f"Evicting idle process: {process_id}")
+                manager.shutdown(force=False)
+
+            except Exception as e:
+                logger.error(f"Error evicting process {process_id}: {e}")
+
+    def _register_process(self, model_id: str):
+        """
+        Register process with resource manager.
+
+        Args:
+            model_id: Model identifier
+        """
+        if self._process_id:
+            # Already registered
+            return
+
+        # Create unique process ID
+        self._process_id = f"{self.process_type}-{model_id}"
+
+        # Get memory requirement
+        memory_mb = self._config_manager.get_memory_requirement_mb(model_id)
+
+        # Register with resource manager
+        self._resource_manager.register_process(
+            process_id=self._process_id,
+            model_name=model_id,
+            memory_mb=memory_mb,
+            is_active=False
+        )
+
+        logger.info(f"Registered process {self._process_id} with resource manager ({memory_mb}MB)")
+
+    def _unregister_process(self):
+        """Unregister process from resource manager."""
+        if self._process_id:
+            self._resource_manager.unregister_process(self._process_id)
+            logger.info(f"Unregistered process {self._process_id} from resource manager")
+            self._process_id = None
+
+    def _mark_active(self):
+        """Mark process as actively executing."""
+        if self._process_id:
+            self._resource_manager.mark_process_active(self._process_id)
+            self._is_active = True
+
+    def _mark_idle(self):
+        """Mark process as idle (not executing)."""
+        if self._process_id:
+            self._resource_manager.mark_process_idle(self._process_id)
+            self._is_active = False
+
     def _start_process(self, model_id: str, config_path: str, sampler_config: str):
         """
         Start inference subprocess with specified model.
@@ -138,6 +246,9 @@ class InferenceProcessManager(ABC):
             logger.info(f"  Model: {model_id}")
             logger.info(f"  Config: {config_path}")
             logger.info("=" * 60)
+
+            # Check memory and evict idle processes if needed
+            self._check_memory_and_evict_if_needed(model_id)
 
             # Get subprocess script path
             script_path = self._get_subprocess_script()
@@ -219,6 +330,9 @@ class InferenceProcessManager(ABC):
                 raise RuntimeError(f"{self.process_type.upper()} process failed to initialize: {response}")
 
             self.current_model = model_id
+
+            # Register process with resource manager
+            self._register_process(model_id)
 
             logger.info(f"{self.process_type.upper()} process ready for model: {model_id}")
 
@@ -316,6 +430,9 @@ class InferenceProcessManager(ABC):
     def _cleanup_process(self):
         """Cleanup subprocess and resources."""
         logger.info(f"Cleaning up {self.process_type.upper()} process")
+
+        # Unregister from resource manager
+        self._unregister_process()
 
         try:
             # Close socket read file
@@ -430,6 +547,9 @@ class InferenceProcessManager(ABC):
             Generated tokens
         """
         try:
+            # Mark process as active
+            self._mark_active()
+
             # Send EXECUTE command
             self._send_command(execute_cmd)
             logger.info(f"Event {event_id}: Sent EXECUTE command")
@@ -496,6 +616,9 @@ class InferenceProcessManager(ABC):
         except Exception as e:
             logger.error(f"Event {event_id}: Error executing request: {e}", exc_info=True)
             raise
+        finally:
+            # Mark process as idle after execution completes
+            self._mark_idle()
 
     def shutdown(self):
         """Gracefully shutdown subprocess."""
