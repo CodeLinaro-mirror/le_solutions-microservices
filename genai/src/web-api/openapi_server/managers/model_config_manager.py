@@ -70,44 +70,36 @@ class ModelConfigManager:
             shutil.rmtree(self.tmp_config_dir)
         os.makedirs(self.tmp_config_dir, exist_ok=True)
 
-        bundle_pattern = os.path.join(self.models_dir, "genie_bundle_*")
-        bundles = glob.glob(bundle_pattern)
+        for root, dirs, files in os.walk(self.models_dir):
+            if "model_config.json" in files:
+                bundle_path = root
+                bundle_name = os.path.basename(bundle_path)
+                model_config_path = os.path.join(bundle_path, "model_config.json")
 
-        for bundle_path in bundles:
-            if not os.path.isdir(bundle_path):
-                continue
+                try:
+                    # Process the bundle (copy configs, update paths)
+                    processed_config_dir = self._process_bundle(bundle_path, bundle_name)
 
-            bundle_name = os.path.basename(bundle_path)
-            model_config_path = os.path.join(bundle_path, "model_config.json")
+                    # Load the model metadata
+                    with open(model_config_path, 'r') as f:
+                        model_config_data = json.load(f)
 
-            if not os.path.exists(model_config_path):
-                logger.warning(f"No model_config.json found in bundle: {bundle_name}")
-                continue
+                    for model_id, model_info in model_config_data.get("models", {}).items():
+                        # Update config_file to point to the processed copy in /tmp/configs
+                        original_config_file = model_info.get("config_file")
+                        if original_config_file:
+                            model_info["config_file"] = os.path.join(processed_config_dir, original_config_file)
 
-            try:
-                # Process the bundle (copy configs, update paths)
-                processed_config_dir = self._process_bundle(bundle_path, bundle_name)
+                        aggregated_config["models"][model_id] = model_info
 
-                # Load the model metadata
-                with open(model_config_path, 'r') as f:
-                    model_config_data = json.load(f)
+                        # Set default model if not set
+                        if aggregated_config["default_model"] is None:
+                            aggregated_config["default_model"] = model_id
 
-                for model_id, model_info in model_config_data.get("models", {}).items():
-                    # Update config_file to point to the processed copy in /tmp/configs
-                    original_config_file = model_info.get("config_file")
-                    if original_config_file:
-                        model_info["config_file"] = os.path.join(processed_config_dir, original_config_file)
+                    logger.info(f"Loaded models from bundle: {bundle_name} at {bundle_path}")
 
-                    aggregated_config["models"][model_id] = model_info
-
-                    # Set default model if not set
-                    if aggregated_config["default_model"] is None:
-                        aggregated_config["default_model"] = model_id
-
-                logger.info(f"Loaded models from bundle: {bundle_name}")
-
-            except Exception as e:
-                logger.error(f"Error processing bundle {bundle_name}: {e}")
+                except Exception as e:
+                    logger.error(f"Error processing bundle {bundle_name} at {bundle_path}: {e}")
 
         return aggregated_config
 
