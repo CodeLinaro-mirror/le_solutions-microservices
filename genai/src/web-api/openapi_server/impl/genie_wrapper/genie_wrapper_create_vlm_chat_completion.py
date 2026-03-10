@@ -408,19 +408,20 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
 
             except Exception as e:
                 logger.error(f"VLM streaming error: {e}", exc_info=True)
-                error_chunk = {
-                    "id": session_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "error",
-                        "logprobs": None
-                    }]
+                from openapi_server.impl.constant import GenieErrorMappings
+                error_msg = str(e)
+                layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                final_msg = layman_msg if layman_msg else error_msg
+
+                error_payload = {
+                    "error": {
+                        "message": final_msg,
+                        "type": "server_error",
+                        "param": None,
+                        "code": 500
+                    }
                 }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield f"data: {json.dumps(error_payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 # Complete event before callback

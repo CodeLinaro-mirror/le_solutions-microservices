@@ -307,15 +307,18 @@ void llm_reset_object(LLMHandle handle);
                     content = self.ffi.string(msg.content).decode("utf-8")
                     finish_reason = self.ffi.string(choice.finish_reason).decode("utf-8")
 
-                    # Send token response
-                    if content:
-                        token_response = InferenceProtocol.create_token_response(event_id, content)
-                        self._send_response(token_response)
+                    if finish_reason == "error":
+                        self._send_error(event_id, content)
+                    else:
+                        # Send token response
+                        if content:
+                            token_response = InferenceProtocol.create_token_response(event_id, content)
+                            self._send_response(token_response)
 
-                    # Send done if finished
-                    if finish_reason == "stop":
-                        done_response = InferenceProtocol.create_done_response(event_id, finish_reason)
-                        self._send_response(done_response)
+                        # Send done if finished
+                        if finish_reason == "stop":
+                            done_response = InferenceProtocol.create_done_response(event_id, finish_reason)
+                            self._send_response(done_response)
 
                 except Exception as e:
                     logger.error(f"[{event_id}] Error in callback: {e}", exc_info=True)

@@ -218,16 +218,16 @@ class RequestQueueManager:
                     async with self.active_lock:
                         # Only release if this session still holds the lock
                         if self.active_session_id == session_id:
-                            if event_state == EventState.COMPLETED:
+                            if event_state in (EventState.COMPLETED, EventState.FAILED, EventState.CANCELLED):
                                 logger.info(
-                                    f"✅ Event {event_id} COMPLETED (callback) - releasing lock"
+                                    f"✅ Event {event_id} finished with state {event_state.name} (callback) - releasing lock"
                                 )
                                 self.active_session_id = None
                                 self.active_event_id = None
                             else:
                                 # Event still active (shouldn't happen in callback, but handle it)
                                 logger.info(
-                                    f"🔄 Event {event_id} still ACTIVE (callback) - keeping lock"
+                                    f"🔄 Event {event_id} still {event_state.name} (callback) - keeping lock"
                                 )
                 finally:
                     # Signal that callback has completed

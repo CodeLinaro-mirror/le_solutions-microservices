@@ -60,6 +60,7 @@ class InferenceProcessManager(ABC):
 
         # Log reader thread
         self._log_reader_thread: Optional[threading.Thread] = None
+        self.last_sdk_error: Optional[str] = None
 
         # Timeouts (in seconds)
         self.startup_timeout = 10
@@ -322,6 +323,9 @@ class InferenceProcessManager(ABC):
             # Start log reader thread
             self._start_log_reader()
 
+            # Reset error tracking before initialization
+            self.last_sdk_error = None
+
             # Send INIT command
             init_cmd = self._create_init_command(model_id, config_path, sampler_config)
             self._send_command(init_cmd)
@@ -329,7 +333,10 @@ class InferenceProcessManager(ABC):
             # Wait for READY response
             response = self._read_response(timeout=self.init_timeout)
             if response["type"] != ResponseType.READY.value:
-                raise RuntimeError(f"{self.process_type.upper()} process failed to initialize: {response}")
+                err_msg = response.get("message", str(response))
+                if self.last_sdk_error:
+                    err_msg += f" (SDK Code: {self.last_sdk_error})"
+                raise RuntimeError(f"{self.process_type.upper()} process failed to initialize: {err_msg}")
 
             self.current_model = model_id
 
@@ -346,11 +353,21 @@ class InferenceProcessManager(ABC):
     def _start_log_reader(self):
         """Start background thread to read subprocess logs."""
         def read_logs():
+            import re
+            # Only search if it looks like an error to save CPU cycles
+            error_pattern = re.compile(r'\b(1002|1003|5000|6000|6001|14001|14003)\b')
             try:
                 for line in iter(self.process.stdout.readline, b''):
                     line = line.decode('utf-8', errors='replace').rstrip()
                     if line:
                         logger.info(f"[{self.process_type.upper()}-PROC] {line}")
+
+                        # Capture known SDK error codes if printed
+                        line_lower = line.lower()
+                        if "err" in line_lower or "error" in line_lower or "fail" in line_lower:
+                            match = error_pattern.search(line)
+                            if match:
+                                self.last_sdk_error = match.group(1)
             except Exception as e:
                 logger.error(f"Error reading {self.process_type.upper()} subprocess logs: {e}")
 
@@ -552,6 +569,9 @@ class InferenceProcessManager(ABC):
             # Mark process as active
             self._mark_active()
 
+            # Reset error tracking before execution
+            self.last_sdk_error = None
+
             # Send EXECUTE command
             self._send_command(execute_cmd)
             logger.info(f"Event {event_id}: Sent EXECUTE command")
@@ -579,12 +599,17 @@ class InferenceProcessManager(ABC):
                             break
                         elif response_type == ResponseType.ERROR.value:
                             error_msg = response.get("message", "Unknown error")
+                            if self.last_sdk_error:
+                                error_msg += f" (SDK Code: {self.last_sdk_error})"
                             token_queue.put(f"__ERROR__{error_msg}")
                             token_queue.put(None)
                             break
                 except Exception as e:
                     logger.error(f"Error in reader thread: {e}")
-                    token_queue.put(f"__ERROR__{str(e)}")
+                    error_msg = str(e)
+                    if self.last_sdk_error:
+                        error_msg += f" (SDK Code: {self.last_sdk_error})"
+                    token_queue.put(f"__ERROR__{error_msg}")
                     token_queue.put(None)
 
             reader_thread = threading.Thread(
@@ -622,9 +647,13 @@ class InferenceProcessManager(ABC):
             # Mark process as idle after execution completes
             self._mark_idle()
 
-    def shutdown(self):
-        """Gracefully shutdown subprocess."""
-        logger.info(f"Shutting down {self.process_type.upper()} process manager")
+    def shutdown(self, force: bool = False):
+        """Gracefully shutdown subprocess, or force kill if requested."""
+        logger.info(f"Shutting down {self.process_type.upper()} process manager (force={force})")
+
+        if force:
+            self._cleanup_process()
+            return
 
         try:
             if self.process and self.process.poll() is None:

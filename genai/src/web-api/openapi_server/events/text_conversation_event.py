@@ -399,7 +399,22 @@ class TextConversationEvent(ConversationEvent):
 
             except Exception as e:
                 logger.error(f"Error in stream generator: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                self.terminate_handle(force=True)
+
+                from openapi_server.impl.constant import GenieErrorMappings
+                error_msg = str(e)
+                layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                final_msg = layman_msg if layman_msg else error_msg
+
+                error_payload = {
+                    "error": {
+                        "message": final_msg,
+                        "type": "server_error",
+                        "param": None,
+                        "code": 500
+                    }
+                }
+                yield f"data: {json.dumps(error_payload)}\n\n"
             finally:
                 # Always ensure event is completed and callback triggered
                 # This prevents deadlock in ADHOC_MODE when LLM initialization fails
@@ -561,6 +576,7 @@ class TextConversationEvent(ConversationEvent):
             except Exception as retry_error:
                 logger.error(f"Event {self.event_id}: Retry failed: {retry_error}")
 
+        self.terminate_handle(force=True)
         self.fail_turn(error)
         return {
             "response": None,
@@ -585,10 +601,10 @@ class TextConversationEvent(ConversationEvent):
         except Exception as e:
             logger.error(f"Event {self.event_id}: Error resetting LLM handle: {e}")
 
-    def terminate_handle(self):
+    def terminate_handle(self, force: bool = False):
         """Forcefully destroy the handle/process."""
         try:
-            LLMProcessManager.get_instance().shutdown()
+            LLMProcessManager.get_instance().shutdown(force=force)
         except Exception as e:
             logger.error(f"Event {self.event_id}: Error terminating LLM process: {e}")
 

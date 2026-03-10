@@ -92,11 +92,43 @@ class ChatApiImpl(BaseChatApi):
 
         except HTTPException as http_exc:
             logger.error(f"HTTPException error in create_chat_completion: {http_exc}")
-            raise HTTPException(status_code=http_exc.status_code, detail=http_exc.detail)
+            from openapi_server.impl.constant import GenieErrorMappings
+
+            error_str = str(http_exc.detail)
+            layman_msg = GenieErrorMappings.get_layman_message(error_str)
+            final_msg = layman_msg if layman_msg else error_str
+
+            return JSONResponse(
+                status_code=http_exc.status_code,
+                content={
+                    "error": {
+                        "message": final_msg,
+                        "type": "server_error" if http_exc.status_code >= 500 else "invalid_request_error",
+                        "param": None,
+                        "code": http_exc.status_code
+                    }
+                }
+            )
 
         except Exception as e:
             logger.error(f"Unexpected error in create_chat_completion: {e}")
-            raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.UNEXPECTED_ERROR)
+            from openapi_server.impl.constant import GenieErrorMappings
+
+            error_str = str(e)
+            layman_msg = GenieErrorMappings.get_layman_message(error_str)
+            final_msg = layman_msg if layman_msg else ErrorMessages.UNEXPECTED_ERROR
+
+            return JSONResponse(
+                status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+                content={
+                    "error": {
+                        "message": final_msg,
+                        "type": "server_error",
+                        "param": None,
+                        "code": HttpStatusCodes.INTERNAL_SERVER_ERROR
+                    }
+                }
+            )
 
     async def delete_chat_completion(
         self,
