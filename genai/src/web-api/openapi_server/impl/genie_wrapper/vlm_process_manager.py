@@ -82,6 +82,7 @@ class VLMProcessManager(InferenceProcessManager):
         max_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int,
         presence_penalty: float,
         frequency_penalty: float,
         **kwargs
@@ -98,6 +99,7 @@ class VLMProcessManager(InferenceProcessManager):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             image_data_b64=image_data_b64,
@@ -116,6 +118,7 @@ class VLMProcessManager(InferenceProcessManager):
         max_tokens: int = 1024,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = -1,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0
     ) -> AsyncGenerator[str, None]:
@@ -133,6 +136,7 @@ class VLMProcessManager(InferenceProcessManager):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling
             presence_penalty: Presence penalty
             frequency_penalty: Frequency penalty
 
@@ -160,6 +164,7 @@ class VLMProcessManager(InferenceProcessManager):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k if top_k is not None else -1,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             image_data_b64=image_data_b64,

@@ -249,7 +249,8 @@ void LLMObject::chat_completion_create () {
     prompt = query->message.content;
 
     //Check if Sampling Parameters are used
-    if (query->temperature != 1 || query->top_p != 1 || query->presence_penalty != 0.0 || query->frequency_penalty != 0.0){
+    if (query->temperature != 1 || query->top_p != 1 || query->top_k > 0 ||
+        query->presence_penalty != 0.0 || query->frequency_penalty != 0.0){
         SamplerConfig sc;
         diag->getSampler();
         sc.createSamplerConfig(sc_configPath);
@@ -258,6 +259,9 @@ void LLMObject::chat_completion_create () {
         }
         if (query->top_p != 1) {
             sc.setParam("top-p", std::to_string(query->top_p));
+        }
+        if (query->top_k > 0) {
+            sc.setParam("top-k", std::to_string(query->top_k));
         }
         if (query->presence_penalty != 0.0) {
             sc.setParam("presence-penalty", std::to_string(query->presence_penalty));

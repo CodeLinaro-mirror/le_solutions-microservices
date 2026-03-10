@@ -58,6 +58,7 @@ class CreateChatCompletionRequest(BaseModel):
     metadata: Optional[Dict[str, StrictStr]] = Field(default=None, description="Set of 16 key-value pairs that can be attached to an object. This can be useful for storing additional information about the object in a structured format, and querying for objects via API or the dashboard.   Keys are strings with a maximum length of 64 characters. Values are strings with a maximum length of 512 characters. ")
     temperature: Optional[Union[Annotated[float, Field(le=2, strict=True, ge=0)], Annotated[int, Field(le=2, strict=True, ge=0)]]] = Field(default=1, description="What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic. We generally recommend altering this or `top_p` but not both. ")
     top_p: Optional[Union[Annotated[float, Field(le=1, strict=True, ge=0)], Annotated[int, Field(le=1, strict=True, ge=0)]]] = Field(default=1, description="An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.  We generally recommend altering this or `temperature` but not both. ")
+    top_k: Optional[Annotated[int, Field(strict=True, ge=1)]] = Field(default=None, description="Top-k sampling parameter. If specified, the sampler considers only the k most likely next tokens at each step. If omitted, the model's configured sampler defaults are used. ")
     user: Optional[StrictStr] = Field(default=None, description="A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids). ")
     service_tier: Optional[ServiceTier] = ServiceTier.AUTO
     model: Optional[StrictStr] = Field(default=None, description="ID of the model to use. You can use the List models API to see all of your available models, or see our Model overview for descriptions of them.")
@@ -86,7 +87,7 @@ class CreateChatCompletionRequest(BaseModel):
     parallel_tool_calls: Optional[StrictBool] = Field(default=True, description="Whether to enable [parallel function calling](/docs/guides/function-calling#configuring-parallel-function-calling) during tool use.")
     function_call: Optional[CreateChatCompletionRequestAllOfFunctionCall] = None
     functions: Optional[Annotated[List[ChatCompletionFunctions], Field(min_length=1, max_length=128)]] = Field(default=None, description="Deprecated in favor of `tools`.  A list of functions the model may generate JSON inputs for. ")
-    __properties: ClassVar[List[str]] = ["metadata", "temperature", "top_p", "user", "service_tier", "messages", "model", "modalities", "reasoning_effort", "max_completion_tokens", "frequency_penalty", "presence_penalty", "web_search_options", "top_logprobs", "response_format", "audio", "store", "stream", "stop", "logit_bias", "logprobs", "max_tokens", "n", "prediction", "seed", "stream_options", "tools", "tool_choice", "parallel_tool_calls", "function_call", "functions"]
+    __properties: ClassVar[List[str]] = ["metadata", "temperature", "top_p", "top_k", "user", "service_tier", "messages", "model", "modalities", "reasoning_effort", "max_completion_tokens", "frequency_penalty", "presence_penalty", "web_search_options", "top_logprobs", "response_format", "audio", "store", "stream", "stop", "logit_bias", "logprobs", "max_tokens", "n", "prediction", "seed", "stream_options", "tools", "tool_choice", "parallel_tool_calls", "function_call", "functions"]
 
     @field_validator('modalities')
     def modalities_validate_enum(cls, value):
@@ -196,6 +197,11 @@ class CreateChatCompletionRequest(BaseModel):
         if self.top_p is None and "top_p" in self.model_fields_set:
             _dict['top_p'] = None
 
+        # set to None if top_k (nullable) is None
+        # and model_fields_set contains the field
+        if self.top_k is None and "top_k" in self.model_fields_set:
+            _dict['top_k'] = None
+
         # set to None if service_tier (nullable) is None
         # and model_fields_set contains the field
         if self.service_tier is None and "service_tier" in self.model_fields_set:
@@ -301,6 +307,7 @@ class CreateChatCompletionRequest(BaseModel):
             "metadata": obj.get("metadata"),
             "temperature": obj.get("temperature") if obj.get("temperature") is not None else 1,
             "top_p": obj.get("top_p") if obj.get("top_p") is not None else 1,
+            "top_k": obj.get("top_k"),
             "user": obj.get("user"),
             "service_tier": obj.get("service_tier") if obj.get("service_tier") is not None else ServiceTier.AUTO,
             "model": obj.get("model"),

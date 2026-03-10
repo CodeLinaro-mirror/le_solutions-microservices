@@ -136,6 +136,14 @@ class ModelConfigManager:
                     logger.warning(f"Failed to parse JSON file: {json_file}")
                     continue
 
+            # NOTE: GenIE/qualla's sampler latches greedy mode at construction time when top-k == 1.
+            # Runtime sampler updates via GenieSampler_applyConfig update temp/top-k/top-p, but do not
+            # recompute the internal greedy flag. This means a model bundle with dialog.sampler.top-k=1
+            # behaves greedily even if the request tries to override top-k > 1.
+            #
+            # Workaround: ensure dialog sampler does not start with top-k == 1 so runtime overrides work.
+            self._patch_dialog_sampler_config(data, bundle_name=bundle_name, filename=filename)
+
             # Update paths in the JSON data
             updated_data = self._update_paths(data, bundle_path, output_dir)
 
@@ -145,6 +153,43 @@ class ModelConfigManager:
                 json.dump(updated_data, f, indent=4)
 
         return output_dir
+
+    @staticmethod
+    def _patch_dialog_sampler_config(data: dict, bundle_name: str, filename: str) -> None:
+        """
+        Patch dialog sampler config in-place to ensure runtime sampling overrides work.
+
+        GenIE/qualla sets internal greedy mode when initializing a basic sampler with top-k == 1.
+        Greedy mode is not updated on later applyConfig() calls, so runtime top-k overrides are
+        effectively ignored if the sampler starts with top-k == 1.
+        """
+        try:
+            # LLM dialog config
+            dialog = data.get("dialog")
+            if isinstance(dialog, dict):
+                sampler = dialog.get("sampler")
+                if isinstance(sampler, dict) and sampler.get("top-k") == 1:
+                    sampler["top-k"] = 2
+                    logger.warning(
+                        f"Patched dialog.sampler.top-k from 1 to 2 in {bundle_name}/{filename} "
+                        "to allow runtime sampling overrides (GenIE greedy mode is latched when top-k==1)."
+                    )
+
+            # VLM/text-generator node config (common in VLM bundles)
+            for node_key in ("text-generator", "text_generator", "textGenerator"):
+                node = data.get(node_key)
+                if not isinstance(node, dict):
+                    continue
+                sampler = node.get("sampler")
+                if isinstance(sampler, dict) and sampler.get("top-k") == 1:
+                    sampler["top-k"] = 2
+                    logger.warning(
+                        f"Patched {node_key}.sampler.top-k from 1 to 2 in {bundle_name}/{filename} "
+                        "to allow runtime sampling overrides (GenIE greedy mode is latched when top-k==1)."
+                    )
+        except Exception:
+            # Best-effort patching; do not fail bundle loading due to unexpected config shapes.
+            return
 
     def _update_paths(self, data, bundle_path: str, output_dir: str):
         """

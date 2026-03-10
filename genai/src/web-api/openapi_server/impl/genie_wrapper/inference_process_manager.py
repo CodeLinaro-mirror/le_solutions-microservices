@@ -108,6 +108,7 @@ class InferenceProcessManager(ABC):
         max_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int,
         presence_penalty: float,
         frequency_penalty: float,
         **kwargs
@@ -122,6 +123,7 @@ class InferenceProcessManager(ABC):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
+            top_k: Top-k sampling (<=0 uses bundle default)
             presence_penalty: Presence penalty
             frequency_penalty: Frequency penalty
             **kwargs: Additional parameters (e.g., image_data_b64 for VLM)

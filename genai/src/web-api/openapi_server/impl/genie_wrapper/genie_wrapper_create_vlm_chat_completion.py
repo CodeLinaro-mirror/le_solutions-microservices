@@ -369,6 +369,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     max_tokens=request_data.max_completion_tokens or 300,
                     temperature=request_data.temperature or 0.7,
                     top_p=request_data.top_p or 0.9,
+                    top_k=getattr(request_data, "top_k", None),
                     presence_penalty=request_data.presence_penalty or 0.0,
                     frequency_penalty=request_data.frequency_penalty or 0.0
                 ):
@@ -480,6 +481,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 max_tokens=request_data.max_completion_tokens or 300,
                 temperature=request_data.temperature or 0.7,
                 top_p=request_data.top_p or 0.9,
+                top_k=getattr(request_data, "top_k", None),
                 presence_penalty=request_data.presence_penalty or 0.0,
                 frequency_penalty=request_data.frequency_penalty or 0.0
             ):
