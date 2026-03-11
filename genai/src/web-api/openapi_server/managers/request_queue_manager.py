@@ -541,3 +541,76 @@ class RequestQueueManager:
             'max_queue_size': MAX_QUEUE_SIZE,
             'request_timeout': REQUEST_TIMEOUT
         }
+
+    async def cancel_request(self, session_id: str) -> bool:
+        """
+        Cancel a request for the given session.
+
+        Handles two cases:
+        1. Request is actively executing: release the DSP lock so the next request can proceed
+        2. Request is queued: remove from queue and cancel the future
+
+        Args:
+            session_id: The session ID to cancel
+
+        Returns:
+            bool: True if a request was found and cancelled, False otherwise
+        """
+        if not self.enabled:
+            return False
+
+        logger.info(f"🚫 Attempting to cancel request for session {session_id}")
+
+        # Case 1: Check if actively executing — release the lock
+        async with self.active_lock:
+            if self.active_session_id == session_id:
+                logger.info(f"🔓 Session {session_id} is actively executing — releasing DSP lock")
+                self.active_session_id = None
+                self.active_event_id = None
+                return True
+
+        # Case 2: Scan the queue and remove the matching entry
+        temp_items = []
+        found = False
+
+        try:
+            while not self.request_queue.empty():
+                try:
+                    item = self.request_queue.get_nowait()
+                    priority, counter, queue_item = item
+
+                    if queue_item['session'].session_id == session_id:
+                        future = queue_item['future']
+                        if not future.done():
+                            future.set_exception(
+                                Exception("Request cancelled by user")
+                            )
+                        logger.info(f"📤 Removed queued request for session {session_id}")
+                        found = True
+                        self.request_queue.task_done()
+                    else:
+                        temp_items.append(item)
+                        self.request_queue.task_done()
+
+                except asyncio.QueueEmpty:
+                    break
+
+            # Put back items we kept
+            for item in temp_items:
+                await self.request_queue.put(item)
+
+            if found:
+                logger.info(f"✅ Successfully cancelled queued request for session {session_id}")
+            else:
+                logger.warning(f"⚠️  No queued or active request found for session {session_id}")
+
+            return found
+
+        except Exception as e:
+            logger.error(f"❌ Error cancelling request for session {session_id}: {e}", exc_info=True)
+            for item in temp_items:
+                try:
+                    await self.request_queue.put(item)
+                except Exception:
+                    pass
+            return False

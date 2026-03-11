@@ -93,6 +93,46 @@ paths:
               schema:
                 $ref: '#/components/schemas/PingResponse'
 
+  /v1/cancel/{completion_id}:
+    post:
+      operationId: cancelChatCompletion
+      tags:
+        - Chat
+      summary: Cancel an active chat completion
+      description: Cancels an actively executing chat completion by terminating the subprocess and rolling back session state.
+      parameters:
+        - name: completion_id
+          in: path
+          required: true
+          description: The ID of the chat completion to cancel
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The chat completion was cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionCancelled"
+        "404":
+          description: The chat completion with the specified ID was not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+        "400":
+          description: No active event to cancel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+
   /v1/metrics:
     get:
       operationId: getMetrics
@@ -681,6 +721,30 @@ components:
           description: Total number of requests processed for this model (all time).
       required:
         - total_requests
+
+    ChatCompletionCancelled:
+      type: object
+      title: Chat completion cancelled
+      description: Represents the cancellation confirmation of an active chat completion.
+      properties:
+        id:
+          type: string
+          description: The ID of the cancelled chat completion.
+        object:
+          type: string
+          description: The object type, which is always "chat.completion.cancelled".
+          enum:
+            - chat.completion.cancelled
+        cancelled:
+          type: boolean
+          description: Whether the chat completion was successfully cancelled.
+        message:
+          type: string
+          description: Additional information about the cancellation.
+      required:
+        - id
+        - object
+        - cancelled
 
     ChatCompletionDeleted:
       type: object

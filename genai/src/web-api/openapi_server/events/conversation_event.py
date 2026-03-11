@@ -132,6 +132,9 @@ class ConversationEvent(ABC):
         self._pending_tool_calls: List[dict] = []
         self._tool_response_received = False
 
+        # Cancellation flag — set by session.cancel_active_event()
+        self.is_cancelled = False
+
         # Completion callback (for ADHOC_MODE lock management)
         self._completion_callback: Optional[Callable] = None
 
@@ -176,8 +179,13 @@ class ConversationEvent(ABC):
         pass
 
     @abstractmethod
-    def terminate_handle(self):
-        """Forcefully destroy the handle, regardless of ownership."""
+    def terminate_handle(self, force: bool = False):
+        """
+        Forcefully destroy the handle, regardless of ownership.
+
+        Args:
+            force: If True, immediately kill the subprocess (SIGKILL).
+        """
         pass
 
     @abstractmethod
@@ -245,6 +253,20 @@ class ConversationEvent(ABC):
             # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
             if self._completion_callback:
                 asyncio.create_task(self._trigger_completion_callback())
+
+    def cancel_turn(self):
+        """Mark turn as cancelled (due to explicit client cancellation)."""
+        if self.state == EventState.ACTIVE:
+            self.state = EventState.CANCELLED
+            self.failed_at = time.time()
+            logger.info(f"Event {self.event_id}: Turn CANCELLED")
+
+            # Release handle if owned
+            if self.handle_owned:
+                try:
+                    self.release_handle()
+                except Exception as e:
+                    logger.error(f"Event {self.event_id}: Error releasing handle on cancel: {e}")
 
     def fail_turn(self, error: Exception):
         """Mark turn as failed."""

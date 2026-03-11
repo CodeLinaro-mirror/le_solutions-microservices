@@ -383,4 +383,57 @@ class ConversationSession:
 
         return should_summarize
 
+    def cancel_active_event(self) -> bool:
+        """
+        Cancel the currently active event and roll back session state.
+
+        This method:
+        1. Marks the event as cancelled (suppresses error responses to client)
+        2. Force-kills the subprocess immediately (SIGKILL)
+        3. Removes messages added by the cancelled event from history
+        4. Clears the current event reference
+
+        Returns:
+            bool: True if an active event was cancelled, False if no active event
+        """
+        if not self.current_event:
+            logger.warning(f"Session {self.session_id}: No current event to cancel")
+            return False
+
+        if not self.current_event.is_active():
+            logger.warning(f"Session {self.session_id}: Current event {self.current_event.event_id} is not active (state={self.current_event.state})")
+            return False
+
+        event = self.current_event
+        logger.info(f"Session {self.session_id}: Cancelling active event {event.event_id}")
+
+        # Step 1: Mark event as cancelled so stream error handlers suppress error payloads
+        event.is_cancelled = True
+        logger.info(f"Session {self.session_id}: Marked event {event.event_id} as cancelled")
+
+        # Step 2: Force-kill the subprocess immediately (SIGKILL)
+        try:
+            event.terminate_handle(force=True)
+            logger.info(f"Session {self.session_id}: Force terminated handle for event {event.event_id}")
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: Error terminating handle: {e}", exc_info=True)
+
+        # Step 3: Roll back messages added by this event
+        if event.message_indices:
+            indices_to_remove = sorted(event.message_indices, reverse=True)
+            for idx in indices_to_remove:
+                if idx < len(self.messages):
+                    removed_msg = self.messages.pop(idx)
+                    logger.debug(f"Session {self.session_id}: Removed message at index {idx}: {removed_msg.get('role')}")
+                else:
+                    logger.warning(f"Session {self.session_id}: Index {idx} out of range (len={len(self.messages)})")
+            logger.info(f"Session {self.session_id}: Rolled back {len(indices_to_remove)} messages")
+
+        # Step 4: Clear current event
+        self.current_event = None
+        self.last_activity = datetime.now()
+
+        logger.info(f"Session {self.session_id}: Successfully cancelled event {event.event_id}")
+        return True
+
     # Removed unused summarization methods as they are now handled directly in TextConversationEvent

@@ -205,6 +205,16 @@ class TextConversationEvent(ConversationEvent):
                 }
 
         except Exception as e:
+            # If cancelled, don't retry — just mark as cancelled and return
+            if self.is_cancelled:
+                logger.info(f"Event {self.event_id}: Non-streaming request cancelled")
+                self.cancel_turn()
+                return {
+                    "response": None,
+                    "finish_reason": "cancelled",
+                    "needs_tool_response": False,
+                    "turn_complete": False,
+                }
             return await self._handle_error(e, request_data)
 
     async def _execute_streaming_inference(self, llm_manager: LLMProcessManager, prompt_content: str, request_data) -> dict:
@@ -424,23 +434,28 @@ class TextConversationEvent(ConversationEvent):
                     await self._completion_callback(self.event_id, self.state)
 
             except Exception as e:
-                logger.error(f"Error in stream generator: {e}", exc_info=True)
-                self.terminate_handle(force=True)
+                # Check if this error is due to cancellation
+                if self.is_cancelled or "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
+                    logger.info(f"Event {self.event_id}: Stream terminated due to cancellation")
+                    # Don't yield error chunk for cancelled requests
+                else:
+                    logger.error(f"Error in stream generator: {e}", exc_info=True)
+                    self.terminate_handle(force=True)
 
-                from openapi_server.impl.constant import GenieErrorMappings
-                error_msg = str(e)
-                layman_msg = GenieErrorMappings.get_layman_message(error_msg)
-                final_msg = layman_msg if layman_msg else error_msg
+                    from openapi_server.impl.constant import GenieErrorMappings
+                    error_msg = str(e)
+                    layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                    final_msg = layman_msg if layman_msg else error_msg
 
-                error_payload = {
-                    "error": {
-                        "message": final_msg,
-                        "type": "server_error",
-                        "param": None,
-                        "code": 500
+                    error_payload = {
+                        "error": {
+                            "message": final_msg,
+                            "type": "server_error",
+                            "param": None,
+                            "code": 500
+                        }
                     }
-                }
-                yield f"data: {json.dumps(error_payload)}\n\n"
+                    yield f"data: {json.dumps(error_payload)}\n\n"
             finally:
                 # Submit metrics to MetricsManager
                 try:
@@ -468,11 +483,14 @@ class TextConversationEvent(ConversationEvent):
                 except Exception as metrics_err:
                     logger.error(f"Event {self.event_id}: Failed to record metrics: {metrics_err}")
 
-                # Always ensure event is completed and callback triggered
-                # This prevents deadlock in ADHOC_MODE when LLM initialization fails
+                # Always ensure event is completed/cancelled/failed and callback triggered
                 if self.state == EventState.ACTIVE:
-                    logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
-                    self.fail_turn(Exception("Stream aborted or failed"))
+                    if self.is_cancelled:
+                        logger.info(f"Event {self.event_id}: Stream ended due to cancellation")
+                        self.cancel_turn()
+                    else:
+                        logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
+                        self.fail_turn(Exception("Stream aborted or failed"))
 
                 if self._completion_callback:
                     logger.info(f"Event {self.event_id}: Triggering completion callback in finally block")
@@ -654,7 +672,12 @@ class TextConversationEvent(ConversationEvent):
             logger.error(f"Event {self.event_id}: Error resetting LLM handle: {e}")
 
     def terminate_handle(self, force: bool = False):
-        """Forcefully destroy the handle/process."""
+        """
+        Terminate the handle/process.
+
+        Args:
+            force: If True, force kill subprocess immediately (for cancellation)
+        """
         try:
             LLMProcessManager.get_instance().shutdown(force=force)
         except Exception as e:

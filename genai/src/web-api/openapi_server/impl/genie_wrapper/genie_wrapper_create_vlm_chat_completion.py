@@ -427,21 +427,27 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 logger.info(f"VLM Event {event_id}: Streaming completed")
 
             except Exception as e:
-                logger.error(f"VLM Event {event_id}: Streaming error: {e}", exc_info=True)
-                from openapi_server.impl.constant import GenieErrorMappings
-                error_msg = str(e)
-                layman_msg = GenieErrorMappings.get_layman_message(error_msg)
-                final_msg = layman_msg if layman_msg else error_msg
+                # Check if this error is due to cancellation
+                if event_object and getattr(event_object, 'is_cancelled', False):
+                    logger.info(f"VLM Event {event_id}: Stream terminated due to cancellation")
+                elif "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
+                    logger.info(f"VLM Event {event_id}: Stream terminated (likely due to cancellation)")
+                else:
+                    logger.error(f"VLM Event {event_id}: Streaming error: {e}", exc_info=True)
+                    from openapi_server.impl.constant import GenieErrorMappings
+                    error_msg = str(e)
+                    layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                    final_msg = layman_msg if layman_msg else error_msg
 
-                error_payload = {
-                    "error": {
-                        "message": final_msg,
-                        "type": "server_error",
-                        "param": None,
-                        "code": 500
+                    error_payload = {
+                        "error": {
+                            "message": final_msg,
+                            "type": "server_error",
+                            "param": None,
+                            "code": 500
+                        }
                     }
-                }
-                yield f"data: {json.dumps(error_payload)}\n\n"
+                    yield f"data: {json.dumps(error_payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 # Submit metrics to MetricsManager
@@ -472,17 +478,23 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 except Exception as metrics_err:
                     logger.error(f"VLM Event {event_id}: Failed to record metrics: {metrics_err}")
 
-                # Complete event before callback
+                # Complete/cancel event before callback
                 if event_object:
                     try:
-                        logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
-                        event_object.complete_turn()
-                        event_object.calculate_event_hash()
-                        if hasattr(event_object, 'session') and event_object.session:
-                            event_object.session.complete_current_event()
-                        logger.info(f"VLM Event {event_id}: Event completed successfully")
+                        from openapi_server.events.conversation_event import EventState
+                        if event_object.state == EventState.ACTIVE:
+                            if getattr(event_object, 'is_cancelled', False):
+                                logger.info(f"VLM Event {event_id}: Stream ended due to cancellation")
+                                event_object.cancel_turn()
+                            else:
+                                logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
+                                event_object.complete_turn()
+                                event_object.calculate_event_hash()
+                                if hasattr(event_object, 'session') and event_object.session:
+                                    event_object.session.complete_current_event()
+                                logger.info(f"VLM Event {event_id}: Event completed successfully")
                     except Exception as e:
-                        logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
+                        logger.error(f"VLM Event {event_id}: Error completing/cancelling event: {e}", exc_info=True)
 
                 # Trigger completion callback
                 if completion_callback:
@@ -587,17 +599,23 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 type=Parameters.INTERNAL_TYPE
             )
         finally:
-            # Complete event before callback
+            # Complete/cancel event before callback
             if event_object:
                 try:
-                    logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
-                    event_object.complete_turn()
-                    event_object.calculate_event_hash()
-                    if hasattr(event_object, 'session') and event_object.session:
-                        event_object.session.complete_current_event()
-                    logger.info(f"VLM Event {event_id}: Event completed successfully")
+                    from openapi_server.events.conversation_event import EventState
+                    if event_object.state == EventState.ACTIVE:
+                        if getattr(event_object, 'is_cancelled', False):
+                            logger.info(f"VLM Event {event_id}: Non-streaming cancelled")
+                            event_object.cancel_turn()
+                        else:
+                            logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
+                            event_object.complete_turn()
+                            event_object.calculate_event_hash()
+                            if hasattr(event_object, 'session') and event_object.session:
+                                event_object.session.complete_current_event()
+                            logger.info(f"VLM Event {event_id}: Event completed successfully")
                 except Exception as e:
-                    logger.error(f"VLM Event {event_id}: Error completing event: {e}", exc_info=True)
+                    logger.error(f"VLM Event {event_id}: Error completing/cancelling event: {e}", exc_info=True)
 
             # Trigger completion callback
             if completion_callback:
