@@ -181,9 +181,12 @@ class InferenceProcessManager(ABC):
                     logger.warning(f"Unknown process ID format: {process_id}")
                     continue
 
-                # Shutdown the process
+                # Force shutdown the process during eviction
                 logger.info(f"Evicting idle process: {process_id}")
-                manager.shutdown(force=False)
+                manager.shutdown(force=True)
+
+                # Brief delay between force shutdowns to allow OS to reclaim resources
+                time.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Error evicting process {process_id}: {e}")
@@ -501,9 +504,28 @@ class InferenceProcessManager(ABC):
                         self.process.kill()
                         self.process.wait()
 
+                # Close stdout pipe to unblock the log reader thread
+                try:
+                    if self.process.stdout:
+                        self.process.stdout.close()
+                except Exception as e:
+                    logger.warning(f"Error closing process stdout pipe: {e}")
+
                 self.process = None
         except Exception as e:
             logger.error(f"Error during process cleanup: {e}")
+
+        # Wait for log reader thread to finish (it will exit once stdout pipe is closed)
+        try:
+            if self._log_reader_thread and self._log_reader_thread.is_alive():
+                self._log_reader_thread.join(timeout=0.2)
+                if self._log_reader_thread.is_alive():
+                    logger.warning(f"{self.process_type.upper()} log reader thread did not exit in time")
+                else:
+                    logger.info(f"{self.process_type.upper()} log reader thread exited cleanly")
+            self._log_reader_thread = None
+        except Exception as e:
+            logger.error(f"Error waiting for log reader thread: {e}")
 
         self.current_model = None
         self.current_session_id = None
