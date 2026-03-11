@@ -32,6 +32,7 @@ class ConversationSession:
     - events = list of ConversationEvents that reference message indices
     - Each event tracks which messages it's responsible for via message_indices
     """
+    BASE64_IMAGE_PREFIX_LENGTH = 256
 
     def __init__(self, chat_completion_id: str, user_id: str):
         """
@@ -69,22 +70,156 @@ class ConversationSession:
 
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
 
-    def add_message(self, message: Dict) -> int:
+    def add_message(self, message: Dict, compact_images: bool = True) -> int:
         """
         Add a message to the shared history.
 
         Args:
             message: OpenAI-format message dict
+            compact_images: Whether to compact older base64 images after appending
 
         Returns:
             Index of the added message
         """
         self.messages.append(message)
+        if compact_images and self._message_contains_base64_image(message):
+            self._compact_historical_base64_images()
+
         self.last_activity = datetime.now()
         idx = len(self.messages) - 1
 
         logger.debug(f"Session {self.session_id}: Added message at index {idx}: {message.get('role')}")
         return idx
+
+    @staticmethod
+    def _safe_get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _extract_image_url_value(cls, image_item) -> str:
+        image_url_data = cls._safe_get(image_item, 'image_url', {})
+        if isinstance(image_url_data, dict):
+            return image_url_data.get('url', '') or ''
+        if isinstance(image_url_data, str):
+            return image_url_data
+
+        url_value = getattr(image_url_data, 'url', '')
+        return url_value if isinstance(url_value, str) else ''
+
+    @staticmethod
+    def _is_base64_data_url(url: str) -> bool:
+        lowered = url.lower()
+        return lowered.startswith('data:image') and ';base64,' in lowered
+
+    @classmethod
+    def _is_raw_base64_image(cls, url: str) -> bool:
+        candidate = url.strip()
+        if len(candidate) <= cls.BASE64_IMAGE_PREFIX_LENGTH:
+            return False
+        if candidate.startswith(('http://', 'https://', 'data:')):
+            return False
+
+        allowed_chars = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-\n\r')
+        return all(char in allowed_chars for char in candidate)
+
+    @classmethod
+    def _is_base64_image_url(cls, url: str) -> bool:
+        return cls._is_base64_data_url(url) or cls._is_raw_base64_image(url)
+
+    @classmethod
+    def _iter_image_items(cls, message):
+        content = cls._safe_get(message, 'content')
+        if not isinstance(content, list):
+            return
+
+        for item_index, item in enumerate(content):
+            if cls._safe_get(item, 'type') != 'image_url':
+                continue
+
+            url = cls._extract_image_url_value(item)
+            if isinstance(url, str) and url:
+                yield item_index, item, url
+
+    @classmethod
+    def _message_contains_base64_image(cls, message: Dict) -> bool:
+        for _, _, url in cls._iter_image_items(message):
+            if cls._is_base64_image_url(url):
+                return True
+        return False
+
+    @classmethod
+    def _build_compacted_base64_url(cls, image_url: str) -> str:
+        if cls._is_base64_data_url(image_url):
+            prefix, payload = image_url.split(',', 1)
+            if len(payload) <= cls.BASE64_IMAGE_PREFIX_LENGTH:
+                return image_url
+            return f"{prefix},{payload[:cls.BASE64_IMAGE_PREFIX_LENGTH]}"
+
+        if len(image_url) <= cls.BASE64_IMAGE_PREFIX_LENGTH:
+            return image_url
+
+        return image_url[:cls.BASE64_IMAGE_PREFIX_LENGTH]
+
+    @staticmethod
+    def _set_image_url_value(image_item, new_url: str) -> bool:
+        if isinstance(image_item, dict):
+            image_url_data = image_item.get('image_url')
+            if isinstance(image_url_data, dict):
+                image_url_data['url'] = new_url
+            else:
+                image_item['image_url'] = {'url': new_url}
+            return True
+
+        image_url_data = getattr(image_item, 'image_url', None)
+        if isinstance(image_url_data, dict):
+            image_url_data['url'] = new_url
+            return True
+
+        if hasattr(image_url_data, 'url'):
+            setattr(image_url_data, 'url', new_url)
+            return True
+
+        try:
+            setattr(image_item, 'image_url', {'url': new_url})
+            return True
+        except Exception:
+            return False
+
+    def _compact_historical_base64_images(self):
+        """
+        Keep the latest base64 image intact and compact older base64 images
+        to the first BASE64_IMAGE_PREFIX_LENGTH characters.
+        """
+        base64_image_items = []
+        for message_index, message in enumerate(self.messages):
+            for item_index, item, url in self._iter_image_items(message):
+                if self._is_base64_image_url(url):
+                    base64_image_items.append((message_index, item_index, item, url))
+
+        if len(base64_image_items) <= 1:
+            return
+
+        latest_message_index, latest_item_index, _, _ = base64_image_items[-1]
+        compacted_count = 0
+
+        for message_index, item_index, item, url in base64_image_items[:-1]:
+            if message_index == latest_message_index and item_index == latest_item_index:
+                continue
+
+            compacted_url = self._build_compacted_base64_url(url)
+            if compacted_url == url:
+                continue
+
+            if self._set_image_url_value(item, compacted_url):
+                compacted_count += 1
+
+        if compacted_count:
+            logger.info(
+                f"Session {self.session_id}: Compacted {compacted_count} historical base64 image(s) to "
+                f"{self.BASE64_IMAGE_PREFIX_LENGTH} chars"
+            )
 
     def get_message(self, index: int) -> Optional[Dict]:
         """Get message at specific index."""
@@ -150,8 +285,12 @@ class ConversationSession:
 
         # Add new messages to history and track indices
         for msg in new_messages:
-            idx = self.add_message(msg)
+            idx = self.add_message(msg, compact_images=False)
             event.message_indices.append(idx)
+
+        # Keep only the latest base64 image unmodified in stored history.
+        if any(self._message_contains_base64_image(msg) for msg in new_messages):
+            self._compact_historical_base64_images()
 
         # Handle management
         if not is_tool_continuation:
