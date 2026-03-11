@@ -440,12 +440,26 @@ class TextConversationEvent(ConversationEvent):
                     # Don't yield error chunk for cancelled requests
                 else:
                     logger.error(f"Error in stream generator: {e}", exc_info=True)
+                    # Record failure for health monitoring (not for cancellations)
+                    try:
+                        MetricsManager.get_instance().record_inference_failure(self.model_id)
+                    except Exception:
+                        pass
                     self.terminate_handle(force=True)
 
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
-                    final_msg = layman_msg if layman_msg else error_msg
+                    if layman_msg:
+                        final_msg = layman_msg
+                    else:
+                        # Strip internal technical prefixes before showing to user
+                        clean_msg = error_msg
+                        for prefix in ("LLM subprocess error: ", "VLM subprocess error: "):
+                            if clean_msg.startswith(prefix):
+                                clean_msg = clean_msg[len(prefix):]
+                                break
+                        final_msg = clean_msg
 
                     error_payload = {
                         "error": {

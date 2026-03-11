@@ -66,17 +66,25 @@ paths:
       tags:
         - Health
       summary: Check the health of microservice
-      description: Health Check of various dependencies
+      description: >
+        Health check for container orchestration (Docker Swarm / Kubernetes).
+        Returns HTTP 200 when healthy, HTTP 503 when unhealthy.
+        Unhealthy conditions: any model has >= 3 consecutive inference failures
+        (DSP/FastRPC fault), or available system memory < 100 MB.
       operationId: healthcheck
       responses:
         '200':
-          description: Success
+          description: Service is healthy
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/UsageRead'
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service is unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
 
   /v1/ping:
     get:
@@ -745,6 +753,25 @@ components:
         - id
         - object
         - cancelled
+
+    HealthResponse:
+      type: object
+      title: Health Response
+      description: Health check response for container orchestration.
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - unhealthy
+          description: Overall health status of the service.
+        reason:
+          type: string
+          description: >
+            Present only when status is "unhealthy". Describes the reason
+            for the unhealthy state.
+      required:
+        - status
 
     ChatCompletionDeleted:
       type: object
