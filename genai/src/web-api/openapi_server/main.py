@@ -21,6 +21,7 @@ from openapi_server.apis.chat_api import router as ChatApiRouter
 from openapi_server.apis.health_api import router as HealthApiRouter
 from openapi_server.apis.ping_api import router as PingApiRouter
 from openapi_server.apis.models_api import router as ModelApiRouter
+from openapi_server.apis.metrics_api import router as MetricsApiRouter
 import logging
 from openapi_server.version import __version__
 from openapi_server.logger.logger_config import LoggerConfig
@@ -224,3 +225,4 @@ app.include_router(ModelApiRouter)
 app.include_router(ChatApiRouter)
 app.include_router(HealthApiRouter)
 app.include_router(PingApiRouter)
+app.include_router(MetricsApiRouter)

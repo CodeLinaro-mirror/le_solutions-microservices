@@ -36,6 +36,7 @@ from openapi_server.impl.constant import Parameters
 from openapi_server.session.conversation_utils import ConversationUtils
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.managers.model_config_manager import ModelConfigManager
+from openapi_server.managers.metrics_manager import MetricsManager
 from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
 
 # Initialize logger
@@ -276,11 +277,13 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     type=Parameters.INTERNAL_TYPE
                 )
 
-            # Process the image from current request
+            # Process the image from current request and measure preprocessing time
             logger.info("Processing image from current request...")
+            preprocessing_start = time.time()
             try:
                 preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(image_input, model_id=request_data.model)
-                logger.info(f"Image preprocessed successfully: {len(preprocessed_image_bytes)} bytes")
+                preprocessing_time_ms = (time.time() - preprocessing_start) * 1000
+                logger.info(f"Image preprocessed successfully: {len(preprocessed_image_bytes)} bytes in {preprocessing_time_ms:.2f}ms")
 
             except Exception as e:
                 logger.error(f"Failed to preprocess image: {e}")
@@ -308,12 +311,12 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             if streaming:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, completion_callback, event_id, event_state, event_object
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object
                 )
             else:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_non_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, completion_callback, event_id, event_state, event_object
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object
                 )
 
         except Exception as e:
@@ -332,6 +335,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         prompt: str,
         image_bytes: bytes,
         session_id: str,
+        preprocessing_time_ms: float = 0.0,
         completion_callback=None,
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
@@ -342,6 +346,12 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         model = request_data.model
 
         async def stream_generator():
+            stream_start_time = time.time()
+            ttft_timestamp = None
+            last_token_timestamp = None
+            inter_token_latencies = []
+            completion_tokens = 0
+
             try:
                 # First chunk: role
                 first_chunk = {
@@ -373,6 +383,16 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     presence_penalty=request_data.presence_penalty or 0.0,
                     frequency_penalty=request_data.frequency_penalty or 0.0
                 ):
+                    now = time.time()
+                    # Capture TTFT on first token
+                    if ttft_timestamp is None:
+                        ttft_timestamp = now
+                    # Capture inter-token latency for subsequent tokens
+                    if last_token_timestamp is not None:
+                        inter_token_latencies.append((now - last_token_timestamp) * 1000)
+                    last_token_timestamp = now
+                    completion_tokens += 1
+
                     # Content chunk
                     content_chunk = {
                         "id": session_id,
@@ -407,7 +427,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 logger.info(f"VLM Event {event_id}: Streaming completed")
 
             except Exception as e:
-                logger.error(f"VLM streaming error: {e}", exc_info=True)
+                logger.error(f"VLM Event {event_id}: Streaming error: {e}", exc_info=True)
                 from openapi_server.impl.constant import GenieErrorMappings
                 error_msg = str(e)
                 layman_msg = GenieErrorMappings.get_layman_message(error_msg)
@@ -424,6 +444,34 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 yield f"data: {json.dumps(error_payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
+                # Submit metrics to MetricsManager
+                try:
+                    if completion_tokens > 0:
+                        total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
+                        ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
+                        avg_stream_latency_ms = (
+                            sum(inter_token_latencies) / len(inter_token_latencies)
+                            if inter_token_latencies else None
+                        )
+                        MetricsManager.get_instance().record_inference_metrics(
+                            model_id=model,
+                            total_pipeline_latency_ms=total_pipeline_latency_ms,
+                            tokens_generated=completion_tokens,
+                            ttft_ms=ttft_ms,
+                            avg_stream_latency_ms=avg_stream_latency_ms,
+                            preprocessing_time_ms=preprocessing_time_ms if preprocessing_time_ms > 0 else None,
+                        )
+                        logger.debug(
+                            f"VLM Event {event_id}: metrics — "
+                            f"Preprocessing={preprocessing_time_ms:.1f}ms, "
+                            f"TTFT={ttft_ms:.1f}ms, "
+                            f"StreamLatency={avg_stream_latency_ms:.1f}ms, "
+                            f"Total={total_pipeline_latency_ms:.1f}ms, "
+                            f"Tokens={completion_tokens}"
+                        )
+                except Exception as metrics_err:
+                    logger.error(f"VLM Event {event_id}: Failed to record metrics: {metrics_err}")
+
                 # Complete event before callback
                 if event_object:
                     try:
@@ -462,6 +510,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         prompt: str,
         image_bytes: bytes,
         session_id: str,
+        preprocessing_time_ms: float = 0.0,
         completion_callback=None,
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
@@ -471,6 +520,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         try:
             # Accumulate tokens from VLM process
             accumulated_content = []
+            non_stream_start = time.time()
 
             async for token in vlm_manager.execute_request(
                 event_id=event_id or f"vlm-{uuid.uuid4()}",
@@ -487,6 +537,18 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 frequency_penalty=request_data.frequency_penalty or 0.0
             ):
                 accumulated_content.append(token)
+
+            # Record non-streaming metrics (TPS approximated as total_tokens / total_time)
+            try:
+                if accumulated_content:
+                    MetricsManager.get_instance().record_inference_metrics(
+                        model_id=request_data.model,
+                        total_pipeline_latency_ms=(time.time() - non_stream_start) * 1000,
+                        tokens_generated=len(accumulated_content),
+                        preprocessing_time_ms=preprocessing_time_ms if preprocessing_time_ms > 0 else None,
+                    )
+            except Exception as metrics_err:
+                logger.error(f"VLM Event {event_id}: Failed to record non-streaming metrics: {metrics_err}")
 
             # Build response
             full_content = ''.join(accumulated_content)
