@@ -58,8 +58,16 @@ class TextConversationEvent(ConversationEvent):
 
         logger.info(f"Created TextConversationEvent {event_id} for model {model_id} (context: {self.context_size})")
 
-    def _should_summarize(self, projected_tokens: int) -> bool:
-        """Determine if summarization should be triggered."""
+    def _should_summarize(self, projected_tokens: int, max_completion_tokens: int = 0) -> bool:
+        """
+        Determine if summarization should be triggered.
+
+        Args:
+            projected_tokens: Estimated tokens for the new incoming message.
+            max_completion_tokens: Maximum tokens the model may generate in this turn.
+                                   Including this ensures we reserve enough headroom in
+                                   the KV cache so the model doesn't crash mid-generation.
+        """
         # Skip for tool continuations
         if self._is_tool_calling and self._tool_response_received:
             return False
@@ -70,7 +78,10 @@ class TextConversationEvent(ConversationEvent):
         threshold = self.context_size * summary_threshold_ratio
 
         tokens_since_last_summary = self.session.calculate_tokens_since_last_summarization()
-        projected_total = tokens_since_last_summary + projected_tokens
+
+        # Include max_completion_tokens so we trigger summarization before the model
+        # runs out of KV cache space during output generation (not just during input).
+        projected_total = tokens_since_last_summary + projected_tokens + max_completion_tokens
 
         should_summarize = projected_total >= threshold
 
@@ -78,6 +89,7 @@ class TextConversationEvent(ConversationEvent):
             logger.info(f"Event {self.event_id}: Summarization threshold reached: "
                        f"tokens_since_last={tokens_since_last_summary}, "
                        f"projected_new={projected_tokens}, "
+                       f"max_completion={max_completion_tokens}, "
                        f"total_projected={projected_total}, "
                        f"threshold={threshold}")
 
@@ -98,8 +110,9 @@ class TextConversationEvent(ConversationEvent):
             # 1. Summarization Check
             if not self._is_tool_calling and not self._tool_response_received:
                 projected_tokens = self._calculate_projected_tokens(request_data)
+                max_completion = request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS
 
-                if self._should_summarize(projected_tokens):
+                if self._should_summarize(projected_tokens, max_completion):
                     max_summary_tokens = int(self.context_size * 0.1)
                     logger.info(f"Event {self.event_id}: Triggering summarization (max {max_summary_tokens} tokens)")
 
