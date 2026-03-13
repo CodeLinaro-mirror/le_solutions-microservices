@@ -21,7 +21,7 @@ t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_infe
 qtimetamux name=metamux_2 ! queue ! tee name=t_split_3 \
 t_split_3. ! queue ! metamux_3. \
 t_split_3. ! queue ! stage_03_preproc. stage_03_preproc. ! queue ! stage_03_inference. stage_03_inference. ! queue ! stage_03_postproc. stage_03_postproc. ! text/x-raw ! queue ! metamux_3. \
-qtimetamux name=metamux_3 ! queue ! qtimetatransform module=roi-label-moving-average ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_4 \
+qtimetamux name=metamux_3 ! queue ! qtimetatransform module=roi-label-moving-average ! queue ! qtivoverlay ! queue ! tee name=t_split_4 \
 t_split_4. ! queue ! waylandsink sync=false async=false fullscreen=true \
 t_split_4. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false  channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
 t_split_4. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-io-mode=4 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900
@@ -47,7 +47,7 @@ t_split_2. ! queue ! stage_02_preproc. stage_02_preproc. ! queue ! stage_02_infe
 qtimetamux name=metamux_2 ! queue ! tee name=t_split_3 \
 t_split_3. ! queue ! metamux_3. \
 t_split_3. ! queue ! stage_03_preproc. stage_03_preproc. ! queue ! stage_03_inference. stage_03_inference. ! queue ! stage_03_postproc. stage_03_postproc. ! text/x-raw ! queue ! metamux_3. \
-qtimetamux name=metamux_3 ! queue ! qtimetatransform module=roi-label-moving-average ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_4 \
+qtimetamux name=metamux_3 ! queue ! qtimetatransform module=roi-label-moving-average ! queue ! qtivoverlay ! queue ! tee name=t_split_4 \
 t_split_4. ! queue ! waylandsink sync=true async=false fullscreen=true \
 t_split_4. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false  channel=$REDIS_DETECTION_CHANNEL host="172.17.0.1" port=6379 \
 t_split_4. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-io-mode=4 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=8900

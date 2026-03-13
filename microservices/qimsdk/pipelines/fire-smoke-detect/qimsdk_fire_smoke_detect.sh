@@ -10,7 +10,7 @@ qtimlpostprocess name=stage_01_postproc results=10 module=yolov8 labels=${LABELS
 rtspsrc location=${INPUT_URL} ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12  ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtivoverlay ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false channel=${REDIS_DETECTION_CHANNEL} host="172.17.0.1" port=${REDIS_OUT_PORT} \
 t_split_2. ! queue ! waylandsink sync=true async=false fullscreen=true \
 t_split_2. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-io-mode=4 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=${OUT_PORT}
@@ -24,7 +24,7 @@ qtimlpostprocess name=stage_01_postproc results=10 module=yolov8 labels=${LABELS
 qtiqmmfsrc name=camsrc camera=${INPUT_URL} ! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,interlace-mode=progressive,colorimetry=bt601 ! identity sync=true  ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtivoverlay ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false channel=${REDIS_DETECTION_CHANNEL} host="172.17.0.1" port=${REDIS_OUT_PORT} \
 t_split_2. ! queue ! waylandsink sync=true async=false fullscreen=true \
 t_split_2. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-io-mode=4 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=${OUT_PORT}
@@ -47,7 +47,7 @@ qtimlpostprocess name=stage_01_postproc results=10 module=yolov8 labels=${LABELS
 ${source_sequence} ! queue ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
-qtimetamux name=metamux_1 ! queue ! qtivoverlay engine=gles ! queue ! tee name=t_split_2 \
+qtimetamux name=metamux_1 ! queue ! qtivoverlay ! queue ! tee name=t_split_2 \
 t_split_2. ! queue ! qtimlmetaparser module=json ! qtiredissink sync=false async=false channel=${REDIS_DETECTION_CHANNEL} host="172.17.0.1" port=${REDIS_OUT_PORT} \
 t_split_2. ! queue ! waylandsink sync=true async=false fullscreen=true \
 t_split_2. ! queue ! identity sync=true ! v4l2h264enc capture-io-mode=4 output-io-mode=4 ! queue ! h264parse config-interval=1 ! queue ! qtirtspbin address=0.0.0.0 port=${OUT_PORT}
