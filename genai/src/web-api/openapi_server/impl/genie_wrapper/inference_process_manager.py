@@ -442,10 +442,28 @@ class InferenceProcessManager(ABC):
             reset_cmd = InferenceProtocol.create_reset_command()
             self._send_command(reset_cmd)
 
-            # Wait for READY response
-            response = self._read_response(timeout=10.0)
-            if response["type"] != ResponseType.READY.value:
-                raise RuntimeError(f"Unexpected response to RESET: {response}")
+            # Wait for READY response, drain any late tokens from a prior stream.
+            deadline = time.time() + 10.0
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError("Timeout waiting for READY after RESET")
+
+                response = self._read_response(timeout=remaining)
+                response_type = response.get("type")
+
+                if response_type == ResponseType.READY.value:
+                    break
+                if response_type == ResponseType.ERROR.value:
+                    raise RuntimeError(f"RESET failed: {response}")
+                if response_type in (ResponseType.TOKEN.value, ResponseType.DONE.value):
+                    logger.warning(
+                        f"Received {response_type} while waiting for READY after RESET; "
+                        f"draining pending stream output"
+                    )
+                    continue
+
+                logger.warning(f"Unexpected response while waiting for READY after RESET: {response}")
 
             logger.info(f"{self.process_type.upper()} handle reset successfully")
         except Exception as e:

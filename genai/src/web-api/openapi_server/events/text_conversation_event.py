@@ -446,6 +446,15 @@ class TextConversationEvent(ConversationEvent):
                 if self._completion_callback:
                     await self._completion_callback(self.event_id, self.state)
 
+            except asyncio.CancelledError:
+                # Client disconnected mid-stream; cancel event and stop the subprocess.
+                logger.info(f"Event {self.event_id}: Stream cancelled by client")
+                self.is_cancelled = True
+                try:
+                    self.terminate_handle(force=True)
+                except Exception as cancel_err:
+                    logger.error(f"Event {self.event_id}: Error terminating handle on cancel: {cancel_err}")
+                raise
             except Exception as e:
                 # Check if this error is due to cancellation
                 if self.is_cancelled or "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
@@ -500,10 +509,14 @@ class TextConversationEvent(ConversationEvent):
                             ttft_ms=ttft_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                         )
+                        ttft_display = f"{ttft_ms:.1f}ms" if ttft_ms is not None else "n/a"
+                        stream_latency_display = (
+                            f"{avg_stream_latency_ms:.1f}ms" if avg_stream_latency_ms is not None else "n/a"
+                        )
                         logger.debug(
                             f"Event {self.event_id}: LLM metrics — "
-                            f"TTFT={ttft_ms:.1f}ms, "
-                            f"StreamLatency={avg_stream_latency_ms:.1f}ms, "
+                            f"TTFT={ttft_display}, "
+                            f"StreamLatency={stream_latency_display}, "
                             f"Total={total_pipeline_latency_ms:.1f}ms, "
                             f"Tokens={completion_tokens}"
                         )
