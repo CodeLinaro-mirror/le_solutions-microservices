@@ -34,7 +34,7 @@ class ImageApiImpl(BaseImageApi):
                 raise HTTPException(status_code = HttpStatusCodes.BAD_REQUEST,
                                     detail = ErrorMessages.INCORRECT_CONTENT)
 
-            # Get default model from config manager
+            # Default model is the first model listed in the 'models' section of models_config.json
             default_model = model_config_manager.get_default_model()
             
             # Determine which model to use
@@ -64,6 +64,26 @@ class ImageApiImpl(BaseImageApi):
             #Fetch environment variable for models_path
             models_path = os.getenv("MODELS_PATH", "/opt/image_gen")
 
+            # Get model file names from config manager
+            model_info = model_config_manager.get_model_info(requested_model)
+            model_files = model_info.get("model_files", {}) if model_info else {}
+
+            # Validate that all required model file keys are present in the config
+            required_model_file_keys = ["text_encoder", "unet", "vae"]
+            missing_keys = [k for k in required_model_file_keys if k not in model_files]
+            if missing_keys:
+                logger.error(
+                    f"Model '{requested_model}' configuration is missing required "
+                    f"model_files keys: {missing_keys}"
+                )
+                raise HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail=(
+                        f"Model '{requested_model}' configuration is missing required "
+                        f"model_files keys: {missing_keys}. Please check the models config file."
+                    )
+                )
+
             #Prepare config for StableDiffusionExecutor
             config = {
                 "prompt": request.prompt,
@@ -71,7 +91,10 @@ class ImageApiImpl(BaseImageApi):
                 "steps": steps_for_model,
                 "guidance_scale": 7.5,
                 "models_path": models_path,
-                "variant": variant
+                "variant": variant,
+                "text_encoder_model": model_files["text_encoder"],
+                "unet_model": model_files["unet"],
+                "vae_model": model_files["vae"]
             }
 
             #Initialize executor and handle errors

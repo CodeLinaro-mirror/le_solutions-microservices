@@ -27,26 +27,40 @@ class ModelConfigManager:
     
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from file."""
-        config_path = os.getenv("GENAI_MODELS_CONFIG_PATH", "/opt/image_gen/models_config.json")
-        
-        if not config_path:
-            logger.error("GENAI_MODELS_CONFIG_PATH is not set.")
-            raise ValueError("Environment variable GENAI_MODELS_CONFIG_PATH is not set.")
-        
+        user_provided_path = os.getenv("GENAI_MODELS_CONFIG_PATH")
+        config_path = user_provided_path or "/app/default_configs/models_config.json"
+
+        if user_provided_path:
+            logger.info(f"GENAI_MODELS_CONFIG_PATH is set. Loading model configuration from: {config_path}")
+        else:
+            logger.info(f"GENAI_MODELS_CONFIG_PATH is not set. Using default model configuration: {config_path}")
+
         try:
             with open(config_path, "r") as f:
                 config = json.load(f)
             logger.info(f"Successfully loaded model configuration from {config_path}")
             return config
         except FileNotFoundError:
-            logger.error(f"Model configuration file not found: {config_path}")
-            raise FileNotFoundError(f"Model configuration file not found: {config_path}")
+            if user_provided_path:
+                logger.error(
+                    f"Model configuration file not found at user-provided path "
+                    f"GENAI_MODELS_CONFIG_PATH='{config_path}'. "
+                    f"Please ensure the file exists and is accessible."
+                )
+                raise FileNotFoundError(
+                    f"Model configuration file not found at user-provided path "
+                    f"GENAI_MODELS_CONFIG_PATH='{config_path}'. "
+                    f"Please ensure the file exists and is accessible."
+                )
+            else:
+                logger.error(f"Default model configuration file not found: {config_path}")
+                raise FileNotFoundError(f"Default model configuration file not found: {config_path}")
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in model configuration file: {e}")
-            raise ValueError(f"Invalid JSON in model configuration file: {e}")
+            logger.error(f"Invalid JSON in model configuration file '{config_path}': {e}")
+            raise ValueError(f"Invalid JSON in model configuration file '{config_path}': {e}")
         except Exception as e:
-            logger.error(f"Failed to read model configuration file: {e}")
-            raise Exception(f"Failed to read model configuration file: {e}")
+            logger.error(f"Failed to read model configuration file '{config_path}': {e}")
+            raise Exception(f"Failed to read model configuration file '{config_path}': {e}")
     
     def get_config(self, force_reload: bool = False) -> Dict[str, Any]:
         """
@@ -58,7 +72,7 @@ class ModelConfigManager:
         Returns:
             Dictionary containing the model configuration.
         """
-        current_config_path = os.getenv("GENAI_MODELS_CONFIG_PATH", "/opt/image_gen/models_config.json")
+        current_config_path = os.getenv("GENAI_MODELS_CONFIG_PATH", "/app/default_configs/models_config.json")
         
         # Reload if forced, config not loaded, or config path changed
         if force_reload or self._config is None or self._config_path != current_config_path:
@@ -80,12 +94,15 @@ class ModelConfigManager:
     def get_default_model(self) -> str:
         """
         Get the default model ID from configuration.
+        Returns the first model listed in the 'models' section of the config.
         
         Returns:
             Default model ID string.
         """
-        config = self.get_config()
-        return config.get("default_model", "stable-diffusion-2.1")
+        models = self.get_models()
+        if not models:
+            raise ValueError("No models available in configuration.")
+        return next(iter(models))
     
     def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
         """

@@ -13,7 +13,7 @@ services:
     environment:
       - GENAI_T2I_PORT=${GENAI_T2I_PORT:-9090}
       - VARIANT=${VARIANT:-2.1}
-      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/opt/image_gen/models_config.json}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH}
     devices:
       - /dev/dma_heap/system
       - /dev/dma_heap/qcom,system

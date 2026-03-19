@@ -90,6 +90,11 @@ COPY --from=builder /mnt/work/venv /mnt/work/venv
 # Copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr
 
+# Copy default model configuration (used when GENAI_MODELS_CONFIG_PATH is not set)
+RUN mkdir -p /app/default_configs
+COPY --chmod=644 --from=builder /mnt/work/src/web-api/openapi_server/configs/models_config.json \
+    /app/default_configs/models_config.json
+
 ENV PATH=/mnt/work/venv/bin:$PATH
 
 # Copy entrypoint script and make it executable

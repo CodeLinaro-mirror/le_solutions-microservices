@@ -2,22 +2,12 @@
   "models": {
     "stable-diffusion-2.1": {
       "model_files": {
-      "text_encoder": "text_encoder.bin",
-      "unet": "unet.bin",
-      "vae": "vae.bin"
-     },
+        "text_encoder": "stable_diffusion_v2_1-text_encoder-qualcomm_sa7255p.bin",
+        "unet": "stable_diffusion_v2_1-unet-qualcomm_sa7255p.bin",
+        "vae": "stable_diffusion_v2_1-vae-qualcomm_sa7255p.bin"
+      },
       "display_name": "Stable Diffusion 2.1",
       "max_tokens": 77
-    },
-   "stable-diffusion-1.5": {
-      "model_files": {
-      "text_encoder": "text_encoder.bin",
-      "unet": "unet.bin",
-      "vae": "vae.bin"
-    },
-      "display_name": "Stable Diffusion 1.5",
-      "max_tokens": 77
     }
-  },
-  "default_model": "stable-diffusion-2.1"
+  }
 }

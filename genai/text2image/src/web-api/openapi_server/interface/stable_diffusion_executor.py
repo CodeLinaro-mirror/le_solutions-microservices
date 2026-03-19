@@ -51,6 +51,18 @@ class StableDiffusionExecutor:
                 "type": "string",
                 "enum": ["2.1"],
                 "description": "Stable Diffusion variant"
+            },
+            "text_encoder_model": {
+                "type": "string",
+                "description": "Filename of the text encoder model binary"
+            },
+            "unet_model": {
+                "type": "string",
+                "description": "Filename of the UNet model binary"
+            },
+            "vae_model": {
+                "type": "string",
+                "description": "Filename of the VAE model binary"
             }
         },
         "additionalProperties": False
@@ -71,7 +83,10 @@ class StableDiffusionExecutor:
             "steps": 20,
             "guidance_scale": 7.5,
             "models_path": "/opt/image_gen",
-            "variant": "2.1"
+            "variant": "2.1",
+            "text_encoder_model": "stable_diffusion_v2_1-text_encoder-qualcomm_sa7255p.bin",
+            "unet_model": "stable_diffusion_v2_1-unet-qualcomm_sa7255p.bin",
+            "vae_model": "stable_diffusion_v2_1-vae-qualcomm_sa7255p.bin"
         }
 
         # Process the configuration
@@ -109,6 +124,9 @@ class StableDiffusionExecutor:
         self.guidance_scale = self.config["guidance_scale"]
         self.models_path = self.config["models_path"]
         self.variant = self.config["variant"]
+        self.text_encoder_model = self.config["text_encoder_model"]
+        self.unet_model = self.config["unet_model"]
+        self.vae_model = self.config["vae_model"]
         self.tokenizer_max_length = 77
 
         # Set up model configuration
@@ -131,7 +149,11 @@ class StableDiffusionExecutor:
         print(f"Using guidance scale: {self.guidance_scale}")
 
         self.app_opts = AppOptions(
-            retrieve_context=self.models_path,            # directory with the 3 .bin files
+            retrieve_contexts=[
+                os.path.join(self.models_path, self.text_encoder_model),
+                os.path.join(self.models_path, self.unet_model),
+                os.path.join(self.models_path, self.vae_model),
+            ],
             backend_path="/usr/lib/libQnnHtp.so",
             system_library="/usr/lib/libQnnSystem.so",
             input_list_paths="",                          # will be set per run
@@ -268,7 +290,7 @@ class StableDiffusionExecutor:
         Returns:
             np.ndarray: Text embeddings
         """
-        model_path = f'{self.models_path}/stable_diffusion_v2_1-text_encoder-qualcomm_sa8775p.bin'
+        model_path = os.path.join(self.models_path, self.text_encoder_model)
         output_data = self.run_qnn_net_run("textencoder", model_path, [input_data])
         # Output of Text encoder should be of shape (1, 77, hidden_size)
         output_data = output_data.reshape((1, 77, self.hidden_size))
@@ -304,7 +326,7 @@ class StableDiffusionExecutor:
                 text_emb_data = text_emb_data.reshape(1, 77, 1024)
 
         # Run the model
-        model_path = f'{self.models_path}/stable_diffusion_v2_1-unet-qualcomm_sa8775p.bin'
+        model_path = os.path.join(self.models_path, self.unet_model)
         output_data = self.run_qnn_net_run("unet", model_path, [timestep_data, latent_data, text_emb_data])
 
         # Output of UNet should be of shape (1, 64, 64, 4)
@@ -328,7 +350,7 @@ class StableDiffusionExecutor:
                 latent_data = latent_data.reshape(1, 64, 64, 4)
 
         # Run the model
-        model_path = f'{self.models_path}/stable_diffusion_v2_1-vae-qualcomm_sa8775p.bin'
+        model_path = os.path.join(self.models_path, self.vae_model)
         output_data = self.run_qnn_net_run("vae", model_path, [latent_data])
 
         # Output of VAE should be of shape (1, 512, 512, 3)

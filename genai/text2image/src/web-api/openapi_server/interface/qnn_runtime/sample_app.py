@@ -148,21 +148,16 @@ class QnnSampleApp:
         Returns a list of context-binary paths to load.
 
         Priority:
-          1) opts.retrieve_contexts (list or comma/semicolon-separated string)
-          2) opts.retrieve_context:
-             - if directory: look for the 3 Stable Diffusion component bins
-             - if string with commas/semicolons: split
-             - else: single path
-        """
-        candidates = [
-            "stable_diffusion_v2_1-vae-qualcomm_sa8775p.bin",
-            "stable_diffusion_v2_1-text_encoder-qualcomm_sa8775p.bin",
-            "stable_diffusion_v2_1-unet-qualcomm_sa8775p.bin",
-        ]
+          1) opts.retrieve_contexts (list or comma/semicolon-separated string of explicit file paths)
+          2) opts.retrieve_context (single file path or comma/semicolon-separated file paths)
 
+        Passing a directory is not supported and raises a ValueError. Callers must always
+        provide explicit model file paths (e.g., constructed from model filenames in the
+        config joined with the MODELS_PATH environment variable).
+        """
         paths: List[str] = []
 
-        # 1) Explicit list param (if AppOptions exposes it)
+        # 1) Explicit list param — primary path (full model file paths from config)
         rc_list = getattr(self.opts, "retrieve_contexts", None)
         if rc_list:
             if isinstance(rc_list, (list, tuple)):
@@ -171,21 +166,20 @@ class QnnSampleApp:
                 parts = [p.strip() for p in rc_list.replace(";", ",").split(",") if p.strip()]
                 paths.extend(parts)
 
-        # 2) Fallback to retrieve_context
+        # 2) Fallback to retrieve_context (must be a file path, not a directory)
         if not paths:
             rc = getattr(self.opts, "retrieve_context", None)
             if rc:
                 if os.path.isdir(rc):
-                    for name in candidates:
-                        p = os.path.join(rc, name)
-                        if os.path.exists(p):
-                            paths.append(p)
+                    raise ValueError(
+                        f"retrieve_context '{rc}' is a directory. "
+                        "Provide explicit model file paths via retrieve_contexts instead."
+                    )
+                if any(sep in rc for sep in [",", ";"]):
+                    parts = [p.strip() for p in rc.replace(";", ",").split(",") if p.strip()]
+                    paths.extend(parts)
                 else:
-                    if any(sep in rc for sep in [",", ";"]):
-                        parts = [p.strip() for p in rc.replace(";", ",").split(",") if p.strip()]
-                        paths.extend(parts)
-                    else:
-                        paths.append(rc)
+                    paths.append(rc)
 
         # Deduplicate while preserving order
         dedup, seen = [], set()
@@ -193,6 +187,10 @@ class QnnSampleApp:
             if p not in seen:
                 dedup.append(p)
                 seen.add(p)
+
+        print(f"[INFO] Resolved {len(dedup)} model context path(s) to load:")
+        for p in dedup:
+            print(f"  {p}")
 
         return dedup
 
