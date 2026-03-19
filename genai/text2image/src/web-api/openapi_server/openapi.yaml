@@ -1,0 +1,292 @@
+openapi: 3.0.3
+info:
+  title: Image Generation and Model Listing API
+  version: 1.0.0
+  description: OpenAI-compliant API for generating images using Qualcomm 9100/9075 devices.
+tags:
+- name: Image
+  description: Operations related to image generation.
+- name: Models
+  description: Operations related to model listing.
+paths:
+  /v1/images/generations:
+    post:
+      tags:
+      - Image
+      summary: Generate image from text prompt
+      description: Generates images from scratch based on a text prompt using supported models.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageGenerationRequest'
+      responses:
+        '200':
+          description: Image generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageResponse'
+
+  /v1/models:
+    get:
+      tags:
+      - Models
+      summary: List available models
+      description: Returns a list of available models for image generation.
+      responses:
+        '200':
+          description: A list of available models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelListResponse'
+
+  /v1/health:
+    get:
+      tags:
+      - Health
+      summary: Check the health of microservice
+      description: Health Check of various dependencies
+      operationId: healthcheck
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UsageRead'
+
+  /v1/ping:
+    get:
+      tags:
+      - Ping
+      summary: Check if server is accessible to the client
+      description: Ping the server to check it's alive and well. Ping will return
+        Pong if you provide the correct BearerToken
+      operationId: ping
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PingResponse'
+
+components:
+  schemas:
+    ImageGenerationRequest:
+      type: object
+      required:
+        - prompt
+      description: Request schema for generating images from a text prompt.
+      properties:
+        prompt:
+          type: string
+          description: A text description of the desired image(s).
+        background:
+          type: string
+          nullable: true
+          enum: [transparent, opaque, auto]
+          default: auto
+          description: Sets transparency for the background.
+        model:
+          oneOf:
+           - type: string
+             enum: [stable-diffusion-2.1, stable-diffusion-1.5]
+           - type: string
+          default: stable-diffusion-2.1
+          description: The model to use for image generation. You may specify a known or custom model name.
+        moderation:
+          type: string
+          nullable: true
+          enum: [low, auto]
+          default: auto
+          description: Controls content-moderation level.
+        n:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 1
+          default: 1
+          description: Number of images to generate.
+        output_compression:
+          type: integer
+          nullable: true
+          minimum: 0
+          maximum: 100
+          default: 100
+          description: Compression level for generated images.
+        output_format:
+          type: string
+          nullable: true
+          enum: [png, jpeg, webp]
+          default: png
+          description: Format of the generated images.
+        partial_images:
+          type: integer
+          minimum: 0
+          maximum: 0
+          default: 0
+          description: Number of partial images to generate for streaming.
+        quality:
+          type: string
+          nullable: true
+          enum: [auto, high, medium, low, hd, standard]
+          default: auto
+          description: Quality of the generated image.
+        response_format:
+          type: string
+          nullable: true
+          enum: [url, b64_json]
+          default: url
+          description: Format in which images are returned.
+        size:
+          type: string
+          nullable: true
+          enum: [512x512]
+          default: 512x512
+          description: Size of the generated image.
+        stream:
+          type: boolean
+          nullable: true
+          default: false
+          description: Enables streaming mode.
+        style:
+          type: string
+          nullable: true
+          enum: [vivid, natural]
+          default: vivid
+          description: Style of the generated image.
+        user:
+          type: string
+          description: Unique identifier for the end-user.
+
+    ImageResponse:
+      type: object
+      description: Represents the response returned after image generation.
+      properties:
+        background:
+          type: string
+          enum: [transparent, opaque]
+          description: Indicates the background setting used for the image generation.
+        created:
+          type: integer
+          description: The Unix timestamp (in seconds) of when the image was created.
+        data:
+          type: array
+          description: The list of generated images.
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+                description: The URL of the generated image.
+              b64_json:
+                type: string
+                description: The base64-encoded JSON of the generated image.
+              revised_prompt:
+                type: string
+                description: Revised prompt used for generation.
+        output_format:
+          type: string
+          enum: [png, jpeg, webp]
+          description: Format of the generated image.
+        quality:
+          type: string
+          enum: [low, medium, high]
+          description: Quality of the generated image.
+        size:
+          type: string
+          enum: [512 x 512]
+          description: Size of the generated image.
+        usage:
+          type: object
+          description: Token usage information.
+          properties:
+            input_tokens:
+              type: integer
+              description: Total number of input tokens.
+            input_tokens_details:
+              type: object
+              description: Breakdown of input tokens.
+              properties:
+                image_tokens:
+                  type: integer
+                  description: Number of image tokens.
+                text_tokens:
+                  type: integer
+                  description: Number of text tokens.
+            output_tokens:
+              type: integer
+              description: Number of output tokens.
+            total_tokens:
+              type: integer
+              description: Total tokens used.
+
+    ModelListResponse:
+      type: object
+      description: Response schema for listing available models.
+      properties:
+        object:
+          type: string
+          description: The object type, typically 'list'.
+        data:
+          type: array
+          description: List of available models.
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: Unique identifier for the model.
+              object:
+                type: string
+                description: Object type, typically 'model'.
+              created:
+                type: integer
+                description: Unix timestamp of model creation.
+              owned_by:
+                type: string
+                description: Owner of the model.
+
+    UsageRead:
+      type: object
+      description: Health status of a dependency or service.
+      required:
+        - userid
+        - date_bin
+        - total_input_tokens
+        - total_output_tokens
+        - total_tokens
+        - total_generation_time
+      properties:
+        date_bin:
+          type: string
+          format: date-time
+        total_generation_time:
+          type: number
+          format: float
+        total_input_tokens:
+          type: integer
+          format: int32
+        total_output_tokens:
+          type: integer
+          format: int32
+        total_tokens:
+          type: integer
+          format: int32
+        userid:
+          type: string
+
+    PingResponse:
+      type: object
+      description: Response returned by the ping endpoint.
+      required:
+        - message
+      properties:
+        message:
+          type: string
