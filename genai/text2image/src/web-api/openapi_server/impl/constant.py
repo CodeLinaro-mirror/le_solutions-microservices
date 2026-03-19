@@ -36,3 +36,4 @@ class ErrorMessages:
     MEM_ALLOCATION_ERR = "Memory allocation error"
     CHAT_ID_EXISTS = "Converstaion already in progress with chat id: "
     MAX_MSG_LIMIT_REACHED = "You've hit the maximum message count for this chat. Start a new conversation to proceed."
+    INVALID_PROMPT = "Prompt must contain meaningful text. Please provide a description with alphabetic characters."
