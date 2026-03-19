@@ -7,6 +7,105 @@
 
 #include "llm-service.hpp"
 
+namespace {
+struct ReasoningMarkerPair {
+    std::string begin;
+    std::string end;
+};
+
+const std::vector<ReasoningMarkerPair> kReasoningMarkers = {
+    {"<think>", "</think>"},
+};
+
+size_t longestSuffixPrefix(const std::string& data, const std::string& token) {
+    const size_t max_len = std::min(token.size() - 1, data.size());
+    for (size_t len = max_len; len > 0; --len) {
+        if (data.compare(data.size() - len, len, token, 0, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+size_t longestSuffixPrefixAny(const std::string& data, const std::vector<ReasoningMarkerPair>& markers) {
+    size_t best = 0;
+    for (const auto& marker : markers) {
+        const size_t suffix = longestSuffixPrefix(data, marker.begin);
+        if (suffix > best) {
+            best = suffix;
+        }
+    }
+    return best;
+}
+
+bool findNextBegin(const std::string& data,
+                   size_t start,
+                   const std::vector<ReasoningMarkerPair>& markers,
+                   size_t& out_pos,
+                   const ReasoningMarkerPair*& out_marker) {
+    size_t best_pos = std::string::npos;
+    const ReasoningMarkerPair* best_marker = nullptr;
+    for (const auto& marker : markers) {
+        size_t pos = data.find(marker.begin, start);
+        if (pos != std::string::npos && (best_marker == nullptr || pos < best_pos)) {
+            best_pos = pos;
+            best_marker = &marker;
+        }
+    }
+    if (best_marker == nullptr) {
+        return false;
+    }
+    out_pos = best_pos;
+    out_marker = best_marker;
+    return true;
+}
+
+std::string filterThinkBlocks(const std::string& chunk, QueryStruct* qmtx) {
+    std::string data = qmtx->think_carry + chunk;
+    qmtx->think_carry.clear();
+
+    std::string out;
+    size_t pos = 0;
+
+    while (pos < data.size()) {
+        if (qmtx->in_think) {
+            size_t end_pos = data.find(qmtx->active_think_end, pos);
+            if (end_pos == std::string::npos) {
+                size_t suffix = longestSuffixPrefix(data, qmtx->active_think_end);
+                if (suffix > 0) {
+                    qmtx->think_carry = data.substr(data.size() - suffix);
+                }
+                return out;
+            }
+            pos = end_pos + qmtx->active_think_end.size();
+            qmtx->in_think = false;
+            qmtx->active_think_end.clear();
+            continue;
+        }
+
+        size_t begin_pos = std::string::npos;
+        const ReasoningMarkerPair* marker = nullptr;
+        if (!findNextBegin(data, pos, kReasoningMarkers, begin_pos, marker)) {
+            size_t suffix = longestSuffixPrefixAny(data, kReasoningMarkers);
+            if (suffix > 0) {
+                out.append(data, pos, data.size() - pos - suffix);
+                qmtx->think_carry = data.substr(data.size() - suffix);
+            } else {
+                out.append(data, pos, std::string::npos);
+            }
+            return out;
+        }
+
+        out.append(data, pos, begin_pos - pos);
+        pos = begin_pos + marker->begin.size();
+        qmtx->in_think = true;
+        qmtx->active_think_end = marker->end;
+    }
+
+    return out;
+}
+}  // namespace
+
 Profile::Profile() {
     const int32_t status = GenieProfile_create(nullptr, &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
@@ -165,10 +264,17 @@ void Dialog::queryCallback(const char* responseStr,
     QueryStruct* qmtx = static_cast<QueryStruct*>(const_cast<void*>(userData));
     if (*qmtx->stream == false) { // Non Streaming
         if (responseStr && qmtx->responseStr) {
-          *(qmtx->responseStr) += responseStr;
+          std::string filtered = filterThinkBlocks(responseStr, qmtx);
+          if (!filtered.empty()) {
+            *(qmtx->responseStr) += filtered;
+          }
         }
 
         if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
+          qmtx->in_think = false;
+          qmtx->think_carry.clear();
+          qmtx->active_think_end.clear();
+
           std::unique_ptr<Response> response = std::make_unique<Response>();
           strlcpy(response->model, qmtx->llmObj->modelSelected, sizeof(response->model));
           Message message;
@@ -192,19 +298,25 @@ void Dialog::queryCallback(const char* responseStr,
       strlcpy(message.role, "assistant", sizeof(message.role));
 
       if (responseStr) {
-        //Token by Token
+        std::string filtered = filterThinkBlocks(responseStr, qmtx);
+        if (!filtered.empty()) {
+          //Token by Token
+          strlcpy(message.content, filtered.c_str(), sizeof(message.content));
+          response->choices[0].message = message;
 
-        strlcpy(message.content, responseStr, sizeof(message.content));
-        response->choices[0].message = message;
-
-        if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
-          qmtx->llmObj->responseCallback(response.get());
-        } else {
-          std::cout << "Callback NOT Registered" << std::endl;
+          if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
+            qmtx->llmObj->responseCallback(response.get());
+          } else {
+            std::cout << "Callback NOT Registered" << std::endl;
+          }
         }
       }
 
       if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
+        qmtx->in_think = false;
+        qmtx->think_carry.clear();
+        qmtx->active_think_end.clear();
+
         std::unique_ptr<Response> endResponse = std::make_unique<Response>();
         Message message;
 
@@ -286,6 +398,9 @@ void LLMObject::chat_completion_create () {
     qmtx.responseStr = &responseText;
     qmtx.stream = &stream;
     qmtx.llmObj = this;
+    qmtx.in_think = false;
+    qmtx.think_carry.clear();
+    qmtx.active_think_end.clear();
 
     diag->query(prompt, GenieDialog_SentenceCode_t::GENIE_DIALOG_SENTENCE_COMPLETE, &qmtx);
 

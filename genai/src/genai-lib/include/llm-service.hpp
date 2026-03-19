@@ -149,6 +149,9 @@ typedef struct {
     std::string* responseStr;
     bool* stream;
     LLMObject* llmObj;
+    bool in_think = false;
+    std::string think_carry;
+    std::string active_think_end;
 } QueryStruct;
 
 #endif// LLM_SERVICE_H
