@@ -29,6 +29,7 @@ class SessionManager:
 
     MAX_SESSIONS = 100
     SESSION_TTL = 3600  # 1 hour
+    TIMED_OUT_TOOL_CALL_TTL = 300  # 5 minutes
 
     def __new__(cls):
         if cls._instance is None:
@@ -44,6 +45,7 @@ class SessionManager:
             self._sessions: Dict[str, ConversationSession] = {}  # session_id -> session
             self._hash_to_session: Dict[str, str] = {}  # hash -> session_id (for completed turns)
             self._tool_calling_map: Dict[str, str] = {}  # event_hash -> session_id (for in-progress tool calls)
+            self._timed_out_tool_call_map: Dict[str, Tuple[str, float]] = {}  # event_hash -> (session_id, expires_at)
             self._lock = threading.RLock()
             self._initialized = True
             logger.info("SessionManager initialized")
@@ -64,6 +66,7 @@ class SessionManager:
         """
         with self._lock:
             self._tool_calling_map[event_hash] = session_id
+            self._timed_out_tool_call_map.pop(event_hash, None)
             logger.info(f"Registered tool calling event hash {event_hash[:8]}... for session {session_id}")
 
     def unregister_tool_calling_event(self, event_hash: str) -> None:
@@ -78,6 +81,33 @@ class SessionManager:
                 session_id = self._tool_calling_map[event_hash]
                 del self._tool_calling_map[event_hash]
                 logger.info(f"Unregistered tool calling event hash {event_hash[:8]}... for session {session_id}")
+
+    def register_timed_out_tool_call(self, event_hash: str, session_id: str, ttl_seconds: Optional[int] = None) -> None:
+        """
+        Register a timed-out tool calling event hash for deterministic late-response handling.
+        """
+        expires_at = time.time() + (ttl_seconds if ttl_seconds is not None else self.TIMED_OUT_TOOL_CALL_TTL)
+        with self._lock:
+            self._tool_calling_map.pop(event_hash, None)
+            self._timed_out_tool_call_map[event_hash] = (session_id, expires_at)
+            logger.info(f"Registered timed-out tool hash {event_hash[:8]}... for session {session_id}")
+
+    def is_timed_out_tool_call(self, event_hash: str) -> bool:
+        """
+        Check whether an event hash belongs to a recently timed-out tool call.
+        Expired or stale entries are cleaned up automatically.
+        """
+        with self._lock:
+            entry = self._timed_out_tool_call_map.get(event_hash)
+            if not entry:
+                return False
+
+            session_id, expires_at = entry
+            if time.time() > expires_at or session_id not in self._sessions:
+                self._timed_out_tool_call_map.pop(event_hash, None)
+                return False
+
+            return True
 
     def create_session(self, chat_completion_id: str, user_id: str) -> ConversationSession:
         """
@@ -183,6 +213,19 @@ class SessionManager:
                     else:
                         # Stale entry
                         del self._tool_calling_map[tool_call_hash]
+
+                # 4. Try timed-out tool calling map - for late tool responses
+                is_tool_response_request = ConversationUtils.safe_get(messages[-1], "role") == "tool"
+                if is_tool_response_request and tool_call_hash in self._timed_out_tool_call_map:
+                    session_id, expires_at = self._timed_out_tool_call_map[tool_call_hash]
+                    if time.time() > expires_at:
+                        del self._timed_out_tool_call_map[tool_call_hash]
+                    elif session_id in self._sessions:
+                        session = self._sessions[session_id]
+                        logger.info(f"Found timed-out tool session {session_id} by hash {tool_call_hash[:8]}...")
+                        return session, False
+                    else:
+                        del self._timed_out_tool_call_map[tool_call_hash]
 
             # Create new session
             chat_completion_id = f"chat-{uuid.uuid4()}"
@@ -303,6 +346,17 @@ class SessionManager:
                     del self._tool_calling_map[k]
                 logger.debug(f"Removed {len(tool_keys_to_remove)} tool calling mappings for session {session_id}")
 
+                # Remove from timed-out tool calling map
+                timed_out_tool_keys_to_remove = [
+                    k for k, (mapped_session_id, _) in self._timed_out_tool_call_map.items()
+                    if mapped_session_id == session_id
+                ]
+                for k in timed_out_tool_keys_to_remove:
+                    del self._timed_out_tool_call_map[k]
+                logger.debug(
+                    f"Removed {len(timed_out_tool_keys_to_remove)} timed-out tool mappings for session {session_id}"
+                )
+
                 # Delete the session
                 del self._sessions[session_id]
                 logger.info(f"Successfully deleted session {session_id} with complete resource cleanup")
@@ -344,6 +398,17 @@ class SessionManager:
                 if hash_key in self._hash_to_session:
                     del self._hash_to_session[hash_key]
 
+                # Remove from tool calling maps
+                tool_keys_to_remove = [k for k, v in self._tool_calling_map.items() if v == session_id]
+                for k in tool_keys_to_remove:
+                    del self._tool_calling_map[k]
+                timed_out_tool_keys_to_remove = [
+                    k for k, (mapped_session_id, _) in self._timed_out_tool_call_map.items()
+                    if mapped_session_id == session_id
+                ]
+                for k in timed_out_tool_keys_to_remove:
+                    del self._timed_out_tool_call_map[k]
+
                 del self._sessions[session_id]
                 logger.info(f"Removed inactive session {session_id} (TTL exceeded)")
 
@@ -367,6 +432,17 @@ class SessionManager:
                     hash_key = session.calculate_hash()
                     if hash_key in self._hash_to_session:
                         del self._hash_to_session[hash_key]
+
+                    # Remove from tool calling maps
+                    tool_keys_to_remove = [k for k, v in self._tool_calling_map.items() if v == session_id]
+                    for k in tool_keys_to_remove:
+                        del self._tool_calling_map[k]
+                    timed_out_tool_keys_to_remove = [
+                        k for k, (mapped_session_id, _) in self._timed_out_tool_call_map.items()
+                        if mapped_session_id == session_id
+                    ]
+                    for k in timed_out_tool_keys_to_remove:
+                        del self._timed_out_tool_call_map[k]
 
                     del self._sessions[session_id]
                     logger.info(f"Removed old session {session_id} (capacity limit)")
@@ -402,7 +478,9 @@ class SessionManager:
                 "unique_users": len(users),
                 "max_sessions": self.MAX_SESSIONS,
                 "session_ttl": self.SESSION_TTL,
-                "hash_mappings": len(self._hash_to_session)
+                "hash_mappings": len(self._hash_to_session),
+                "tool_call_mappings": len(self._tool_calling_map),
+                "timed_out_tool_mappings": len(self._timed_out_tool_call_map)
             }
 
     def clear_all_sessions(self):
@@ -421,4 +499,5 @@ class SessionManager:
             self._sessions.clear()
             self._hash_to_session.clear()
             self._tool_calling_map.clear()
+            self._timed_out_tool_call_map.clear()
             logger.warning("Cleared all sessions")

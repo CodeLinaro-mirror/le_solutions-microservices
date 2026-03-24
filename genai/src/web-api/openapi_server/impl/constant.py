@@ -24,6 +24,7 @@ class HttpStatusCodes:
     UNAUTHORIZED = 401
     FORBIDDEN = 403
     NOT_FOUND = 404
+    REQUEST_TIMEOUT = 408
 
     # Server error responses
     INTERNAL_SERVER_ERROR = 500
@@ -154,6 +155,11 @@ class ModelConfigConstants:
 # When enabled, LLM handles are created and destroyed for each conversation turn
 # This prevents QAIRT handle conflicts when multiple containers access the same NSP
 ADHOC_MODE = os.getenv("ADHOC_MODE", "false").lower() in ("true", "1", "yes", "on")
+
+try:
+    TOOL_RESPONSE_TIMEOUT_SECONDS = max(1, int(os.getenv("TOOL_RESPONSE_TIMEOUT_SECONDS", "30")))
+except (TypeError, ValueError):
+    TOOL_RESPONSE_TIMEOUT_SECONDS = 30
 
 class SystemResourceConstants:
     """

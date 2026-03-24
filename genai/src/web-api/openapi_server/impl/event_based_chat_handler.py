@@ -23,12 +23,19 @@ from openapi_server.models.completion_usage import CompletionUsage
 from openapi_server.models.error import Error
 from openapi_server.managers.session_manager import SessionManager
 from openapi_server.session.conversation_session import ConversationSession
+from openapi_server.session.conversation_utils import ConversationUtils
 from openapi_server.events.text_conversation_event import TextConversationEvent
 from openapi_server.events.vision_conversation_event import VisionConversationEvent
 from openapi_server.session.tool_handler import ToolHandler
 from openapi_server.utils.image_validator import has_image_content
 from openapi_server.managers.model_config_manager import ModelConfigManager
-from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages, Parameters, LLMServiceKeys
+from openapi_server.impl.constant import (
+    HttpStatusCodes,
+    ErrorMessages,
+    Parameters,
+    LLMServiceKeys,
+    TOOL_RESPONSE_TIMEOUT_SECONDS,
+)
 from openapi_server.logger.logger_config import LoggerConfig
 
 LoggerConfig.initialize()
@@ -121,16 +128,47 @@ class EventBasedChatHandler:
             is_new = len(session.messages) == 0
 
             logger.info(f"Session: {chat_completion_id} (new={is_new}, existing_messages={len(session.messages)})")
+            session_mgr = SessionManager.get_instance()
+            is_tool_response_request = messages[-1].get('role') == 'tool'
+
+            if is_tool_response_request:
+                user_messages_for_hash = [msg for msg in messages if msg.get('role') == 'user']
+                if user_messages_for_hash:
+                    tool_call_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages_for_hash)
+                    if session_mgr.is_timed_out_tool_call(tool_call_hash):
+                        raise HTTPException(
+                            status_code=HttpStatusCodes.REQUEST_TIMEOUT,
+                            detail="Tool response timed out. Please retry the turn."
+                        )
 
             # STEP 1: Check if we're continuing a tool calling event FIRST
             # This must be checked before calculating new_messages to handle tool continuations correctly
             current_event = session.get_current_event()
-            is_tool_continuation = (
+            has_active_tool_call = (
                 current_event and
                 current_event.is_active() and
-                current_event._is_tool_calling and
-                messages[-1].get('role') == 'tool'
+                current_event._is_tool_calling
             )
+            is_tool_continuation = has_active_tool_call and is_tool_response_request
+
+            if current_event and is_tool_response_request:
+                if current_event.tool_wait_timed_out or current_event.has_tool_response_timed_out():
+                    raise HTTPException(
+                        status_code=HttpStatusCodes.REQUEST_TIMEOUT,
+                        detail="Tool response timed out. Please retry the turn."
+                    )
+
+            if is_tool_response_request and not is_tool_continuation:
+                raise HTTPException(
+                    status_code=HttpStatusCodes.REQUEST_TIMEOUT,
+                    detail="No active tool call is waiting for a response (request timed out)."
+                )
+
+            if has_active_tool_call and not is_tool_response_request:
+                raise HTTPException(
+                    status_code=HttpStatusCodes.CONFLICT,
+                    detail="Tool response required before sending the next user message."
+                )
 
             # STEP 2: Determine new messages based on whether this is a tool continuation
             if is_tool_continuation:
@@ -176,6 +214,14 @@ class EventBasedChatHandler:
             if is_tool_continuation:
                 logger.info("=== CONTINUING TOOL CALLING ===")
 
+                if not current_event.is_active() or current_event.tool_wait_timed_out or current_event.has_tool_response_timed_out():
+                    raise HTTPException(
+                        status_code=HttpStatusCodes.REQUEST_TIMEOUT,
+                        detail="Tool response timed out. Please retry the turn."
+                    )
+
+                current_event.mark_tool_response_received()
+
                 tool_response_parts = []
                 for tool_msg in new_messages:
                     tool_msg_idx = session.add_message(tool_msg)
@@ -207,13 +253,11 @@ class EventBasedChatHandler:
                     current_event.assistant_message = result['response']
 
                     # Unregister from tool calling map since tool calling is complete
-                    from openapi_server.session.conversation_utils import ConversationUtils
                     # Use ONLY user messages for hash (same as registration)
                     user_message_indices = [idx for idx in current_event.message_indices
                                            if session.messages[idx].get('role') == 'user']
                     user_messages = [session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
-                    session_mgr = SessionManager.get_instance()
                     session_mgr.unregister_tool_calling_event(event_hash)
 
                     # Complete the event state
@@ -304,13 +348,12 @@ class EventBasedChatHandler:
 
                     # Register this session in the tool calling map for fallback lookup
                     # Use ONLY user messages for stable hash during tool calling
-                    from openapi_server.session.conversation_utils import ConversationUtils
                     user_message_indices = [idx for idx in event.message_indices
                                            if session.messages[idx].get('role') == 'user']
                     user_messages = [session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
-                    session_mgr = SessionManager.get_instance()
                     session_mgr.register_tool_calling_event(event_hash, session.session_id)
+                    event.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
 
                 elif result['turn_complete']:
                     # Regular response - add assistant message
