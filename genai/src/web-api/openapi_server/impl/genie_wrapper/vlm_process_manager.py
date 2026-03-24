@@ -164,7 +164,7 @@ class VLMProcessManager(InferenceProcessManager):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            top_k=top_k if top_k is not None else -1,
+            top_k=top_k,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             image_data_b64=image_data_b64,

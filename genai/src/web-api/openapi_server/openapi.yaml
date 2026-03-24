@@ -255,6 +255,7 @@ components:
         top_k:
           type: integer
           minimum: 1
+          default: 40
           nullable: true
           description: Top-k sampling parameter. If specified, the sampler considers only the k most likely next tokens at each step. If omitted, the model's configured sampler defaults are used.
       required:
