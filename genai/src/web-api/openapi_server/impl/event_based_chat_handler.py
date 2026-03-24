@@ -134,10 +134,16 @@ class EventBasedChatHandler:
 
             # STEP 2: Determine new messages based on whether this is a tool continuation
             if is_tool_continuation:
-                # Tool continuation - only process the tool message (last message)
-                # This is robust against any session state issues
-                new_messages = [messages[-1]]
-                logger.info(f"Tool continuation detected - processing tool message only")
+                # Tool continuation - process all trailing tool messages
+                trailing_tool_messages = []
+                for msg in reversed(messages):
+                    if msg.get('role') == 'tool':
+                        trailing_tool_messages.append(msg)
+                    else:
+                        break
+
+                new_messages = list(reversed(trailing_tool_messages))
+                logger.info(f"Tool continuation detected - processing {len(new_messages)} trailing tool message(s)")
             else:
                 # New turn - calculate new messages based on session state
                 if is_new:
@@ -170,12 +176,20 @@ class EventBasedChatHandler:
             if is_tool_continuation:
                 logger.info("=== CONTINUING TOOL CALLING ===")
 
-                # Add tool message to session
-                tool_msg_idx = session.add_message(new_messages[-1])
-                current_event.message_indices.append(tool_msg_idx)
+                tool_response_parts = []
+                for tool_msg in new_messages:
+                    tool_msg_idx = session.add_message(tool_msg)
+                    current_event.message_indices.append(tool_msg_idx)
 
-                # Extract tool response content
-                tool_response = new_messages[-1]['content']
+                    tool_call_id = tool_msg.get('tool_call_id', 'unknown')
+                    tool_content = tool_msg.get('content', '')
+
+                    if tool_call_id and tool_call_id != 'unknown':
+                        tool_response_parts.append(f"[tool_call_id={tool_call_id}]\n{tool_content}")
+                    else:
+                        tool_response_parts.append(str(tool_content))
+
+                tool_response = "\n\n".join(tool_response_parts).strip()
 
                 # Continue turn with tool response (now async)
                 result = await current_event.continue_with_tool_response(tool_response, request_data)
