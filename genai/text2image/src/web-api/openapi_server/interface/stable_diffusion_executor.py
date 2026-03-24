@@ -227,7 +227,14 @@ class StableDiffusionExecutor:
         if exit_code != 0:
             # Cleanup before raising, to keep behavior neat
             try:
-                shutil.rmtree(tmp_dirpath)
+                for filename in os.listdir(tmp_dirpath):
+                    file_path = os.path.join(tmp_dirpath, filename)
+
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.remove(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+
             except Exception:
                 pass
             raise RuntimeError(f"QnnSampleApp failed with exit code {exit_code}")
@@ -242,7 +249,12 @@ class StableDiffusionExecutor:
 
         output_data = np.fromfile(output_file_path, dtype=np.float32)
 
-        shutil.rmtree(tmp_dirpath)
+        for filename in os.listdir(tmp_dirpath):
+            file_path = os.path.join(tmp_dirpath, filename)
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.remove(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
 
         return output_data
 

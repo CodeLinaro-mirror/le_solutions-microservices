@@ -64,10 +64,22 @@ RUN pip install ${T2I_SRC_DIR}
 
 FROM python:3.10-slim AS service
 
-#Installing Runtime dependencies
+# Installing Runtime dependencies
+# Install Python 3.12, runtime tools needed by entrypoint.sh
+# (stat/chown from coreutils, groupmod/usermod/runuser from
+# passwd and util-linux, getent from libc-bin)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libatomic1 && \
+    apt-get install -y --no-install-recommends libatomic1 coreutils passwd util-linux libc-bin  && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
+
+# Create groups for fastrpc and dmaheap with placeholder GIDs.
+# The real GIDs are set at container startup by entrypoint.sh.
+RUN groupadd --gid 1500 fastrpc                                                                 && \
+    groupadd --gid 1501 dmaheap
+
+# Create iot-user and add to the placeholder groups
+RUN useradd --create-home --shell /bin/bash                                                        \
+        --groups fastrpc,dmaheap iot-user
 
 # Create directory
 RUN mkdir -p /root/app/site-packages
@@ -79,3 +91,10 @@ COPY --from=builder /mnt/work/venv /mnt/work/venv
 COPY --from=builder /mnt/work/deploy/usr /usr
 
 ENV PATH=/mnt/work/venv/bin:$PATH
+
+# Copy entrypoint script and make it executable
+COPY --chmod=755 entrypoint.sh /entrypoint.sh
+
+# Container starts as root so entrypoint.sh can adjust group IDs,
+# then drops to iot-user before executing the application command.
+ENTRYPOINT ["/entrypoint.sh"]
