@@ -2,7 +2,7 @@
 # Stage 1: Build Stage
 #######################
 
-FROM python:3.10-slim AS builder
+FROM python:3.13-slim AS builder
 
 # Install system dependencies required for Qualcomm SDK and other tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -62,7 +62,7 @@ RUN pip install ${T2I_SRC_DIR}
 # Stage 2: Runtime Stage
 #########################
 
-FROM python:3.10-slim AS service
+FROM debian:trixie-slim AS service
 
 # Installing Runtime dependencies
 # Install Python 3.12, runtime tools needed by entrypoint.sh
@@ -94,6 +94,13 @@ COPY --from=builder /mnt/work/deploy/usr /usr
 RUN mkdir -p /app/default_configs
 COPY --chmod=644 --from=builder /mnt/work/src/web-api/openapi_server/configs/models_config.json \
     /app/default_configs/models_config.json
+
+# Install python3 as a dependency of hypercorn and SWaggerUI web api
+RUN apt-get update && apt-get install -y python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy installed site-packages from builder
+COPY --from=builder /usr/local /usr/local
 
 ENV PATH=/mnt/work/venv/bin:$PATH
 
