@@ -201,3 +201,87 @@ class ChatApiImpl(BaseChatApi):
                 status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR,
                 detail=f"Internal server error: {str(e)}"
             )
+
+    async def cancel_chat_completion(
+        self,
+        completion_id: StrictStr
+    ):
+        """
+        Cancel an actively executing chat completion.
+
+        This will:
+        - If in ADHOC_MODE and queued, remove from queue
+        - If actively executing, force-kill subprocess and roll back session state
+        - Preserve session history integrity
+
+        Args:
+            completion_id: The ID of the chat completion to cancel
+
+        Returns:
+            ChatCompletionCancelled: Cancellation confirmation object
+
+        Raises:
+            HTTPException: If the chat completion is not found or no active event exists
+        """
+        try:
+            from openapi_server.models.chat_completion_cancelled import ChatCompletionCancelled
+
+            logger.info(f"=== CANCEL CHAT COMPLETION: {completion_id} ===")
+
+            session_manager = SessionManager.get_instance()
+            session = session_manager.get_session(completion_id)
+
+            if not session:
+                logger.warning(f"Chat completion {completion_id} not found")
+                raise HTTPException(
+                    status_code=HttpStatusCodes.NOT_FOUND,
+                    detail=f"Chat completion {completion_id} not found"
+                )
+
+            if not session.current_event or not session.current_event.is_active():
+                logger.warning(f"No active event for chat completion {completion_id}")
+                raise HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail=f"No active event to cancel for chat completion {completion_id}"
+                )
+
+            logger.info(f"Cancelling active event {session.current_event.event_id} for session {completion_id}")
+
+            # Step 1: Cancel in queue manager if ADHOC_MODE (removes from queue or releases lock)
+            from openapi_server.impl.constant import ADHOC_MODE
+            queue_cancelled = False
+            if ADHOC_MODE:
+                queue_manager = RequestQueueManager.get_instance()
+                queue_cancelled = await queue_manager.cancel_request(completion_id)
+                if queue_cancelled:
+                    logger.info(f"Cancelled queued/active request for session {completion_id}")
+
+            # Step 2: Cancel active event in session (force-kills subprocess, rolls back messages)
+            session_cancelled = session.cancel_active_event()
+
+            if session_cancelled or queue_cancelled:
+                message = "Queued request cancelled" if queue_cancelled and not session_cancelled else \
+                          "Active event cancelled and session state rolled back"
+                logger.info(f"Successfully cancelled chat completion {completion_id}: {message}")
+                return ChatCompletionCancelled(
+                    object="chat.completion.cancelled",
+                    id=completion_id,
+                    cancelled=True,
+                    message=message
+                )
+            else:
+                logger.error(f"Failed to cancel chat completion {completion_id}")
+                raise HTTPException(
+                    status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to cancel chat completion {completion_id}"
+                )
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            logger.error(f"Unexpected error cancelling chat completion {completion_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+                detail=f"Internal server error: {str(e)}"
+            )

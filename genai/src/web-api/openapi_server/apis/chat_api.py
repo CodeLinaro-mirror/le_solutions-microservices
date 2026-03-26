@@ -114,3 +114,32 @@ async def delete_chat_completion(
         raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.NOT_IMPELEMENTED)
 
     return await BaseChatApi.subclasses[0]().delete_chat_completion(completion_id)
+
+
+@router.post(
+    "/v1/cancel/{completion_id}",
+    responses={
+        HttpStatusCodes.OK: {"description": "Chat completion cancelled successfully"},
+        HttpStatusCodes.NOT_FOUND: {"description": "Chat completion not found"},
+        HttpStatusCodes.BAD_REQUEST: {"description": "No active event to cancel"},
+    },
+    tags=[APITags.CHAT],
+    summary="Cancel an active chat completion",
+    response_model_by_alias=True,
+)
+async def cancel_chat_completion(
+    completion_id: Annotated[StrictStr, Path(description="The ID of the chat completion to cancel")],
+):
+    """
+    Cancel an actively executing chat completion.
+
+    This will:
+    - Terminate the subprocess if actively executing
+    - Remove queued request if waiting in queue (ADHOC_MODE)
+    - Roll back session state to last completed event
+    - Preserve session history integrity
+    """
+    if not BaseChatApi.subclasses:
+        raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.NOT_IMPELEMENTED)
+
+    return await BaseChatApi.subclasses[0]().cancel_chat_completion(completion_id)

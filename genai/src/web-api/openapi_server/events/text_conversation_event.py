@@ -23,6 +23,7 @@ from openapi_server.events.text_event_helpers import TextEventHelpers
 from openapi_server.session.token_counter import TokenCounter
 from openapi_server.session.tool_handler import ToolHandler
 from openapi_server.managers.model_config_manager import ModelConfigManager
+from openapi_server.managers.metrics_manager import MetricsManager
 from openapi_server.impl.constant import LLMServiceQueryConstant as QUERY_CONST
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.logger.logger_config import LoggerConfig
@@ -146,6 +147,7 @@ class TextConversationEvent(ConversationEvent):
 
             # Accumulate non-streaming response
             accumulated_content = []
+            non_stream_start = time.time()
             async for token in llm_manager.execute_request(
                 event_id=self.event_id,
                 session_id=self.session.session_id,
@@ -162,6 +164,17 @@ class TextConversationEvent(ConversationEvent):
                 accumulated_content.append(token)
 
             response_content = "".join(accumulated_content)
+
+            # Record non-streaming metrics (TPS approximated as total_tokens / total_time)
+            try:
+                if accumulated_content:
+                    MetricsManager.get_instance().record_inference_metrics(
+                        model_id=self.model_id,
+                        total_pipeline_latency_ms=(time.time() - non_stream_start) * 1000,
+                        tokens_generated=len(accumulated_content),
+                    )
+            except Exception as metrics_err:
+                logger.error(f"Event {self.event_id}: Failed to record non-streaming metrics: {metrics_err}")
 
             if not response_content or response_content.strip() == "":
                 raise ValueError("LLM returned empty response")
@@ -192,6 +205,16 @@ class TextConversationEvent(ConversationEvent):
                 }
 
         except Exception as e:
+            # If cancelled, don't retry — just mark as cancelled and return
+            if self.is_cancelled:
+                logger.info(f"Event {self.event_id}: Non-streaming request cancelled")
+                self.cancel_turn()
+                return {
+                    "response": None,
+                    "finish_reason": "cancelled",
+                    "needs_tool_response": False,
+                    "turn_complete": False,
+                }
             return await self._handle_error(e, request_data)
 
     async def _execute_streaming_inference(self, llm_manager: LLMProcessManager, prompt_content: str, request_data) -> dict:
@@ -199,6 +222,10 @@ class TextConversationEvent(ConversationEvent):
 
         async def stream_generator():
             created_time = int(time.time())
+            stream_start_time = time.time()
+            ttft_timestamp = None          # Time of first token
+            last_token_timestamp = None    # For inter-token latency
+            inter_token_latencies = []     # Collect per-token latencies
 
             # Yield role chunk immediately
             first_chunk = {
@@ -237,6 +264,15 @@ class TextConversationEvent(ConversationEvent):
                     presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
                     frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
                 ):
+                    now = time.time()
+                    # Capture TTFT on first token
+                    if ttft_timestamp is None:
+                        ttft_timestamp = now
+                    # Capture inter-token latency for subsequent tokens
+                    if last_token_timestamp is not None:
+                        inter_token_latencies.append((now - last_token_timestamp) * 1000)
+                    last_token_timestamp = now
+
                     completion_tokens += 1
                     full_response_content.append(token)
 
@@ -398,29 +434,63 @@ class TextConversationEvent(ConversationEvent):
                     await self._completion_callback(self.event_id, self.state)
 
             except Exception as e:
-                logger.error(f"Error in stream generator: {e}")
-                self.terminate_handle(force=True)
+                # Check if this error is due to cancellation
+                if self.is_cancelled or "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
+                    logger.info(f"Event {self.event_id}: Stream terminated due to cancellation")
+                    # Don't yield error chunk for cancelled requests
+                else:
+                    logger.error(f"Error in stream generator: {e}", exc_info=True)
+                    self.terminate_handle(force=True)
 
-                from openapi_server.impl.constant import GenieErrorMappings
-                error_msg = str(e)
-                layman_msg = GenieErrorMappings.get_layman_message(error_msg)
-                final_msg = layman_msg if layman_msg else error_msg
+                    from openapi_server.impl.constant import GenieErrorMappings
+                    error_msg = str(e)
+                    layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                    final_msg = layman_msg if layman_msg else error_msg
 
-                error_payload = {
-                    "error": {
-                        "message": final_msg,
-                        "type": "server_error",
-                        "param": None,
-                        "code": 500
+                    error_payload = {
+                        "error": {
+                            "message": final_msg,
+                            "type": "server_error",
+                            "param": None,
+                            "code": 500
+                        }
                     }
-                }
-                yield f"data: {json.dumps(error_payload)}\n\n"
+                    yield f"data: {json.dumps(error_payload)}\n\n"
             finally:
-                # Always ensure event is completed and callback triggered
-                # This prevents deadlock in ADHOC_MODE when LLM initialization fails
+                # Submit metrics to MetricsManager
+                try:
+                    if completion_tokens > 0:
+                        total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
+                        ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
+                        avg_stream_latency_ms = (
+                            sum(inter_token_latencies) / len(inter_token_latencies)
+                            if inter_token_latencies else None
+                        )
+                        MetricsManager.get_instance().record_inference_metrics(
+                            model_id=self.model_id,
+                            total_pipeline_latency_ms=total_pipeline_latency_ms,
+                            tokens_generated=completion_tokens,
+                            ttft_ms=ttft_ms,
+                            avg_stream_latency_ms=avg_stream_latency_ms,
+                        )
+                        logger.debug(
+                            f"Event {self.event_id}: LLM metrics — "
+                            f"TTFT={ttft_ms:.1f}ms, "
+                            f"StreamLatency={avg_stream_latency_ms:.1f}ms, "
+                            f"Total={total_pipeline_latency_ms:.1f}ms, "
+                            f"Tokens={completion_tokens}"
+                        )
+                except Exception as metrics_err:
+                    logger.error(f"Event {self.event_id}: Failed to record metrics: {metrics_err}")
+
+                # Always ensure event is completed/cancelled/failed and callback triggered
                 if self.state == EventState.ACTIVE:
-                    logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
-                    self.fail_turn(Exception("Stream aborted or failed"))
+                    if self.is_cancelled:
+                        logger.info(f"Event {self.event_id}: Stream ended due to cancellation")
+                        self.cancel_turn()
+                    else:
+                        logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
+                        self.fail_turn(Exception("Stream aborted or failed"))
 
                 if self._completion_callback:
                     logger.info(f"Event {self.event_id}: Triggering completion callback in finally block")
@@ -602,7 +672,12 @@ class TextConversationEvent(ConversationEvent):
             logger.error(f"Event {self.event_id}: Error resetting LLM handle: {e}")
 
     def terminate_handle(self, force: bool = False):
-        """Forcefully destroy the handle/process."""
+        """
+        Terminate the handle/process.
+
+        Args:
+            force: If True, force kill subprocess immediately (for cancellation)
+        """
         try:
             LLMProcessManager.get_instance().shutdown(force=force)
         except Exception as e:

@@ -427,6 +427,9 @@ class InferenceProcessManager(ABC):
             return response
         except socket.timeout:
             raise TimeoutError(f"Timeout waiting for response ({timeout}s)")
+        except ValueError as e:
+            # "I/O operation on closed file" — process was force-killed (cancellation)
+            raise EOFError(f"{self.process_type.upper()} process socket closed (force-killed): {e}")
         except Exception as e:
             if isinstance(e, (EOFError, TimeoutError)):
                 raise
@@ -449,9 +452,14 @@ class InferenceProcessManager(ABC):
             logger.error(f"Error resetting {self.process_type.upper()} handle: {e}")
             raise
 
-    def _cleanup_process(self):
-        """Cleanup subprocess and resources."""
-        logger.info(f"Cleaning up {self.process_type.upper()} process")
+    def _cleanup_process(self, force: bool = False):
+        """
+        Cleanup subprocess and resources.
+
+        Args:
+            force: If True, kill process immediately (SIGKILL) without graceful termination
+        """
+        logger.info(f"Cleaning up {self.process_type.upper()} process (force={force})")
 
         # Unregister from resource manager
         self._unregister_process()
@@ -493,16 +501,23 @@ class InferenceProcessManager(ABC):
             # Terminate process
             if self.process:
                 if self.process.poll() is None:
-                    logger.info(f"Terminating {self.process_type.upper()} process (PID: {self.process.pid})")
-                    self.process.terminate()
-
-                    # Wait for graceful shutdown
-                    try:
-                        self.process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"{self.process_type.upper()} process did not terminate, killing")
+                    if force:
+                        # Force kill immediately (SIGKILL) — used for cancellation
+                        logger.info(f"Force killing {self.process_type.upper()} process (PID: {self.process.pid})")
                         self.process.kill()
                         self.process.wait()
+                    else:
+                        # Graceful termination (SIGTERM)
+                        logger.info(f"Terminating {self.process_type.upper()} process (PID: {self.process.pid})")
+                        self.process.terminate()
+
+                        # Wait for graceful shutdown
+                        try:
+                            self.process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            logger.warning(f"{self.process_type.upper()} process did not terminate, killing")
+                            self.process.kill()
+                            self.process.wait()
 
                 # Close stdout pipe to unblock the log reader thread
                 try:
@@ -674,7 +689,7 @@ class InferenceProcessManager(ABC):
         logger.info(f"Shutting down {self.process_type.upper()} process manager (force={force})")
 
         if force:
-            self._cleanup_process()
+            self._cleanup_process(force=True)
             return
 
         try:

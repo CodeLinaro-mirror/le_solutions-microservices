@@ -93,6 +93,63 @@ paths:
               schema:
                 $ref: '#/components/schemas/PingResponse'
 
+  /v1/cancel/{completion_id}:
+    post:
+      operationId: cancelChatCompletion
+      tags:
+        - Chat
+      summary: Cancel an active chat completion
+      description: Cancels an actively executing chat completion by terminating the subprocess and rolling back session state.
+      parameters:
+        - name: completion_id
+          in: path
+          required: true
+          description: The ID of the chat completion to cancel
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The chat completion was cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionCancelled"
+        "404":
+          description: The chat completion with the specified ID was not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+        "400":
+          description: No active event to cancel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+
+  /v1/metrics:
+    get:
+      operationId: getMetrics
+      tags:
+        - Metrics
+      summary: Get system and model inference metrics
+      description: >
+        Returns a unified snapshot of live system resource metrics (CPU, memory)
+        and per-model moving averages for all pipeline stages (last 100 requests).
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+
   /v1/models:
     get:
       operationId: listModels
@@ -570,6 +627,124 @@ components:
         - id
         - type
         - function
+
+    MetricsResponse:
+      type: object
+      title: Metrics Response
+      description: Unified snapshot of system resource metrics and per-model inference metrics.
+      properties:
+        system:
+          $ref: '#/components/schemas/SystemMetrics'
+        models:
+          type: object
+          description: >
+            Map of model ID to its moving-average inference metrics.
+            Empty object if no requests have been processed yet.
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInferenceMetrics'
+      required:
+        - system
+        - models
+
+    SystemMetrics:
+      type: object
+      title: System Metrics
+      description: Live system resource utilization.
+      properties:
+        cpu_usage_percent:
+          type: number
+          format: float
+          description: Current CPU utilization (0–100).
+        memory_total_gb:
+          type: number
+          format: float
+          description: Total system memory in GB.
+        memory_used_gb:
+          type: number
+          format: float
+          description: Used system memory in GB.
+        memory_free_gb:
+          type: number
+          format: float
+          description: Available system memory in GB.
+        memory_usage_percent:
+          type: number
+          format: float
+          description: Memory utilization percentage (0–100).
+      required:
+        - cpu_usage_percent
+        - memory_total_gb
+        - memory_used_gb
+        - memory_free_gb
+        - memory_usage_percent
+
+    ModelInferenceMetrics:
+      type: object
+      title: Model Inference Metrics
+      description: >
+        Moving-average pipeline-stage metrics for a single model (last 100 requests).
+        All avg_* fields are null until at least one request has been processed.
+      properties:
+        avg_preprocessing_time_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            Pre-processing stage — average image encode/resize time in ms.
+            Present only for VLM models; null for LLM models.
+        avg_ttft_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            VLM/LLM Inference Start — average Time to First Token in ms.
+        avg_tokens_per_second:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            VLM/LLM Inference Steady-State — average token generation rate (tokens/sec).
+        avg_stream_latency_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            Token Streaming — average inter-token stream latency in ms.
+        avg_total_pipeline_latency_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            End-to-End — average total pipeline latency in ms.
+        total_requests:
+          type: integer
+          description: Total number of requests processed for this model (all time).
+      required:
+        - total_requests
+
+    ChatCompletionCancelled:
+      type: object
+      title: Chat completion cancelled
+      description: Represents the cancellation confirmation of an active chat completion.
+      properties:
+        id:
+          type: string
+          description: The ID of the cancelled chat completion.
+        object:
+          type: string
+          description: The object type, which is always "chat.completion.cancelled".
+          enum:
+            - chat.completion.cancelled
+        cancelled:
+          type: boolean
+          description: Whether the chat completion was successfully cancelled.
+        message:
+          type: string
+          description: Additional information about the cancellation.
+      required:
+        - id
+        - object
+        - cancelled
 
     ChatCompletionDeleted:
       type: object
