@@ -312,18 +312,11 @@ class EventBasedChatHandler:
                     error_msg = str(e)
                     logger.error(f"Event execution failed: {error_msg}")
 
-                    # Determine appropriate HTTP status code based on error message
-                    if "circuit breaker" in error_msg.lower() or "temporarily unavailable" in error_msg.lower():
-                        status_code = HttpStatusCodes.SERVICE_UNAVAILABLE  # 503
-                        error_type = "service_unavailable"
-                    elif "initialization failed" in error_msg.lower() or "failed to create" in error_msg.lower():
-                        status_code = HttpStatusCodes.INTERNAL_SERVER_ERROR  # 500
-                        error_type = "model_initialization_error"
-                    else:
-                        status_code = HttpStatusCodes.INTERNAL_SERVER_ERROR  # 500
-                        error_type = "internal_error"
-
                     from openapi_server.impl.constant import GenieErrorMappings
+                    status_code = GenieErrorMappings.get_http_status_code(
+                        error_msg,
+                        default_status=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+                    )
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
 
                     raise HTTPException(
@@ -384,9 +377,16 @@ class EventBasedChatHandler:
             raise
         except Exception as e:
             logger.error(f"Unexpected error in event-based chat handler: {e}", exc_info=True)
+            from openapi_server.impl.constant import GenieErrorMappings
+            error_msg = str(e)
+            status_code = GenieErrorMappings.get_http_status_code(
+                error_msg,
+                default_status=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+            )
+            layman_msg = GenieErrorMappings.get_layman_message(error_msg)
             raise HTTPException(
-                status_code=500,
-                detail=f"Internal server error: {str(e)}"
+                status_code=status_code,
+                detail=layman_msg if layman_msg else f"Internal server error: {error_msg}"
             )
 
     @staticmethod
@@ -411,10 +411,14 @@ class EventBasedChatHandler:
         if result.get('error'):
             from openapi_server.impl.constant import GenieErrorMappings
             error_msg = result['error']['message']
+            status_code = GenieErrorMappings.get_http_status_code(
+                error_msg,
+                default_status=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+            )
             layman_msg = GenieErrorMappings.get_layman_message(error_msg)
             # Error response
             raise HTTPException(
-                status_code=500,
+                status_code=status_code,
                 detail=layman_msg if layman_msg else error_msg
             )
 

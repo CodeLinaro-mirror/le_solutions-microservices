@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 import os
-
+from typing import Optional
 # GENAI interface file path
 # This path is mounted path of container. Check docker-compose volume section for path in host machine.
 GENAI_INTERFACE_FILE = '/iot-user/app/site-packages/genai_interface.h'
@@ -183,6 +183,55 @@ class GenieErrorMappings:
         "14001": "System resources are busy. Consider using a model with a smaller context size in your requests.",
         "14003": "The system encountered an issue while cleaning up memory."
     }
+
+    SERVICE_UNAVAILABLE_CODES = {"1002","14001"}
+    SERVICE_UNAVAILABLE_PATTERNS = (
+        "system resources are busy",
+        "insufficient system memory",
+        "memory exhaustion",
+        "out of memory",
+        "temporarily unavailable",
+        "cannot proceed even after evicting all idle processes",
+    )
+
+    @classmethod
+    def extract_error_code(cls, error_string: str) -> Optional[str]:
+        """Extract first known Genie SDK code found in error_string."""
+        import re
+        if not error_string:
+            return None
+
+        for code in cls.MAPPINGS:
+            if re.search(rf"\b{code}\b", str(error_string)):
+                return code
+        return None
+
+    @classmethod
+    def is_service_unavailable_error(cls, error_string: str) -> bool:
+        """
+        Determine whether an error is transient/service-level pressure and
+        should be surfaced as HTTP 503.
+        """
+        if not error_string:
+            return False
+
+        code = cls.extract_error_code(error_string)
+        if code in cls.SERVICE_UNAVAILABLE_CODES:
+            return True
+
+        error_lower = str(error_string).lower()
+        return any(pattern in error_lower for pattern in cls.SERVICE_UNAVAILABLE_PATTERNS)
+
+    @classmethod
+    def get_http_status_code(
+        cls,
+        error_string: str,
+        default_status: int = HttpStatusCodes.INTERNAL_SERVER_ERROR,
+    ) -> int:
+        """Map error_string to an HTTP status while preserving non-resource defaults."""
+        if cls.is_service_unavailable_error(error_string):
+            return HttpStatusCodes.SERVICE_UNAVAILABLE
+        return default_status
 
     @classmethod
     def get_layman_message(cls, error_string: str) -> str:

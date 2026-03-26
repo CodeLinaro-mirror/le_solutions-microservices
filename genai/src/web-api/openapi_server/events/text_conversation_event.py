@@ -472,6 +472,7 @@ class TextConversationEvent(ConversationEvent):
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+                    status_code = GenieErrorMappings.get_http_status_code(error_msg, default_status=500)
                     if layman_msg:
                         final_msg = layman_msg
                     else:
@@ -488,7 +489,7 @@ class TextConversationEvent(ConversationEvent):
                             "message": final_msg,
                             "type": "server_error",
                             "param": None,
-                            "code": 500
+                            "code": status_code
                         }
                     }
                     yield f"data: {json.dumps(error_payload)}\n\n"
