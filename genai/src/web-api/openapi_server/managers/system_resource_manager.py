@@ -21,7 +21,7 @@ class ProcessInfo:
     def __init__(self, process_id: str, model_name: str, memory_mb: int, is_active: bool = False):
         self.process_id = process_id
         self.model_name = model_name
-        self.memory_mb = memory_mb
+        self.memory_mb = int(memory_mb)
         self.is_active = is_active
         self.last_accessed = time.time()
         self.created_at = time.time()
@@ -151,7 +151,7 @@ class SystemResourceManager:
             is_active: Whether the process is actively executing
         """
         with self._registry_lock:
-            process_info = ProcessInfo(process_id, model_name, memory_mb, is_active)
+            process_info = ProcessInfo(process_id, model_name, int(memory_mb), is_active)
             self._process_registry[process_id] = process_info
             logger.info(f"Registered process {process_id} for model {model_name} "
                        f"({memory_mb}MB, active={is_active})")

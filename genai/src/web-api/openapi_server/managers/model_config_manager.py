@@ -81,8 +81,9 @@ class ModelConfigManager:
                     # Process the bundle (copy configs, update paths)
                     processed_config_dir = self._process_bundle(bundle_path, bundle_name)
 
-                    # Load the model metadata
-                    with open(model_config_path, 'r') as f:
+                    # Load the model metadata from the PROCESSED config (which has capping applied)
+                    processed_model_config_path = os.path.join(processed_config_dir, "model_config.json")
+                    with open(processed_model_config_path, 'r') as f:
                         model_config_data = json.load(f)
 
                     for model_id, model_info in model_config_data.get("models", {}).items():
@@ -365,17 +366,32 @@ class ModelConfigManager:
     def get_context_size(self, model_id: str) -> int:
         """
         Get the context window size for a specific model.
+        Respects GENAI_CONTEXT_CAPPING as a hard upper bound, even if the
+        model's model_config.json does not define a top-level context.size
+        (in which case _apply_context_capping would not have patched it).
 
         Args:
             model_id: The model identifier
 
         Returns:
-            int: Context window size in tokens
+            int: Context window size in tokens (capped if GENAI_CONTEXT_CAPPING is set)
         """
         model_config = self.get_model_config(model_id)
+        size = 4096  # Default fallback
         if model_config and 'context' in model_config:
-            return model_config['context'].get('size', 4096)
-        return 4096  # Default fallback
+            size = model_config['context'].get('size', 4096)
+
+        # Safety net: always honour GENAI_CONTEXT_CAPPING regardless of whether
+        # model_config.json defines context.size (some bundles only define it in
+        # the engine config, e.g. genie_config.json, not in model_config.json).
+        cap_str = os.getenv("GENAI_CONTEXT_CAPPING")
+        if cap_str:
+            try:
+                size = min(size, int(cap_str))
+            except ValueError:
+                pass
+
+        return size
 
     def get_summarization_threshold(self, model_id: str) -> float:
         """
