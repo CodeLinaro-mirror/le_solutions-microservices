@@ -34,8 +34,7 @@ from fastapi import (  # noqa: F401
 )
 
 from openapi_server.models.extra_models import TokenModel  # noqa: F401
-from typing import List
-from openapi_server.models.usage_read import UsageRead
+from typing import Dict
 
 
 router = APIRouter()
@@ -48,15 +47,22 @@ for _, name, _ in pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + "."):
 @router.get(
     "/v1/health",
     responses={
-        HttpStatusCodes.OK: {APIResponseKeys.MODEL: List[UsageRead], APIResponseKeys.DESCRIPTION: APIDescription.SUCCESS},
+        HttpStatusCodes.OK: {APIResponseKeys.DESCRIPTION: "Service is healthy"},
+        HttpStatusCodes.SERVICE_UNAVAILABLE: {APIResponseKeys.DESCRIPTION: "Service is unhealthy"},
     },
     tags=[APITags.HEALTH],
     summary=APISummary.HEALTH_CHECK,
     response_model_by_alias=True,
 )
-async def healthcheck(
-) -> List[UsageRead]:
-    """Health Check of various dependencies"""
+async def healthcheck():
+    """
+    Health check for container orchestration (Docker Swarm / Kubernetes).
+
+    Returns HTTP 200 when healthy, HTTP 503 when unhealthy.
+    Unhealthy conditions:
+    - Any model has >= 3 consecutive inference failures (DSP/FastRPC fault)
+    - Available system memory < 100 MB
+    """
     if not BaseHealthApi.subclasses:
         raise HTTPException(status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR, detail=ErrorMessages.NOT_IMPELEMENTED)
     return await BaseHealthApi.subclasses[0]().healthcheck()

@@ -434,10 +434,24 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     logger.info(f"VLM Event {event_id}: Stream terminated (likely due to cancellation)")
                 else:
                     logger.error(f"VLM Event {event_id}: Streaming error: {e}", exc_info=True)
+                    # Record failure for health monitoring (not for cancellations)
+                    try:
+                        MetricsManager.get_instance().record_inference_failure(model)
+                    except Exception:
+                        pass
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
-                    final_msg = layman_msg if layman_msg else error_msg
+                    if layman_msg:
+                        final_msg = layman_msg
+                    else:
+                        # Strip internal technical prefixes before showing to user
+                        clean_msg = error_msg
+                        for prefix in ("LLM subprocess error: ", "VLM subprocess error: "):
+                            if clean_msg.startswith(prefix):
+                                clean_msg = clean_msg[len(prefix):]
+                                break
+                        final_msg = clean_msg
 
                     error_payload = {
                         "error": {

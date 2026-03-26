@@ -48,6 +48,8 @@ class ModelMetrics:
         self._total_pipeline_latency_window = deque(maxlen=window_size) # End-to-end (ms)
 
         self._total_requests = 0
+        self._total_failures = 0
+        self._consecutive_failures = 0
         self._lock = threading.Lock()
 
     def record_request(
@@ -59,7 +61,8 @@ class ModelMetrics:
         preprocessing_time_ms: Optional[float] = None,
     ):
         """
-        Record metrics for one completed request.
+        Record metrics for one completed (successful) request.
+        Resets consecutive_failures on success.
 
         Args:
             total_pipeline_latency_ms : End-to-end latency in ms
@@ -86,13 +89,21 @@ class ModelMetrics:
                 self._preprocessing_time_window.append(preprocessing_time_ms)
 
             self._total_requests += 1
+            # Reset consecutive failures on success
+            self._consecutive_failures = 0
 
+    def record_failure(self):
+        """
+        Record an inference failure for this model.
+        Increments both total_failures and consecutive_failures.
+        consecutive_failures is reset to 0 on the next successful request.
+        """
+        with self._lock:
+            self._total_failures += 1
+            self._consecutive_failures += 1
             logger.debug(
-                f"Model {self.model_id}: recorded — "
-                f"TTFT={ttft_ms}ms, TPS={tps if total_pipeline_latency_ms > 0 else 'N/A'}, "
-                f"StreamLatency={avg_stream_latency_ms}ms, "
-                f"TotalLatency={total_pipeline_latency_ms}ms, "
-                f"Preprocessing={preprocessing_time_ms}ms"
+                f"Model {self.model_id}: failure recorded — "
+                f"consecutive={self._consecutive_failures}, total={self._total_failures}"
             )
 
     def get_averages(self) -> Dict:
@@ -113,6 +124,8 @@ class ModelMetrics:
                 "avg_stream_latency_ms": _avg(self._stream_latency_window),
                 "avg_total_pipeline_latency_ms": _avg(self._total_pipeline_latency_window),
                 "total_requests": self._total_requests,
+                "total_failures": self._total_failures,
+                "consecutive_failures": self._consecutive_failures,
             }
             return result
 
@@ -152,6 +165,17 @@ class MetricsManager:
     # ------------------------------------------------------------------
     # Recording
     # ------------------------------------------------------------------
+
+    def record_inference_failure(self, model_id: str):
+        """
+        Record an inference failure for a model (e.g. subprocess crash, SDK error).
+        Does NOT record cancelled requests — only genuine execution failures.
+
+        Args:
+            model_id: Model identifier
+        """
+        model_metrics = self._get_or_create(model_id)
+        model_metrics.record_failure()
 
     def record_inference_metrics(
         self,
