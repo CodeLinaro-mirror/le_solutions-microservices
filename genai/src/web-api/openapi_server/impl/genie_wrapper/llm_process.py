@@ -268,11 +268,13 @@ void llm_reset_object(LLMHandle handle);
             max_tokens = command.get("max_tokens", 1024)
             temperature = command.get("temperature", 0.7)
             top_p = command.get("top_p", 0.9)
+            top_k = command.get("top_k", -1)
             presence_penalty = command.get("presence_penalty", 0.0)
             frequency_penalty = command.get("frequency_penalty", 0.0)
 
             logger.info(f"[{event_id}] Executing LLM request")
             logger.info(f"[{event_id}]   Streaming: {streaming}")
+            logger.info(f"[{event_id}]   Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}")
 
             # Create query structure
             query = self.ffi.new(LLMServiceKeys.QUERY)
@@ -288,6 +290,7 @@ void llm_reset_object(LLMHandle handle);
             CommonUtils.copy_py_int_to_c_field(self.ffi, query, 'max_completion_tokens', max_tokens)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'temperature', temperature)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'top_p', top_p)
+            CommonUtils.copy_py_int_to_c_field(self.ffi, query, 'top_k', top_k)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'presence_penalty', presence_penalty)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'frequency_penalty', frequency_penalty)
 

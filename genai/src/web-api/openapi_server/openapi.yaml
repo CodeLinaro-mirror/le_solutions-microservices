@@ -187,6 +187,11 @@ components:
           default: 1
           nullable: true
           description: An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.
+        top_k:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Top-k sampling parameter. If specified, the sampler considers only the k most likely next tokens at each step. If omitted, the model's configured sampler defaults are used.
       required:
         - messages
         - model

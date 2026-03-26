@@ -69,6 +69,7 @@ class VisionConversationEvent(ConversationEvent):
                 'max_completion_tokens': getattr(request_data, 'max_completion_tokens', None),
                 'temperature': getattr(request_data, 'temperature', None),
                 'top_p': getattr(request_data, 'top_p', None),
+                'top_k': getattr(request_data, 'top_k', None),
                 'presence_penalty': getattr(request_data, 'presence_penalty', None),
                 'frequency_penalty': getattr(request_data, 'frequency_penalty', None),
                 'session_id': self.session.session_id  # Pass session ID for response consistency

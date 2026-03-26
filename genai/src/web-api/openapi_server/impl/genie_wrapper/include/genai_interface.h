@@ -74,6 +74,7 @@ typedef struct {
     int max_completion_tokens;
     float temperature;
     float top_p;
+    int top_k;
     float seed;
     float presence_penalty;
     float frequency_penalty;

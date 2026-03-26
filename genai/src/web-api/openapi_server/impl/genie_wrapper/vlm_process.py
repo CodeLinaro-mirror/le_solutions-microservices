@@ -264,6 +264,7 @@ const char* vlm_get_last_error(VLMHandle handle);
             max_tokens = command.get("max_tokens", 1024)
             temperature = command.get("temperature", 0.7)
             top_p = command.get("top_p", 0.9)
+            top_k = command.get("top_k", -1)
             presence_penalty = command.get("presence_penalty", 0.0)
             frequency_penalty = command.get("frequency_penalty", 0.0)
             pipe_path = command.get("pipe_path")
@@ -276,6 +277,7 @@ const char* vlm_get_last_error(VLMHandle handle);
             logger.info(f"[{event_id}]   Streaming: {streaming}")
             logger.info(f"[{event_id}]   Has image: {image_data_b64 is not None}")
             logger.info(f"[{event_id}]   Pipe path: {pipe_path}")
+            logger.info(f"[{event_id}]   Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}")
 
             # Decode image data if provided
             image_data = None
@@ -322,6 +324,7 @@ const char* vlm_get_last_error(VLMHandle handle);
             CommonUtils.copy_py_int_to_c_field(self.ffi, query, 'max_completion_tokens', max_tokens)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'temperature', temperature)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'top_p', top_p)
+            CommonUtils.copy_py_int_to_c_field(self.ffi, query, 'top_k', top_k)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'presence_penalty', presence_penalty)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'frequency_penalty', frequency_penalty)
 
