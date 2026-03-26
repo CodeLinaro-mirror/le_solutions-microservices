@@ -144,6 +144,9 @@ class ModelConfigManager:
             # Workaround: ensure dialog sampler does not start with top-k == 1 so runtime overrides work.
             self._patch_dialog_sampler_config(data, bundle_name=bundle_name, filename=filename)
 
+            # Apply context capping if configured
+            self._apply_context_capping(data, bundle_name, filename)
+
             # Update paths in the JSON data
             updated_data = self._update_paths(data, bundle_path, output_dir)
 
@@ -153,6 +156,54 @@ class ModelConfigManager:
                 json.dump(updated_data, f, indent=4)
 
         return output_dir
+
+    @staticmethod
+    def _apply_context_capping(data: dict, bundle_name: str, filename: str) -> None:
+        """
+        Apply context size capping if GENAI_CONTEXT_CAPPING env var is set.
+        Updates dialog.context.size or context.size to be min(original, cap).
+        """
+        try:
+            cap_str = os.getenv("GENAI_CONTEXT_CAPPING")
+            if not cap_str:
+                return
+
+            try:
+                cap_size = int(cap_str)
+            except ValueError:
+                logger.warning(f"Invalid GENAI_CONTEXT_CAPPING value: {cap_str}")
+                return
+
+            # Check all known root node keys that may contain context.size
+            # Covers LLM configs ("dialog") and VLM text-generator node configs
+            for node_key in ("dialog", "text-generator", "text_generator", "textGenerator"):
+                node = data.get(node_key)
+                if isinstance(node, dict):
+                    context = node.get("context")
+                    if isinstance(context, dict):
+                        original_size = context.get("size")
+                        if isinstance(original_size, int) and original_size > cap_size:
+                            context["size"] = cap_size
+                            logger.warning(
+                                f"[CONTEXT OVERRIDE] GENAI_CONTEXT_CAPPING applied to "
+                                f"{bundle_name}/{filename}: "
+                                f"{node_key}.context.size {original_size} -> {cap_size}"
+                            )
+
+            # Check for top-level context -> size (model_config.json)
+            context = data.get("context")
+            if isinstance(context, dict):
+                original_size = context.get("size")
+                if isinstance(original_size, int) and original_size > cap_size:
+                    context["size"] = cap_size
+                    logger.warning(
+                        f"[CONTEXT OVERRIDE] GENAI_CONTEXT_CAPPING applied to "
+                        f"{bundle_name}/{filename}: "
+                        f"context.size {original_size} -> {cap_size}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Error applying context capping: {e}")
 
     @staticmethod
     def _patch_dialog_sampler_config(data: dict, bundle_name: str, filename: str) -> None:

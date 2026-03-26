@@ -137,6 +137,7 @@ class VisionConversationEvent(ConversationEvent):
 
         except Exception as e:
             logger.error(f"Event {self.event_id}: VLM execution failed: {e}")
+            self.terminate_handle(force=True)
             self.fail_turn(e)
             return {
                 "response": None,
@@ -179,15 +180,15 @@ class VisionConversationEvent(ConversationEvent):
         logger.debug(f"Event {self.event_id}: release_handle called (no-op for VLM)")
         pass
 
-    def terminate_handle(self):
+    def terminate_handle(self, force: bool = False):
         """
         Terminate VLM subprocess.
         Shuts down the VLM process to free resources.
         """
         from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
-        logger.info(f"Event {self.event_id}: Terminating VLM subprocess for model {self.model_id}")
+        logger.info(f"Event {self.event_id}: Terminating VLM subprocess for model {self.model_id} (force={force})")
         try:
-            VLMProcessManager.get_instance().shutdown()
+            VLMProcessManager.get_instance().shutdown(force=force)
         except Exception as e:
             logger.error(f"Event {self.event_id}: Error terminating VLM subprocess: {e}")
 

@@ -26,6 +26,7 @@ class EventState(Enum):
     ACTIVE = "active"        # Processing this turn (may include tool calling)
     COMPLETED = "completed"  # Turn successfully completed
     FAILED = "failed"        # Turn failed
+    CANCELLED = "cancelled"  # Turn cancelled
 
 
 class EventType(Enum):

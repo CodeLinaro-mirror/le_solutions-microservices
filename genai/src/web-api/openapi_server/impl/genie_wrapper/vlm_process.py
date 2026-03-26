@@ -357,13 +357,28 @@ const char* vlm_get_last_error(VLMHandle handle);
                     content = self.ffi.string(msg.content).decode("utf-8")
                     finish_reason = self.ffi.string(choice.finish_reason).decode("utf-8")
 
+                    if finish_reason == "error":
+                        if pipe_handle:
+                            pipe_handle.write(json.dumps({
+                                "type": "error",
+                                "message": content
+                            }) + '\n')
+                            pipe_handle.flush()
+                        else:
+                            self._send_error(event_id, content)
+
+                        execution_error = RuntimeError(content)
+                        completion_event.set()
+                        return
+
                     if pipe_handle:
                         # Write token to pipe
-                        pipe_handle.write(json.dumps({
-                            "type": "token",
-                            "content": content
-                        }) + '\n')
-                        pipe_handle.flush()
+                        if content:
+                            pipe_handle.write(json.dumps({
+                                "type": "token",
+                                "content": content
+                            }) + '\n')
+                            pipe_handle.flush()
 
                         if finish_reason == "stop":
                             pipe_handle.write(json.dumps({

@@ -252,9 +252,12 @@ class EventBasedChatHandler:
                         status_code = HttpStatusCodes.INTERNAL_SERVER_ERROR  # 500
                         error_type = "internal_error"
 
+                    from openapi_server.impl.constant import GenieErrorMappings
+                    layman_msg = GenieErrorMappings.get_layman_message(error_msg)
+
                     raise HTTPException(
                         status_code=status_code,
-                        detail=error_msg
+                        detail=layman_msg if layman_msg else error_msg
                     )
 
                 # Handle streaming response
@@ -336,10 +339,13 @@ class EventBasedChatHandler:
             OpenAI-compatible response
         """
         if result.get('error'):
+            from openapi_server.impl.constant import GenieErrorMappings
+            error_msg = result['error']['message']
+            layman_msg = GenieErrorMappings.get_layman_message(error_msg)
             # Error response
             raise HTTPException(
                 status_code=500,
-                detail=result['error']['message']
+                detail=layman_msg if layman_msg else error_msg
             )
 
         if result['finish_reason'] == 'tool_calls':

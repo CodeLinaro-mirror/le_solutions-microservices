@@ -115,7 +115,7 @@ class LLMServiceQueryConstant:
 class ErrorMessages:
     """ Error Messages. """
     NOT_IMPELEMENTED = "Not implemented"
-    UNEXPECTED_ERROR = "Unexpected error in processing request"
+    UNEXPECTED_ERROR = "System resources are busy. Consider using a model with a smaller context size in your requests."
     INCORRECT_CONTENT = "Provide correct content"
     MAX_CONTENT_EXCEED = "Length of query exceeds the max length: " + str(LLMServiceQueryConstant.MESSAGE_CONTENT_MAX_SIZE)
     COMPLETION_ID_NOT_EXIST = "Completion id does not exist"
@@ -165,3 +165,37 @@ class SystemResourceConstants:
 
     # Enable/disable resource guardrails (default: True)
     ENABLE_RESOURCE_GUARDRAILS = True
+
+class GenieErrorMappings:
+    """ Mapping of internal Genie SDK error codes to layman API response messages. """
+    MAPPINGS = {
+        "1002": "The system is not configured correctly to run AI models.",
+        "1003": "This AI model cannot be run on your current hardware.",
+        "5000": "This AI model is not compatible with the system's current software version.",
+        "6000": "This AI model is not supported on this system.",
+        "6001": "This AI model is not supported on this system.",
+        "14001": "System resources are busy. Consider using a model with a smaller context size in your requests.",
+        "14003": "The system encountered an issue while cleaning up memory."
+    }
+
+    @classmethod
+    def get_layman_message(cls, error_string: str) -> str:
+        """ Parses the error string for SDK error codes and returns the layman message. """
+        import re
+        if not error_string:
+            return None
+
+        for code, message in cls.MAPPINGS.items():
+            if re.search(rf'\b{code}\b', str(error_string)):
+                return message
+
+        # Handle specific common string-based errors that don't have codes but indicate resource exhaustion
+        if "NULL returned" in str(error_string) or "socket closed" in str(error_string).lower():
+            return cls.MAPPINGS["14001"]
+
+        # Handle broken pipe/connection reset errors (process crash)
+        error_lower = str(error_string).lower()
+        if "broken pipe" in error_lower or "connection reset" in error_lower or "errno 32" in error_lower or "errno 104" in error_lower:
+            return "Service temporarily unavailable. Please try again."
+
+        return None

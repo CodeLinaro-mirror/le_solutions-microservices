@@ -71,7 +71,16 @@ class SystemResourceManager:
         self._memory_headroom_percent = SystemResourceConstants.MEMORY_HEADROOM_PERCENT
         self._guardrails_enabled = SystemResourceConstants.ENABLE_RESOURCE_GUARDRAILS
 
-        logger.info("SystemResourceManager initialized")
+        # Max active models configuration
+        import os
+        try:
+            max_active = os.getenv("MAX_ACTIVE_MODELS", "3")
+            self._max_active_models = int(max_active)
+        except ValueError:
+            logger.warning(f"Invalid MAX_ACTIVE_MODELS value: {max_active}, defaulting to 3")
+            self._max_active_models = 3
+
+        logger.info(f"SystemResourceManager initialized (max_active_models={self._max_active_models})")
 
     def configure(self, memory_headroom_percent: int = 15, enable_guardrails: bool = True):
         """
@@ -246,21 +255,47 @@ class SystemResourceManager:
         # Get current available memory
         available_mb = self.get_available_memory_mb()
 
-        logger.info(f"Memory check: required={required_memory_mb}MB, "
-                   f"with_headroom={required_with_headroom}MB, available={available_mb}MB")
+        # Check MAX_ACTIVE_MODELS constraint first
+        active_count, idle_count = self.get_process_count()
+        total_processes = active_count + idle_count
 
-        # Check if we already have sufficient memory
-        if available_mb >= required_with_headroom:
-            logger.info("Sufficient memory available")
-            return True, available_mb, []
-
-        # Need to evict idle processes
         processes_to_evict = []
         freed_memory = 0
         idle_processes = self.get_idle_processes_lru()
 
-        logger.info(f"Insufficient memory. Need to free {required_with_headroom - available_mb}MB. "
-                   f"Found {len(idle_processes)} idle processes")
+        # If we hit the max active models limit, we MUST evict idle processes
+        if total_processes >= self._max_active_models:
+            logger.info(f"Max active models limit reached ({total_processes} >= {self._max_active_models}). Evicting idle processes...")
+
+            # Calculate how many we need to evict to make room for 1 new process
+            # We need (total_processes - max_active_models + 1) evictions
+            # e.g. if max=3, total=3, we need to evict 1 so total becomes 2, then +1 new = 3.
+            needed_evictions = total_processes - self._max_active_models + 1
+
+            if len(idle_processes) < needed_evictions:
+                logger.warning(f"Cannot start new process: Max active models limit reached ({self._max_active_models}) and not enough idle processes to evict.")
+                return False, available_mb, []
+
+            # Mark for eviction to satisfy count constraint
+            for i in range(needed_evictions):
+                process_id, process_info = idle_processes[i]
+                processes_to_evict.append(process_id)
+                freed_memory += process_info.memory_mb
+                logger.info(f"Evicting process {process_id} to satisfy MAX_ACTIVE_MODELS limit")
+
+            # Remove evicted from idle list so we don't double count if we need more for memory
+            idle_processes = idle_processes[needed_evictions:]
+
+        logger.info(f"Memory check: required={required_memory_mb}MB, "
+                   f"with_headroom={required_with_headroom}MB, available={available_mb}MB")
+
+        # Check if we already have sufficient memory (including freed from count eviction)
+        if available_mb + freed_memory >= required_with_headroom:
+            logger.info("Sufficient memory available")
+            return True, available_mb, processes_to_evict
+
+        logger.info(f"Insufficient memory. Need to free {required_with_headroom - (available_mb + freed_memory)}MB. "
+                   f"Found {len(idle_processes)} remaining idle processes")
 
         # Evict idle processes in LRU order until we have enough memory
         for process_id, process_info in idle_processes:
