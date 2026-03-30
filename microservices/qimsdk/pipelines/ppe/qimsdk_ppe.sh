@@ -8,7 +8,7 @@ qtimltflite name=stage_01_inference delegate=external external-delegate-path=lib
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
 qtimlvconverter name=stage_02_preproc mode=roi-batch-cumulative \
 qtimltflite name=stage_02_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PPE} \
-qtimlpostprocess name=stage_02_postproc results=10 module=yolov5 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
+qtimlpostprocess name=stage_02_postproc results=10 module=yolov8 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
 rtspsrc location=${INPUT_URL} ! queue ! rtpptdemux ! rtph264depay ! h264parse ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
@@ -27,7 +27,7 @@ qtimltflite name=stage_01_inference delegate=external external-delegate-path=lib
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
 qtimlvconverter name=stage_02_preproc mode=roi-batch-cumulative \
 qtimltflite name=stage_02_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PPE} \
-qtimlpostprocess name=stage_02_postproc results=10 module=yolov5 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
+qtimlpostprocess name=stage_02_postproc results=10 module=yolov8 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
 qtiqmmfsrc name=camsrc camera=${INPUT_URL} ! video/x-raw,format=NV12,width=1280,height=720,framerate=30/1,interlace-mode=progressive,colorimetry=bt601 ! identity sync=true  ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
@@ -55,7 +55,7 @@ qtimltflite name=stage_01_inference delegate=external external-delegate-path=lib
 qtimlpostprocess name=stage_01_postproc results=10 module=qpd labels=${LABELS_PATH_PERSON} settings=${SETTINGS_PATH_PERSON} \
 qtimlvconverter name=stage_02_preproc mode=roi-batch-cumulative \
 qtimltflite name=stage_02_inference delegate=external external-delegate-path=libQnnTFLiteDelegate.so external-delegate-options="QNNExternalDelegate,backend_type=htp;" model=${MODEL_PATH_PPE} \
-qtimlpostprocess name=stage_02_postproc results=10 module=yolov5 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
+qtimlpostprocess name=stage_02_postproc results=10 module=yolov8 labels=${LABELS_PATH_PPE} settings="{\"confidence\": 50.0}" \
 ${source_sequence} ! h264parse config-interval=1 ! v4l2h264dec capture-io-mode=4 output-io-mode=4 ! video/x-raw,format=NV12 ! queue ! tee name=t_split_1 \
 t_split_1. ! queue ! metamux_1. \
 t_split_1. ! queue ! stage_01_preproc. stage_01_preproc. ! queue ! stage_01_inference. stage_01_inference. ! queue ! stage_01_postproc. stage_01_postproc. ! text/x-raw ! queue ! metamux_1. \
