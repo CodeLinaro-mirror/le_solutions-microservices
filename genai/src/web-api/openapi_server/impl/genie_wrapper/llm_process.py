@@ -158,9 +158,14 @@ class LLMProcess:
         self.sock_file_write.write(InferenceProtocol.serialize(response))
         self.sock_file_write.flush()
 
-    def _send_error(self, event_id: Optional[str], message: str):
+    def _send_error(
+        self,
+        event_id: Optional[str],
+        message: str,
+        command_id: Optional[str] = None
+    ):
         """Send an error response."""
-        response = InferenceProtocol.create_error_response(event_id, message)
+        response = InferenceProtocol.create_error_response(event_id, message, command_id=command_id)
         self._send_response(response)
 
     def _handle_init(self, command: dict):
@@ -328,27 +333,30 @@ void llm_reset_object(LLMHandle handle);
 
             logger.info(f"[{event_id}] LLM execution completed")
 
-            # Send READY for next request
-            ready_response = InferenceProtocol.create_ready_response(event_id=event_id)
-            self._send_response(ready_response)
-            logger.info(f"[{event_id}] Ready for next request")
-
         except Exception as e:
             logger.error(f"[{event_id}] Error executing LLM: {e}", exc_info=True)
             self._send_error(event_id, str(e))
+        finally:
+            try:
+                ready_response = InferenceProtocol.create_ready_response(event_id=event_id)
+                self._send_response(ready_response)
+                logger.info(f"[{event_id}] Ready for next request")
+            except Exception as ready_error:
+                logger.error(f"[{event_id}] Error sending READY for next request: {ready_error}", exc_info=True)
 
     def _handle_reset(self, command: dict):
         """Handle RESET command - reset LLM handle to clear KV cache."""
+        command_id = command.get("command_id")
         try:
             if self.llm_handle:
                 self.lib.llm_reset_object(self.llm_handle)
                 logger.info("LLM handle reset - KV cache cleared")
 
-            response = InferenceProtocol.create_ready_response()
+            response = InferenceProtocol.create_ready_response(command_id=command_id)
             self._send_response(response)
         except Exception as e:
             logger.error(f"Error resetting LLM handle: {e}")
-            self._send_error(None, f"Reset failed: {e}")
+            self._send_error(None, f"Reset failed: {e}", command_id=command_id)
 
     def _cleanup(self):
         """Cleanup resources."""
