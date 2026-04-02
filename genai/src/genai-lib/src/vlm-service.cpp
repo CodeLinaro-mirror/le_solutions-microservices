@@ -71,28 +71,27 @@ static void customGenieLogCallback(
     GenieLog_Level_t level,
     long unsigned int timestampOrSize,
     va_list args) {
-    static std::ofstream logFile(
-        "vlm_process.log", std::ios_base::app);
-    if (logFile.is_open()) {
-        const char* levelStr = "INFO";
-        if (level == GENIE_LOG_LEVEL_ERROR) {
-            levelStr = "ERROR";
-        } else if (level == GENIE_LOG_LEVEL_WARN) {
-            levelStr = "WARN";
-        } else if (level == GENIE_LOG_LEVEL_VERBOSE) {
-            levelStr = "VERBOSE";
-        }
+    (void)handle;
+    (void)timestampOrSize;
 
-        char buffer[4096];
-        if (format) {
-            vsnprintf(buffer, sizeof(buffer), format, args);
-        } else {
-            buffer[0] = '\0';
-        }
-
-        logFile << "[GenIE-SDK] [" << levelStr << "] "
-                << buffer << std::endl;
+    const char* levelStr = "INFO";
+    if (level == GENIE_LOG_LEVEL_ERROR) {
+        levelStr = "ERROR";
+    } else if (level == GENIE_LOG_LEVEL_WARN) {
+        levelStr = "WARN";
+    } else if (level == GENIE_LOG_LEVEL_VERBOSE) {
+        levelStr = "VERBOSE";
     }
+
+    char buffer[4096];
+    if (format) {
+        vsnprintf(buffer, sizeof(buffer), format, args);
+    } else {
+        buffer[0] = '\0';
+    }
+
+    std::fprintf(stdout, "[GenIE-SDK] [%s] %s\n", levelStr, buffer);
+    std::fflush(stdout);
 }
 
 Log::Log(GenieLog_Level_t logLevel) {

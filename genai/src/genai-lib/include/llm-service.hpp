@@ -30,6 +30,7 @@
 
 #include "GenieCommon.h"
 #include "GenieDialog.h"
+#include "GenieLog.h"
 #include "GenieProfile.h"
 #include "GenieSampler.h"
 
@@ -61,6 +62,16 @@ class SamplerConfig
         std::string m_config;
 };
 
+class Log
+{
+    public:
+        explicit Log(GenieLog_Level_t logLevel);
+        ~Log();
+        GenieLog_Handle_t operator()() const { return m_handle; }
+    private:
+        GenieLog_Handle_t m_handle = NULL;
+};
+
 class Dialog
 {
     public:
@@ -68,7 +79,9 @@ class Dialog
         class Config
         {
             public:
-                Config(const std::string& config, std::shared_ptr<Profile> profile);
+                Config(const std::string& config,
+                       std::shared_ptr<Profile> profile,
+                       std::shared_ptr<Log> log);
                 ~Config();
                 // Disable both copying and moving
                 Config(const Config&) = delete;
@@ -136,6 +149,7 @@ class LLMObject
 
     private:
         Dialog *diag;
+        std::shared_ptr<Log> logger;
         std::string config{};
         std::string prompt{};
         std::string savePath{};
