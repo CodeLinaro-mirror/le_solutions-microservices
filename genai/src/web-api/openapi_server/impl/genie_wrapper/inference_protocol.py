@@ -112,16 +112,19 @@ class InferenceProtocol:
         return cmd
 
     @staticmethod
-    def create_reset_command() -> Dict[str, Any]:
+    def create_reset_command(command_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Create RESET command to reset inference handle (clear KV cache).
 
         Returns:
             RESET command dictionary
         """
-        return {
+        command = {
             "type": CommandType.RESET.value
         }
+        if command_id:
+            command["command_id"] = command_id
+        return command
 
     @staticmethod
     def create_shutdown_command() -> Dict[str, Any]:
@@ -136,7 +139,10 @@ class InferenceProtocol:
         }
 
     @staticmethod
-    def create_ready_response(event_id: Optional[str] = None) -> Dict[str, Any]:
+    def create_ready_response(
+        event_id: Optional[str] = None,
+        command_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Create READY response indicating subprocess is ready.
 
@@ -151,6 +157,8 @@ class InferenceProtocol:
         }
         if event_id:
             response["event_id"] = event_id
+        if command_id:
+            response["command_id"] = command_id
         return response
 
     @staticmethod
@@ -190,7 +198,11 @@ class InferenceProtocol:
         }
 
     @staticmethod
-    def create_error_response(event_id: Optional[str], message: str) -> Dict[str, Any]:
+    def create_error_response(
+        event_id: Optional[str],
+        message: str,
+        command_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Create ERROR response indicating an error occurred.
 
@@ -201,11 +213,14 @@ class InferenceProtocol:
         Returns:
             ERROR response dictionary
         """
-        return {
+        response = {
             "type": ResponseType.ERROR.value,
             "event_id": event_id,
             "message": message
         }
+        if command_id:
+            response["command_id"] = command_id
+        return response
 
     @staticmethod
     def serialize(message: Dict[str, Any]) -> str:

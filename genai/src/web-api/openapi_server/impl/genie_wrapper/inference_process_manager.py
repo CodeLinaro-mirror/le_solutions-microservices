@@ -18,6 +18,7 @@ import threading
 import queue
 import asyncio
 import resource
+import uuid
 from typing import Optional, AsyncGenerator, Dict, Any
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -437,12 +438,13 @@ class InferenceProcessManager(ABC):
             raise
 
     def _send_reset_and_wait(self):
-        """Send RESET command and wait for READY response."""
+        """Send RESET command and wait for the matching READY response."""
+        reset_command_id = f"reset-{uuid.uuid4().hex[:16]}"
         try:
-            reset_cmd = InferenceProtocol.create_reset_command()
+            reset_cmd = InferenceProtocol.create_reset_command(command_id=reset_command_id)
             self._send_command(reset_cmd)
 
-            # Wait for READY response, drain any late tokens from a prior stream.
+            # Wait for the matching RESET response and drain any late stream output.
             deadline = time.time() + 10.0
             while True:
                 remaining = deadline - time.time()
@@ -451,11 +453,42 @@ class InferenceProcessManager(ABC):
 
                 response = self._read_response(timeout=remaining)
                 response_type = response.get("type")
+                response_event_id = response.get("event_id")
+                response_command_id = response.get("command_id")
 
                 if response_type == ResponseType.READY.value:
-                    break
+                    if response_command_id:
+                        if response_command_id != reset_command_id:
+                            logger.warning(
+                                f"Ignoring stale RESET READY for command {response_command_id} while waiting for {reset_command_id}"
+                            )
+                            continue
+                        break
+                    if response_event_id:
+                        logger.warning(
+                            f"Ignoring event READY for event {response_event_id} while waiting for RESET {reset_command_id}"
+                        )
+                        continue
+                    logger.warning(
+                        f"Ignoring READY without command_id while waiting for RESET {reset_command_id}"
+                    )
+                    continue
+
                 if response_type == ResponseType.ERROR.value:
+                    if response_command_id:
+                        if response_command_id != reset_command_id:
+                            logger.warning(
+                                f"Ignoring stale RESET ERROR for command {response_command_id} while waiting for {reset_command_id}"
+                            )
+                            continue
+                        raise RuntimeError(f"RESET failed: {response}")
+                    if response_event_id:
+                        logger.warning(
+                            f"Ignoring event ERROR for event {response_event_id} while waiting for RESET {reset_command_id}"
+                        )
+                        continue
                     raise RuntimeError(f"RESET failed: {response}")
+
                 if response_type in (ResponseType.TOKEN.value, ResponseType.DONE.value):
                     logger.warning(
                         f"Received {response_type} while waiting for READY after RESET; "
@@ -636,33 +669,77 @@ class InferenceProcessManager(ABC):
 
             # Start background thread to read responses
             def read_responses():
+                pending_error = None
                 try:
                     while True:
                         response = self._read_response(timeout=self.execute_timeout)
                         response_type = response["type"]
+                        response_event_id = response.get("event_id")
 
                         if response_type == ResponseType.TOKEN.value:
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale TOKEN for event {response_event_id}"
+                                )
+                                continue
+                            if response_event_id is None:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring TOKEN without event_id while waiting for stream completion"
+                                )
+                                continue
                             content = response.get("content", "")
                             if content:
                                 token_queue.put(content)
                         elif response_type == ResponseType.DONE.value:
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale DONE for event {response_event_id}"
+                                )
+                                continue
+                            if response_event_id is None:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring DONE without event_id while waiting for stream completion"
+                                )
+                                continue
                             logger.debug(f"Event {event_id}: Received DONE, waiting for READY")
-                            # Don't break yet, wait for READY
                         elif response_type == ResponseType.READY.value:
-                            logger.debug(f"Event {event_id}: Received READY, stream complete")
-                            token_queue.put(None)  # Sentinel
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale READY for event {response_event_id}"
+                                )
+                                continue
+                            if response_event_id is None:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring READY without event_id while waiting for stream completion"
+                                )
+                                continue
+                            logger.debug(f"Event {event_id}: Received matching READY, stream complete")
+                            if pending_error:
+                                token_queue.put(f"__ERROR__{pending_error}")
+                            token_queue.put(None)
                             break
                         elif response_type == ResponseType.ERROR.value:
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale ERROR for event {response_event_id}"
+                                )
+                                continue
+                            if response_event_id is None:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring ERROR without event_id while waiting for stream completion"
+                                )
+                                continue
                             error_msg = response.get("message", "Unknown error")
                             if self.last_sdk_error:
                                 error_msg += f" (SDK Code: {self.last_sdk_error})"
-                            token_queue.put(f"__ERROR__{error_msg}")
-                            token_queue.put(None)
-                            break
+                            pending_error = error_msg
+                            logger.warning(
+                                f"Event {event_id}: Received ERROR, waiting for matching READY to finish draining state"
+                            )
                 except Exception as e:
                     logger.error(f"Error in reader thread: {e}")
-                    error_msg = str(e)
-                    if self.last_sdk_error:
+                    error_msg = pending_error or str(e)
+                    if pending_error is None and self.last_sdk_error:
                         error_msg += f" (SDK Code: {self.last_sdk_error})"
                     token_queue.put(f"__ERROR__{error_msg}")
                     token_queue.put(None)
