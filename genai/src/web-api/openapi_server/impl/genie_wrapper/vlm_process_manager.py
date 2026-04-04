@@ -205,6 +205,8 @@ class VLMProcessManager(InferenceProcessManager):
 
             # Create queue for tokens
             token_queue = queue.Queue()
+            pipe_done = threading.Event()
+            socket_done = threading.Event()
 
             def read_pipe():
                 try:
@@ -215,35 +217,58 @@ class VLMProcessManager(InferenceProcessManager):
                                 if data['type'] == 'token':
                                     token_queue.put(data['content'])
                                 elif data['type'] == 'done':
-                                    pass # Done is just informational, socket will send READY
+                                    # Do not stop on DONE; keep draining until writer closes
+                                    # to avoid BrokenPipeError in the subprocess callback.
+                                    logger.debug(f"Event {event_id}: Pipe reported DONE")
                                 elif data['type'] == 'error':
                                     token_queue.put(f"__ERROR__{data['message']}")
+                                    # Keep reading to EOF so the writer side can close cleanly.
                             except json.JSONDecodeError:
                                 pass
                 except Exception as e:
                     logger.error(f"Event {event_id}: Error reading pipe: {e}")
                     token_queue.put(f"__ERROR__{str(e)}")
+                finally:
+                    pipe_done.set()
 
             def read_socket():
                 try:
                     while True:
                         response = self._read_response(timeout=self.execute_timeout)
                         response_type = response["type"]
+                        response_event_id = response.get("event_id")
 
                         if response_type == ResponseType.READY.value:
-                            logger.debug(f"Event {event_id}: Received READY, stream complete")
-                            token_queue.put(None)  # Sentinel
+                            # Ignore stale READY from another event to avoid
+                            # prematurely ending the current stream.
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale READY for event {response_event_id}"
+                                )
+                                continue
+                            if response_event_id is None:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring READY without event_id while waiting for stream completion"
+                                )
+                                continue
+                            logger.debug(f"Event {event_id}: Received matching READY, stream complete")
+                            socket_done.set()
                             break
                         elif response_type == ResponseType.ERROR.value:
+                            if response_event_id and response_event_id != event_id:
+                                logger.warning(
+                                    f"Event {event_id}: Ignoring stale ERROR for event {response_event_id}"
+                                )
+                                continue
                             error_msg = response.get("message", "Unknown error")
                             token_queue.put(f"__ERROR__{error_msg}")
-                            token_queue.put(None)
+                            socket_done.set()
                             break
                         # Ignore TOKEN/DONE over socket since we use pipe
                 except Exception as e:
                     logger.error(f"Event {event_id}: Error reading socket: {e}")
                     token_queue.put(f"__ERROR__{str(e)}")
-                    token_queue.put(None)
+                    socket_done.set()
 
             pipe_thread = threading.Thread(
                 target=read_pipe,
@@ -264,13 +289,10 @@ class VLMProcessManager(InferenceProcessManager):
                 try:
                     token = token_queue.get(timeout=0.1)
                 except queue.Empty:
-                    if not socket_thread.is_alive() and not pipe_thread.is_alive() and token_queue.empty():
+                    if pipe_done.is_set() and socket_done.is_set() and token_queue.empty():
                         break
                     await asyncio.sleep(0.01)
                     continue
-
-                if token is None:
-                    break
 
                 if isinstance(token, str) and token.startswith("__ERROR__"):
                     error_msg = token.replace("__ERROR__", "")
@@ -278,6 +300,7 @@ class VLMProcessManager(InferenceProcessManager):
 
                 yield token
 
+            pipe_thread.join(timeout=2.0)
             socket_thread.join(timeout=2.0)
 
         except Exception as e:
