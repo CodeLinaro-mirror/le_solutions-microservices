@@ -150,7 +150,20 @@ class EventBasedChatHandler:
 
             # Validate we have messages to process
             if not new_messages:
-                raise HTTPException(400, "No new messages to process")
+                # If a prior streaming request was interrupted, the session may still
+                # have an active event with the same last user message recorded.
+                # In that case, cancel the active event and retry with fresh messages.
+                if session.current_event and session.current_event.is_active():
+                    logger.warning(
+                        f"No new messages for session {session.session_id} with active event; "
+                        f"cancelling active event to allow retry"
+                    )
+                    if session.cancel_active_event():
+                        existing_count = len(session.messages)
+                        new_messages = messages[existing_count:]
+
+                if not new_messages:
+                    raise HTTPException(400, "No new messages to process")
 
             logger.info(f"Processing {len(new_messages)} new message(s)")
 
