@@ -43,7 +43,7 @@ class ToolHandler:
         )
         tools_text += (
             '{\n  "tool_calls": [{\n    "type": "function",\n    "function": {\n      "name": "tool_name",\n'
-            '      "arguments": "{\\"param\\": \\"value\\"}"\n    }\n  }]\n}\n\n'
+            '      "arguments": {\n        "param": "value"\n      }\n    }\n  }]\n}\n\n'
         )
         tools_text += "Available tools:\n\n"
 
@@ -193,10 +193,12 @@ class ToolHandler:
                 # Extract function data
                 func_data = tc_data.get("function", {})
 
-                # Ensure arguments is a string (JSON string)
-                arguments = func_data.get("arguments", "{}")
-                if isinstance(arguments, dict):
-                    arguments = json.dumps(arguments)
+                # Ensure arguments are valid JSON and normalized as a JSON string.
+                arguments = ToolHandler._normalize_arguments(func_data.get("arguments", "{}"))
+                if arguments is None:
+                    raise ValueError(
+                        f"Invalid function arguments for tool '{func_data.get('name', 'unknown')}'"
+                    )
 
                 tool_call = ChatCompletionMessageToolCall(
                     id=tc_data.get("id", f"call_{uuid.uuid4().hex[:24]}"),
@@ -214,6 +216,76 @@ class ToolHandler:
                 continue
 
         return tool_calls if tool_calls else None
+
+    @staticmethod
+    def _normalize_arguments(arguments: Any) -> Optional[str]:
+        """
+        Normalize function arguments to a valid JSON string.
+        Returns None when arguments cannot be normalized into valid JSON.
+        """
+        # Canonical form when model already emitted object arguments.
+        if isinstance(arguments, dict):
+            return json.dumps(arguments, ensure_ascii=False)
+
+        if arguments is None:
+            raw = "{}"
+        elif isinstance(arguments, str):
+            raw = arguments.strip() or "{}"
+        else:
+            try:
+                raw = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                logger.warning(f"Unsupported function arguments type: {type(arguments)}")
+                return None
+
+        parsed = ToolHandler._json_loads_safe(raw)
+        if parsed is None:
+            repaired = ToolHandler._repair_argument_json(raw)
+            parsed = ToolHandler._json_loads_safe(repaired)
+
+        # Handle doubly-encoded JSON string payloads.
+        if parsed is None and isinstance(raw, str) and raw.startswith('"') and raw.endswith('"'):
+            outer = ToolHandler._json_loads_safe(raw)
+            if isinstance(outer, str):
+                nested = ToolHandler._json_loads_safe(outer)
+                if nested is None:
+                    nested = ToolHandler._json_loads_safe(ToolHandler._repair_argument_json(outer))
+                parsed = nested
+
+        if parsed is None:
+            logger.warning(f"Invalid function.arguments JSON, dropping tool call: {raw}")
+            return None
+
+        return json.dumps(parsed, ensure_ascii=False)
+
+    @staticmethod
+    def _json_loads_safe(raw: str) -> Optional[Any]:
+        """Best-effort JSON parsing helper."""
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _repair_argument_json(raw: str) -> str:
+        """
+        Attempt minimal repairs for common malformed quote patterns in arguments.
+        Example repaired input: {""location"": "Paris"} -> {"location": "Paris"}
+        """
+        repaired = raw.strip()
+
+        # Strip markdown JSON fences if present.
+        if repaired.startswith("```"):
+            repaired = re.sub(r"^```(?:json)?\s*", "", repaired, flags=re.IGNORECASE)
+            repaired = re.sub(r"\s*```$", "", repaired, flags=re.IGNORECASE)
+            repaired = repaired.strip()
+
+        # Fix doubled quotes around keys.
+        repaired = re.sub(r'([{,]\s*)""([^"]+?)""\s*:', r'\1"\2":', repaired)
+        # Final fallback for repeated quote artifacts.
+        repaired = repaired.replace('""', '"')
+
+        return repaired
 
     @staticmethod
     def should_check_for_tools(response_text: str) -> bool:

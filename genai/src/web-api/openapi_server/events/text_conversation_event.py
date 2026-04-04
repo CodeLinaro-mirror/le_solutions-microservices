@@ -420,6 +420,24 @@ class TextConversationEvent(ConversationEvent):
                                 }]
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
+                    elif tool_check_buffer:
+                        # Short non-tool responses may never cross the in-loop
+                        # threshold that flushes tool_check_buffer. Flush them now.
+                        for buf_token in tool_check_buffer:
+                            chunk = {
+                                "id": self.session.session_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": self.model_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": buf_token},
+                                    "finish_reason": None,
+                                    "logprobs": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        tool_check_buffer = []
 
                     # Final stop chunk
                     final_chunk = {
