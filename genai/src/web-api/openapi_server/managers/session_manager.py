@@ -130,21 +130,43 @@ class SessionManager:
         full_hash_key = ConversationUtils.calculate_conversation_hash(messages, exclude_last_pair=False)
 
         with self._lock:
+            def should_reuse_session(candidate_session: ConversationSession, match_type: str, key: str) -> bool:
+                incoming_count = len(messages)
+                existing_count = len(candidate_session.messages)
+
+                if incoming_count < existing_count:
+                    current_event = candidate_session.get_current_event()
+                    is_active_tool_turn = (
+                        current_event and
+                        current_event.is_active() and
+                        getattr(current_event, '_is_tool_calling', False)
+                    )
+                    if not is_active_tool_turn:
+                        logger.debug(
+                            f"Skipping {match_type} match {key}: session {candidate_session.session_id} has newer history "
+                            f"(incoming_messages={incoming_count}, session_messages={existing_count})"
+                        )
+                        return False
+
+                return True
+
             # 1. Try to find by hash (n-2) - standard lookup for continuing conversations
             if hash_key and hash_key in self._hash_to_session:
                 session_id = self._hash_to_session[hash_key]
                 if session_id in self._sessions:
                     session = self._sessions[session_id]
-                    logger.info(f"Found existing session {session_id} by hash {hash_key}")
-                    return session, False
+                    if should_reuse_session(session, "hash", hash_key):
+                        logger.info(f"Found existing session {session_id} by hash {hash_key}")
+                        return session, False
 
             # 2. Try full hash (n-1) - for retries or identical requests
             if full_hash_key and full_hash_key in self._hash_to_session:
                 session_id = self._hash_to_session[full_hash_key]
                 if session_id in self._sessions:
                     session = self._sessions[session_id]
-                    logger.info(f"Found existing session {session_id} by full hash {full_hash_key}")
-                    return session, False
+                    if should_reuse_session(session, "full hash", full_hash_key):
+                        logger.info(f"Found existing session {session_id} by full hash {full_hash_key}")
+                        return session, False
 
             # 3. Try tool calling map - for in-progress tool calls
             # Calculate hash of ONLY user messages to match the registration logic

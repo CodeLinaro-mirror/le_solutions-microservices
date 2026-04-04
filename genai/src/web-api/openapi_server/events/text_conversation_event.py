@@ -443,9 +443,6 @@ class TextConversationEvent(ConversationEvent):
 
                 yield "data: [DONE]\n\n"
 
-                if self._completion_callback:
-                    await self._completion_callback(self.event_id, self.state)
-
             except asyncio.CancelledError:
                 # Client disconnected mid-stream; cancel event and stop the subprocess.
                 logger.info(f"Event {self.event_id}: Stream cancelled by client")
@@ -528,6 +525,11 @@ class TextConversationEvent(ConversationEvent):
                     if self.is_cancelled:
                         logger.info(f"Event {self.event_id}: Stream ended due to cancellation")
                         self.cancel_turn()
+                    elif self._is_tool_calling and not self._tool_response_received:
+                        logger.info(
+                            f"Event {self.event_id}: Stream ended after tool call request; "
+                            "keeping event ACTIVE for tool continuation"
+                        )
                     else:
                         logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
                         self.fail_turn(Exception("Stream aborted or failed"))
