@@ -96,7 +96,7 @@ class LLMServiceQueryConstant:
     MODEL_STR_MAX_SIZE = 256
     DEFAULT_COMPLETION_TOKEN = 0
     DEFAULT_TEMPERATURE = 1.0
-    DEFAULT_TOP_K = 0
+    DEFAULT_TOP_K = 40
     DEFAULT_TOP_P = 1.0
     DEFAULT_FREQUENCY_PENALTY = 0
     DEFAULT_PRESENCE_PENALTY = 0
@@ -110,7 +110,7 @@ class LLMServiceQueryConstant:
     MAX_MESSAGE_COUNT = 12
     # Session and token management constants
     MAX_MESSAGE_PAIRS = 50  # Maximum conversation pairs (100 messages total)
-    DEFAULT_MAX_COMPLETION_TOKENS = 1024  # Default if not provided by user
+    DEFAULT_MAX_COMPLETION_TOKENS = 512  # Default if not provided by user
     CONTEXT_THRESHOLD_PERCENTAGE = 0.8  # 80% threshold for summarization
 
 class ErrorMessages:

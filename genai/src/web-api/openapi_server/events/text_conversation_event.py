@@ -173,7 +173,7 @@ class TextConversationEvent(ConversationEvent):
                 max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
-                top_k=getattr(request_data, 'top_k', None),
+                top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
                 presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
                 frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
             ):
@@ -276,7 +276,7 @@ class TextConversationEvent(ConversationEvent):
                     max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
                     temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                     top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
-                    top_k=getattr(request_data, 'top_k', None),
+                    top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
                     presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
                     frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
                 ):
@@ -595,7 +595,7 @@ class TextConversationEvent(ConversationEvent):
                 max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
-                top_k=getattr(request_data, 'top_k', None),
+                top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
                 presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
                 frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
             ):
