@@ -115,17 +115,21 @@ class ChatApiImpl(BaseChatApi):
             from openapi_server.impl.constant import GenieErrorMappings
 
             error_str = str(e)
+            status_code = GenieErrorMappings.get_http_status_code(
+                error_str,
+                default_status=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+            )
             layman_msg = GenieErrorMappings.get_layman_message(error_str)
             final_msg = layman_msg if layman_msg else ErrorMessages.UNEXPECTED_ERROR
 
             return JSONResponse(
-                status_code=HttpStatusCodes.INTERNAL_SERVER_ERROR,
+                status_code=status_code,
                 content={
                     "error": {
                         "message": final_msg,
                         "type": "server_error",
                         "param": None,
-                        "code": HttpStatusCodes.INTERNAL_SERVER_ERROR
+                        "code": status_code
                     }
                 }
             )

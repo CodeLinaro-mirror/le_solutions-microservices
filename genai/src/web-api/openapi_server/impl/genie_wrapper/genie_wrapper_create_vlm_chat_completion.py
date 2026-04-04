@@ -441,6 +441,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                         pass
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
+                    status_code = GenieErrorMappings.get_http_status_code(error_msg)
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
                     if layman_msg:
                         final_msg = layman_msg
@@ -458,7 +459,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             "message": final_msg,
                             "type": "server_error",
                             "param": None,
-                            "code": 500
+                            "code": status_code
                         }
                     }
                     yield f"data: {json.dumps(error_payload)}\n\n"
