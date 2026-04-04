@@ -10,6 +10,7 @@ import torch
 import jsonschema
 from tokenizers import Tokenizer
 from diffusers import DPMSolverMultistepScheduler
+from openapi_server.interface.qnn_runtime import AppOptions, QnnSampleApp
 from PIL import Image
 
 class StableDiffusionExecutor:
@@ -193,19 +194,27 @@ class StableDiffusionExecutor:
         with open(input_list_filepath, 'w') as f:
             f.write(input_list_text.strip())
 
-        # Run qnn-net-run using subprocess
-        log_file_path = os.path.join(tmp_dirpath, 'log.txt')
-        cmd = [
-            'qnn-net-run',
-            '--retrieve_context', model_context,
-            '--backend', '/usr/lib/libQnnHtp.so',
-            '--input_list', input_list_filepath,
-            '--output_dir', tmp_dirpath,
-            '--log_level', 'verbose',
-        ]
+        opts = AppOptions(
+            retrieve_context=model_context,
+            backend_path="/usr/lib/libQnnHtp.so",
+            system_library="/usr/lib/libQnnSystem.so",
+            input_list_paths=input_list_filepath,
+            output_dir=tmp_dirpath,
 
-        with open(log_file_path, 'w') as log_file:
-            subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, check=True)
+            # Logging / profiling
+            log_level=4, # 0=ERROR,1=WARN,2=INFO,3=DEBUG,4=VERBOSE
+            profiling_level="off",
+        )
+
+        app = QnnSampleApp(opts)
+        exit_code = app.run()
+        if exit_code != 0:
+            # Cleanup before raising, to keep behavior neat
+            try:
+                shutil.rmtree(tmp_dirpath)
+            except Exception:
+                pass
+            raise RuntimeError(f"QnnSampleApp failed with exit code {exit_code}")
 
         if type == "textencoder":
             output_file_path = os.path.join(tmp_dirpath, 'Result_0', 'text_embedding.raw')

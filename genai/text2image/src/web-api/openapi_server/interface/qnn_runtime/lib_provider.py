@@ -1,18 +1,19 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-# coding: utf-8
-
 import ctypes
 from ctypes import (
-    c_void_p, c_uint64, c_uint32, c_int, c_char_p, POINTER, Structure, CFUNCTYPE
+    c_void_p, c_uint64, c_uint32, c_int, c_char_p, POINTER, Structure, CFUNCTYPE,
+    c_size_t
 )
+from .system_structs import QnnSystemContext_BinaryInfo_t
+from .qnn_types import Qnn_Tensor_t
+from .utils_dump import print
+
 
 # =========================================================================================
 # 1) Low-level QNN structs & prototypes (header-accurate fragments)
 # =========================================================================================
-
-
 class Qnn_Version_t(Structure):
     _fields_ = [("major", c_uint32), ("minor", c_uint32), ("patch", c_uint32)]
 
@@ -328,13 +329,24 @@ QnnGraph_PrepareExecutionEnvironmentFn_t = CFUNCTYPE(
 # typedef Qnn_ErrorHandle_t (*QnnGraph_ExecuteFn_t)(
 #   Qnn_GraphHandle_t graphHandle, const Qnn_Tensor_t* inputs, uint32_t numInputs,
 #   Qnn_Tensor_t* outputs, uint32_t numOutputs, Qnn_ProfileHandle_t profileHandle, Qnn_SignalHandle_t signalHandle);
-QnnGraph_ExecuteFn_t = CFUNCTYPE(c_int, c_void_p, POINTER(
-    c_void_p), c_uint32, POINTER(c_void_p), c_uint32, c_void_p, c_void_p)
+QnnGraph_ExecuteFn_t = CFUNCTYPE(
+    c_int,
+    c_void_p,
+    POINTER(Qnn_Tensor_t), c_uint32,
+    POINTER(Qnn_Tensor_t), c_uint32,
+    c_void_p, c_void_p
+)
 
 # typedef Qnn_ErrorHandle_t (*QnnGraph_ExecuteAsyncFn_t)(
 #   ..., Qnn_NotifyFn_t notifyFn, void* notifyParam);
-QnnGraph_ExecuteAsyncFn_t = CFUNCTYPE(c_int, c_void_p, POINTER(
-    c_void_p), c_uint32, POINTER(c_void_p), c_uint32, c_void_p, c_void_p, c_void_p, c_void_p)
+QnnGraph_ExecuteAsyncFn_t = CFUNCTYPE(
+    c_int,
+    c_void_p,
+    POINTER(Qnn_Tensor_t), c_uint32,
+    POINTER(Qnn_Tensor_t), c_uint32,
+    c_void_p, c_void_p,
+    c_void_p, c_void_p
+)
 
 # typedef Qnn_ErrorHandle_t (*QnnGraph_ReleaseExecutionEnvironmentFn_t)(
 #   Qnn_GraphHandle_t graphHandle, const QnnGraph_ExecuteEnvironment_t** envs, uint32_t envSize);
@@ -360,7 +372,6 @@ QnnTensor_UpdateGraphTensorsFn_t = CFUNCTYPE(
     c_int, c_void_p, POINTER(POINTER(c_void_p)), ctypes.c_uint64)
 
 # ----------------------------------------- Log -------------------------------------------
-# (Exact callback signature is in QnnLog.h; we keep your working signature.)
 QnnLog_Callback_t = CFUNCTYPE(
     None, c_char_p, c_uint32, ctypes.c_uint64, c_void_p)
 
@@ -429,32 +440,25 @@ QnnError_FreeVerboseMessageFn_t = CFUNCTYPE(c_int, c_char_p)
 # typedef Qnn_ErrorHandle_t (*QnnSystemContext_CreateFn_t)(QnnSystemContext_Handle_t* sysCtxHandle);
 QnnSystemContext_CreateFn_t = CFUNCTYPE(ctypes.c_int, POINTER(c_void_p))
 
-# typedef Qnn_ErrorHandle_t (*QnnSystemContext_GetBinaryInfoFn_t)(
-#   QnnSystemContext_Handle_t sysCtxHandle,
-#   void* binaryBuffer,
-#   uint64_t binaryBufferSize,
-#   const QnnSystemContext_BinaryInfo_t** binaryInfo,
-#   Qnn_ContextBinarySize_t* binaryInfoSize);
+# int QnnSystemContext_getBinaryInfo(QnnSystemContext_Handle_t, void*, uint64_t,
+#                                    const QnnSystemContext_BinaryInfo_t**, Qnn_ContextBinarySize_t*)
 QnnSystemContext_GetBinaryInfoFn_t = CFUNCTYPE(
-    ctypes.c_int,
-    c_void_p,                   # sysCtxHandle
-    c_void_p,                   # binaryBuffer
-    c_uint64,                   # binaryBufferSize
-    POINTER(POINTER(c_void_p)),  # binaryInfo (const T**)
-    POINTER(ctypes.c_size_t)    # binaryInfoSize (size_t*)
+    c_int,
+    c_void_p,                    # sysCtxHandle
+    c_void_p,                    # binaryBuffer
+    c_uint64,                    # binaryBufferSize (uint64_t)
+    POINTER(POINTER(QnnSystemContext_BinaryInfo_t)),  # out: const BinaryInfo_t**
+    POINTER(c_size_t),           # out: size_t* binaryInfoSize
 )
 
-# typedef Qnn_ErrorHandle_t (*QnnSystemContext_GetMetaDataFn_t)(
-#   QnnSystemContext_Handle_t sysCtxHandle,
-#   const void* binaryBuffer,
-#   uint64_t binaryBufferSize,
-#   const QnnSystemContext_BinaryInfo_t** binaryInfo);
+# int QnnSystemContext_getMetadata(QnnSystemContext_Handle_t, const void*, Qnn_ContextBinarySize_t,
+#                                  const QnnSystemContext_BinaryInfo_t**)
 QnnSystemContext_GetMetaDataFn_t = CFUNCTYPE(
-    ctypes.c_int,
-    c_void_p,                   # sysCtxHandle
-    c_void_p,                   # binaryBuffer (const void*)
-    c_uint64,                   # binaryBufferSize
-    POINTER(POINTER(c_void_p))  # binaryInfo (const T**)
+    c_int,
+    c_void_p,                    # sysCtxHandle
+    c_void_p,                    # binaryBuffer (const void*)
+    c_size_t,                    # binaryBufferSize (Qnn_ContextBinarySize_t == size_t)
+    POINTER(POINTER(QnnSystemContext_BinaryInfo_t)),  # out: const BinaryInfo_t**
 )
 
 # typedef Qnn_ErrorHandle_t (*QnnSystemContext_FreeFn_t)(QnnSystemContext_Handle_t sysCtxHandle);
@@ -464,7 +468,7 @@ QnnSystemContext_FreeFn_t = CFUNCTYPE(ctypes.c_int, c_void_p)
 
 # typedef Qnn_ErrorHandle_t (*QnnSystemTensor_getMemoryFootprintFn_t)(Qnn_Tensor_t tensor, uint64_t* footprint);
 QnnSystemTensor_getMemoryFootprintFn_t = CFUNCTYPE(
-    ctypes.c_int, c_void_p, POINTER(c_uint64))
+    ctypes.c_int, Qnn_Tensor_t, POINTER(c_uint64))
 
 # ------------------------------ System Log --------------------------------
 
@@ -540,6 +544,11 @@ QnnSystemProfile_freeSerializationTargetFn_t = CFUNCTYPE(
     ctypes.c_int, c_void_p)
 
 
+import ctypes
+from ctypes import (
+    c_void_p, c_uint64, c_uint32, c_int, c_char_p, POINTER, Structure, CFUNCTYPE
+)
+
 # Simple core log callback (prints formatted string if provided)
 @QnnLog_Callback_t
 def CORE_LOG_CB(fmt: c_char_p, level: int, timestamp: int, va_list_ptr: c_void_p):
@@ -567,9 +576,8 @@ class QnnErrHandling(Structure):
     _fields_ = [
         ("errorGetMessage",        QnnError_GetMessageFn_t),
         ("errorGetVerboseMessage", QnnError_GetVerboseMessageFn_t),
-        ("errorFreeVerboseMessage",QnnError_FreeVerboseMessageFn_t),
+        ("errorFreeVerboseMessage", QnnError_FreeVerboseMessageFn_t),
     ]
-
 
 class Binder:
     @staticmethod
@@ -585,7 +593,7 @@ class ErrorHelper:
         sm, vm = None, None
         try:
             out = c_char_p()
-            _ =  err.errorGetMessage(int(rc), ctypes.byref(out))
+            _ = err.errorGetMessage(int(rc), ctypes.byref(out))
 
             if out.value:
                 sm = out.value.decode(errors="replace")
@@ -703,11 +711,11 @@ class QnnProvider:
         bv = self._p.apiVersion.backendApiVersion
 
         return {
-            "addr":        ctypes.addressof(self._p),
-            "name_ptr":    (ctypes.cast(self._p.providerName, c_void_p).value or 0),
-            "coreApi":     f"{int(cv.major)}.{int(cv.minor)}.{int(cv.patch)}",
-            "backendApi":  f"{int(bv.major)}.{int(bv.minor)}.{int(bv.patch)}",
-            "backendId":   int(self._p.backendId),
+            "addr":         ctypes.addressof(self._p),
+            "name_ptr":     (ctypes.cast(self._p.providerName, c_void_p).value or 0),
+            "coreApi":      f"{int(cv.major)}.{int(cv.minor)}.{int(cv.patch)}",
+            "backendApi":   f"{int(bv.major)}.{int(bv.minor)}.{int(bv.patch)}",
+            "backendId":    int(self._p.backendId),
             "providerName": name,
         }
 
@@ -720,6 +728,50 @@ class QnnProvider:
             self._iface = iface_ptr.contents
 
         return self._iface
+
+    def compose_graphs(
+        self,
+        backend_handle: ctypes.c_void_p,
+        context_handle: ctypes.c_void_p,
+        model_interop,  # instance of QnnModelInterop
+        debug: bool,
+        log_level: int,
+        graph_configs_pp: ctypes.POINTER(
+            ctypes.POINTER(ctypes.c_void_p)) = None,
+        num_graph_configs: int = 0
+    ):
+        # Ensure callable function table is available
+        iface = self.__interface()
+
+        # Defaults for configs if none are provided
+        if graph_configs_pp is None:
+            graph_configs_pp = ctypes.POINTER(
+                ctypes.POINTER(ctypes.c_void_p))()
+            num_graph_configs = 0
+
+        # Outputs
+        graphs_ppp = ctypes.POINTER(
+            ctypes.POINTER(ctypes.POINTER(GraphInfo)))()
+        num_graphs = ctypes.c_uint32(0)
+
+        # Call into the model’s composeGraphs with the typed interface table
+        rc = model_interop.compose(
+            backend_handle,
+            iface,
+            context_handle,
+            graph_configs_pp,
+            ctypes.c_uint32(num_graph_configs),
+            ctypes.byref(graphs_ppp),
+            ctypes.byref(num_graphs),
+            ctypes.c_bool(bool(debug)),
+            CORE_LOG_CB,
+            ctypes.c_int(int(log_level)),
+        )
+
+        if rc != 0:
+            raise RuntimeError(f"composeGraphs failed rc={rc}")
+
+        return graphs_ppp, int(num_graphs.value)
 
     def make_callable(self):
         self.__iface = self.__interface()
@@ -1029,50 +1081,6 @@ class QnnProvider:
         )
 
 
-    def backend_create_free(self, log_level: int = 3):
-        logger = c_void_p()
-
-        # Create logger
-        rc_l = self.logCreate(CORE_LOG_CB, int(
-            log_level), ctypes.byref(logger))
-        print(
-            f"[CALL] logCreate rc={rc_l} logger=0x{(ctypes.cast(logger, c_void_p).value or 0):016x}")
-
-        if rc_l != 0:
-            sm, vm = ErrorHelper.describe(self.__iface, rc_l)
-            ErrorHelper.print("logCreate", rc_l, sm, vm)
-
-            # Fallback to NULL logger
-            logger = c_void_p()
-
-        configs = POINTER(POINTER(c_void_p))()
-        backend = c_void_p()
-
-        rc_b = self.backendCreate(logger, configs, ctypes.byref(backend))
-        print("[CALL] backendCreate rc=", rc_b, " backend=",
-              hex(backend.value if backend.value else 0))
-
-        if rc_b != 0:
-            sm, vm = ErrorHelper.describe(self.__iface, rc_b)
-            ErrorHelper.print("backendCreate", rc_b, sm, vm)
-            # If we created a logger, free it
-            if 'logFree' in locals() and self.logFree and logger:
-                rc_lf = self.logFree(logger)
-                print(f"[CALL] logFree rc={rc_lf}")
-
-            return rc_b
-
-        rc_f = self.backendFree(backend)
-        print("[CALL] backendFree rc=", rc_f)
-
-        # Free logger if created
-        if 'logFree' in locals() and self.logFree and logger:
-            rc_lf = self.logFree(logger)
-            print(f"[CALL] logFree rc={rc_lf}")
-
-        return 0
-
-
 class SystemProvider:
     def __init__(self, provider_ptr: POINTER(QnnSystemInterface_t)):
         self._p = provider_ptr.contents
@@ -1085,10 +1093,10 @@ class SystemProvider:
         sv = self._p.systemApiVersion
 
         return {
-            "addr":        ctypes.addressof(self._p),
-            "name_ptr":    (ctypes.cast(self._p.providerName, c_void_p).value or 0),
-            "systemApi":   f"{int(sv.major)}.{int(sv.minor)}.{int(sv.patch)}",
-            "backendId":   int(self._p.backendId),
+            "addr":         ctypes.addressof(self._p),
+            "name_ptr":     (ctypes.cast(self._p.providerName, c_void_p).value or 0),
+            "systemApi":    f"{int(sv.major)}.{int(sv.minor)}.{int(sv.patch)}",
+            "backendId":    int(self._p.backendId),
             "providerName": name,
         }
 
@@ -1110,7 +1118,7 @@ class SystemProvider:
         if not self._ptrs_look_sane(self.__iface):
             raise RuntimeError(
                 "System interface pointers look invalid. "
-                "Ensure your QNN System table layout matches this struct"
+                "Ensure QNN System table layout matches this struct"
                 "or share headers to refine ctypes layout."
             )
 
@@ -1211,25 +1219,3 @@ class SystemProvider:
         ]
 
         return all(p is not None and p >= 0x1000 for p in ptrs)
-
-    def smoke_test(self, log_level: int = 5):
-        # System log (NULL callback, just to prove we can create/free)
-        sys_logger = c_void_p()
-        rc_sl = self.systemLogCreate(CORE_LOG_CB, int(
-            log_level), ctypes.byref(sys_logger))
-        print(
-            f"[CALL] systemLogCreate rc={rc_sl} sys_logger=0x{(ctypes.cast(sys_logger, c_void_p).value or 0):016x}")
-
-        rc_slf = self.systemLogFree(sys_logger)
-        print(f"[CALL] systemLogFree rc={rc_slf}")
-
-        # System context create/free
-        sys_ctx = c_void_p()
-
-        rc_sc = self.systemContextCreate(ctypes.byref(sys_ctx))
-        print(
-            f"[CALL] systemContextCreate rc={rc_sc} sys_ctx=0x{(ctypes.cast(sys_ctx, c_void_p).value or 0):016x}")
-        rc_sf = self.systemContextFree(sys_ctx)
-        print(f"[CALL] systemContextFree rc={rc_sf}")
-
-        return 0
