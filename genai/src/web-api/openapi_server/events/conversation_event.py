@@ -131,12 +131,126 @@ class ConversationEvent(ABC):
         self._is_tool_calling = False
         self._pending_tool_calls: List[dict] = []
         self._tool_response_received = False
+        self._waiting_for_tool_response = False
+        self._tool_wait_started_at: Optional[float] = None
+        self._tool_wait_deadline: Optional[float] = None
+        self._tool_wait_timed_out = False
+        self._tool_timeout_task: Optional[asyncio.Task] = None
+        self._tool_timeout_lock = asyncio.Lock()
 
         # Cancellation flag — set by session.cancel_active_event()
         self.is_cancelled = False
 
         # Completion callback (for ADHOC_MODE lock management)
         self._completion_callback: Optional[Callable] = None
+
+    def start_tool_response_timeout(self, timeout_seconds: int):
+        """
+        Start timeout tracking for tool response.
+        Keeps event state ACTIVE but marks it as waiting for tool output.
+        """
+        self.cancel_tool_response_timeout(clear_flags=False)
+
+        now = time.time()
+        self._waiting_for_tool_response = True
+        self._tool_wait_started_at = now
+        self._tool_wait_deadline = now + timeout_seconds
+        self._tool_wait_timed_out = False
+
+        self._tool_timeout_task = asyncio.create_task(
+            self._tool_response_timeout_worker(timeout_seconds)
+        )
+        logger.info(
+            f"Event {self.event_id}: Waiting for tool response (timeout={timeout_seconds}s)"
+        )
+
+    def cancel_tool_response_timeout(self, clear_flags: bool = True):
+        """Cancel active tool response timeout task if any."""
+        if self._tool_timeout_task and not self._tool_timeout_task.done():
+            self._tool_timeout_task.cancel()
+        self._tool_timeout_task = None
+
+        if clear_flags:
+            self._waiting_for_tool_response = False
+            self._tool_wait_started_at = None
+            self._tool_wait_deadline = None
+
+    def is_waiting_for_tool_response(self) -> bool:
+        """Return True if event is waiting for external tool output."""
+        return self._waiting_for_tool_response and self._is_tool_calling and not self._tool_response_received
+
+    def has_tool_response_timed_out(self) -> bool:
+        """Return True if waiting window has already expired."""
+        if self._tool_wait_timed_out:
+            return True
+        if not self._tool_wait_deadline:
+            return False
+        return time.time() > self._tool_wait_deadline
+
+    def mark_tool_response_received(self):
+        """Mark that tool response arrived in time and timeout watcher can stop."""
+        self._tool_response_received = True
+        self.cancel_tool_response_timeout(clear_flags=True)
+
+    @property
+    def tool_wait_timed_out(self) -> bool:
+        return self._tool_wait_timed_out
+
+    async def _tool_response_timeout_worker(self, timeout_seconds: int):
+        """Background task that fails the event if tool output never arrives."""
+        try:
+            await asyncio.sleep(timeout_seconds)
+            await self.expire_tool_wait(
+                reason=f"Tool response timed out after {timeout_seconds} seconds"
+            )
+        except asyncio.CancelledError:
+            return
+
+    async def expire_tool_wait(self, reason: str) -> bool:
+        """
+        Expire current tool-wait window and fail the event.
+        Returns True when timeout transition happened, False otherwise.
+        """
+        async with self._tool_timeout_lock:
+            if not self.is_active():
+                return False
+            if not self._is_tool_calling:
+                return False
+            if self._tool_response_received:
+                return False
+            if self._tool_wait_timed_out:
+                return False
+
+            self._tool_wait_timed_out = True
+            self._waiting_for_tool_response = False
+            self._tool_wait_deadline = time.time()
+            self._tool_timeout_task = None
+
+            logger.warning(f"Event {self.event_id}: {reason}")
+
+            self.fail_turn(TimeoutError(reason))
+
+            try:
+                from openapi_server.session.conversation_utils import ConversationUtils
+                from openapi_server.managers.session_manager import SessionManager
+
+                user_messages = [
+                    self.session.messages[idx]
+                    for idx in self.message_indices
+                    if idx < len(self.session.messages) and self.session.messages[idx].get('role') == 'user'
+                ]
+                if user_messages:
+                    event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
+                    session_manager = SessionManager.get_instance()
+                    session_manager.unregister_tool_calling_event(event_hash)
+                    session_manager.register_timed_out_tool_call(event_hash, self.session.session_id)
+            except Exception as map_error:
+                logger.error(f"Event {self.event_id}: Failed tool-timeout map cleanup: {map_error}")
+
+            if self._completion_callback:
+                await self._completion_callback(self.event_id, self.state)
+
+            return True
 
     @abstractmethod
     async def execute_turn(self, request_data) -> dict:
@@ -222,6 +336,7 @@ class ConversationEvent(ABC):
     def complete_turn(self):
         """Mark turn as completed with enhanced token tracking."""
         if self.state == EventState.ACTIVE:
+            self.cancel_tool_response_timeout(clear_flags=True)
             self.state = EventState.COMPLETED
             self.completed_at = time.time()
 
@@ -257,6 +372,7 @@ class ConversationEvent(ABC):
     def cancel_turn(self):
         """Mark turn as cancelled (due to explicit client cancellation)."""
         if self.state == EventState.ACTIVE:
+            self.cancel_tool_response_timeout(clear_flags=True)
             self.state = EventState.CANCELLED
             self.failed_at = time.time()
             logger.info(f"Event {self.event_id}: Turn CANCELLED")
@@ -271,6 +387,7 @@ class ConversationEvent(ABC):
     def fail_turn(self, error: Exception):
         """Mark turn as failed."""
         if self.state == EventState.ACTIVE:
+            self.cancel_tool_response_timeout(clear_flags=True)
             self.state = EventState.FAILED
             self.failed_at = time.time()
 

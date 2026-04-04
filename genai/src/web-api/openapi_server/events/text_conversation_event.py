@@ -24,7 +24,10 @@ from openapi_server.session.token_counter import TokenCounter
 from openapi_server.session.tool_handler import ToolHandler
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.managers.metrics_manager import MetricsManager
-from openapi_server.impl.constant import LLMServiceQueryConstant as QUERY_CONST
+from openapi_server.impl.constant import (
+    LLMServiceQueryConstant as QUERY_CONST,
+    TOOL_RESPONSE_TIMEOUT_SECONDS,
+)
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.logger.logger_config import LoggerConfig
 
@@ -396,6 +399,7 @@ class TextConversationEvent(ConversationEvent):
                     user_messages = [self.session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
                     SessionManager.get_instance().register_tool_calling_event(event_hash, self.session.session_id)
+                    self.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
 
                 else:
                     # Regular content or failed tool parse
@@ -464,7 +468,6 @@ class TextConversationEvent(ConversationEvent):
                         MetricsManager.get_instance().record_inference_failure(self.model_id)
                     except Exception:
                         pass
-                    self.terminate_handle(force=True)
 
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
@@ -553,7 +556,7 @@ class TextConversationEvent(ConversationEvent):
                 raise RuntimeError(f"Event {self.event_id}: Not in tool calling state")
 
             self.tool_info = tool_response
-            self._tool_response_received = True
+            self.mark_tool_response_received()
 
             logger.info(f"Event {self.event_id}: Generating final answer after tool call")
 
@@ -688,7 +691,9 @@ class TextConversationEvent(ConversationEvent):
             except Exception as retry_error:
                 logger.error(f"Event {self.event_id}: Retry failed: {retry_error}")
 
-        self.terminate_handle(force=True)
+        # Avoid abrupt global kill for per-request failures.
+        # Graceful shutdown lets the manager recover without force-killing the subprocess.
+        self.terminate_handle(force=False)
         self.fail_turn(error)
         return {
             "response": None,
