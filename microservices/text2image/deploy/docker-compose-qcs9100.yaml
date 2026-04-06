@@ -18,7 +18,5 @@ services:
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
     volumes:
-      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
-      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
       - ${MODELS_PATH:-/opt/image_gen}:/opt/image_gen/
     command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:9090"]

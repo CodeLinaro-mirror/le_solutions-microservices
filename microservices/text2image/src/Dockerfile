@@ -58,8 +58,31 @@ COPY web-api ${T2I_SRC_DIR}/web-api
 # Install web-api server as python package
 RUN pip install ${T2I_SRC_DIR}
 
+###############################################
+# Stage 2: FastRPC Base Layer Builder
+###############################################
+
+FROM debian:trixie-slim AS fastrpc-builder
+
+# Install build dependencies for fastrpc
+RUN apt-get update                                                                              && \
+    apt-get install -y --no-install-recommends build-essential                                  && \
+    apt-get install -y git wget unzip libtool libbsd-dev libyaml-dev pkg-config m4 autoconf        \
+            automake                                                                            && \
+    apt-get clean                                                                               && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build and install fastrpc
+RUN git clone --depth 1 https://github.com/quic/fastrpc.git                                     && \
+    cd fastrpc                                                                                  && \
+    autoreconf -is                                                                              && \
+    CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"'                         \
+            ./configure --prefix=/usr --libdir=/usr/lib                                         && \
+    make -j"$(nproc)"                                                                           && \
+    make install
+
 #########################
-# Stage 2: Runtime Stage
+# Stage 3: Runtime Stage
 #########################
 
 FROM debian:trixie-slim AS service
@@ -89,6 +112,8 @@ COPY --from=builder /mnt/work/venv /mnt/work/venv
 
 # Copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr
+COPY --from=fastrpc-builder /usr/lib/libcdsprpc.so* /usr/lib/
+COPY --from=fastrpc-builder /usr/lib/aarch64-linux-gnu/libyaml* /usr/lib/
 
 # Copy default model configuration (used when GENAI_MODELS_CONFIG_PATH is not set)
 RUN mkdir -p /app/default_configs

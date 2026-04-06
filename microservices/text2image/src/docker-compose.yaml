@@ -20,7 +20,7 @@ services:
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
     volumes:
-      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
-      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - /sys/firmware/devicetree/base/model:/run/device-model
+      - /usr/lib/dsp/cdsp:/usr/lib/dsp/cdsp
       - ${MODELS_PATH:-/opt/image_gen}:/opt/image_gen/
     command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2I_PORT} --reload"
