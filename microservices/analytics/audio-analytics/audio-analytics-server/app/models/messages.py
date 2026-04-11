@@ -30,6 +30,7 @@ class TranscriptionsCreateRequest:
     language: Optional[str] = None                     # e.g., "en", "es"
     stream: bool = False                               # Streaming output?
     parameters: Optional[Union[str, List[Dict[str, Any]]]] = None  # Custom parameters (e.g., sampling_rate, channels)
+    channels: Optional[int] = None                     # Number of audio channels (1=mono, 2=stereo)
     file: Optional[str] = None                         # Base64 encoded audio (or null for live stream)
     filename: Optional[str] = None                     # Original filename
     sync_id: Optional[str] = None                      # For synchronous requests
@@ -48,6 +49,9 @@ class TranscriptionsCreateRequest:
         # Filter out unexpected fields to handle legacy/extra client fields
         valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        # Coerce keep_alive to bool — form fields arrive as strings "true"/"false"
+        if 'keep_alive' in filtered_data and not isinstance(filtered_data['keep_alive'], bool):
+            filtered_data['keep_alive'] = str(filtered_data['keep_alive']).lower() in ('true', '1', 'yes')
         return cls(**filtered_data)
 
 
@@ -71,18 +75,23 @@ class TranscriptionsResult:
         return cls(**data)
     
     @classmethod
-    def create_result(cls, text: str, language: str, result_type: str, 
+    def create_result(cls, text: str, language: str, result_type: str,
                      stream: bool = False, session_id: Optional[str] = None,
-                     sync_id: Optional[str] = None):
+                     sync_id: Optional[str] = None, language_name: Optional[str] = None,
+                     state: Optional[str] = None):
         """Helper to create a result message"""
         result = {
             "text": text,
             "language": language,
             "type": result_type  # "transcript.text.done" or "transcript.text.delta"
         }
+        if language_name:
+            result["language_name"] = language_name
         if session_id:
             result["session_id"] = session_id
-        
+        if state:
+            result["state"] = state
+
         return cls(
             message_type="transcriptions_result",
             stream=stream,
@@ -124,15 +133,39 @@ class TranscriptionsClose:
     message_type: str = "transcriptions_close"
     message_source: str = "audio_analytics_api"
     session_id: Optional[str] = None
-    
+    sync_id: Optional[str] = None
+
     def to_json(self) -> str:
         return json.dumps(asdict(self))
-    
+
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
         # Filter out unexpected fields
-        valid_fields = {'message_type', 'message_source', 'session_id'}
+        valid_fields = {'message_type', 'message_source', 'session_id', 'sync_id'}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+
+@dataclass
+class TranscriptionsFlush:
+    """
+    Message sent from API to Server to flush the audio buffer and force
+    immediate processing of any buffered audio.
+    Sent on channel: asr.transcription.in
+    """
+    message_type: str = "transcriptions_flush"
+    message_source: str = "audio_analytics_api"
+    session_id: Optional[str] = None
+    sync_id: Optional[str] = None
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, json_str: str):
+        data = json.loads(json_str)
+        valid_fields = {'message_type', 'message_source', 'session_id', 'sync_id'}
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered_data)
 
@@ -153,7 +186,10 @@ class TranscriptionsModelsRequest:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        # Filter out unexpected fields
+        valid_fields = {'message_type', 'message_source', 'sync_id'}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -173,7 +209,9 @@ class TranscriptionsModelsResponse:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 # ============================================================================
@@ -194,14 +232,18 @@ class TranslationRequest:
     source_language: str = "en"                        # e.g., "en", "fr", "es"
     target_language: str = "en"                        # e.g., "en", "fr", "es"
     parameters: Optional[Dict[str, Any]] = None        # e.g., {"formality": "informal"}
-    
+    keep_alive: Optional[bool] = False                 # Keep T2T engine alive after translation (default: False)
+
     def to_json(self) -> str:
         return json.dumps(asdict(self))
     
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        # Filter out unexpected fields
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -228,7 +270,9 @@ class TranslationResponse:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
     
     @classmethod
     def create_response(cls, sync_id: str, translations: List[TranslationResult]):
@@ -262,7 +306,9 @@ class TranslationModelsRequest:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -282,7 +328,9 @@ class TranslationModelsResponse:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 # ============================================================================
@@ -307,17 +355,20 @@ class TTSSynthesizeRequest:
     sample_rate: Optional[int] = None                  # Sample rate for output audio
     output_speaker: Optional[bool] = False
     on_device_playback: Optional[bool] = False
-    output_speaker_name: Optional[str] = None         # Device name for on-device playback (e.g., "Yeti Nano: USB Audio (hw:0,0)")
-    keep_alive: Optional[bool] = True                 # Keep TTS engine alive after synthesis (default: True)
+    output_speaker_name: Optional[str] = None          # Device name for on-device playback (e.g., "Yeti Nano: USB Audio (hw:0,0)")
+    keep_alive: Optional[bool] = False                 # Keep TTS engine alive after synthesis (default: False)
     sync_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    
+    override_max_chars_check: bool = False
+
     def to_json(self) -> str:
         return json.dumps(asdict(self))
     
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -351,7 +402,29 @@ class TTSComplete:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+
+@dataclass
+class TTSCloseRequest:
+    """
+    Message sent from API to Server to close the TTS session and release resources.
+    Sent on channel: tts.text.in
+    """
+    message_type: str = "tts_close"
+    message_source: str = "audio_analytics_api"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, json_str: str):
+        data = json.loads(json_str)
+        valid_fields = {'message_type', 'message_source'}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 @dataclass
@@ -414,7 +487,9 @@ class TTSModelsResponse:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 # ============================================================================
@@ -436,7 +511,9 @@ class ErrorMessage:
     @classmethod
     def from_json(cls, json_str: str):
         data = json.loads(json_str)
-        return cls(**data)
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
 
 
 # ============================================================================

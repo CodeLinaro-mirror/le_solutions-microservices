@@ -1,4 +1,4 @@
-﻿# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+#  Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 # Multi-stage Dockerfile for Audio Analytics
@@ -6,28 +6,38 @@
 # For blackbox mode (API + Server in single container)
 
 ARG INSTALL_NATIVE_LIBS=true
-ARG DISTRO=debian
+ARG INSTALL_PULSE_AUDIO=false
+#ARG DISTRO=debian
 
-ARG DEBIAN_VERSION=trixie
-FROM docker-registry.qualcomm.com/library/debian:${DEBIAN_VERSION} AS base
+#ARG DEBIAN_VERSION=trixie
+#FROM docker-registry.qualcomm.com/library/debian:${DEBIAN_VERSION} AS base
 
-#ARG DISTRO=ubuntu
-#ARG UBUNTU_VERSION=24.04
-#FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS base
+ARG DISTRO=ubuntu
+ARG UBUNTU_VERSION=24.04
+FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS base
 
-# Install common dependencies (no nodejs here!)
+# Install common dependencies
+# NOTE: curl is only needed in builder stages; runtime uses python3 for healthcheck
 RUN apt-get update && \
     apt-get upgrade -y && \
-    apt-get install -y \
+    apt-get install -y --no-install-recommends \
     curl \
-    sudo \
-    build-essential \
-    libpulse0 \
-    portaudio19-dev \
-    libportaudio2 \
-    pulseaudio-utils \
-    pulseaudio \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Conditionally install PulseAudio / PortAudio libs (required for microphone and speaker support)
+# Pass --build-arg INSTALL_PULSE_AUDIO=true to enable
+ARG INSTALL_PULSE_AUDIO=false
+RUN if [ "$INSTALL_PULSE_AUDIO" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        libpulse0 \
+        portaudio19-dev \
+        libportaudio2 \
+        pulseaudio-utils \
+        pulseaudio && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # ============================
 # Stage: Native Libraries (ARM64 only)
@@ -40,7 +50,7 @@ ARG INSTALL_NATIVE_LIBS=true
 # Tools for download/unzip
 RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
     apt-get update && \
-    apt-get install -y wget unzip cmake file && \
+    apt-get install -y wget unzip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*; \
     fi
@@ -48,8 +58,8 @@ RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
 ENV VLM_BUILD_DIR="/mnt/work/build"
 ENV VLM_DEPLOY_DIR="/mnt/work/deploy"
 ENV VLM_ADSP_DIR=${VLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
-ENV VLM_QNP_VER=2.40.0.251030
-#ENV VLM_QNP_VER=2.39.0.250925
+ENV VLM_QNP_VER=2.45.40.260406
+#ENV VLM_QNP_VER=2.40.0.251030
 ENV VLM_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV VLM_QNP_SDK=v${VLM_QNP_VER}.zip
 # Expected unzip layout (adjust if archive differs)
@@ -85,13 +95,7 @@ RUN set -eu && \
       test -d "${VLM_QNN_ROOT}" || { echo "ERROR: ${VLM_QNN_ROOT} missing"; ls -la "${VLM_DOWNLOAD_DIR}/qairt" || true; exit 1; }; \
       test -d "${VLM_QNN_LIB_PATH}" || { echo "ERROR: ${VLM_QNN_LIB_PATH} missing"; ls -la "${VLM_QNN_ROOT}" || true; exit 1; }; \
       \
-      echo '==> Validate Genie headers & libs exist in archive'; \
-      test -d "${VLM_QNN_ROOT}/include/Genie" || { echo "ERROR: Genie headers missing"; exit 1; }; \
-      test -f "${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so" || { echo "ERROR: libGenie.so missing"; exit 1; }; \
-      \
-      echo '==> Copy headers & aarch64 libs to system and deploy'; \
-      cp -v "${VLM_QNN_ROOT}/include/Genie/"* /usr/include/; \
-      cp -v "${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so" /usr/lib/; \
+      echo '==> Copy aarch64 QNN libs to deploy'; \
       cp -v "${VLM_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/"* "${VLM_DEPLOY_DIR}/usr/lib/"; \
       \
       echo '==> Copy ADSP (Hexagon) unsigned binaries'; \
@@ -107,18 +111,6 @@ RUN set -eu && \
       test -d "${VLM_ADSP_DIR}" && test "$(find "${VLM_ADSP_DIR}" -type f -name '*.so' | wc -l)" -ge 1 || { \
         echo "ERROR: No ADSP .so files copied into ${VLM_ADSP_DIR}"; exit 1; \
       }; \
-      \
-      echo '==> Validate libGenie.so version string contains 2.40'; \
-      if command -v strings >/dev/null 2>&1; then \
-        strings /usr/lib/libGenie.so | grep -E "2\.40|${VLM_QNP_VER}" >/dev/null || { \
-          echo "ERROR: /usr/lib/libGenie.so does not appear to be ${VLM_QNP_VER}"; exit 1; \
-        }; \
-        strings "${VLM_DEPLOY_DIR}/usr/lib/libGenie.so" | grep -E "2\.40|${VLM_QNP_VER}" >/dev/null || { \
-          echo "ERROR: deploy libGenie.so does not appear to be ${VLM_QNP_VER}"; exit 1; \
-        }; \
-      else \
-        echo "WARN: 'strings' not available; skipping embedded version check"; \
-      fi; \
       \
       echo "==> QAIRT ${VLM_QNP_VER} install and validation complete"; \
     else \
@@ -144,30 +136,37 @@ RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
 # ============================
 # Stage: Build API (Node.js)
 # ============================
-FROM base AS api-builder
+# node:22-slim is not available in the internal registry, so we install via
+# nodesource - but ONLY in this builder stage. The runtime stage copies just
+# the node binary + app files across, so the ~288 MB install never lands in
+# the final image.
+FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS api-builder
 
-# Install prerequisites (Debian may need extra cert/GPG tooling)
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    if [ "$DISTRO" = "debian" ]; then \
-      apt-get install -y --no-install-recommends gnupg; \
-    fi && \
+    apt-get install -y --no-install-recommends \
+      curl ca-certificates gnupg && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Use bash + pipefail so curl failures don't silently pass
-RUN ["/bin/bash", "-c", "set -o pipefail && curl -fsSL https://deb.nodesource.com/setup_22.x | bash -"]
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 RUN node --version
 
-RUN useradd -ms /bin/bash iot-user
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    useradd -ms /bin/bash -u 1000 iot-user && \
+    mkdir -p /usr/src/api && \
+    chown -R iot-user:iot-user /usr/src/api
 USER iot-user
 WORKDIR /usr/src/api
 COPY --chown=iot-user:iot-user audio-analytics-api/package*.json ./
-RUN npm install --production
+RUN npm install --omit=dev
 COPY --chown=iot-user:iot-user audio-analytics-api/data ./data
 
 
@@ -178,13 +177,13 @@ COPY --chown=iot-user:iot-user audio-analytics-api/data ./data
 FROM base AS server-builder
 
 ARG INSTALL_NATIVE_LIBS
+ARG INSTALL_PULSE_AUDIO=false
 
 # Install default Python 3 packages
 RUN apt-get update --fix-missing && \
     apt-get install -y \
     python3 \
     python3-pip \
-    python3-dev \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
@@ -193,12 +192,19 @@ RUN python3 -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 
 RUN pip install --upgrade pip
-RUN useradd -ms /bin/bash iot-user
-
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    useradd -ms /bin/bash -u 1000 iot-user
 # Create virtual environment and install requirements as root
 WORKDIR /usr/src/server
 COPY audio-analytics-server/app/requirements.txt ./
+COPY audio-analytics-server/app/requirements-audio.txt ./
 RUN pip install -r requirements.txt && \
+    if [ "$INSTALL_PULSE_AUDIO" = "true" ]; then \
+      echo "==> Installing audio device packages (sounddevice/cffi/pycparser)"; \
+      pip install -r requirements-audio.txt; \
+    else \
+      echo "==> Skipping audio device packages (INSTALL_PULSE_AUDIO!=true)"; \
+    fi && \
     python3 -c "import site; print('Python packages installed at:', site.getsitepackages())"
 
 # Change ownership of the server directory to iot-user
@@ -208,46 +214,60 @@ COPY --chown=iot-user:iot-user audio-analytics-server/app ./
 
 # Copy Python wrapper files to server directory (same location as .so files)
 USER root
-RUN mkdir -p /usr/src/engine/python /opt/audio/models /usr/src/engine/native
+RUN mkdir -p /usr/src/engine/python /opt/audio/models /usr/src/engine/native /usr/src/engine/models/whisper
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/*.py /usr/src/server/
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/melo /usr/src/server/melo
 
 # Pre-compile all melo dictionary modules so imports take <1s instead of ~27s
 RUN python3 -m compileall -q /usr/src/server/melo
 COPY --chown=root:root audio-analytics-server/engine/native/aarch64-oe-linux/*.so /usr/src/engine/native/
+COPY --chown=iot-user:iot-user audio-analytics-server/engine/models/whisper/ /usr/src/engine/models/whisper/
 #COPY --chown=iot-user:iot-user audio-analytics-server/engine/config/models.json /opt/audio/models/models.json
 
 # ============================
 # Stage: Final Runtime Image
 # ============================
-FROM base AS runtime
+# Use a clean base — do NOT inherit from `base` which carries curl + apt-get
+# upgrade baggage (~50-100 MB). Runtime only needs what's explicitly installed here.
+FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS runtime
 
 ARG INSTALL_NATIVE_LIBS
 
-# 1) Install runtime deps + Debian-only prerequisites for NodeSource
+# Single combined layer: upgrade + runtime deps only.
+# No curl, no build tools, no nodesource. Node binary is copied from api-builder.
+# Healthcheck uses python3 so curl is not needed.
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-      curl python3 python3-pip python3-venv supervisor ca-certificates && \
-    if [ "$DISTRO" = "debian" ]; then \
-      apt-get install -y --no-install-recommends gnupg; \
-    fi && \
+      python3 supervisor ca-certificates && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# 2) Run NodeSource with pipefail so curl failures don't get masked
-RUN ["/bin/bash", "-c", "set -o pipefail && curl -fsSL https://deb.nodesource.com/setup_22.x | bash -"] 
+# Conditionally install PulseAudio / PortAudio runtime libs
+ARG INSTALL_PULSE_AUDIO=false
+RUN if [ "$INSTALL_PULSE_AUDIO" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        libpulse0 \
+        libportaudio2 \
+        pulseaudio-utils \
+        pulseaudio && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
-# 3) Install nodejs from the added repo
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
+# Copy Node.js binary from the builder stage - this is the only thing needed
+# to run `node data/index.js` at runtime. No npm, no nodesource, no apt repo.
+# nodesource installs node at /usr/bin/node on Debian.
+COPY --from=api-builder /usr/bin/node /usr/bin/node
 
 RUN node --version
 
 
-RUN useradd -ms /bin/bash iot-user && \
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    useradd -ms /bin/bash -u 1000 iot-user && \
     usermod -aG audio iot-user
-RUN mkdir -p /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /var/log/supervisor /app/uploads /opt/audio/models /opt/cache /tmp/audio-sockets && \
-    chown iot-user:iot-user /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /opt/audio/models /opt/cache /var/log/supervisor /var/run && \
+RUN mkdir -p /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /app/uploads /opt/audio/models /opt/cache /tmp/audio-sockets /usr/src/engine/models/whisper && \
+    chown iot-user:iot-user /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /opt/audio/models /opt/cache /var/run && \
     chmod 777 /tmp/audio-sockets /app/uploads && \
     chmod -R 777 /app
 
@@ -267,11 +287,7 @@ COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/styles.css /usr/src/aud
 COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/script.js /usr/src/audio-tester/script.js
 COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/proxy.py /usr/src/audio-tester/proxy.py
 COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/logo.png /usr/src/audio-tester/logo.png
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/snapdragonlogo3.png /usr/src/audio-tester/snapdragonlogo3.png
 COPY --from=server-builder --chown=iot-user:iot-user /usr/src/server /usr/src/server
-COPY --chown=iot-user:iot-user audio-analytics-server/app/requirements.txt ./
-#RUN pip3 install --no-cache-dir -r requirements.txt
-
 # Copy native libraries (directory always exists, only populated when INSTALL_NATIVE_LIBS=true)
 COPY --from=native-libs /mnt/work/deploy/usr /usr
 
@@ -280,18 +296,19 @@ COPY --from=server-builder /venv /venv
 
 # Copy pre-built wrapper libraries for ARM64 to server directory (like temp setup)
 COPY --from=server-builder --chown=iot-user:iot-user /usr/src/engine/native/*.so /usr/src/server/
+COPY --from=server-builder --chown=iot-user:iot-user /usr/src/engine/models/whisper/ /usr/src/engine/models/whisper/
 
 # Using virtual environment Python packages
 ENV PYTHONPATH=/usr/src/server
 ENV PATH="/venv/bin:$PATH"
-RUN python -m pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p /etc/supervisor/conf.d
 COPY <<'EOF' /etc/supervisor/conf.d/supervisord.conf
 [supervisord]
 nodaemon=true
 user=iot-user
-logfile=/var/log/supervisor/supervisord.log
+logfile=/dev/null
+logfile_maxbytes=0
 pidfile=/var/run/supervisord.pid
 
 [program:server]
@@ -301,9 +318,13 @@ directory=/usr/src/server
 user=iot-user
 autostart=true
 autorestart=true
-stdout_logfile=/var/log/supervisor/server.log
-stderr_logfile=/var/log/supervisor/server.err.log
-environment=LOG_LEVEL="%(ENV_LOG_LEVEL)s",DEV_MODE="%(ENV_DEV_MODE)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s",DSP_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/src/server",LD_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/lib:/usr/src/server:/usr/src/engine/native:/mnt/work/deploy/usr/lib"
+stdout_logfile=/proc/1/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/proc/1/fd/2
+stderr_logfile_maxbytes=0
+stdout_events_enabled=true
+stderr_events_enabled=true
+environment=LOG_LEVEL="%(ENV_LOG_LEVEL)s",DEV_MODE="%(ENV_DEV_MODE)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s",DSP_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/src/server",LD_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/lib:/usr/src/server:/usr/src/engine/native:/mnt/work/deploy/usr/lib",PYTHONUNBUFFERED="1"
 
 [program:api]
 priority=20
@@ -315,8 +336,12 @@ autorestart=true
 startsecs=5
 stopasgroup=true
 killasgroup=true
-stdout_logfile=/var/log/supervisor/api.log
-stderr_logfile=/var/log/supervisor/api.err.log
+stdout_logfile=/proc/1/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/proc/1/fd/2
+stderr_logfile_maxbytes=0
+stdout_events_enabled=true
+stderr_events_enabled=true
 environment=NODE_ENV="%(ENV_NODE_ENV)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s"
 
 [program:audio-chat]
@@ -326,8 +351,12 @@ directory=/usr/src/audio-chat
 user=iot-user
 autostart=true
 autorestart=true
-stdout_logfile=/var/log/supervisor/audio-chat.log
-stderr_logfile=/var/log/supervisor/audio-chat.err.log
+stdout_logfile=/proc/1/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/proc/1/fd/2
+stderr_logfile_maxbytes=0
+stdout_events_enabled=true
+stderr_events_enabled=true
 
 [program:audio-tester]
 priority=31
@@ -336,13 +365,18 @@ directory=/usr/src/audio-tester
 user=iot-user
 autostart=true
 autorestart=true
-stdout_logfile=/var/log/supervisor/audio-tester.log
-stderr_logfile=/var/log/supervisor/audio-tester.err.log
+stdout_logfile=/proc/1/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/proc/1/fd/2
+stderr_logfile_maxbytes=0
+stdout_events_enabled=true
+stderr_events_enabled=true
 EOF
 
 EXPOSE 8085 8001 8000
+# Use python3 for healthcheck — eliminates the need for curl in the runtime image
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:8085/audio-analytics/v1/api/health || exit 1
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8085/audio-analytics/v1/api/health')" || exit 1
 
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379

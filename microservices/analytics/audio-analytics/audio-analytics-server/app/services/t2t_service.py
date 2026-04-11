@@ -6,7 +6,6 @@ import asyncio
 import os
 import sys
 import importlib.util
-import ctypes
 from common.base_service import BaseService
 from common.redis_client import RedisClient
 from common.config import Config
@@ -28,335 +27,239 @@ logger = get_logger(__name__)
 class T2TService(BaseService):
     """
     Text-to-Text Translation Service.
-    Handles translation requests between different languages.
+    Handles translation requests between different languages using a singleton
+    TranslationWrapper instance — the same pattern as ASR (WhisperWrapper) and
+    TTS (TTS wrapper).
     """
-    
+
     def __init__(self, redis_client: RedisClient):
         super().__init__(redis_client, "T2T")
         self.dev_mode = Config.DEV_MODE
         self.model_config = ModelLoader.get_translation_models(self.dev_mode)
-        self.available_models = []  # Will be populated during initialization
-        
-        # Initialize T2T engine if not in dev mode
+        self.available_models = []  # Populated during initialize()
+
+        # Translation engine module (loaded dynamically from engine/python)
         self.t2t_engine = None
+
+        # Singleton wrapper instance — one wrapper at a time, reused across requests.
+        # Reinitialised only when the model/language pair changes.
         self.t2t_wrapper = None
-        self.engine_handle = None
-        self.callback_handle = None
-        self.translation_results = {}
-        
-        # Use process manager for separate worker processes
-        self.process_manager = None
-        self.use_process_mode = True  # Flag to enable process-based translation
-        
-        # Keep old wrapper system as fallback
-        self.translation_wrappers = {}  # Dict to store wrapper instances by model key
-        self.current_wrapper_key = None
-        self.wrapper_was_cleaned_up = False  # Track if wrapper was cleaned up
-        
-        # Service coordinator for managing resource conflicts with ASR
+        self.t2t_wrapper_lock = asyncio.Lock()
+        self.current_wrapper_key = None  # "<model>_<input_lang>_<output_lang>"
+
+        # Service coordinator for managing resource conflicts with ASR/TTS
         self.coordinator = get_service_coordinator()
-        
+
         if not self.dev_mode:
-            self.logger.info("Running in production mode - initializing T2T engine")
-            
-            if self.use_process_mode:
-                self.logger.info("Using process-based translation mode")
-                try:
-                    # Import process manager
-                    engine_path = os.path.join(
+            self.logger.info("Running in production mode - loading translation wrapper")
+            try:
+                # Try multiple possible locations for the translation wrapper
+                possible_paths = [
+                    os.path.join(
                         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "engine", "python"
-                    )
-                    if engine_path not in sys.path:
-                        sys.path.insert(0, engine_path)
-                    
-                    from translation_process_manager import get_process_manager
-                    self.process_manager = get_process_manager()
-                    self.logger.info("Process manager initialized successfully")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error initializing process manager: {e}", exc_info=True)
-                    self.logger.info("Falling back to wrapper mode")
-                    self.use_process_mode = False
-            
-            if not self.use_process_mode:
-                self.logger.info("Using wrapper-based translation mode")
-                try:
-                    # Try to import the translation wrapper module from engine/python directory
-                    engine_path = os.path.join(
-                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "engine", "python"
-                    )
-                    wrapper_path = os.path.join(engine_path, "translate_wrapper.py")
-                    
-                    if os.path.exists(wrapper_path):
-                        self.logger.info(f"Found translation wrapper at {wrapper_path}")
-                        # Add engine path to sys.path if not already there
-                        if engine_path not in sys.path:
-                            sys.path.insert(0, engine_path)
-                        
-                        # Import the module dynamically
-                        spec = importlib.util.spec_from_file_location("translate_wrapper", wrapper_path)
-                        if spec and spec.loader:
-                            self.t2t_engine = importlib.util.module_from_spec(spec)
-                            sys.modules["translate_wrapper"] = self.t2t_engine
-                            spec.loader.exec_module(self.t2t_engine)
-                            self.logger.info("Translation wrapper module loaded successfully")
-                            
-                            # Check if TranslationWrapper class is available
-                            if hasattr(self.t2t_engine, 'TranslationWrapper'):
-                                self.logger.info("TranslationWrapper class found successfully")
-                            else:
-                                self.logger.warning("TranslationWrapper class not found in wrapper module")
-                        else:
-                            self.logger.error("Failed to load translation wrapper module specification")
+                        "translate_wrapper.py"
+                    ),
+                    "/usr/src/server/translate_wrapper.py",
+                    os.path.join(os.path.dirname(__file__), "..", "..", "translate_wrapper.py")
+                ]
+                
+                self.logger.info(f"Searching for translation wrapper in {len(possible_paths)} locations...")
+                wrapper_path = None
+                for path in possible_paths:
+                    self.logger.info(f"  Checking: {path}")
+                    if os.path.exists(path):
+                        wrapper_path = path
+                        self.logger.info(f"  ✓ Found translation wrapper at {path}")
+                        break
                     else:
-                        self.logger.warning(f"Translation wrapper not found at {wrapper_path}")
-                except Exception as e:
-                    self.logger.error(f"Error initializing translation wrapper: {e}", exc_info=True)
+                        self.logger.info(f"  ✗ Not found at {path}")
+                
+                if wrapper_path:
+                    self.logger.info(f"Loading translation wrapper from {wrapper_path}")
+                    wrapper_dir = os.path.dirname(wrapper_path)
+                    if wrapper_dir not in sys.path:
+                        sys.path.insert(0, wrapper_dir)
+                        self.logger.info(f"Added {wrapper_dir} to Python path")
+
+                    spec = importlib.util.spec_from_file_location("translate_wrapper", wrapper_path)
+                    if spec and spec.loader:
+                        self.logger.info("Creating module from spec...")
+                        self.t2t_engine = importlib.util.module_from_spec(spec)
+                        sys.modules["translate_wrapper"] = self.t2t_engine
+                        self.logger.info("Executing module...")
+                        spec.loader.exec_module(self.t2t_engine)
+                        self.logger.info("Module executed successfully")
+
+                        if hasattr(self.t2t_engine, 'TranslationWrapper'):
+                            self.logger.info("✓ TranslationWrapper class found")
+                            # Try to instantiate to check if .so files are accessible
+                            try:
+                                # Note: TranslationWrapper requires model_path/model_dir, input_lang, output_lang
+                                # We can't fully test it here without a model, but we can check if the class is callable
+                                self.logger.info("✓ TranslationWrapper class is accessible (will test .so files on first use)")
+                            except Exception as inst_error:
+                                self.logger.error(f"✗ TranslationWrapper check failed: {inst_error}", exc_info=True)
+                        else:
+                            self.logger.error("✗ TranslationWrapper class not found in wrapper module")
+                            self.t2t_engine = None
+                    else:
+                        self.logger.error("✗ Failed to load translation wrapper module specification")
+                else:
+                    self.logger.error(f"✗ Translation wrapper not found in any of the {len(possible_paths)} locations")
+            except Exception as e:
+                self.logger.error(f"✗ Error loading translation wrapper: {e}", exc_info=True)
         else:
             self.logger.info("Running in development mode - using mock responses")
-        
+
     def get_subscriptions(self) -> Dict[str, Callable]:
         """Subscribe to T2T input channels."""
         return {
             Config.T2T_TRANSLATION_IN: self.handle_message_safely(self.handle_translation_input),
             Config.T2T_MODELS: self.handle_message_safely(self.handle_models_request)
         }
-    
+
     async def initialize(self):
-        """Initialize T2T engine and load models."""
+        """Initialize T2T service and load model list."""
         self.logger.info('Initializing T2T service...')
-        
-        if not self.dev_mode and self.t2t_engine:
-            try:
-                # The translation wrapper uses the TranslationWrapper class
-                # We don't need to initialize it here, we'll create instances per request
-                # Just verify the wrapper is available
-                if hasattr(self.t2t_engine, 'TranslationWrapper'):
-                    self.logger.info("TranslationWrapper class is available")
-                else:
-                    self.logger.warning("TranslationWrapper class not found in wrapper module")
-                
-                # Convert the model config to the format expected by the API
-                self.available_models = ModelLoader.convert_translation_models_to_api_format(self.model_config)
-                
-                self.logger.info("T2T wrapper initialized successfully")
-            except Exception as e:
-                self.logger.error(f"Error initializing T2T wrapper: {e}", exc_info=True)
-                # Fall back to mock models
-                self.setup_mock_models()
-        else:
-            # In development mode, use mock models
-            self.setup_mock_models()
-        
-        self.logger.info(f'Available models: {[m["name"] for m in self.available_models]}')
-    
-    def setup_mock_models(self):
-        """Set up translation models for the API format."""
-        # Convert the model config to the format expected by the API
         self.available_models = ModelLoader.convert_translation_models_to_api_format(self.model_config)
-    
+        self.logger.info(f'Available models: {[m["name"] for m in self.available_models]}')
+
+    # -------------------------------------------------------------------------
+    # Resource management
+    # -------------------------------------------------------------------------
+
+    async def _close_wrapper(self, reason: str = ""):
+        """Close the singleton wrapper and clear the reference (caller holds lock or not needed)."""
+        if self.t2t_wrapper is not None:
+            try:
+                self.logger.info(f"Closing T2T wrapper (key: {self.current_wrapper_key}){' — ' + reason if reason else ''}")
+                self.t2t_wrapper.close()
+                self.logger.info("T2T wrapper closed")
+            except Exception as e:
+                self.logger.error(f"Error closing T2T wrapper: {e}", exc_info=True)
+            finally:
+                self.t2t_wrapper = None
+                self.current_wrapper_key = None
+
     async def cleanup_resources_for_service_switch(self):
         """Cleanup T2T resources when switching to another service."""
-        
         self.logger.info('Cleaning up T2T resources for service switch...')
-        
+
         if Config.T2T_KEEPALIVE_SINGLETON:
-            self.logger.info("T2T_KEEPALIVE_SINGLETON is true")
+            self.logger.info("T2T_KEEPALIVE_SINGLETON is true — skipping wrapper close")
             return
-        
-        if self.use_process_mode and self.process_manager:
-            self.logger.info("Stopping all translation worker processes for service switch...")
-            try:
-                self.process_manager.stop_all_workers()
-                self.logger.info("All translation worker processes stopped")
-            except Exception as e:
-                self.logger.error(f"Error stopping worker processes: {e}")
-        else:
-            # Clean up all translation wrappers if they exist
-            if self.translation_wrappers:
-                self.logger.info(f"Destroying {len(self.translation_wrappers)} translation wrapper instances for service switch...")
-                
-                for wrapper_key, wrapper in list(self.translation_wrappers.items()):
-                    try:
-                        self.logger.info(f"Closing wrapper for key: {wrapper_key}")
-                        wrapper.close()
-                        self.logger.info(f"Translation wrapper {wrapper_key} closed successfully")
-                    except Exception as e:
-                        self.logger.error(f"Error closing translation wrapper {wrapper_key}: {e}")
-                
-                # Clear all references
-                self.translation_wrappers.clear()
-                self.current_wrapper_key = None
-            
-            # Force garbage collection to ensure resources are freed
-            import gc
-            gc.collect()
-            
-            # Add a delay to ensure resources are fully released
-            import asyncio
-            self.logger.info("Waiting for resources to be fully released...")
-            await asyncio.sleep(2.0)
-            
-            self.logger.info("T2T resources released for service switch")
-            
-            # Note: We keep the global callback system intact since it's shared
-            # Only the individual wrapper instances are destroyed
-            self.logger.info("Global callback system preserved for reuse by new instances")
-            
-            self.logger.info("T2T resources fully released for service switch")
-    
+
+        async with self.t2t_wrapper_lock:
+            await self._close_wrapper("service switch")
+
+        import gc
+        gc.collect()
+        self.logger.info("Waiting for resources to be fully released...")
+        await asyncio.sleep(2.0)
+        self.logger.info("T2T resources released for service switch")
+
+    async def handle_close_request(self):
+        """Handle a translation_close message: close the singleton wrapper and release resources."""
+        self.logger.info('T2T close request received — closing singleton wrapper')
+
+        async with self.t2t_wrapper_lock:
+            await self._close_wrapper("explicit close")
+
+        # Mark keep_alive as False so the next service switch triggers a full cleanup
+        self.coordinator.set_t2t_keep_alive(False)
+        self.logger.info("T2T close complete")
+
     async def cleanup(self):
-        """Cleanup T2T resources."""
+        """Cleanup T2T resources on service shutdown."""
         self.logger.info('Cleaning up T2T service...')
-        
-        if self.use_process_mode and self.process_manager:
-            self.logger.info("Stopping all translation worker processes...")
-            try:
-                self.process_manager.stop_all_workers()
-                self.logger.info("All translation worker processes stopped")
-            except Exception as e:
-                self.logger.error(f"Error stopping worker processes: {e}")
-        else:
-            # Clean up all translation wrappers if they exist
-            if self.translation_wrappers:
-                self.logger.info(f"Cleaning up {len(self.translation_wrappers)} translation wrapper instances...")
-                
-                for wrapper_key, wrapper in list(self.translation_wrappers.items()):
-                    try:
-                        self.logger.info(f"Closing wrapper for key: {wrapper_key}")
-                        wrapper.close()
-                        self.logger.info(f"Translation wrapper {wrapper_key} closed successfully")
-                    except Exception as e:
-                        self.logger.error(f"Error closing translation wrapper {wrapper_key}: {e}")
-                
-                # Clear all references
-                self.translation_wrappers.clear()
-                self.current_wrapper_key = None
-        
+        async with self.t2t_wrapper_lock:
+            await self._close_wrapper("service shutdown")
         self.logger.info("T2T service cleaned up successfully")
-    
+
+    # -------------------------------------------------------------------------
+    # Message routing
+    # -------------------------------------------------------------------------
+
     def handle_translation_input(self, message: str):
-        """Handle incoming translation requests."""
+        """Handle incoming translation requests or control messages."""
         try:
-            # Translation requests don't have message_type, they're direct requests
+            msg_type = get_message_type(message)
+            if msg_type == 'translation_close':
+                asyncio.create_task(self.handle_close_request())
+                return
+            # All other messages are treated as translation requests
             asyncio.create_task(self.handle_translate_request(message))
         except Exception as e:
             self.logger.error(f'Error handling translation input: {e}', exc_info=True)
-    
+
+    # -------------------------------------------------------------------------
+    # Translation request handling
+    # -------------------------------------------------------------------------
+
     async def handle_translate_request(self, message: str):
-        """Handle translation request."""
+        """Handle a translation request."""
         try:
-            # Request service start - this will cleanup ASR if it's active
+            # Parse the request first so keep_alive is set before request_service_start
+            # runs — the cleanup callback reads keep_alive, so it must be current.
+            request = TranslationRequest.from_json(message)
+            self.coordinator.set_t2t_keep_alive(request.keep_alive)
+            
+            #handle translation tag 
+            supported_source_langs = {
+                mc.get("source_languages", [{}])[0].get("code", "")
+                for mc in self.model_config if mc.get("source_languages")
+            }
+            if request.source_language not in supported_source_langs:
+                await self.send_error(
+                    Config.T2T_TRANSLATION_OUT,
+                    f'Source language "{request.source_language}" is not supported. '
+                    f'Supported: {sorted(supported_source_langs)}',
+                    sync_id=request.sync_id, code="400", param='source_language'
+                )
+                return
+            # Request service start — cleans up ASR/TTS if they are active
             await self.coordinator.request_service_start(
                 'T2T',
                 self.cleanup_resources_for_service_switch
             )
-            
-            request = TranslationRequest.from_json(message)
+
             self.logger.info(
                 f'Translation request: {request.source_language} -> {request.target_language}, '
-                f'{len(request.text)} texts'
+                f'{len(request.text)} text(s), keep_alive={request.keep_alive}'
             )
-            
-            # Find the appropriate model for the language pair
-            model_found = False
-            model_name = request.model
-            
-            # If model is not specified, find a model that supports the language pair
-            if not model_name:
-                for model_config in self.model_config:
-                    # Get source and target languages from arrays
-                    source_languages = model_config.get("source_languages", [])
-                    target_languages = model_config.get("target_languages", [])
-                    
-                    # Extract first language from each array (models have single source/target)
-                    source_lang = source_languages[0].get("code", "") if source_languages else ""
-                    target_lang = target_languages[0].get("code", "") if target_languages else ""
-                    
-                    if source_lang == request.source_language and target_lang == request.target_language:
-                        model_name = model_config["name"]
-                        model_found = True
-                        self.logger.info(f"Found model {model_name} for {source_lang} to {target_lang}")
-                        break
-                
-                if not model_found:
-                    # Check if the languages are supported at all
-                    supported_pairs = [(m.get("source_language", {}).get("code"), 
-                                      m.get("target_language", {}).get("code")) 
-                                     for m in self.model_config]
-                    await self.send_error(
-                        Config.T2T_TRANSLATION_OUT,
-                        f'Translation from "{request.source_language}" to "{request.target_language}" is not supported. '
-                        f'Supported language pairs: {supported_pairs}',
-                        sync_id=request.sync_id,
-                        param='language'
-                    )
-                    return
-            else:
-                # Check if the specified model exists
-                model_found = any(m["name"] == model_name for m in self.model_config)
-                
-                if not model_found:
-                    available_models = [m["name"] for m in self.model_config]
-                    await self.send_error(
-                        Config.T2T_TRANSLATION_OUT,
-                        f'Translation model "{model_name}" is not available. '
-                        f'Available models: {", ".join(available_models)}',
-                        sync_id=request.sync_id,
-                        param='model'
-                    )
-                    return
-                
-                # Verify the model supports the requested language pair
-                model_config = next((m for m in self.model_config if m["name"] == model_name), None)
-                if model_config:
-                    # Get source and target languages from arrays
-                    source_languages = model_config.get("source_languages", [])
-                    target_languages = model_config.get("target_languages", [])
-                    
-                    # Extract first language from each array (models have single source/target)
-                    source_lang = source_languages[0].get("code", "") if source_languages else ""
-                    target_lang = target_languages[0].get("code", "") if target_languages else ""
-                    
-                    if source_lang != request.source_language or target_lang != request.target_language:
-                        await self.send_error(
-                            Config.T2T_TRANSLATION_OUT,
-                            f'Model "{model_name}" does not support translation from '
-                            f'"{request.source_language}" to "{request.target_language}". '
-                            f'This model supports: {source_lang} to {target_lang}',
-                            sync_id=request.sync_id,
-                            param='language'
-                        )
-                        return
-            
-            # Update the request model
+
+            # Resolve model name
+            model_name = await self._resolve_model(request)
+            if model_name is None:
+                return  # error already sent
             request.model = model_name
-            
-            # Translate texts
-            self.logger.info("Starting translation process...")
-            translations = await self.translate_texts(
+
+            # Translate
+            code, result = await self.translate_texts(
                 request.text,
                 request.source_language,
                 request.target_language,
                 request.model,
                 request.parameters
             )
-            self.logger.info(f"Translation process completed, got {len(translations)} results")
-            
-            # Send response
-            self.logger.info("Creating translation response...")
+
+            if code != 0:
+                # result is an error message string
+                self.logger.error(f'Translation failed (code {code}): {result}')
+                await self.send_error(
+                    Config.T2T_TRANSLATION_OUT,
+                    result,
+                    sync_id=request.sync_id
+                )
+                return
+
             response = TranslationResponse.create_response(
                 sync_id=request.sync_id,
-                translations=translations
+                translations=result
             )
-            self.logger.info(f"Created response with sync_id: {request.sync_id}")
-            
-            self.logger.info(f"Publishing response to {Config.T2T_TRANSLATION_OUT}...")
             await self.publish(Config.T2T_TRANSLATION_OUT, response.to_json())
-            self.logger.info(f'Sent translation response with {len(translations)} results')
-            
+            self.logger.info(f'Sent translation response with {len(result)} result(s)')
+
         except Exception as e:
             self.logger.error(f'Error handling translate request: {e}', exc_info=True)
             await self.send_error(
@@ -364,7 +267,73 @@ class T2TService(BaseService):
                 str(e),
                 sync_id=getattr(request, 'sync_id', None) if 'request' in locals() else None
             )
-    
+
+    async def _resolve_model(self, request: TranslationRequest):
+        """
+        Resolve the model name from the request, auto-selecting by language pair if needed.
+        Returns the model name, or None if an error was sent.
+        """
+        model_name = request.model
+
+        if not model_name:
+            # Auto-select by language pair
+            for mc in self.model_config:
+                src_langs = mc.get("source_languages", [])
+                tgt_langs = mc.get("target_languages", [])
+                src = src_langs[0].get("code", "") if src_langs else ""
+                tgt = tgt_langs[0].get("code", "") if tgt_langs else ""
+                if src == request.source_language and tgt == request.target_language:
+                    self.logger.info(f"Auto-selected model {mc['name']} for {src}->{tgt}")
+                    return mc["name"]
+
+            supported_pairs = [
+                (mc.get("source_languages", [{}])[0].get("code"),
+                 mc.get("target_languages", [{}])[0].get("code"))
+                for mc in self.model_config
+            ]
+            await self.send_error(
+                Config.T2T_TRANSLATION_OUT,
+                f'Translation from "{request.source_language}" to "{request.target_language}" '
+                f'is not supported. Supported pairs: {supported_pairs}',
+                sync_id=request.sync_id,
+                param='language'
+            )
+            return None
+
+        # Verify the specified model exists
+        mc = next((m for m in self.model_config if m["name"] == model_name), None)
+        if mc is None:
+            available = [m["name"] for m in self.model_config]
+            await self.send_error(
+                Config.T2T_TRANSLATION_OUT,
+                f'Translation model "{model_name}" is not available. '
+                f'Available models: {", ".join(available)}',
+                sync_id=request.sync_id,
+                param='model'
+            )
+            return None
+
+        # Verify language pair
+        src_langs = mc.get("source_languages", [])
+        tgt_langs = mc.get("target_languages", [])
+        src = src_langs[0].get("code", "") if src_langs else ""
+        tgt = tgt_langs[0].get("code", "") if tgt_langs else ""
+        if src != request.source_language or tgt != request.target_language:
+            await self.send_error(
+                Config.T2T_TRANSLATION_OUT,
+                f'Model "{model_name}" supports {src}->{tgt}, not '
+                f'"{request.source_language}"->"{request.target_language}".',
+                sync_id=request.sync_id,
+                param='language'
+            )
+            return None
+
+        return model_name
+
+    # -------------------------------------------------------------------------
+    # Translation engine
+    # -------------------------------------------------------------------------
+
     async def translate_texts(
         self,
         texts: List[str],
@@ -372,368 +341,170 @@ class T2TService(BaseService):
         target_lang: str,
         model: str,
         parameters: Dict = None
-    ) -> List[TranslationResult]:
+    ):
         """
-        Translate a list of texts.
-        
-        Args:
-            texts: List of texts to translate
-            source_lang: Source language code
-            target_lang: Target language code
-            model: Model to use
-            parameters: Optional translation parameters
-            
+        Translate a list of texts using the singleton TranslationWrapper.
+
         Returns:
-            List of TranslationResult objects
+            (0, List[TranslationResult])  on success
+            (error_code, error_message)   on failure  (error_code != 0)
         """
+        ERROR_ENGINE_UNAVAILABLE = 1
+        ERROR_MODEL_NOT_FOUND    = 2
+        ERROR_INIT_FAILED        = 3
+        ERROR_ENGINE_ERROR       = 4
+        ERROR_NO_RESULT          = 5
+
         if self.dev_mode:
-            # In development mode, use mock translations
-            self.logger.info("Using mock translations")
-            await asyncio.sleep(0.3)  # Simulate processing time
-            
-            # Mock translations
-            translations = []
-            for text in texts:
-                # Simple mock: return a sample Chinese translation
-                translated_text = "转录的文本：天空是蓝色的。"
-                
-                translations.append(TranslationResult(
-                    translated_text=translated_text,
+            self.logger.info("Using mock translations (dev mode)")
+            await asyncio.sleep(0.3)
+            return (0, [
+                TranslationResult(
+                    translated_text="转录的文本：天空是蓝色的。",
                     target_language=target_lang,
                     source_language=source_lang
-                ))
-            
-            return translations
-        elif self.use_process_mode and self.process_manager:
-            # Use process-based translation
-            self.logger.info("Using process-based translation engine")
-            return await self.translate_texts_with_processes(texts, source_lang, target_lang, model, parameters)
-        elif self.use_process_mode and not self.process_manager:
-            # Process mode enabled but manager failed to initialize
-            self.logger.error("Process mode enabled but process manager is None - initialization failed")
-            raise RuntimeError('Translation engine is not available. The process manager failed to initialize at startup.')
-        else:
-            # In production mode, use the actual translation engine with wrappers
-            self.logger.info("Using wrapper-based translation engine")
-            translations = []
-            
-            try:
-                # Find the model configuration
-                model_config = next((m for m in self.model_config if m["name"] == model), None)
-                if not model_config:
-                    self.logger.error(f"Model configuration not found for {model}")
-                    raise RuntimeError(f'Internal error: model configuration not found for "{model}".')
-                
-                # Get the model path
-                model_path = model_config.get("model_path", "").encode('utf-8')
-                if not model_path:
-                    self.logger.error(f"Model path not found for {model}")
-                    raise RuntimeError(f'Internal error: model path not configured for "{model}".')
-                
-                # Get the language names (the wrapper expects language names, not codes)
-                # Map language codes to names
-                lang_name_map = {
-                    'en': 'English',
-                    'es': 'Spanish',
-                    'fr': 'French',
-                    'de': 'German',
-                    'zh': 'Chinese',
-                    'ja': 'Japanese',
-                    'ko': 'Korean',
-                    'ar': 'Arabic',
-                    'ru': 'Russian',
-                    'pt': 'Portuguese',
-                    'it': 'Italian'
-                }
-                
-                input_lang = lang_name_map.get(source_lang, source_lang).encode('utf-8')
-                output_lang = lang_name_map.get(target_lang, target_lang).encode('utf-8')
-                
-                self.logger.info(f"Using languages: {source_lang} ({input_lang}) -> {target_lang} ({output_lang})")
-                self.logger.info(f"Model path: {model_path}")
-                
-                # Create a unique key for this model configuration
-                wrapper_key = f"{model}_{input_lang.decode()}_{output_lang.decode()}"
-                self.logger.info(f"Wrapper key: {wrapper_key}")
-                
-                # Check if we already have a wrapper for this configuration
-                if wrapper_key in self.translation_wrappers:
-                    self.logger.info(f"Reusing existing wrapper for key: {wrapper_key}")
-                    wrapper = self.translation_wrappers[wrapper_key]
-                    self.current_wrapper_key = wrapper_key
-                    
-                    # Verify the wrapper is configured for the correct model/languages
-                    self.logger.info(f"Verifying wrapper configuration:")
-                    self.logger.info(f"  Expected: {model_path} | {input_lang} -> {output_lang}")
-                    self.logger.info(f"  Wrapper has: {wrapper.current_model_path} | {wrapper.current_input_lang} -> {wrapper.current_output_lang}")
-                    
-                    # The wrapper key should guarantee the right model, but let's be safe
-                    # Don't check wrapper's stored values here since _ensure_correct_model will handle it
-                else:
-                    self.logger.info(f"Creating new wrapper for key: {wrapper_key}")
-                    wrapper = None  # Will be created below
-                
-                # Create new wrapper if needed
-                if wrapper is None:
-                    # Add delay before creating new wrapper to ensure resources are available
-                    self.logger.info("Waiting before creating new wrapper (1 second)...")
-                    await asyncio.sleep(1.0)
-                    
-                    try:
-                        wrapper = self.t2t_engine.TranslationWrapper(
-                            model_path=model_path,
-                            input_lang=input_lang,
-                            output_lang=output_lang
-                        )
-                        
-                        # Verify the wrapper was created successfully
-                        if wrapper is None:
-                            raise RuntimeError("Failed to create TranslationWrapper - returned None")
-                            
-                        # Store the new wrapper instance
-                        self.translation_wrappers[wrapper_key] = wrapper
-                        self.current_wrapper_key = wrapper_key
-                        self.logger.info(f"TranslationWrapper created and stored for key: {wrapper_key}")
-                    except Exception as e:
-                        self.logger.error(f"Error creating new wrapper for key {wrapper_key}: {e}", exc_info=True)
-                        raise RuntimeError(f'Translation engine failed to initialize for model "{model}": {e}')
-                
-                # Verify we have a valid wrapper before proceeding
-                if wrapper is None:
-                    self.logger.error(f"Translation wrapper is None for key {wrapper_key}, cannot proceed with translation")
-                    raise RuntimeError(f'Internal error: translation wrapper could not be created for model "{model}".')
-                
-                # Ensure wrapper has correct model before processing
-                # Pass the EXPECTED model parameters, not the wrapper's stored ones
-                if hasattr(wrapper, '_ensure_correct_model'):
-                    self.logger.info(f"Ensuring wrapper {wrapper_key} has correct model: {model_path} {input_lang}->{output_lang}")
-                    if not wrapper._ensure_correct_model(model_path, input_lang, output_lang):
-                        self.logger.error(f"Failed to set correct model on wrapper {wrapper_key}")
-                        raise RuntimeError(f'Internal error: failed to configure translation model "{model}" for {source_lang} -> {target_lang}.')
-                
-                # Process each text using the new callback-based approach
-                for i, text in enumerate(texts):
-                    try:
-                        self.logger.info(f"Processing text {i+1}/{len(texts)}: {text[:100]}...")
-                        # Storage for the translation result - use list to collect all parts
-                        translation_result = {'text_parts': [], 'error': None, 'done': False}
-                        
-                        # Define callback functions for this translation
-                        def on_result(result_text: str):
-                            """Callback to receive translation result."""
-                            self.logger.info(f"Translation result chunk received: {result_text}")
-                            # Append each result chunk to the list
-                            translation_result['text_parts'].append(result_text)
-                        
-                        def on_done():
-                            """Callback when translation is complete."""
-                            self.logger.info("Translation done callback called")
-                            translation_result['done'] = True
-                        
-                        def on_error(error_code: int):
-                            """Callback when translation error occurs."""
-                            self.logger.error(f"Translation error: code {error_code}")
-                            translation_result['error'] = error_code
-                        
-                        # Process the text with callbacks
-                        self.logger.info(f"Calling process_with_cb for text: '{text}'")
-                        ret = wrapper.process_with_cb(text, on_result, on_done, on_error)
-                        self.logger.info(f"process_with_cb returned: {ret}")
-                        
-                        if ret != 0:
-                            self.logger.error(f"Translation process failed with code {ret}")
-                            self.logger.error(f"Wrapper {wrapper_key} is in bad state, will remove and recreate on next request")
-                            # Remove the bad wrapper
-                            try:
-                                wrapper.close()
-                            except:
-                                pass
-                            if wrapper_key in self.translation_wrappers:
-                                del self.translation_wrappers[wrapper_key]
-                            if self.current_wrapper_key == wrapper_key:
-                                self.current_wrapper_key = None
-                            raise RuntimeError(f'Translation engine returned error code {ret} for model "{model}".')
-                        elif translation_result['error'] is not None:
-                            self.logger.error(f"Translation error: {translation_result['error']}")
-                            self.logger.error(f"Wrapper {wrapper_key} is in bad state, will remove and recreate on next request")
-                            # Remove the bad wrapper
-                            try:
-                                wrapper.close()
-                            except:
-                                pass
-                            if wrapper_key in self.translation_wrappers:
-                                del self.translation_wrappers[wrapper_key]
-                            if self.current_wrapper_key == wrapper_key:
-                                self.current_wrapper_key = None
-                            raise RuntimeError(f'Translation engine error code {translation_result["error"]} for model "{model}".')
-                        elif translation_result['text_parts']:
-                            # Successfully translated - concatenate all parts
-                            full_translation = ' '.join(translation_result['text_parts']).strip()
-                            self.logger.info(f"Successfully translated: '{text}' -> '{full_translation}'")
-                            self.logger.info(f"Translation had {len(translation_result['text_parts'])} parts: {translation_result['text_parts']}")
-                            translations.append(TranslationResult(
-                                translated_text=full_translation,
-                                target_language=target_lang,
-                                source_language=source_lang
-                            ))
-                        else:
-                            self.logger.warning(f"No translation result for text: {text}")
-                            self.logger.warning(f"Translation result state: {translation_result}")
-                            self.logger.error(f"No results received - wrapper {wrapper_key} may be in bad state, removing")
-                            # Remove the bad wrapper since we got no results
-                            try:
-                                wrapper.close()
-                            except:
-                                pass
-                            if wrapper_key in self.translation_wrappers:
-                                del self.translation_wrappers[wrapper_key]
-                            if self.current_wrapper_key == wrapper_key:
-                                self.current_wrapper_key = None
-                            raise RuntimeError(f'Translation engine returned no result for model "{model}".')
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error translating text: {e}", exc_info=True)
-                        raise
-                
-                # We're keeping all wrapper instances for reuse, so don't close them here
-                self.logger.info(f"Keeping {len(self.translation_wrappers)} translation wrapper instances for future requests")
-                self.logger.info(f"Current wrapper keys: {list(self.translation_wrappers.keys())}")
-                
-                self.logger.info(f"Returning {len(translations)} translations")
-                return translations
-                
-            except Exception as e:
-                self.logger.error(f"Error using translation engine: {e}", exc_info=True)
-                raise
-    
-    async def translate_texts_with_processes(self, texts: List[str], source_lang: str, target_lang: str, model: str, parameters: Dict = None) -> List[TranslationResult]:
-        """Translate texts using separate worker processes."""
-        try:
-            # Find the model configuration
-            model_config = next((m for m in self.model_config if m["name"] == model), None)
-            if not model_config:
-                self.logger.error(f"Model configuration not found for {model}")
-                raise RuntimeError(f'Internal error: model configuration not found for "{model}".')
-            
-            # Get the model path
-            model_path = model_config.get("model_path", "")
-            if not model_path:
-                self.logger.error(f"Model path not found for {model}")
-                raise RuntimeError(f'Internal error: model path not configured for "{model}".')
-            
-            # Map language codes to names for the C++ engine
-            lang_name_map = {
-                'en': 'English',
-                'es': 'Spanish', 
-                'fr': 'French',
-                'de': 'German',
-                'zh': 'Chinese',
-                'ja': 'Japanese',
-                'ko': 'Korean',
-                'ar': 'Arabic',
-                'ru': 'Russian',
-                'pt': 'Portuguese',
-                'it': 'Italian'
-            }
-            
-            input_lang = lang_name_map.get(source_lang, source_lang)
-            output_lang = lang_name_map.get(target_lang, target_lang)
-            
-            self.logger.info(f"Process translation: {model_path} | {input_lang} -> {output_lang}")
-            
-            translations = []
-            
-            # Process each text
-            for i, text in enumerate(texts):
-                try:
-                    self.logger.info(f"Processing text {i+1}/{len(texts)} with process manager: {text[:100]}...")
-                    
-                    # Use process manager to translate
-                    result = self.process_manager.translate_text(
-                        text=text,
-                        model_path=model_path,
-                        input_lang=input_lang,
-                        output_lang=output_lang,
-                        timeout=15.0
+                )
+                for _ in texts
+            ])
+
+        if not self.t2t_engine:
+            msg = 'Translation engine is not available. The wrapper failed to load at startup.'
+            self.logger.error(msg)
+            return (ERROR_ENGINE_UNAVAILABLE, msg)
+
+        # Find model config
+        model_config = next((m for m in self.model_config if m["name"] == model), None)
+        if not model_config:
+            msg = f'Internal error: model configuration not found for "{model}".'
+            self.logger.error(msg)
+            return (ERROR_MODEL_NOT_FOUND, msg)
+
+        # Get the model directory path (injected by ModelLoader)
+        model_dir = model_config.get("model_path", "")
+        if not model_dir:
+            msg = f'Internal error: model directory not configured for "{model}".'
+            self.logger.error(msg)
+            return (ERROR_MODEL_NOT_FOUND, msg)
+
+        # Map language codes to names expected by the C++ engine
+        lang_name_map = {
+            'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
+            'zh': 'Chinese', 'ja': 'Japanese', 'ko': 'Korean', 'ar': 'Arabic',
+            'ru': 'Russian', 'pt': 'Portuguese', 'it': 'Italian'
+        }
+        input_lang = lang_name_map.get(source_lang, source_lang).encode('utf-8')
+        output_lang = lang_name_map.get(target_lang, target_lang).encode('utf-8')
+
+        wrapper_key = f"{model}_{input_lang.decode()}_{output_lang.decode()}"
+        self.logger.info(f"Wrapper key: {wrapper_key}")
+
+        # Get or create the singleton wrapper
+        async with self.t2t_wrapper_lock:
+            if self.t2t_wrapper is None or self.current_wrapper_key != wrapper_key:
+                if self.t2t_wrapper is not None:
+                    self.logger.info(
+                        f"Model/language changed from '{self.current_wrapper_key}' to "
+                        f"'{wrapper_key}' — reinitializing T2T wrapper"
                     )
-                    
-                    if result["error"]:
-                        self.logger.error(f"Process translation error: {result['error']}")
-                        raise RuntimeError(f'Translation engine error for model "{model}": {result["error"]}')
-                    elif result["result"]:
-                        self.logger.info(f"Process translation successful: '{text}' -> '{result['result']}'")
-                        translations.append(TranslationResult(
-                            translated_text=result["result"],
-                            target_language=target_lang,
-                            source_language=source_lang
-                        ))
-                    else:
-                        self.logger.warning(f"No translation result for text: {text}")
-                        raise RuntimeError(f'Translation engine returned no result for model "{model}".')
-                        
+                    await self._close_wrapper("model/language change")
+
+                self.logger.info("Waiting 1 s before creating new wrapper...")
+                await asyncio.sleep(1.0)
+
+                try:
+                    self.logger.info(f"Creating singleton T2T wrapper for key: {wrapper_key}")
+                    self.t2t_wrapper = self.t2t_engine.TranslationWrapper(
+                        model_path=None,
+                        model_dir=model_dir,
+                        input_lang=input_lang,
+                        output_lang=output_lang
+                    )
+                    if self.t2t_wrapper is None:
+                        raise RuntimeError("TranslationWrapper constructor returned None")
+                    self.current_wrapper_key = wrapper_key
+                    self.logger.info(f"Singleton T2T wrapper created: {wrapper_key}")
                 except Exception as e:
-                    self.logger.error(f"Error processing text with process manager: {e}", exc_info=True)
-                    raise
-            
-            # Log worker status
-            try:
-                status = self.process_manager.get_worker_status()
-                self.logger.info(f"Active workers: {list(status.keys())}")
-            except:
-                pass
-            
-            self.logger.info(f"Process-based translation completed, returning {len(translations)} results")
-            return translations
-            
-        except Exception as e:
-            self.logger.error(f"Error in process-based translation: {e}", exc_info=True)
-            raise
-    
-    async def translate_texts_mock(self, texts: List[str], source_lang: str, target_lang: str) -> List[TranslationResult]:
-        """Generate mock translations for fallback."""
-        await asyncio.sleep(0.3)  # Simulate processing time
-        
+                    self.logger.error(f"Error creating T2T wrapper: {e}", exc_info=True)
+                    self.t2t_wrapper = None
+                    self.current_wrapper_key = None
+                    msg = f'Translation engine failed to initialize for model "{model}": {e}'
+                    return (ERROR_INIT_FAILED, msg)
+            else:
+                self.logger.info(f"Reusing existing singleton T2T wrapper: {wrapper_key}")
+
+            wrapper = self.t2t_wrapper
+
+        # Model is managed via model_dir — no additional model check needed
+
+        # Translate each text
         translations = []
-        for text in texts:
-            # Simple mock: return a sample Chinese translation
-            translated_text = "转录的文本：天空是蓝色的。"
-            
+        for i, text in enumerate(texts):
+            self.logger.info(f"Translating text {i+1}/{len(texts)}: {text[:100]}...")
+            result_parts = []
+            error_code = [None]
+            done_flag = [False]
+
+            def on_result(chunk: str):
+                result_parts.append(chunk)
+
+            def on_done():
+                done_flag[0] = True
+
+            def on_error(code: int):
+                error_code[0] = code
+
+            ret = wrapper.process_with_cb(text, on_result, on_done, on_error)
+
+            if ret != 0 or error_code[0] is not None:
+                code = ret if ret != 0 else error_code[0]
+                self.logger.error(f"Translation failed (code {code}) — invalidating wrapper")
+                async with self.t2t_wrapper_lock:
+                    await self._close_wrapper("translation error")
+                msg = f'Translation engine returned error code {code} for model "{model}".'
+                return (ERROR_ENGINE_ERROR, msg)
+
+            if not result_parts:
+                self.logger.error("No translation result received — invalidating wrapper")
+                async with self.t2t_wrapper_lock:
+                    await self._close_wrapper("empty result")
+                msg = f'Translation engine returned no result for model "{model}".'
+                return (ERROR_NO_RESULT, msg)
+
+            full_translation = ' '.join(result_parts).strip()
+            self.logger.info(f"Translated: '{text[:60]}' -> '{full_translation[:60]}'")
             translations.append(TranslationResult(
-                translated_text=translated_text,
+                translated_text=full_translation,
                 target_language=target_lang,
                 source_language=source_lang
             ))
-        
-        return translations
-    
+
+        self.logger.info(f"Keeping singleton T2T wrapper alive for reuse (key: {wrapper_key})")
+        return (0, translations)
+
+    # -------------------------------------------------------------------------
+    # Models request
+    # -------------------------------------------------------------------------
+
     def handle_models_request(self, message: str):
         """Handle models list request."""
         try:
-            # Parse the message to check the source
             import json
             data = json.loads(message)
-            message_source = data.get('message_source', '')
-            
-            # Ignore messages from ourselves (responses)
-            if message_source == 'audio_analytics_server':
-                self.logger.debug('Ignoring message from server (our own response)')
+            if data.get('message_source') == 'audio_analytics_server':
                 return
-            
+
             request = TranslationModelsRequest.from_json(message)
-            
-            # Send models list in the format the API expects
-            # The API expects: {"sync_id": "...", "result": [...]}
             response = {
                 "sync_id": request.sync_id,
                 "result": self.available_models,
-                "message_source": "audio_analytics_server"  # Mark as server response
+                "message_source": "audio_analytics_server"
             }
-            
             asyncio.create_task(
                 self.publish(Config.T2T_MODELS, json.dumps(response))
             )
-            
             self.logger.info(f'Sent models list: {len(self.available_models)} models')
-            
+
         except Exception as e:
             self.logger.error(f'Error handling models request: {e}', exc_info=True)
+
+    

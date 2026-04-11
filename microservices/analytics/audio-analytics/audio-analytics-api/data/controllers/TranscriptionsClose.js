@@ -10,43 +10,24 @@ const messages = require('../utils/messages');
 module.exports.closeTranscription = async function closeTranscription (req, res, next, body) {
     try {
         console.log('Close transcription request received');
+        const sessionId = (body && body.session_id) || null;
 
-
-        // // Extract session ID from body if provided
-        // const session_id = body.session_id || crypto.randomUUID();
-        
-        // // Create close message
-        // const request = {
-        //     message_type: 'transcriptions_close',
-        //     session_id: session_id
-        // };
-        
-        // if (config.blackboxContainer) {
-        //     // Use Unix socket
-        //     console.log('Sending close via Unix socket');
-        //     const indexModule = require('../index');
-        //     const socketClient = indexModule.getSocketClient();
-            
-        //     if (!socketClient) {
-        //         throw new Error('Socket client not initialized');
-        //     }
-            
-        //     const response = await socketClient.sendRequest(config.asrTranscriptionIn, request);
-        //     console.log('Session closed');
-        //     res.status(200).json({ status: "closed" });
-        // } else {
-        //     // Use Redis
-        //     console.log('Publishing close to Redis channel:', config.asrTranscriptionIn);
-        //     await redis.publish(config.asrTranscriptionIn, request);
-            
-        //     res.status(200).json({ status: "closed" });
-        // }
-
-
-
-
-        messages.publish(config.asrTranscriptionIn, {message_type: 'transcriptions_close', session_id: body.session_id}, ()=>{});
-        res.status(200).send('Transcription session successfully closed.');
+        messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut,
+            {message_type: 'transcriptions_close', session_id: sessionId},
+            (err, data) => {
+                console.log(`[close] callback received — err=${err}, data=${JSON.stringify(data)}`);
+                if (res.headersSent) return;
+                if (err) {
+                    return res.status(500).json({
+                        error: { message: (data && data.message) || 'Close failed', type: 'server_error' }
+                    });
+                }
+                return res.status(200).json({
+                    session_id: sessionId,
+                    state: (data && data.state) || 'asr_closed'
+                });
+            }
+        );
     } catch (e) {
         console.error('Close transcription error:', e);
         res.status(500).json({

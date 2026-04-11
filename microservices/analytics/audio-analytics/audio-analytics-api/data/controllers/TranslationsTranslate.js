@@ -14,8 +14,8 @@ module.exports.translateText = async function translateText (req, res, next, bod
         // Extract parameters from body
         const text = body.text;
         const model = body.model || 'translation-model-1';
-        const source_language = body.source_language;
-        const target_language = body.target_language;
+        const source_language = body.source_language?.toLowerCase();
+        const target_language = body.target_language?.toLowerCase();
         const parameters = body.parameters || {};
         
         // Validate required fields

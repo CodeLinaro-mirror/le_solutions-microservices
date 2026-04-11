@@ -33,6 +33,26 @@ async function initializeCommunication() {
     }
 }
 
+async function ensureSocketConnected() {
+    if (!globalSocketClient) return false;
+    if (globalSocketClient.connected) return true;
+
+    // If the client has exhausted its reconnect attempts, reset and try again
+    if (globalSocketClient.reconnectAttempts >= globalSocketClient.maxReconnectAttempts) {
+        console.log('🔄 Socket client exhausted retries, resetting connection...');
+        globalSocketClient.reconnectAttempts = 0;
+        globalSocketClient.reconnectTimer = null;
+    }
+
+    try {
+        await globalSocketClient.connect();
+        return globalSocketClient.connected;
+    } catch (err) {
+        console.error('❌ Socket reconnect failed:', err.message);
+        return false;
+    }
+}
+
 async function publishAndListenOnce (channelIn, channelOut, data, cb) {
     // Insert a message_source to signal that the message is from here
     data.message_source = 'audio_analytics_api';
@@ -47,8 +67,11 @@ async function publishAndListenOnce (channelIn, channelOut, data, cb) {
             return cb(true, {message: 'Socket client not initialized'});
         }
         
+        if (!(await ensureSocketConnected())) {
+            return cb(true, {message: 'Socket server not available'});
+        }
+
         try {
-            // Generate sync_id for request-response correlation
             const { randomUUID } = require('crypto');
             const sync_id = randomUUID();
             data.sync_id = sync_id;
@@ -58,32 +81,35 @@ async function publishAndListenOnce (channelIn, channelOut, data, cb) {
                 try {
                     console.log(`[${sync_id}] Received message on ${channelOut}:`, message.substring(0, 200) + '...');
                     const retData = JSON.parse(message);
-                    
+
                     console.log(`[${sync_id}] Parsed response sync_id: ${retData.sync_id}, expected: ${sync_id}`);
                     console.log(`[${sync_id}] Response keys:`, Object.keys(retData));
-                    
+
                     // Check if this is the response we're waiting for
                     if (retData.sync_id === sync_id) {
                         console.log(`[${sync_id}] ✅ Sync ID matches, processing response`);
-                        
+
                         // Clear the timeout
                         if (responseHandler.timeout) {
                             clearTimeout(responseHandler.timeout);
                         }
-                        
+
                         // Unsubscribe this specific handler after receiving the response
                         globalSocketClient.unsubscribe(channelOut, responseHandler);
-                        
-                        // Call the callback with the result
+
+                        // Call the callback with the result — do NOT wrap in try/catch so
+                        // errors in cb don't re-invoke cb via the outer catch block
                         if (retData.error) {
                             console.log(`[${sync_id}] ❌ Response has error:`, retData.error);
+                            responseHandler.cbCalled = true;
                             cb(true, retData.result);
                         } else if (retData.result !== undefined) {
                             console.log(`[${sync_id}] ✅ Response has result, calling callback`);
+                            responseHandler.cbCalled = true;
                             cb(false, retData.result);
                         } else {
                             console.log(`[${sync_id}] ⚠️ Response has no result field:`, retData);
-                            // Try to use the whole response as result
+                            responseHandler.cbCalled = true;
                             cb(false, retData);
                         }
                     } else {
@@ -91,7 +117,10 @@ async function publishAndListenOnce (channelIn, channelOut, data, cb) {
                     }
                 } catch (e) {
                     console.error(`[${sync_id}] Error processing socket response:`, e.message);
-                    cb(true, {message: e.message});
+                    // Only call cb on parse/internal errors, not on errors thrown by cb itself
+                    if (!responseHandler.cbCalled) {
+                        cb(true, {message: e.message});
+                    }
                 }
             };
             
@@ -133,6 +162,10 @@ async function publish (channel, data, cb) {
             return cb(true, {message: 'Socket client not initialized'});
         }
         
+        if (!(await ensureSocketConnected())) {
+            return cb(true, {message: 'Socket server not available'});
+        }
+
         try {
             await globalSocketClient.publish(channel, data);
             cb(false, data);

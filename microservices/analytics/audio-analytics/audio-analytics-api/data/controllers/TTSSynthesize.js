@@ -11,6 +11,7 @@ const fs = require('fs');
 
 module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, next, body) {
     try {
+        const MAX_TTS_CHAR_SIZE = 1024;
 
         console.log('TTS synthesis request received');
         console.log(body);
@@ -18,9 +19,10 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
         // Extract parameters from body
         const text = body.text;
         const model = body.model || 'tts-model-1';
-        const language = body.language || 'en';
+        const language = (body.language || 'en').toLowerCase();
         const voice = body.voice || 'default';
         const speaker = body.output_speaker || false;
+        const override_max_chars_check = body.override_max_chars_check || false;
         const gender = body.gender;
         const style = body.style;
         const sample_rate = body.sample_rate;
@@ -38,6 +40,18 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
             });
         }
 
+        const text_len = text.length;
+        if (!override_max_chars_check && text_len >= MAX_TTS_CHAR_SIZE) {
+            return res.status(400).json({
+                error: {
+                    message: `Text exceeds maximum length of ${MAX_TTS_CHAR_SIZE} characters. Current length: ${text_len}. Use 'override_max_chars_check: true' to bypass this limit.`,
+                    type: "invalid_request_error",
+                    param: "text",
+                    code: "text_too_long"
+                }
+            });
+        }
+
         // Generate a unique sync_id for this request so the handler can ignore
         // audio chunks and done-messages that belong to other requests.
         const { randomUUID } = require('crypto');
@@ -46,6 +60,7 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
         body.message_type = 'tts_synthesize';
 
         console.log('   Text:', text.substring(0, 50) + (text.length > 50 ? '...' : ''));
+        console.log('   Text length:', text_len);
         console.log('   Model:', model);
         console.log('   Language:', language);
         console.log('   Voice:', voice);
@@ -108,7 +123,7 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
         // Now publish the TTS request to start server-side synthesis
         messages.publish(config.ttsTextIn, body, () => {});
 
-        
+
 
     } catch (e) {
         console.error('TTS synthesis error:', e);

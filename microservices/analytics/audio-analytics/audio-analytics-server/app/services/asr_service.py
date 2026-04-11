@@ -27,6 +27,7 @@ from models.messages import (
     TranscriptionsResult,
     TranscriptionsSessionAudio,
     TranscriptionsClose,
+    TranscriptionsFlush,
     TranscriptionsModelsRequest,
     TranscriptionsModelsResponse,
     get_message_type
@@ -69,10 +70,11 @@ class ASRService(BaseService):
         self.model_config = ModelLoader.get_asr_models(self.dev_mode)
         self.available_models = [model["name"] for model in self.model_config]
         self.vad_len_hangover = self._get_vad_len_hangover_from_env()
+        self.default_session_timeout_s = self._get_session_timeout_from_env()
         
         self.speakers = dict()
 
-                # Singleton WhisperWrapper instance (reused across all requests)
+        # Singleton WhisperWrapper instance (reused across all requests)
         self.whisper_wrapper = None
         self.whisper_wrapper_lock = asyncio.Lock()
 
@@ -141,13 +143,29 @@ class ASRService(BaseService):
         except ValueError:
             self.logger.warning(f"Invalid VAD_LEN_HANGOVER value in environment, using default 700ms (0.7s)")
             return 700  # 70 * 10ms = 700ms
-        
+
+    def _get_session_timeout_from_env(self) -> int:
+        """
+        Read SESSION_TIMEOUT_S from environment variable.
+        This is the number of seconds of no incoming audio before a streaming
+        session is automatically closed. Default is 30 seconds.
+        Can be overridden per-request via the server_timeout parameter.
+        """
+        try:
+            timeout_s = int(os.environ.get('SESSION_TIMEOUT_S', '30'))
+            self.logger.info(f"SESSION_TIMEOUT_S set to {timeout_s}s from environment")
+            return timeout_s
+        except ValueError:
+            self.logger.warning(f"Invalid SESSION_TIMEOUT_S value in environment, using default 30s")
+            return 30
+
     def get_subscriptions(self) -> Dict[str, Callable]:
         """Subscribe to ASR input channels."""
         return {
             Config.ASR_TRANSCRIPTION_IN: self.handle_message_safely(self.handle_transcription_input),
             Config.ASR_MODELS: self.handle_message_safely(self.handle_models_request),
             Config.ASR_DEVICES: self.handle_message_safely(self.handle_devices_request),
+            # Note: flush is routed through ASR_TRANSCRIPTION_IN via message_type dispatch
         }
     
     async def initialize(self):
@@ -330,13 +348,17 @@ class ASRService(BaseService):
             
         self.logger.info(f'Cleaning up {len(self.active_sessions)} active session(s) before starting new request...')
         
-        # Stop and reset the wrapper if it exists
+        # Close and destroy the wrapper fully — stale sessions mean the previous
+        # request did not clean up normally, so the DSP state is unknown.
+        # Reusing a potentially dirty wrapper risks memory corruption on the DSP.
         if not self.dev_mode and self.whisper_wrapper is not None:
             try:
-                self.logger.info('Stopping and resetting wrapper for session cleanup')
-                await asyncio.to_thread(self.whisper_wrapper.stop_and_reset)
+                self.logger.info('Closing wrapper fully due to stale session(s)')
+                await asyncio.to_thread(self.whisper_wrapper.close)
+                self.whisper_wrapper = None
             except Exception as e:
-                self.logger.error(f"Error stopping wrapper during cleanup: {e}", exc_info=True)
+                self.logger.error(f"Error closing wrapper during cleanup: {e}", exc_info=True)
+                self.whisper_wrapper = None
         
         # Clear the session data - don't close the singleton wrapper
         self.active_sessions.clear()
@@ -472,13 +494,14 @@ class ASRService(BaseService):
                 self.logger.warning(f'Failed to parse message as JSON: {e}')
                 self.logger.debug(f'Raw message that failed parsing: {message[:200]}...')
                 msg_type = None
-            
             if msg_type == "transcriptions_create":
                 asyncio.create_task(self.handle_create_transcription(message))
             elif msg_type == "transcriptions_session_audio":
                 asyncio.create_task(self.handle_session_audio(message))
             elif msg_type == "transcriptions_close":
                 asyncio.create_task(self.handle_close_transcription(message))
+            elif msg_type == "transcriptions_flush":
+                asyncio.create_task(self.handle_flush_transcription(message))
             else:
                 self.logger.warning(f'Unknown message type: {msg_type}')
                 
@@ -490,11 +513,42 @@ class ASRService(BaseService):
         Handle transcription creation request.
         Supports file-based (sync/async) and live streaming.
         """
+        self.logger.info("=== ENTERED handle_create_transcription ===")
         try:
-            # Request service start - this will cleanup T2T if it's active
-                        # Parse the request first so keep_alive is set before request_service_start
-            # runs — the cleanup callback reads keep_alive, so it must be current
+            # Parse the request first so keep_alive is set before request_service_start
+            # runs - the cleanup callback reads keep_alive, so it must be current
             request = TranscriptionsCreateRequest.from_json(message)
+
+            # Busy-check: reject new create if a session is already active.
+            # Reserve a sentinel slot immediately so concurrent requests that
+            # arrive while we are still initializing (slow NPU cold-start) also
+            # get rejected rather than racing past this guard.
+            if self.active_sessions:
+                existing_ids = list(self.active_sessions.keys())
+                if request.keep_alive:
+                    # keep_alive=true means the client wants to reuse/restart the engine —
+                    # clean up the stale session and proceed rather than rejecting.
+                    self.logger.info(
+                        f'keep_alive create: cleaning up stale session(s) {existing_ids} and restarting'
+                    )
+                    await self._cleanup_all_sessions()
+                else:
+                    self.logger.warning(
+                        f'Rejecting new transcription_create: session(s) already active: {existing_ids}'
+                    )
+                    await self.send_error(
+                        Config.ASR_TRANSCRIPTION_OUT,
+                        f'A transcription session is already active ({existing_ids[0]}). '
+                        f'Please close it first via /transcriptions/close.',
+                        sync_id=request.sync_id,
+                        param='session'
+                    )
+                    return
+
+            # Reserve the slot before any await so concurrent requests see it
+            _sentinel_id = f"pending-{request.sync_id or 'init'}"
+            self.active_sessions[_sentinel_id] = {'pending': True}
+
             self.coordinator.set_asr_keep_alive(request.keep_alive)
 
             await self.coordinator.request_service_start(
@@ -511,8 +565,21 @@ class ASRService(BaseService):
             channels = 1  # Default to mono
             vad_value = None  # VAD parameter from client
             on_device_recording = False  # On-device recording flag
+            server_timeout_s = None  # Per-request session timeout (seconds)
+
+            # Top-level 'channels' field takes priority over the parameters array
+            if request.channels is not None:
+                try:
+                    channels = int(request.channels)
+                    self.logger.info(f"Using top-level channels field: {channels}")
+                except (ValueError, TypeError):
+                    self.logger.warning(f"Invalid top-level channels value: {request.channels}")
+
+            # Log parameters before parsing
+            self.logger.info(f"Request has parameters attr: {hasattr(request, 'parameters')}, value: {getattr(request, 'parameters', 'NOT_SET')}")
             
-            if hasattr(request, 'parameters') and request.parameters:
+            if hasattr(request, 'parameters') and request.parameters is not None and request.parameters != '':
+                self.logger.info(f"Parsing parameters: type={type(request.parameters)}, value={request.parameters}")
                 # Parse parameters
                 params = []
                 if isinstance(request.parameters, str):
@@ -538,26 +605,37 @@ class ASRService(BaseService):
                                 self.logger.warning(f"Invalid sampling_rate value: {param['value']}")
                         
                         elif param.get("key") == "channels" and param.get("value"):
-                            try:
-                                channels = int(param["value"])
-                            except (ValueError, TypeError):
-                                self.logger.warning(f"Invalid channels value: {param['value']}")
+                            # Only override if top-level channels was not provided
+                            if request.channels is None:
+                                try:
+                                    channels = int(param["value"])
+                                    self.logger.info(f"Using channels from parameters: {channels}")
+                                except (ValueError, TypeError):
+                                    self.logger.warning(f"Invalid channels value: {param['value']}")
                         elif param.get("key") == "vad" and param.get("value"):
                             try:
                                 # Ensure we convert to int, even if it comes as float
                                 vad_value = int(float(param["value"]))
                                 self.logger.info(f"Using custom VAD value: {vad_value} (units of 10ms)")
-                            except (ValueError, TypeError):
-                                self.logger.warning(f"Invalid vad value: {param['value']}")
+                            except (ValueError, TypeError) as e:
+                                self.logger.warning(f"Invalid vad value: {param['value']}, error: {e}")
                         
                         elif param.get("key") == "on_device_recording" and param.get("value"):
                             on_device_recording = param["value"].lower() in ["true", "1", "yes"]
                             self.logger.info(f"On-device recording: {on_device_recording}")
+
+                        elif param.get("key") == "server_timeout" and param.get("value"):
+                            try:
+                                server_timeout_s = int(float(param["value"]))
+                                self.logger.info(f"Using per-request server_timeout: {server_timeout_s}s")
+                            except (ValueError, TypeError) as e:
+                                self.logger.warning(f"Invalid server_timeout value: {param['value']}, error: {e}")
             
             # Validate file format if file is provided
             if request.file and request.filename:
                 filename_lower = request.filename.lower()
                 if not filename_lower.endswith('.wav'):
+                    self.active_sessions.pop(_sentinel_id, None)
                     await self.send_error(
                         Config.ASR_TRANSCRIPTION_OUT,
                         f'Unsupported file format for "{request.filename}". Only .wav files are supported.',
@@ -565,13 +643,13 @@ class ASRService(BaseService):
                         param='file'
                     )
                     return
-            
+
             # Validate model
             if request.model not in self.available_models:
                 # If model not specified or not found, use default model
                 if not request.model:
                     # Find default model from config
-                    default_model = next((model["name"] for model in self.model_config 
+                    default_model = next((model["name"] for model in self.model_config
                                         if model.get("default", False)), None)
                     if default_model:
                         self.logger.info(f"Using default model: {default_model}")
@@ -581,6 +659,7 @@ class ASRService(BaseService):
                         request.model = self.available_models[0]
                         self.logger.info(f"Using first available model: {request.model}")
                     else:
+                        self.active_sessions.pop(_sentinel_id, None)
                         await self.send_error(
                             Config.ASR_TRANSCRIPTION_OUT,
                             f'No ASR models available on this server.',
@@ -589,6 +668,7 @@ class ASRService(BaseService):
                         )
                         return
                 else:
+                    self.active_sessions.pop(_sentinel_id, None)
                     await self.send_error(
                         Config.ASR_TRANSCRIPTION_OUT,
                         f'ASR model "{request.model}" is not available. Available models: {", ".join(self.available_models)}',
@@ -603,13 +683,20 @@ class ASRService(BaseService):
             request.vad_value = vad_value
             request.on_device_recording = on_device_recording
             
-            if request.file:
-                # File-based transcription
-                await self.process_file_transcription(request)
-            else:
-                # Live streaming - create session
-                await self.create_streaming_session(request)
-                
+            self.logger.info(f"Stored parameters on request: vad_value={vad_value}, sampling_rate={sampling_rate}, channels={channels}")
+
+            try:
+                if request.file:
+                    # File-based transcription
+                    await self.process_file_transcription(request)
+                else:
+                    # Live streaming - create session
+                    await self.create_streaming_session(request)
+            finally:
+                # Remove sentinel if it is still present (real session id replaces it
+                # inside create_streaming_session; file transcription never adds one)
+                self.active_sessions.pop(_sentinel_id, None)
+
         except Exception as e:
             self.logger.error(f'Error creating transcription: {e}', exc_info=True)
             await self.send_error(
@@ -692,11 +779,13 @@ class ASRService(BaseService):
                             raise ValueError(f"Model configuration not found for {request.model}")
                         
                         # Extract model paths from config
-                        encoder_path = model_info.get("model_path", "").encode("utf-8")
-                        decoder_path = model_info.get("decoder_path", "").encode("utf-8")
-                        vocab_path = model_info.get("vocab_path", "").encode("utf-8")
-                        speech_path = model_info.get("speech_path", "").encode("utf-8")
-                        model_path = b""  # Empty for now
+                        _model_dir = model_info.get("model_path", "")
+                        _assets = model_info.get("assets", {})
+                        encoder_path = os.path.join(_model_dir, _assets.get("model_path", "")).encode("utf-8")
+                        decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
+                        vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
+                        speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"
+                        model_path = b""  # adsp_path — empty for now
                         
                         self.logger.info(f"Using model paths: encoder={encoder_path}, decoder={decoder_path}, vocab={vocab_path}, speech={speech_path}")
                         
@@ -708,35 +797,55 @@ class ASRService(BaseService):
                             f"detected rate={detected_rate}Hz, channels={detected_channels}, bits={bits_per_sample}"
                         )
                         
-                        # Resample if needed to match requested format
-                        if detected_rate != sampling_rate or detected_channels != channels:
+                                                # Always resample to 16000 Hz mono — the ASR engine requires it.
+                        # sampling_rate/channels describe what the client sent; the
+                        # detected_rate/detected_channels come from the WAV header.
+                        # Use whichever source is more reliable: if the WAV header
+                        # matches what the client declared, use detected values;
+                        # otherwise trust the WAV header (it is embedded in the file).
+                        ASR_TARGET_RATE = 16000
+                        ASR_TARGET_CH   = 1
+                        if detected_rate != ASR_TARGET_RATE or detected_channels != ASR_TARGET_CH:
                             self.logger.info(
                                 f"Resampling from {detected_rate}Hz {detected_channels}ch "
-                                f"to {sampling_rate}Hz {channels}ch"
+                                f"to {ASR_TARGET_RATE}Hz {ASR_TARGET_CH}ch for ASR engine"
                             )
                             try:
                                 raw_pcm = resample_audio(
                                     raw_pcm,
                                     original_sample_rate=detected_rate,
-                                    target_sample_rate=sampling_rate,
+                                    target_sample_rate=ASR_TARGET_RATE,
                                     original_channels=detected_channels,
-                                    target_channels=channels,
+                                    target_channels=ASR_TARGET_CH,
                                     sample_width=bits_per_sample // 8,
                                     is_wav_file=False  # Already raw PCM
                                 )
-                                self.logger.info(f"Resampled to {len(raw_pcm)} bytes")
+                                self.logger.info(f"Resampled to {len(raw_pcm)} bytes at {ASR_TARGET_RATE}Hz")
                             except Exception as e:
                                 self.logger.error(f"Error resampling: {e}", exc_info=True)
                         
                         # Set up callbacks to capture transcription results
                         transcription_results = []
-                        processing_complete = asyncio.Event()
+                        import threading as _threading
+                        processing_complete = _threading.Event()  # thread-safe: set from C callback thread
                         speech_ended_count = 0
-                        
+                        detected_language = None       # ISO 639-1 code (e.g. "zh")
+                        detected_language_name = None  # Full name from C++ (e.g. "Chinese")
+
+                        # ISO 639-1 normalization map — C++ returns full English names
+                        _LANG_NAME_TO_CODE = {
+                            "english": "en", "chinese": "zh", "spanish": "es",
+                            "french": "fr", "german": "de", "japanese": "ja",
+                            "korean": "ko", "portuguese": "pt", "italian": "it",
+                            "russian": "ru", "arabic": "ar", "hindi": "hi",
+                            "dutch": "nl", "polish": "pl", "turkish": "tr",
+                        }
+
                         # Get the event loop to schedule coroutines from C callback thread
                         loop = asyncio.get_event_loop()
-                        
+
                         def capture_transcription(results, count, user_data):
+                            nonlocal detected_language, detected_language_name
                             # Parse the key-value pairs from the C callback
                             result_dict = {}
                             for i in range(count):
@@ -744,38 +853,50 @@ class ASRService(BaseService):
                                 key = kv.key.decode("utf-8") if kv.key else ""
                                 value = kv.value.decode("utf-8") if kv.value else ""
                                 result_dict[key] = value
-                            
-                            # Extract the transcription text and is_final flag
+
+                            # Extract the transcription text, is_final flag, and detected language
                             transcription_text = result_dict.get("transcription", "")
                             is_final_str = result_dict.get("is_final", "true")  # Note: key is "is_final" not "isFinal"
                             # Handle various possible values: "true", "True", "1", "false", "False", "0"
                             is_final = is_final_str.lower() in ["true", "1"]
+                            # Capture detected language from C++ — store both raw name and ISO code
+                            cb_language = result_dict.get("language") or None
+                            if cb_language:
+                                detected_language_name = cb_language
+                                detected_language = _LANG_NAME_TO_CODE.get(cb_language.lower(), cb_language.lower())
                             
                             self.logger.info(f"Received transcription chunk: is_final={is_final} (raw='{is_final_str}'), text={transcription_text[:100]}...")
                             
                             if transcription_text:
                                 transcription_results.append(transcription_text)
-                                
+
                                 # Send results immediately to avoid lag
                                 if request.stream:
                                     # For streaming mode, send each chunk as it arrives
                                     # Check isFinal to determine result type
                                     result_type = "transcript.text.done" if is_final else "transcript.text.delta"
-                                
+
                                     # Use call_soon_threadsafe since callback is from C thread
                                     loop.call_soon_threadsafe(
                                         asyncio.create_task,
                                         self._send_streaming_chunk_with_type(
                                             transcription_text,
-                                            request.language or "en",
+                                            detected_language or request.language or None,
                                             request.sync_id,
-                                            result_type
+                                            result_type,
+                                            language_name=detected_language_name
                                         )
                                     )
                                 else:
                                     # For non-streaming mode, collect results
                                     # The final result will be the concatenation
                                     pass  # Will concatenate at the end
+
+                            # Signal processing complete when the engine sends is_final,
+                            # regardless of whether speech_ended fires (mEverDetectedSpeech
+                            # can be 0 even when a valid transcript is produced).
+                            if is_final:
+                                processing_complete.set()
                         
                         # Define event callback type
                         EventCallback = CFUNCTYPE(None, c_int32, c_void_p)
@@ -790,12 +911,6 @@ class ASRService(BaseService):
                                 elif event_code == wrapper.EVENT_SPEECH_ENDED:
                                     speech_ended_count += 1
                                     self.logger.info(f"[ASR Event] Speech ended (count: {speech_ended_count})")
-                                    # Signal that we might be done processing
-                                    # Set event after a short delay to allow final transcription callbacks
-                                    # def signal_complete():
-                                    #     loop.call_soon_threadsafe(processing_complete.set)
-                                    # import threading
-                                    # threading.Timer(0.5, signal_complete).start()
                                 else:
                                     self.logger.info(f"[ASR Event] Unknown event code: {event_code}")
                             except Exception as e:
@@ -808,19 +923,19 @@ class ASRService(BaseService):
                                 self.logger.info("Creating singleton WhisperWrapper instance...")
                                 language = request.language.encode("utf-8") if request.language else None
                                 
-                                # Determine continuous mode based on VAD parameter
+                                # Always use continuous mode — session runs until transcriptions/close.
+                                # When VAD is provided use the custom hangover value; otherwise use
+                                # the environment default.  continuous=True means the C++ engine
+                                # resets after each EPD and keeps listening rather than stopping.
                                 vad_value = getattr(request, 'vad_value', None)
-                                if vad_value is not None:
-                                    # If VAD is provided, use non-continuous mode with custom VAD
-                                    continuous_mode = False
-                                    vad_hangover = vad_value
-                                    self.logger.info(f"Using VAD mode: continuous=False, vad_hangover={vad_hangover}")
-                                else:
-                                    # Default behavior: continuous mode with environment VAD
-                                    continuous_mode = True
-                                    vad_hangover = self.vad_len_hangover
-                                    self.logger.info(f"Using continuous mode: continuous=True, vad_hangover={vad_hangover}")
-                                
+                                continuous_mode = True
+                                vad_hangover = vad_value if vad_value is not None else self.vad_len_hangover
+                                self.logger.info(
+                                    f"Using continuous mode: continuous=True, "
+                                    f"vad_hangover={vad_hangover} "
+                                    f"({'custom VAD' if vad_value is not None else 'env default'})"
+                                )
+                            
                                 logger.info(f"asr-service process_file_transcription language={language}, continuous={continuous_mode}, partial_transcriptions={request.stream}")
                                 
                                 self.whisper_wrapper = self.asr_engine.WhisperWrapper(
@@ -854,7 +969,15 @@ class ASRService(BaseService):
                                     on_event=EventCallback(capture_event),
                                     partial_transcriptions=request.stream
                                 )
-                                
+
+                                # Update language for this request (not updated by update_callbacks).
+                                # None → null pointer → empty std::string → auto-detect (same as init path)
+                                language = request.language.encode("utf-8") if request.language else None
+                                self.logger.info(f"Updating language to: {language}")
+                                self.whisper_wrapper.lib.whisper_set_language_code(
+                                    self.whisper_wrapper.handle, language
+                                )
+
                                 # Update VAD setting if provided
                                 vad_value = getattr(request, 'vad_value', None)
                                 if vad_value is not None:
@@ -864,28 +987,40 @@ class ASRService(BaseService):
                             wrapper = self.whisper_wrapper
                         
                         # Start processing
-                        await asyncio.to_thread(wrapper.start)
-                        
-                        # Calculate audio duration
-                        audio_duration_sec = len(raw_pcm) / (sampling_rate * channels * 2)  # 2 bytes per sample (16-bit)
-                        self.logger.info(f"Audio duration: {audio_duration_sec:.1f}s ({len(raw_pcm)} bytes)")
-                        
-                        # Write all audio at once - let continuous mode handle chunking
-                        buf = (ctypes.c_uint8 * len(raw_pcm)).from_buffer_copy(raw_pcm)
-                        wrapper.lib.input_stream_write_buffer(wrapper.stream, buf, len(raw_pcm))
-                        wrapper.lib.input_stream_set_use_audio_file(wrapper.stream, True)
-                        self.logger.info(f"Wrote {len(raw_pcm)} bytes of raw PCM to input stream")
-                        
-                        # For short audio files (< 10 seconds), add a small delay to allow C++ processing to complete
-                        # This prevents the callback from being lost when we stop too quickly
-                        if audio_duration_sec < 10.0:
-                            wait_time = audio_duration_sec * 0.25
-                            self.logger.info(f"Short audio file detected ({audio_duration_sec:.1f}s), waiting {wait_time:.2f}s for processing...")
-                            await asyncio.sleep(wait_time)
-                        
-                        # Stop processing and reset for next use (but don't close the singleton wrapper)
-                        self.logger.info('stopping and resetting wrapper (keeping singleton alive)')
-                        await asyncio.to_thread(wrapper.stop_and_reset)
+                        try:
+                            await asyncio.to_thread(wrapper.start)
+                            
+                            # Calculate audio duration using post-resampling constants (raw_pcm is
+                            # already at ASR_TARGET_RATE/ASR_TARGET_CH regardless of what the client sent)
+                            audio_duration_sec = len(raw_pcm) / (ASR_TARGET_RATE * ASR_TARGET_CH * 2)  # 2 bytes per sample (16-bit)
+                            self.logger.info(f"Audio duration: {audio_duration_sec:.1f}s ({len(raw_pcm)} bytes)")
+                            
+                            # Write all audio at once - let continuous mode handle chunking
+                            buf = (ctypes.c_uint8 * len(raw_pcm)).from_buffer_copy(raw_pcm)
+                            wrapper.lib.input_stream_write_buffer(wrapper.stream, buf, len(raw_pcm))
+                            wrapper.lib.input_stream_set_use_audio_file(wrapper.stream, True)
+                            self.logger.info(f"Wrote {len(raw_pcm)} bytes of raw PCM to input stream")
+
+                            # Block in a thread until the C callback sets processing_complete,
+                            # with a timeout of audio_duration + 10s headroom.
+                            wait_timeout = audio_duration_sec + 10.0
+                            self.logger.info(f"Waiting up to {wait_timeout:.1f}s for processing_complete event...")
+                            signalled = await asyncio.to_thread(processing_complete.wait, wait_timeout)
+                            if signalled:
+                                self.logger.info("processing_complete event received")
+                            else:
+                                self.logger.warning(f"Timed out waiting for processing_complete after {wait_timeout:.1f}s")
+                        finally:
+                            # Always stop and reset - even on error - so the wrapper is
+                            # in a clean state for the next request.
+                            #self.logger.info('stopping and resetting wrapper (keeping singleton alive)')
+                            #await asyncio.to_thread(wrapper.stop_and_reset)
+                            # If keep_alive is False, fully close and release the wrapper
+                            # so DSP resources are freed immediately after this request.
+                            if not request.keep_alive:
+                                self.logger.info('keep_alive=False: closing wrapper and releasing DSP resources')
+                                await asyncio.to_thread(wrapper.close)
+                                self.whisper_wrapper = None
 
                         # Use the results
                         if transcription_results:
@@ -901,7 +1036,8 @@ class ASRService(BaseService):
                                 
                                 result = TranscriptionsResult.create_result(
                                     text=full_text,
-                                    language=request.language or "en",
+                                    language=detected_language or request.language or None,
+                                    language_name=detected_language_name,
                                     result_type="transcript.text.done",
                                     stream=False,
                                     sync_id=request.sync_id
@@ -950,16 +1086,18 @@ class ASRService(BaseService):
         await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
         self.logger.debug(f'Sent immediate streaming chunk: "{text[:50]}..."')
     
-    async def _send_streaming_chunk_with_type(self, text: str, language: str, sync_id: str, result_type: str):
+    async def _send_streaming_chunk_with_type(self, text: str, language: str, sync_id: str, result_type: str, language_name: str = None):
         """Send a streaming chunk with specific result type (called from callback)."""
         result = TranscriptionsResult.create_result(
             text=text,
             language=language,
+            language_name=language_name,
             result_type=result_type,
             stream=True,
-            sync_id=sync_id
+            sync_id=sync_id,
+            state="transcription"
         )
-        
+
         await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
         self.logger.info(f'Sent streaming chunk ({result_type}): "{text[:50]}..."')
     
@@ -992,7 +1130,7 @@ class ASRService(BaseService):
             
             result = TranscriptionsResult.create_result(
                 text=text_to_send,
-                language=request.language or "en",
+                language=request.language or None,
                 result_type=result_type,
                 stream=True,
                 sync_id=request.sync_id
@@ -1004,16 +1142,18 @@ class ASRService(BaseService):
             if not is_final and self.dev_mode:
                 await asyncio.sleep(0.2)  # Simulate processing time
     
-    async def send_streaming_result(self, session_id: str, text: str, is_final: bool = False):
+    async def send_streaming_result(self, session_id: str, text: str, is_final: bool = False, detected_language: str = None):
         """Send a streaming result for a specific session."""
-        # Get session language, but don't fail if session doesn't exist
-        # (callback might be called after session cleanup)
-        language = "en"
-        if session_id in self.active_sessions:
-            session = self.active_sessions[session_id]
-            language = session.get('language', "en")
-        else:
-            self.logger.warning(f'Session {session_id} not found when sending result, using default language')
+        # Prefer the language detected by the engine; fall back to the session's
+        # requested language; default to "en" if neither is set.
+        language = detected_language
+        if not language:
+            if session_id in self.active_sessions:
+                session = self.active_sessions[session_id]
+                language = session.get('language') or "en"
+            else:
+                self.logger.warning(f'Session {session_id} not found when sending result, using default language')
+                language = "en"
         
         result_type = "transcript.text.done" if is_final else "transcript.text.delta"
         
@@ -1022,11 +1162,14 @@ class ASRService(BaseService):
             language=language,
             result_type=result_type,
             stream=True,
-            session_id=session_id
+            session_id=session_id,
+            state="transcription"
         )
         
         await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
         self.logger.info(f'Sent streaming result ({result_type}) for session {session_id}: {text[:50]}...')
+        if is_final and session_id in self.active_sessions:
+            self.active_sessions[session_id]['final_sent'] = True
     
     async def send_speech_event(self, session_id: str, event: str):
         """Send a speech detection event for a specific session."""
@@ -1035,6 +1178,9 @@ class ASRService(BaseService):
         if session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             language = session.get('language', "en")
+            if event == "speech_start" and session.get('speech_start_sent', False):
+                self.logger.info(f'speech_start already sent for session {session_id}, skipping')
+                return
         else:
             self.logger.warning(f'Session {session_id} not found when sending event, using default language')
         
@@ -1043,12 +1189,73 @@ class ASRService(BaseService):
             language=language,
             result_type="transcript.event",
             stream=True,
-            session_id=session_id
+            session_id=session_id,
+            state=event  # "speech_start" or "speech_end"
         )
         
         await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
         self.logger.info(f'Sent speech event ({event}) for session {session_id}')
+        if session_id in self.active_sessions:
+            if event == "speech_start":
+                self.active_sessions[session_id]['speech_start_sent'] = True
+                # Reset flags so the next utterance's events are not suppressed
+                self.active_sessions[session_id]['speech_end_sent'] = False
+            elif event == "speech_end":
+                self.active_sessions[session_id]['speech_end_sent'] = True
+                # Reset speech_start flag so the next utterance's start is not suppressed
+                self.active_sessions[session_id]['speech_start_sent'] = False
     
+
+    async def handle_flush_transcription(self, message: str):
+        """
+        Handle flush request - signal the C++ processing thread to drain
+        the current audio buffer as a partial result (transcript.text.delta)
+        without stopping the engine. The session stays alive and audio
+        streaming continues uninterrupted.
+        """
+        try:
+            flush_msg = TranscriptionsFlush.from_json(message)
+            session_id = flush_msg.session_id
+
+            self.logger.info(f"handle_flush_transcription session_id={session_id}")
+
+            # Resolve session: use provided id, or fall back to the only active session
+            if session_id and session_id in self.active_sessions:
+                session = self.active_sessions[session_id]
+            elif not session_id and len(self.active_sessions) == 1:
+                session_id = next(iter(self.active_sessions))
+                session = self.active_sessions[session_id]
+            else:
+                self.logger.warning(
+                    f"flush: session '{session_id}' not found. "
+                    f"Active sessions: {list(self.active_sessions.keys())}"
+                )
+                return
+
+            if self.dev_mode:
+                self.logger.info("flush: dev mode - nothing to flush")
+                return
+
+            # The wrapper is a singleton on self.whisper_wrapper, not on the session dict.
+            if self.whisper_wrapper is None:
+                self.logger.warning(f"flush: no active whisper_wrapper (singleton is None)")
+                return
+
+            wrapper = self.whisper_wrapper
+
+            # Signal the C++ processing thread to flush the buffer.
+            # whisper_flush() sets mFlushRequested=true and notifies mCv so
+            # the thread wakes immediately, drains mBuffers under mBufferLock,
+            # calls processFullBuffer(false, 0) -> fires transcript.text.delta
+            # callback, resets speech state, and continues running.
+            # This call returns immediately - processing is async on the C++ thread.
+            self.logger.info(f"flush: signalling C++ processing thread for session {session_id}")
+            await asyncio.to_thread(wrapper.flush)
+            self.logger.info(f"flush: signal sent for session {session_id}")
+
+        except Exception as e:
+            self.logger.error(f"Error handling flush: {e}", exc_info=True)
+
     async def send_final_result(self, request: TranscriptionsCreateRequest, text: str = None):
         """Send final transcription result (non-streaming)."""
         # Use provided text or default mock text
@@ -1057,7 +1264,7 @@ class ASRService(BaseService):
         
         result = TranscriptionsResult.create_result(
             text=text,
-            language=request.language or "en",
+            language=request.language or None,
             result_type="transcript.text.done",
             stream=False,
             sync_id=request.sync_id
@@ -1078,7 +1285,36 @@ class ASRService(BaseService):
         # Get sampling rate and channels from request
         sampling_rate = getattr(request, 'sampling_rate', 16000)
         channels = getattr(request, 'channels', 1)
-        
+
+        # Parse on_device_mic early so capture_event closure can reference it
+        on_device_mic = False
+        mic_name = None
+        _params: list = []
+        if hasattr(request, "parameters") and request.parameters:
+            if isinstance(request.parameters, str):
+                try:
+                    _params = json.loads(request.parameters)
+                except json.JSONDecodeError:
+                    pass
+            elif isinstance(request.parameters, list):
+                _params = request.parameters
+
+        for _p in _params:
+            if isinstance(_p, dict):
+                if _p.get("key") == "on_device_recording":
+                    on_device_mic = _p.get("value", "false").lower() in ["true", "1", "yes"]
+                elif _p.get("key") == "on_device_recorder_name":
+                    mic_name = _p.get("value") or None
+
+        server_timeout_s = None
+        for _p in _params:
+            if isinstance(_p, dict) and _p.get("key") == "server_timeout" and _p.get("value"):
+                try:
+                    server_timeout_s = int(float(_p["value"]))
+                    self.logger.info(f"create_streaming_session: per-request server_timeout={server_timeout_s}s")
+                except (ValueError, TypeError):
+                    pass
+
         session_data = {
             'model': request.model,
             'language': request.language,
@@ -1086,7 +1322,15 @@ class ASRService(BaseService):
             'audio_chunks': [],
             'sampling_rate': sampling_rate,
             'channels': channels,
-            'recorder': None                    # For on device recording
+            'recorder': None,                   # For on device recording
+            'on_device_mic': on_device_mic,     # Whether on-device mic is active
+            'final_sent': False,                # Tracks whether a final transcript result was sent
+            'speech_start_sent': False,         # Tracks whether a speech_start event was sent
+            'speech_end_sent': False,           # Tracks whether a speech_end event was sent
+            'server_timeout_s': server_timeout_s if server_timeout_s is not None else self.default_session_timeout_s,
+            'last_audio_time': time.time(),     # Updated on every audio chunk for timeout tracking
+            'timeout_task': None,               # asyncio.Task for the inactivity watchdog
+            'keep_alive': request.keep_alive,   # If True, watchdog skips auto-close between utterances
         }
         
         if not self.dev_mode and self.asr_engine:
@@ -1101,11 +1345,13 @@ class ASRService(BaseService):
                     raise ValueError(f"Model configuration not found for {request.model}")
                 
                 # Extract model paths from config
-                encoder_path = model_info.get("model_path", "").encode("utf-8")
-                decoder_path = model_info.get("decoder_path", "").encode("utf-8")
-                vocab_path = model_info.get("vocab_path", "").encode("utf-8")
-                speech_path = model_info.get("speech_path", "").encode("utf-8")
-                model_path = b""  # Empty for now
+                _model_dir = model_info.get("model_path", "")
+                _assets = model_info.get("assets", {})
+                encoder_path = os.path.join(_model_dir, _assets.get("model_path", "")).encode("utf-8")
+                decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
+                vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
+                speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"
+                model_path = b""  # adsp_path — empty for now
                 
                 # Get the event loop to schedule coroutines from C callback thread
                 loop = asyncio.get_event_loop()
@@ -1130,15 +1376,17 @@ class ASRService(BaseService):
                         is_final_str = result_dict.get("is_final", "true")  # Note: key is "is_final" not "isFinal"
                         # Handle various possible values: "true", "True", "1", "false", "False", "0"
                         is_final = is_final_str.lower() in ["true", "1"]
+                        # Language detected by the engine (e.g. "English"); may be absent
+                        detected_language = result_dict.get("language", None)
 
                         if transcription_text:
                             self.logger.info(f"[CALLBACK] Received transcription for session {session_id}: is_final={is_final} (raw='{is_final_str}'), text={transcription_text[:50]}...")
-                            
+
                             # Send the result immediately to the client
                             # Use call_soon_threadsafe since callback is from C thread
                             loop.call_soon_threadsafe(
                                 asyncio.create_task,
-                                self.send_streaming_result(session_id, transcription_text, is_final=is_final)
+                                self.send_streaming_result(session_id, transcription_text, is_final=is_final, detected_language=detected_language)
                             )
                         else:
                             self.logger.debug(f"[CALLBACK] Empty transcription text for session {session_id}, is_final={is_final}")
@@ -1159,18 +1407,28 @@ class ASRService(BaseService):
                             )
                         elif event_code == wrapper.EVENT_SPEECH_ENDED:
                             self.logger.info(f"[ASR Event] Speech ended for session {session_id}")
+                            # Send speech_end event first so the client receives it before
+                            # the transcript.text.done that follows from the C++ callback.
                             loop.call_soon_threadsafe(
                                 asyncio.create_task,
                                 self.send_speech_event(session_id, "speech_end")
                             )
-                            # Stop whisper + recorder on a background thread so we don't block
-                            stop_thread = threading.Thread(
-                                target=self._stop_and_restart_recorder,
-                                args=(wrapper, loop),
-                                daemon=True
-                            )
-                            stop_thread.start()
-                            self.logger.info(f"[ASR Event] Stop+restart dispatched to background thread for session {session_id}")
+                            # In continuous mode the C++ engine has already called
+                            # processFullBuffer(true, ...) which fires the final
+                            # transcription callback (is_final=true → transcript.text.done)
+                            # and then resets state for the next utterance.  No stop/restart
+                            # needed here for WebSocket streaming.
+                            # Only stop+restart the recorder when on-device mic is active.
+                            if on_device_mic:
+                                stop_thread = threading.Thread(
+                                    target=self._stop_and_restart_recorder,
+                                    args=(wrapper, loop),
+                                    daemon=True
+                                )
+                                stop_thread.start()
+                                self.logger.info(f"[ASR Event] Stop+restart dispatched to background thread for session {session_id}")
+                            else:
+                                self.logger.info(f"[ASR Event] Continuous mode — C++ handles buffer flush and reset after speech_end for session {session_id}")
                         else:
                             self.logger.info(f"[ASR Event] Unknown event code: {event_code} for session {session_id}")
                     except Exception as e:
@@ -1182,18 +1440,18 @@ class ASRService(BaseService):
                         self.logger.info("Creating singleton WhisperWrapper instance...")
                         language = request.language.encode("utf-8") if request.language else None
                         
-                        # Determine continuous mode based on VAD parameter
+                                                # Always use continuous mode — session runs until transcriptions/close.
+                        # When VAD is provided use the custom hangover value; otherwise use
+                        # the environment default.  continuous=True means the C++ engine
+                        # resets after each EPD and keeps listening rather than stopping.
                         vad_value = getattr(request, 'vad_value', None)
-                        if vad_value is not None:
-                            # If VAD is provided, use non-continuous mode with custom VAD
-                            continuous_mode = False
-                            vad_hangover = vad_value
-                            self.logger.info(f"Using VAD mode for streaming: continuous=False, vad_hangover={vad_hangover}")
-                        else:
-                            # Default behavior: continuous mode with environment VAD
-                            continuous_mode = True
-                            vad_hangover = self.vad_len_hangover
-                            self.logger.info(f"Using continuous mode for streaming: continuous=True, vad_hangover={vad_hangover}")
+                        continuous_mode = True
+                        vad_hangover = vad_value if vad_value is not None else self.vad_len_hangover
+                        self.logger.info(
+                            f"Using continuous mode for streaming: continuous=True, "
+                            f"vad_hangover={vad_hangover} "
+                            f"({'custom VAD' if vad_value is not None else 'env default'})"
+                        )
                         
                         logger.info(f"asr-service streaming session language={language}, continuous={continuous_mode}, partial_transcriptions=True")
                         
@@ -1229,7 +1487,14 @@ class ASRService(BaseService):
                             on_event=EventCallback(capture_event),
                             partial_transcriptions=True  # Always True for streaming sessions
                         )
-                        
+
+                        # Update language for this request (not updated by update_callbacks).
+                        language = request.language.encode("utf-8") if request.language else None
+                        self.logger.info(f"Updating language to: {language}")
+                        self.whisper_wrapper.lib.whisper_set_language_code(
+                            self.whisper_wrapper.handle, language
+                        )
+
                         # Update VAD setting if provided
                         vad_value = getattr(request, 'vad_value', None)
                         if vad_value is not None:
@@ -1261,34 +1526,29 @@ class ASRService(BaseService):
                 )
                 return
         
-        # Store session info
+                # Store session info
         self.active_sessions[session_id] = session_data
+
+        # Start inactivity watchdog — auto-closes session if no audio arrives
+        # for server_timeout_s seconds (protects against dropped connections).
+        # Skipped when keep_alive=True: the client will reuse the session between
+        # utterances so silence between recordings is expected and normal.
+        timeout_s = session_data['server_timeout_s']
+        if session_data.get('keep_alive', False):
+            self.logger.info(f"Skipping inactivity watchdog for session {session_id} (keep_alive=True)")
+            session_data['timeout_task'] = None
+        else:
+            self.logger.info(f"Starting inactivity watchdog for session {session_id} (timeout={timeout_s}s)")
+            session_data['timeout_task'] = asyncio.create_task(
+                self._session_inactivity_watchdog(session_id, timeout_s)
+            )
         
         self.logger.info(f'Created streaming session: {session_id}')
 
         self.logger.info(request)
 
-        params = []
-        mic_name = None
-        if hasattr(request, "parameters") and request.parameters:
-            if isinstance(request.parameters, str):
-                try:
-                    params = json.loads(request.parameters)
-                except json.JSONDecodeError:
-                    self.logger.warning(f"Could not parse parameters: {request.parameters}")
-            elif isinstance(request.parameters, list):
-                params = request.parameters
-
-        on_device_mic = False
-        for param in params:
-            if isinstance(param, dict):
-                if param.get("key") == "on_device_recording":
-                    value = param.get("value", "false")
-                    on_device_mic = value.lower() in ["true", "1", "yes"]
-                    self.logger.info(f"on_device_recording set to: {on_device_mic}")
-                elif param.get("key") == "on_device_recorder_name":
-                    mic_name = param.get("value") or None
-                    self.logger.info(f"on_device_recorder_name set to: {mic_name}")
+        # on_device_mic / mic_name were already parsed above (before capture_event closure)
+        self.logger.info(f"After parsing parameters: on_device_mic={on_device_mic}")
 
         # Create recorder if we want on_device_microphone
         if on_device_mic:
@@ -1358,11 +1618,12 @@ class ASRService(BaseService):
         # The WebSocket should ONLY be used for actual transcription results
         result = TranscriptionsResult.create_result(
             text="Successfully started Transcription Engine. Please connect to the WebSocket to send audio data & receive transcription output.",
-            language=request.language or "en",
-            result_type="session.created",  # Not a transcription message
+            language=request.language or None,
+            result_type="transcript.event",
             stream=True,
             session_id=session_id,
-            sync_id=request.sync_id
+            sync_id=request.sync_id,
+            state="asr_initialized"
         )
 
         ### DEBUG using speaker playback
@@ -1536,7 +1797,7 @@ class ASRService(BaseService):
             return
 
         if not self.recorder:
-            self.logger.error(f"There is no recorder for session {session_id}")
+            self.logger.debug(f"No on-device recorder for session {session_id} — audio arrives via WebSocket, nothing to do here")
             return
 
         while session_id in self.active_sessions and not self.recorder.done_recording():
@@ -1580,6 +1841,37 @@ class ASRService(BaseService):
         self.logger.info(f"Recording stopped for session {session_id}, clearing remaining audio queue")
         self.recorder.clear_queue()
         self.logger.info(f"Audio recording handler stopped for session {session_id}")
+
+    async def _session_inactivity_watchdog(self, session_id: str, timeout_s: int):
+        """Watchdog task that auto-closes a session if no audio arrives for timeout_s seconds.
+
+        Runs as a background asyncio task for the lifetime of the session.
+        Cancelled cleanly when the session is closed normally.
+        """
+        self.logger.info(f"[watchdog] Started for session {session_id}, timeout={timeout_s}s")
+        try:
+            while True:
+                await asyncio.sleep(1)  # Check every second
+
+                if session_id not in self.active_sessions:
+                    self.logger.info(f"[watchdog] Session {session_id} no longer active, exiting")
+                    return
+
+                session = self.active_sessions[session_id]
+                elapsed = time.time() - session.get('last_audio_time', time.time())
+
+                if elapsed >= timeout_s:
+                    self.logger.warning(
+                        f"[watchdog] Session {session_id} inactive for {elapsed:.1f}s "
+                        f"(timeout={timeout_s}s) — auto-closing"
+                    )
+                    await self.handle_close_transcription(None, session_id=session_id)
+                    return
+
+        except asyncio.CancelledError:
+            self.logger.info(f"[watchdog] Cancelled for session {session_id}")
+        except Exception as e:
+            self.logger.error(f"[watchdog] Error for session {session_id}: {e}", exc_info=True)
 
     async def handle_session_audio(self, message: str):
         """Handle incoming audio chunks for live streaming."""
@@ -1631,9 +1923,11 @@ class ASRService(BaseService):
                     # The message itself is the binary audio data
                     audio_bytes = message.encode('latin1') if isinstance(message, str) else message
 
-            # Store chunk
+                        # Store chunk
             session = self.active_sessions[session_id]
             session['audio_chunks'].append(audio_bytes)
+            # Reset inactivity timer
+            session['last_audio_time'] = time.time()
             
             self.logger.debug(
                 f'Received audio chunk for session {session_id}: '
@@ -1681,13 +1975,39 @@ class ASRService(BaseService):
                     # If the session has a whisper wrapper, use it
                     if 'whisper_wrapper' in session:
                         wrapper = session['whisper_wrapper']
-                        
-                        # Audio chunks are already raw PCM, no header stripping needed
-                        # Just write directly to the stream using write_buffer
-                        buf = (ctypes.c_uint8 * len(audio_bytes)).from_buffer_copy(audio_bytes)
-                        wrapper.lib.input_stream_write_buffer(wrapper.stream, buf, len(audio_bytes))
+
+                        # Resample to 16000 Hz mono if the session was created with a
+                        # different sampling rate (e.g. client streaming 44100 Hz PCM).
+                        session_rate = session.get('sampling_rate', 16000)
+                        session_ch   = session.get('channels', 1)
+                        pcm_to_write = audio_bytes
+                        if session_rate != 16000 or session_ch != 1:
+                            try:
+                                pcm_to_write = resample_audio(
+                                    audio_bytes,
+                                    original_sample_rate=session_rate,
+                                    target_sample_rate=16000,
+                                    original_channels=session_ch,
+                                    target_channels=1,
+                                    sample_width=2,  # int16 PCM
+                                    is_wav_file=False
+                                )
+                                self.logger.debug(
+                                    f"Resampled chunk {len(audio_bytes)}B @ {session_rate}Hz "
+                                    f"-> {len(pcm_to_write)}B @ 16000Hz for session {session_id}"
+                                )
+                            except Exception as resample_err:
+                                self.logger.error(
+                                    f"Error resampling chunk for session {session_id}: {resample_err}",
+                                    exc_info=True
+                                )
+                                # Fall back to sending as-is rather than dropping the chunk
+                                pcm_to_write = audio_bytes
+
+                        buf = (ctypes.c_uint8 * len(pcm_to_write)).from_buffer_copy(pcm_to_write)
+                        wrapper.lib.input_stream_write_buffer(wrapper.stream, buf, len(pcm_to_write))
                         wrapper.lib.input_stream_set_use_audio_file(wrapper.stream, False)
-                        self.logger.debug(f"Wrote {len(audio_bytes)} bytes of raw PCM to input stream for session {session_id}")
+                        self.logger.debug(f"Wrote {len(pcm_to_write)} bytes of raw PCM to input stream for session {session_id}")
                         
                         # The engine should call our callback when it has results
                         # We don't need to do anything else here
@@ -1723,14 +2043,21 @@ class ASRService(BaseService):
             elif message:
                 close_msg = TranscriptionsClose.from_json(message)
                 session_id = close_msg.session_id
-            else:
-                self.logger.info("handle_close_transcription called with no message or session id!")
-                return                        
+            # session_id may still be None here — the fallback below handles it
 
             self.logger.info(f"handle_close_transcription {session_id}")
 
+            # If the provided session_id isn't found (or is null), fall back to
+            # whatever session is currently active — there is only ever one.
+            if session_id not in self.active_sessions and self.active_sessions:
+                fallback_id = next(iter(self.active_sessions))
+                self.logger.info(f"Session {session_id!r} not found — closing active session {fallback_id} instead")
+                session_id = fallback_id
+
             if session_id and session_id in self.active_sessions:
                 session = self.active_sessions[session_id]
+
+                # Stop recorder first
                 if self.recorder and not self.recorder.done_recording():
                     self.logger.info(f"Stopping recorder on close for session {session_id}")
                     self.recorder.stop_recording()
@@ -1742,18 +2069,62 @@ class ASRService(BaseService):
 
                 if not self.dev_mode and self.asr_engine:
                     try:
-                        # Stop and reset the wrapper for this session (but keep singleton alive)
+                        # Flush remaining buffer and get final transcription
                         if 'whisper_wrapper' in session:
-                            self.logger.info(f"Stopping and resetting ASR processing for session {session_id}")
-                            #await asyncio.to_thread(session['whisper_wrapper'].stop_and_reset)
-                            await asyncio.to_thread(session['whisper_wrapper'].close)  # ← Deinitializes
-                            self.whisper_wrapper = None  # ← Clear singleton reference
+                            wrapper = session['whisper_wrapper']
+                            self.logger.info(f"Flushing remaining audio buffer for session {session_id}")
+
+                            # Signal the C++ processing thread to stop.
+                            # whisper_stop() is non-blocking — it signals the thread and returns
+                            # immediately. The thread fires the final callback, then does its
+                            # post-stop reset ("Resetting state for next utterance in continuous
+                            # mode") before fully exiting. We must wait for all of that to finish
+                            # before calling deinit, otherwise the DSP transport is torn down
+                            # while the thread is still running → SIGSEGV.
+                            await asyncio.to_thread(wrapper.stop)
+
+                            # Wait for the final callback to arrive.
+                            final_sent = session.get("final_sent", False)
+                            if not final_sent:
+                                self.logger.info(f"Waiting for final callback for session {session_id}...")
+                                for _ in range(20):  # up to 2s in 100ms steps
+                                    await asyncio.sleep(0.1)
+                                    session = self.active_sessions.get(session_id, {})
+                                    if session.get("final_sent", False):
+                                        break
+                                final_sent = session.get("final_sent", False)
+                                if not final_sent:
+                                    self.logger.info(f"No final result sent yet for session {session_id}, sending now")
+                            else:
+                                self.logger.info(f"Final result already sent for session {session_id}, skipping")
+
+                            # Give the C++ thread time to finish its post-callback reset loop
+                            # before deinit tears down the DSP. The reset fires immediately after
+                            # the callback and takes <200ms, but we use 500ms to be safe.
+                            await asyncio.sleep(0.5)
+
+                            self.logger.info(f"Closing ASR wrapper for session {session_id}")
+                            await asyncio.to_thread(wrapper.close)  # stop (idempotent) + deinit + destroy
+
+                            if not final_sent:
+                                await self.send_streaming_result(session_id, "", True)
+
+                            if session.get('speech_start_sent', False) and not session.get('speech_end_sent', False):
+                                self.logger.info(f"speech_start was sent but speech_end was not — sending speech_end on close for session {session_id}")
+                                await self.send_speech_event(session_id, "speech_end")
+
+                            self.whisper_wrapper = None  # Clear singleton reference
                     except Exception as e:
                         self.logger.error(f"Error stopping ASR processing: {e}", exc_info=True)
 
                     # recorder is a singleton on self, already stopped above
 
                 # Cleanup session
+                # Cancel the inactivity watchdog before removing the session
+                timeout_task = session.get('timeout_task')
+                if timeout_task and not timeout_task.done():
+                    timeout_task.cancel()
+                    self.logger.info(f"Cancelled inactivity watchdog for session {session_id}")
                 del self.active_sessions[session_id]
                 self.logger.info(f'Closed session: {session_id}')
             else:
@@ -1763,16 +2134,38 @@ class ASRService(BaseService):
                 if self.whisper_wrapper is not None:
                     self.logger.info("Deinitializing WhisperWrapper (no specific session)...")
                     try:
-                        await asyncio.to_thread(self.whisper_wrapper.close)  # ← Deinitializes
-                        self.whisper_wrapper = None  # ← Clear singleton reference
+                        await asyncio.to_thread(self.whisper_wrapper.close)  # Deinitializes
+                        self.whisper_wrapper = None  # Clear singleton reference
                         self.logger.info("WhisperWrapper deinitialized successfully")
                     except Exception as e:
                         self.logger.error(f"Error deinitializing WhisperWrapper: {e}", exc_info=True)
-            
+
+            # Mark keep_alive as False so the next service switch triggers a full cleanup
+            self.coordinator.set_asr_keep_alive(False)
+            self.logger.info("ASR close complete")
+
+            # Respond to the caller. sync_id is only present on explicit API closes;
+            # internal closes (watchdog) have no caller waiting.
+            if message:
+                try:
+                    close_msg = TranscriptionsClose.from_json(message)
+                    if close_msg.sync_id:
+                        result = TranscriptionsResult.create_result(
+                            text="",
+                            language=None,
+                            result_type="asr_closed",
+                            stream=False,
+                            session_id=session_id,
+                            sync_id=close_msg.sync_id,
+                            state="asr_closed"
+                        )
+                        await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
+                except Exception as e:
+                    self.logger.error(f'Error publishing asr_closed response: {e}', exc_info=True)
 
         except Exception as e:
             self.logger.error(f'Error handling close: {e}', exc_info=True)
-    
+
     def handle_models_request(self, message: str):
         """Handle models list request."""
         try:
@@ -1780,14 +2173,14 @@ class ASRService(BaseService):
             import json
             data = json.loads(message)
             message_source = data.get('message_source', '')
-            
+
             # Ignore messages from ourselves (responses)
             if message_source == 'audio_analytics_server':
                 self.logger.debug('Ignoring message from server (our own response)')
                 return
-            
+
             request = TranscriptionsModelsRequest.from_json(message)
-            
+
             # Build detailed model information for API
             detailed_models = []
             for model in self.model_config:
@@ -1800,18 +2193,18 @@ class ASRService(BaseService):
                     "parameters": model.get("parameters", {})
                 }
                 detailed_models.append(detailed_model)
-            
-            # Send models list — result is the plain models array
+
+            # Send models list - result is the plain models array
             response = {
                 "sync_id": request.sync_id,
                 "result": detailed_models,
                 "message_source": "audio_analytics_server"
             }
-            
+
             asyncio.create_task(
                 self.publish(Config.ASR_MODELS, json.dumps(response))
             )
-            
+
             self.logger.info(f'Sent models list: {len(detailed_models)} models')
 
         except Exception as e:

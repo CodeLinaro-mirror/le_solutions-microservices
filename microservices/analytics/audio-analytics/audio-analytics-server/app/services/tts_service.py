@@ -54,6 +54,8 @@ class TTSService(BaseService):
         self.tts_instance_lock = asyncio.Lock()  # Protect singleton access
         self.audio_chunks = []
         
+        self.tts_max_char_len = 1024
+
         # Persistent speaker instance — started once, lives for the app lifetime
         self.speaker: Speaker = None
         self.speaker_thread: threading.Thread = None
@@ -84,28 +86,63 @@ class TTSService(BaseService):
         if not self.dev_mode:
             self.logger.info("Running in production mode - initializing TTS engine")
             try:
-                # Try to import the TTS wrapper module (now in server directory)
-                wrapper_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "tts_wrapper.py"
-                )
-                if os.path.exists(wrapper_path):
-                    self.logger.info(f"Found TTS wrapper at {wrapper_path}")
+                # Try multiple possible locations for the TTS wrapper
+                possible_paths = [
+                    os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tts_wrapper.py"
+                    ),
+                    "/usr/src/server/tts_wrapper.py",
+                    os.path.join(os.path.dirname(__file__), "..", "..", "tts_wrapper.py")
+                ]
+                
+                self.logger.info(f"Searching for TTS wrapper in {len(possible_paths)} locations...")
+                wrapper_path = None
+                for path in possible_paths:
+                    self.logger.info(f"  Checking: {path}")
+                    if os.path.exists(path):
+                        wrapper_path = path
+                        self.logger.info(f"  ✓ Found TTS wrapper at {path}")
+                        break
+                    else:
+                        self.logger.info(f"  ✗ Not found at {path}")
+                
+                if wrapper_path:
+                    self.logger.info(f"Loading TTS wrapper from {wrapper_path}")
+                    # Add the wrapper directory to Python path so wrapper_utils can be imported
+                    wrapper_dir = os.path.dirname(wrapper_path)
+                    if wrapper_dir not in sys.path:
+                        sys.path.insert(0, wrapper_dir)
+                        self.logger.info(f"Added {wrapper_dir} to Python path")
                     # Import the module dynamically
                     spec = importlib.util.spec_from_file_location("tts_wrapper", wrapper_path)
                     if spec and spec.loader:
+                        self.logger.info("Creating module from spec...")
                         tts_module = importlib.util.module_from_spec(spec)
                         sys.modules["tts_wrapper"] = tts_module
+                        self.logger.info("Executing module...")
                         spec.loader.exec_module(tts_module)
+                        self.logger.info("Module executed successfully")
                         # Get the TTS class from the module
-                        self.tts_wrapper_class = tts_module.TTS
-                        self.logger.info("TTS wrapper class loaded successfully")
+                        if hasattr(tts_module, 'TTS'):
+                            self.tts_wrapper_class = tts_module.TTS
+                            self.logger.info("✓ TTS wrapper class loaded successfully")
+                            # Try to instantiate to check if .so files are accessible
+                            try:
+                                test_instance = self.tts_wrapper_class()
+                                self.logger.info("✓ TTS wrapper instantiated successfully (library .so files are OK)")
+                                del test_instance
+                            except Exception as inst_error:
+                                self.logger.error(f"✗ TTS wrapper instantiation failed (library .so files may be bad): {inst_error}", exc_info=True)
+                                self.tts_wrapper_class = None
+                        else:
+                            self.logger.error("✗ TTS class not found in wrapper module")
                     else:
-                        self.logger.error("Failed to load TTS wrapper module specification")
+                        self.logger.error("✗ Failed to load TTS wrapper module specification")
                 else:
-                    self.logger.warning(f"TTS wrapper not found at {wrapper_path}")
+                    self.logger.error(f"✗ TTS wrapper not found in any of the {len(possible_paths)} locations")
             except Exception as e:
-                self.logger.error(f"Error initializing TTS wrapper: {e}", exc_info=True)
+                self.logger.error(f"✗ Error initializing TTS wrapper: {e}", exc_info=True)
         else:
             self.logger.info("Running in development mode - using mock responses")
         
@@ -116,6 +153,35 @@ class TTSService(BaseService):
             Config.TTS_MODELS: self.handle_message_safely(self.handle_models_request),
             Config.TTS_DEVICES: self.handle_message_safely(self.handle_devices_request),
         }
+
+    async def handle_close_request(self):
+        """Handle a tts_close message: cancel in-flight synthesis, deinitialize the TTS
+        instance, and release DSP/NPU resources."""
+        self.logger.info('TTS close request received — deinitializing TTS instance')
+
+        # Cancel any in-flight or queued synthesis first
+        self.handle_cancel_request()
+
+        # Deinitialize the singleton TTS instance
+        async with self.tts_instance_lock:
+            if self.tts_instance is not None:
+                try:
+                    self.logger.info("Deinitializing TTS instance on close...")
+                    await asyncio.to_thread(self.tts_instance.deinit)
+                    await asyncio.sleep(0.1)
+                    self.tts_instance = None
+                    self.current_model_path = None
+                    self.logger.info("TTS instance deinitialized on close")
+                except Exception as e:
+                    self.logger.error(f"Error deinitializing TTS instance on close: {e}", exc_info=True)
+                    self.tts_instance = None
+                    self.current_model_path = None
+            else:
+                self.logger.info("TTS close: no active instance to deinitialize")
+
+        # Mark keep_alive as False so the next service switch triggers a full cleanup
+        self.coordinator.set_tts_keep_alive(False)
+        self.logger.info("TTS close complete")
 
     def handle_cancel_request(self):
         """Handle a tts_cancel message: set the cancellation flag, drain the
@@ -165,6 +231,12 @@ class TTSService(BaseService):
         # Start the sequential queue worker
         self._queue_worker_task = asyncio.create_task(self._request_queue_worker())
         self.logger.info("TTS sequential request queue worker started")
+
+        # Pre-warm the default TTS model so the first real request hits the
+        # warm path (cached .qnn file) instead of running generate_model().
+        # This runs in the background so it does not block service startup.
+        # if not self.dev_mode and self.tts_wrapper_class and self.available_models:
+        #     asyncio.create_task(self._prewarm_default_model())
 
         # NOTE: The persistent speaker is started lazily on the first
         # on_device_playback=True request rather than eagerly here.
@@ -344,7 +416,98 @@ class TTSService(BaseService):
         """Set up TTS models based on the engine capabilities."""
         # Convert the model config to the format expected by the API
         self.available_models = ModelLoader.convert_tts_models_to_api_format(self.model_config)
+
+    async def _prewarm_default_model(self):
+        """Pre-warm the TTS engine for the default (first) model at startup.
+
+        This runs `init_dir` in a background thread so that:
+        - The packed .qnn cache file is generated/validated before the first
+          real request arrives.
+        - Subsequent requests skip `generate_model()` entirely and go straight
+          to `init_model_file`, which is dramatically faster.
+
+        The instance is stored in the singleton so the first real request
+        reuses it without any re-initialization.
+        """
+        try:
+            # Resolve the model path for the first available model
+            first_model_config = self.model_config[0] if self.model_config else None
+            if not first_model_config:
+                self.logger.warning("Pre-warm skipped: no model config available")
+                return
+
+            first_voice = (
+                first_model_config.get("voices", [None])[0]
+                if first_model_config.get("voices")
+                else None
+            )
+            if not first_voice:
+                self.logger.warning("Pre-warm skipped: no voices in default model config")
+                return
+
+            model_path = first_voice.get("model_path", "")
+            if not model_path:
+                self.logger.warning("Pre-warm skipped: model_path not set in default voice config")
+                return
+
+            self.logger.info(
+                f"Pre-warming TTS engine for default model: {first_model_config.get('name')} "
+                f"at {model_path}"
+            )
+            t_start = time.time()
+
+            async with self.tts_instance_lock:
+                if self.tts_instance is not None:
+                    # Already initialized (e.g. a request arrived before pre-warm ran)
+                    self.logger.info("Pre-warm skipped: TTS instance already exists")
+                    return
+
+                instance = self.tts_wrapper_class()
+                handle = await asyncio.to_thread(instance.init_dir, model_path)
+
+                if not handle:
+                    self.logger.error(
+                        f"Pre-warm failed: init_dir returned no handle for {model_path}"
+                    )
+                    return
+
+                self.tts_instance = instance
+                self.current_model_path = model_path
+
+            self.logger.info(
+                f"TTS pre-warm complete in {time.time() - t_start:.1f}s — "
+                f"first request will reuse this instance"
+            )
+        except Exception as e:
+            self.logger.error(f"Error during TTS pre-warm: {e}", exc_info=True)
     
+    
+    async def cleanup_tts_resources_after_synthesis(self):
+        """Cleanup TTS resources after synthesis when keep_alive=False."""
+        self.logger.info('Cleaning up TTS resources after synthesis...')
+        
+        # Clean up TTS instance
+        async with self.tts_instance_lock:
+            if self.tts_instance:
+                try:
+                    self.logger.info("Deinitializing TTS instance (keep_alive=False)...")
+                    await asyncio.to_thread(self.tts_instance.deinit)
+                    await asyncio.sleep(0.1)
+                    self.tts_instance = None
+                    self.current_model_path = None
+                    self.logger.info("TTS instance deinitialized (keep_alive=False)")
+                except Exception as e:
+                    self.logger.error(f"Error deinitializing TTS instance: {e}", exc_info=True)
+                    self.tts_instance = None
+                    self.current_model_path = None
+        
+        # Clear audio chunks
+        self.audio_chunks = []
+        
+        self.logger.info("TTS resources cleaned up after synthesis")
+        await asyncio.sleep(0.5)
+        import gc
+        gc.collect()
     
     async def cleanup_resources_for_service_switch(self):
         """Cleanup TTS resources when switching to another service."""
@@ -426,11 +589,14 @@ class TTSService(BaseService):
                 self.logger.error(f"Unexpected error in TTS queue worker: {e}", exc_info=True)
 
     def handle_tts_input(self, message: str):
-        """Handle incoming TTS messages — cancel or enqueue for sequential processing."""
+        """Handle incoming TTS messages — cancel, close, or enqueue for sequential processing."""
         try:
             msg_type = get_message_type(message)
             if msg_type == 'tts_cancel':
                 self.handle_cancel_request()
+                return
+            if msg_type == 'tts_close':
+                asyncio.create_task(self.handle_close_request())
                 return
             # Any real synthesize request clears the cancellation flag so that
             # subsequent sentences in the same LLM response are not silently dropped.
@@ -473,6 +639,14 @@ class TTSService(BaseService):
             
             # Validate model
             model_names = [m["name"] for m in self.available_models]
+
+            request_model_voices = []
+            for m in self.available_models:
+                if m["name"] == request.model:
+                    request_model_voices = m["voices"]
+                    break
+
+            request_model_languages = {v["language"] for v in request_model_voices}
             if not request.model:
                 # If model not specified, use default model
                 default_model = next((m["name"] for m in self.available_models), None)
@@ -496,7 +670,17 @@ class TTSService(BaseService):
                     param='model'
                 )
                 return
-            
+            elif request.language not in request_model_languages:
+                await self.send_error(
+                    Config.TTS_AUDIO_OUT,
+                    f'TTS language, {request.language}, is not supported for given model: "{request.model}". '
+                    f'Available languages: {", ".join(language for language in request_model_languages)}',
+                    sync_id=request.sync_id,
+                    param='language',
+                    code='invalid_language_request'
+                )
+                return
+
             # Validate voice if specified
             model = next(m for m in self.available_models if m["name"] == request.model)
             if request.voice:
@@ -658,6 +842,11 @@ class TTSService(BaseService):
             await self.publish(Config.TTS_AUDIO_OUT, complete.to_json())
             self.logger.info('Mock TTS synthesis complete')
             
+            # Clean up resources if keep_alive is False
+            if not request.keep_alive:
+                await self.cleanup_tts_resources_after_synthesis()
+                self.logger.info('TTS resources cleaned up (keep_alive=False)')
+            
         except Exception as e:
             self.logger.error(f"Error reading mock WAV file: {e}", exc_info=True)
             # Fall back to generating silence
@@ -694,6 +883,11 @@ class TTSService(BaseService):
         
         await self.publish(Config.TTS_AUDIO_OUT, complete.to_json())
         self.logger.info('Fallback mock TTS synthesis complete')
+        
+        # Clean up resources if keep_alive is False
+        if not request.keep_alive:
+            await self.cleanup_tts_resources_after_synthesis()
+            self.logger.info('TTS resources cleaned up (keep_alive=False)')
     
     async def synthesize_speech_real(self, request: TTSSynthesizeRequest):
         """Use the actual TTS engine to synthesize speech."""
@@ -817,16 +1011,15 @@ class TTSService(BaseService):
                     self.logger.info(f"Creating new TTS instance for model: {model_path}")
                     self.tts_instance = self.tts_wrapper_class()
                     
-                    # Initialize the TTS engine
+                    # Initialize the TTS engine with the model directory
+                    t_init = time.time()
                     handle = await asyncio.to_thread(
-                        self.tts_instance.init,
-                        model_location=model_path,
-                        audio_encoding=0,
-                        speaking_rate=speaking_rate,
-                        pitch=pitch,
-                        volume_gain=volume_gain,
-                        sample_rate=sample_rate,
-                        language_code=language_code
+                        self.tts_instance.init_dir,
+                        model_path
+                    )
+                    self.logger.info(
+                        f"TTS init_dir completed in {time.time() - t_init:.1f}s "
+                        f"for model: {model_path}"
                     )
                     
                     if not handle:
@@ -943,9 +1136,17 @@ class TTSService(BaseService):
             # Start processing in a separate thread
             def process_tts():
                 try:
-                    result = tts_instance.process_with_callback(text, chunk_callback)
-                    if result != 0:
-                        self.logger.error(f"TTS process failed with code {result}")
+                    text_index = 0
+                    batch_number = 0
+                    while text_index < len(text):
+                        chunked_text = text[text_index: text_index + self.tts_max_char_len - 1]
+                        result = tts_instance.process_with_callback(chunked_text, chunk_callback)
+                        if result != 0:
+                            self.logger.error(f"TTS process failed with code {result}")
+                        else:
+                            self.logger.info(f"TTS processed batch #{batch_number} of text from {text_index} to {text_index + len(chunked_text)}")
+                        text_index += len(chunked_text)
+                        batch_number += 1
                 finally:
                     chunk_queue.put(None)  # Signal completion (only used in stream mode)
 
@@ -1025,6 +1226,11 @@ class TTSService(BaseService):
             )
             await self.publish(Config.TTS_AUDIO_OUT, complete.to_json())
             self.logger.info('TTS synthesis complete')
+            
+            # Clean up resources if keep_alive is False
+            if not request.keep_alive:
+                await self.cleanup_tts_resources_after_synthesis()
+                self.logger.info('TTS resources cleaned up (keep_alive=False)')
                         
         except Exception as e:
             self.logger.error(f"Error using TTS engine: {e}", exc_info=True)

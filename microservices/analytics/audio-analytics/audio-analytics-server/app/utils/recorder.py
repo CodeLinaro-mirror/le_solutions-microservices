@@ -1,6 +1,8 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
+from __future__ import annotations
+
 """
 Audio Recorder Module
 
@@ -10,12 +12,17 @@ disconnection detection.
 """
 
 from typing import Optional, List, Dict, Any, Callable
-import sounddevice as sd
-import asyncio
 import queue
 import threading
-import numpy as np
 import time
+import numpy as np
+
+try:
+    import sounddevice as sd
+    AUDIO_AVAILABLE = True
+except (ImportError, OSError):
+    sd = None  # type: ignore
+    AUDIO_AVAILABLE = False
 
 
 class Recorder:
@@ -45,6 +52,11 @@ class Recorder:
                      another PortAudio stream — e.g. the TTS speaker — is active,
                      since refresh_devices() calls sd._terminate() which kills it).
         """
+        if not AUDIO_AVAILABLE:
+            raise RuntimeError(
+                "Audio libraries (sounddevice/PortAudio/PulseAudio) are not available. "
+                "Rebuild the container with --build-arg INSTALL_PULSE_AUDIO=true to enable microphone support."
+            )
         if refresh:
             Recorder.refresh_devices()
         self.device_name: Optional[str] = Recorder.get_mic_by_name(device_name)
@@ -80,8 +92,11 @@ class Recorder:
         List all available audio input devices.
         
         Returns:
-            List of device information dictionaries
+            List of device information dictionaries, or empty list if audio is unavailable.
         """
+        if not AUDIO_AVAILABLE:
+            print("Audio libraries not available — no input devices to list.")
+            return []
         Recorder.refresh_devices()
         print("\nAvailable Input Devices:")
         devices = sd.query_devices()
@@ -108,8 +123,10 @@ class Recorder:
             key: Information key to retrieve (e.g., 'default_samplerate')
             
         Returns:
-            The requested device information, or None if error occurs
+            The requested device information, or None if audio is unavailable or error occurs.
         """
+        if not AUDIO_AVAILABLE:
+            return None
         try:
             device_info = sd.query_devices(device_name)
             value = device_info[key]
@@ -138,6 +155,8 @@ class Recorder:
 
         **IMPORTANT**: Do not call this function while this is an active stream
         """
+        if not AUDIO_AVAILABLE:
+            return
         sd._terminate()
         sd._initialize()
 
@@ -153,12 +172,14 @@ class Recorder:
                   use the system default input device.
 
         Returns:
-            Full device name if found, None otherwise
+            Full device name if found, None if audio is unavailable or not found.
 
         Example:
             get_mic_by_name("usb") might return "USB Audio Device"
             get_mic_by_name(None) returns the system default input device name
         """
+        if not AUDIO_AVAILABLE:
+            return None
         # No name supplied — return the system default input device
         if not name:
             try:

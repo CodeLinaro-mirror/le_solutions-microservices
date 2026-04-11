@@ -4,6 +4,14 @@
  */
 'use strict';
 
+// Prefix all console output with [api] for log filtering
+const _log = console.log.bind(console);
+const _err = console.error.bind(console);
+const _warn = console.warn.bind(console);
+console.log   = (...a) => _log('[api]',   ...a);
+console.error = (...a) => _err('[api]',   ...a);
+console.warn  = (...a) => _warn('[api]',  ...a);
+
 var path = require('path');
 var http = require('http');
 var cors = require('cors');
@@ -37,6 +45,19 @@ console.log('🚀 STARTING API SERVER');
 // Log every single request that hits the server
 mainApp.use((req, res, next) => {
     console.log(`🌐 INCOMING REQUEST: ${req.method} ${req.path} from ${req.ip}`);
+    next();
+});
+
+// Reject multipart uploads larger than 50 MB before they reach multer
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+mainApp.use((req, res, next) => {
+    const ct = req.headers['content-type'] || '';
+    if (ct.includes('multipart/form-data')) {
+        const len = parseInt(req.headers['content-length'] || '0', 10);
+        if (len > MAX_UPLOAD_BYTES) {
+            return res.status(413).json({ error: { message: 'File size is greater than 50MB', type: 'server_error', param: null, code: null } });
+        }
+    }
     next();
 });
 
@@ -126,11 +147,8 @@ async function startWebsocket() {
         console.log('WebSocket client connected');
 
         try {
-            // Send a proper JSON welcome message instead of plain text
             wsc.send(JSON.stringify({
-                message_type: 'connection_established',
-                message: 'Welcome to the Audio Analytics API!',
-                timestamp: new Date().toISOString()
+                state: 'connection_established'
             }));
             resetInactivityTimer(wsc); // Start timer when connection opens
 

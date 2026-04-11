@@ -8,7 +8,6 @@ sounddevice==0.4.6 \
 # For sound device
 cffi==1.17.1 \
     --hash=sha256:da95af8214998d77a98cc14e3a3bd00aa191526343078b530ceb0bd710fb48a5 \
-    --hash=sha256:dd398dbc6773384a17fe0d3e7eeb8d1a21c2200473ee6806bb5e6a8e62bb73dd \
     --hash=sha256:706510fe141c86a69c8ddc029c7910003a17353970cff3b904ff0686a5927683 # debian
 
 # cffi dependency

@@ -161,6 +161,9 @@ class WhisperWrapper:
         lib.whisper_stop.argtypes = [c_void_p]
         lib.whisper_stop.restype = None
 
+        lib.whisper_flush.argtypes = [c_void_p]
+        lib.whisper_flush.restype = None
+
         # Language / translation
         lib.whisper_set_translation_enabled.argtypes = [c_void_p, c_bool]
         lib.whisper_set_translation_enabled.restype = None
@@ -366,6 +369,19 @@ class WhisperWrapper:
     def stop(self):
         print("Stopping Whisper...")
         self.lib.whisper_stop(self.handle)
+
+    def flush(self):
+        """Request the processing thread to drain the current buffer as a
+        partial result (transcript.text.delta) without stopping the engine.
+        The flag is set and mCv is notified so the thread wakes immediately.
+        Returns as soon as the signal is sent - the actual processing happens
+        asynchronously on the C++ processing thread.
+        """
+        if not self.handle:
+            print("flush: no handle, ignoring")
+            return
+        print("Flushing Whisper buffer (partial)...")
+        self.lib.whisper_flush(self.handle)
     
     def stop_and_reset(self):
         """Stop processing and reset for next use (for singleton pattern)."""

@@ -27,7 +27,7 @@ from melo.tts_melo_model_generation import generate_model, generate_packed_model
 import wrapper_utils as wu
 
 # Environment variable for model storage location
-TTS_MODEL_STORE_DIR = os.environ.get('TTS_MODEL_STORE_DIR', '/tmp/tts')
+TTS_MODEL_STORE_DIR = os.environ.get('TTS_MODEL_STORE_DIR', '/tmp/audio-cache')
 
 # ----------------------------------------------------------------------
 # Callback type definition
@@ -135,9 +135,6 @@ class TTS:
     # Class-level variables (shared across all instances)
     _shared_lib = None
     _library_loaded = False
-
-    # Previous model in /tmp location
-    _prev_model = None
 
     # Background cache writer thread and the cache path it is writing to —
     # tracked so init_dir can wait for it only when the same model is requested
@@ -255,6 +252,23 @@ class TTS:
         self._define_deinit_ctype(c_lib)
 
     @staticmethod
+    def _cleanup_cache_dir(cache_dir: str):
+        """Remove all .qnn and .qnn.tmp files from the cache directory."""
+        try:
+            for filename in os.listdir(cache_dir):
+                if filename.endswith('.qnn') or filename.endswith('.qnn.tmp'):
+                    file_path = os.path.join(cache_dir, filename)
+                    try:
+                        os.remove(file_path)
+                        print(f"[cache_writer] Removed old cache file: {file_path}")
+                    except Exception as e:
+                        print(f"[cache_writer] Could not remove {file_path}: {e}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[cache_writer] Error during cache cleanup: {e}")
+
+    @staticmethod
     def _write_cache_files_bg(model_buffer, source_cache_location,
                               tmp_cache_location, store_location_dir,
                               cancel_event: threading.Event):
@@ -264,6 +278,8 @@ class TTS:
             print(f"[cache_writer] Cancelled before persistent cache write")
             return
         try:
+            if os.path.exists(source_cache_location):
+                os.remove(source_cache_location)
             t = time.time()
             generate_packed_model_file(source_cache_location, model_buffer)
             print(f"[cache_writer] Wrote persistent cache to {source_cache_location} "
@@ -279,6 +295,8 @@ class TTS:
         try:
             if not os.path.isdir(store_location_dir):
                 os.makedirs(store_location_dir)
+            if os.path.exists(tmp_cache_location):
+                os.remove(tmp_cache_location)
             t = time.time()
             generate_packed_model_file(tmp_cache_location, model_buffer)
             print(f"[cache_writer] Wrote /tmp cache to {tmp_cache_location} "
@@ -383,7 +401,8 @@ class TTS:
             "melo_flow", 
             "melo_decoder", 
             "g2p_encoder", 
-            "g2p_decoder"
+            "g2p_decoder",
+            "sdp_model",
         }
 
         # Some files are not required for the models. If they are not in the dir, it is not needed
@@ -484,21 +503,30 @@ class TTS:
         print(f"[init_dir] GC collected before generate_model()")
 
         t_gen = time.time()
+
+        is_model_quantized = 1 if runtimes.get("is_model_quantized") else 0
+        model_version_major = 2 if is_model_quantized else 1
+        model_version_minor = 0
+
         model_buffer = generate_model(
-            bert_model_path         = models_dict.get("bert_model"),
-            bert_tokenizer_path     = models_dict.get("bert_tokenizer"),
-            bert_normalizer_path    = models_dict.get("bert_normalizer"),
-            melo_encoder_model_path = models_dict.get("melo_encoder"),
-            melo_flow_model_path    = models_dict.get("melo_flow"),
-            melo_decoder_model_path = models_dict.get("melo_decoder"),
-            g2p_enc_model_path      = models_dict.get("g2p_encoder"),
-            g2p_dec_model_path      = models_dict.get("g2p_decoder"),
-            qnn_version_major       = runtimes.get("qnn_version", {}).get("major"),
-            qnn_version_minor       = runtimes.get("qnn_version", {}).get("minor"),
-            qnn_version_patch       = runtimes.get("qnn_version", {}).get("patch"),
-            arch_bit                = runtimes.get("arch_bit"),
+            bert_model              = models_dict.get("bert_model"),
+            bert_tokenizer          = models_dict.get("bert_tokenizer"),
+            bert_normalizer         = models_dict.get("bert_normalizer"),
+            melo_encoder_model      = models_dict.get("melo_encoder"),
+            melo_flow_model         = models_dict.get("melo_flow"),
+            melo_decoder_model      = models_dict.get("melo_decoder"),
+            g2p_enc_model           = models_dict.get("g2p_encoder"),
+            g2p_dec_model           = models_dict.get("g2p_decoder"),
+            model_version_major     = model_version_major,
+            model_version_minor     = model_version_minor,
+            qnn_version_major       = int(runtimes.get("qnn_version", {}).get("major")),
+            qnn_version_minor       = int(runtimes.get("qnn_version", {}).get("minor")),
+            qnn_version_patch       = int(runtimes.get("qnn_version", {}).get("patch")),
+            arch_bit                = int(runtimes.get("arch_bit")),
             model_lang              = runtimes.get("language"),
-            scratch_mem_size_req    = runtimes.get("scratch_mem_size_req")
+            scratch_mem_size_req    = int(runtimes.get("scratch_mem_size_req")),
+            is_model_quantized      = is_model_quantized,
+            melo_sdp_model          = models_dict.get("sdp_model")
         )
         print(f"[init_dir] generate_model() took {time.time() - t_gen:.2f}s")
 
@@ -514,13 +542,6 @@ class TTS:
         )
         print(f"[init_dir] init_model_buffer took {time.time() - t_init:.2f}s "
               f"(total so far: {time.time() - t_start:.2f}s)")
-
-        # ── Remove old /tmp cache for a different model (on calling thread) ──
-        if TTS._prev_model and TTS._prev_model != tmp_cache_location:
-            print(f"[init_dir] Removing old /tmp cache: {TTS._prev_model}")
-            wu.remove_file_from_folder(TTS._prev_model)
-            print(f"[init_dir] Old /tmp cache removed")
-        TTS._prev_model = tmp_cache_location
 
         # ── Kick off background cache write ───────────────────────────────────
         cache_thread = threading.Thread(

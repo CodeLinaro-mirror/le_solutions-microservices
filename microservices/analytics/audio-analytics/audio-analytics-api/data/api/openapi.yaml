@@ -5,325 +5,47 @@ info:
   title: "Audio Analytics API"
   version: "1.0.0"
   description: |
-    # Audio Analytics API - Documentation
-    
-    Welcome to the Audio Analytics API, a powerful REST API providing AI-powered audio processing services including speech recognition, text translation, and speech synthesis.
-    
-    ## 🎯 Core Services
-    
-    ### 1. Speech-to-Text (ASR - Automatic Speech Recognition)
-    Convert spoken audio into written text using state-of-the-art Whisper models.
-    
-    **Key Features:**
-    - **File-based transcription**: Upload audio files (WAV) for transcription
-    - **Streaming transcription**: Get real-time partial results as audio is processed
-    - **Live audio streaming**: Stream audio chunks via WebSocket for real-time transcription
-    - **Language detection**: Automatic language identification
-    - **Multiple sample rates**: Support for 16kHz (recommended), with automatic resampling
-    - **Mono/Stereo support**: Automatic channel conversion
-    
-    **Supported Audio Formats:**
-    - WAV (PCM, 16-bit recommended)
-    
-    **Recommended Audio Specifications:**
-    - Sample Rate: 16000 Hz
-    - Channels: 1 (mono)
-    - Bit Depth: 16-bit
-    - Max File Size: 25 MB
-    
-    ### 2. Text-to-Text Translation (T2T)
-    Translate text between multiple languages using Opus and NLLB models.
-    
-    **Key Features:**
-    - **Batch translation**: Translate multiple texts in a single request
-    - **Multiple language pairs**: English ↔ Chinese, English ↔ Spanish, and more
-    - **Automatic language detection**: Optional source language detection
-    - **Preserves formatting**: Maintains text structure
-    
-    **Supported Language Pairs:**
-    - English (en) ↔ Chinese (zh)
-    - English (en) ↔ Spanish (es)
-    - Spanish (es) ↔ English (en)
-    - Chinese (zh) ↔ English (en)
-    
-    **Translation Limits:**
-    - Max text length: 1024 characters per text (model/language-dependent)
-    - Max batch size: 100 texts per request (model-dependent)
-    
-    ### 3. Text-to-Speech (TTS)
-    Generate natural-sounding speech from text using MeloTTS models.
-    
-    **Key Features:**
-    - **Multiple languages**: English, Spanish, Chinese
-    - **Multiple voices**: Different voice options per language
-    - **Configurable sample rates**: 44100 Hz, 22050 Hz, 16000 Hz
-    - **Automatic resampling**: Request any supported sample rate
-    - **Streaming output**: Audio streamed via HTTP chunked transfer encoding
-    - **WAV format**: Standard WAV output for maximum compatibility
-    
-    **Supported Languages:**
-    - English (en) - Multiple voice options
-    - Spanish (es) - Multiple voice options
-    - Chinese (zh) - Multiple voice options
-    
-    **Audio Output Specifications:**
-    - Format: PCM (raw audio data, not WAV)
-    - Native Sample Rate: 44100 Hz
-    - Supported Sample Rates: 44100, 22050, 16000 Hz (resampled if requested)
-    - Channels: 1 (mono)
-    - Bit Depth: 16-bit
-    
-    **Converting PCM to WAV:**
-    The TTS service returns raw PCM audio data. To convert it to a playable WAV file, use the provided `pcm_to_wav.py` script:
-    ```bash
-    python pcm_to_wav.py speech.pcm speech.wav --rate 44100 --channels 1 --bits 16
+    REST API providing AI-powered audio processing: speech recognition (ASR),
+    text translation (T2T), and speech synthesis (TTS).
+
+    ## Services
+
+    | Service | Endpoint prefix | Description |
+    |---------|----------------|-------------|
+    | ASR | `/transcriptions/` | Whisper-based speech-to-text (file or live WebSocket streaming) |
+    | T2T | `/translations/` | Opus/NLLB text translation (batch supported) |
+    | TTS | `/tts/` | MeloTTS speech synthesis; returns raw PCM audio |
+
+    ## Audio formats (ASR input)
+    - WAV, 16-bit PCM; 16 kHz mono recommended; max 25 MB
+
+    ## TTS output
+    - Supported sample rates: 44100, 22050, 16000 Hz (auto-resampled)
+
+    ## WebSocket streaming sequence
+
     ```
-    
-    ## 🚀 Getting Started
-    
-    ### Step 1: Check Service Health
-    ```bash
-    curl http://<device-ip>:8085/audio-analytics/v1/api/health
+    App                                           Server
+     |===POST /transcriptions/create================>|
+     |<==200 {session_id, state: asr_initialized}====|
+     |
+     |===WS /stream=================================>|
+     |<==  {state: connection_established}===========|
+     |
+     |===WS {transcriptions_session_audio} (loop)===>|
+     |<===WS {transcript.event,     speech_start}====|
+     |<===WS {transcript.text.delta, ...}============|  (zero or more)
+     |<===WS {transcript.event,     speech_end}======|
+     |<===WS {transcript.text.done,  ...}============|
+     |
+     |===POST /transcriptions/close=================>|  (after transcript.text.done)
     ```
-    
-    ### Step 2: Discover Available Models
-    ```bash
-    # List ASR models
-    curl http://<device-ip>:8085/audio-analytics/v1/api/transcriptions/models
-    
-    # List translation models
-    curl http://<device-ip>:8085/audio-analytics/v1/api/translations/models
-    
-    # List TTS models and voices
-    curl http://<device-ip>:8085/audio-analytics/v1/api/tts/models
-    ```
-    
-    ### Step 3: Use the Services
-    
-    **Transcribe Audio:**
-    ```bash
-    curl -X POST http://<device-ip>:8085/audio-analytics/v1/api/transcriptions/create \
-      -F "file=@audio.wav" \
-      -F "model=whisper-small" \
-      -F "language=en" \
-      -F "stream=false"
-    ```
-    
-    **Translate Text:**
-    ```bash
-    curl -X POST http://<device-ip>:8085/audio-analytics/v1/api/translations/translate \
-      -H "Content-Type: application/json" \
-      -d '{"text":["Hello world"],"model":"opus-en-es","source_language":"en","target_language":"es"}'
-    ```
-    
-    **Synthesize Speech:**
-    ```bash
-    curl -X POST http://<device-ip>:8085/audio-analytics/v1/api/tts/synthesize \
-      -H "Content-Type: application/json" \
-      -d '{"text":"Hello world","model":"melo-tts-en","language":"en","voice":"default"}' \
-      --output speech.pcm
-    
-    # Convert PCM to WAV for playback
-    python pcm_to_wav.py speech.pcm speech.wav --rate 44100 --channels 1 --bits 16
-    ```
-    
-    ## 🌐 Base URLs
-    
-    - **Development**: `http://<device-ip>:8085/audio-analytics/v1/api`
-    - **Production**: `http://<device-ip>:8085/audio-analytics/v1/api`
-    - **Swagger UI**: `http://<device-ip>:8085/docs` (or `http://<device-ip>:8085/docs`)
-    
-    ## 🔐 Authentication
-    
-    Currently, no authentication is required. Future versions may implement:
-    - API key authentication
-    - OAuth 2.0
-    - JWT tokens
-    
-    ## ⚡ Rate Limiting
-    
-    No rate limiting is currently enforced. However, clients should:
-    - Implement exponential backoff for retries
-    - Respect server resources
-    - Avoid excessive concurrent requests
-    - Cache results when appropriate
-    
-    ## 📊 Response Formats
-    
-    All responses use standard HTTP status codes:
-    - **2xx**: Success
-    - **4xx**: Client errors (invalid request, missing parameters)
-    - **5xx**: Server errors (internal errors, service unavailable)
-    
-    **Success Response Format:**
-    ```json
-    {
-      "result_field": "value",
-      ...
-    }
-    ```
-    
-    **Error Response Format:**
-    ```json
-    {
-      "error": {
-        "message": "Human-readable error description",
-        "type": "error_type",
-        "param": "parameter_name",
-        "code": "error_code"
-      }
-    }
-    ```
-    
-    ## 🔄 WebSocket Streaming
-    
-    For real-time audio processing, the API supports WebSocket connections:
-    
-    1. Create a streaming session via `/transcriptions/create` with `stream=true`
-    2. Connect to WebSocket at `ws://<host>:8085/stream`
-    3. Send audio chunks as base64-encoded JSON messages
-    4. Receive partial transcription results in real-time
-    5. Receive final complete transcription
-    
-    **WebSocket URL:** `ws://<device-ip>:8085/stream`
-    
-    ## 📝 Best Practices
-    
-    ### Audio Preparation (ASR)
-    - Convert to mono (1 channel) for best results
-    - Resample to 16kHz for optimal performance
-    - Use WAV format when possible (lossless)
-    - Keep file sizes under 25 MB
-    - Remove background noise if possible
-    
-    ### Translation
-    - Keep texts under 1024 characters for best results
-    - Use batch translation for multiple texts
-    - Specify source language when known (faster processing)
-    - Handle special characters and formatting appropriately
-    
-    ### Text-to-Speech
-    - Keep text under 2000 characters per request
-    - Use appropriate punctuation for natural pauses
-    - Select the correct language and voice
-    - Choose sample rate based on your use case:
-      - 44100 Hz: High quality, larger files
-      - 22050 Hz: Good quality, medium files
-      - 16000 Hz: Acceptable quality, smaller files
-    
-    ## 🐛 Error Handling
-    
-    Implement proper error handling in your applications:
-    
-    ```python
-    try:
-        response = requests.post(url, ...)
-        response.raise_for_status()
-        result = response.json()
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 400:
-            # Handle bad request
-        elif response.status_code == 500:
-            # Handle server error
-    except requests.exceptions.Timeout:
-        # Handle timeout
-    except requests.exceptions.ConnectionError:
-        # Handle connection error
-    ```
-    
-    ## 📚 Additional Resources
-    
-    - **Developer Guide**: See DEVELOPER.md for comprehensive examples
-    - **Deployment Guide**: See HOST-DEPLOYMENT-GUIDE.md for production setup
-    - **Models Configuration**: See models.json documentation below
-    - **GitHub Repository**: [Repository URL]
-    - **Support Forums**: https://mysupport.qualcomm.com/supportforums/s/
-    
-    ## 🔧 Models Configuration (models.json)
-    
-    The Audio Analytics API uses a `models.json` configuration file to define available models for ASR, translation, and TTS services.
-    
-    **Configuration File Location:**
-    - Default: `/opt/audio/models/models.json`
-    - Can be customized via `MODELS_CONFIG` environment variable
-    - Models directory: `/opt/audio/models` (customizable via `MODELS_DIR` environment variable)
-    
-    **Environment Variables:**
-    - `MODELS_DIR`: Directory containing model files (default: `/opt/audio/models`)
-    - `MODELS_CONFIG`: Full path to models.json file (default: `/opt/audio/models/models.json`)
-    
-    **Configuration Structure:**
-    The models.json file contains three main sections:
-    - `asr`: ASR model configurations (Whisper models)
-    - `translation`: Translation model configurations (Opus/NLLB models)
-    - `tts`: TTS model configurations (MeloTTS models)
-    
-    Each model entry includes:
-    - Model name, display name, version, and description
-    - Capabilities (streaming, batch processing, language detection, etc.)
-    - Parameters (max file size, supported formats, sample rates, etc.)
-    - Model file paths (encoder, decoder, vocab, etc.)
-    
-    **Example models.json structure:**
-    ```json
-    {
-      "asr": {
-        "default_model": "whisper-small",
-        "models": [
-          {
-            "name": "whisper-small",
-            "display_name": "Whisper Small",
-            "version": "1.0.0",
-            "description": "OpenAI Whisper small model",
-            "capabilities": {
-              "streaming": true,
-              "file_based": true,
-              "language_detection": true
-            },
-            "parameters": {
-              "max_file_size_mb": 25,
-              "supported_formats": ["wav"],
-              "sample_rates": [16000]
-            },
-            "model_path": "/opt/audio/models/whisper/encoder_model_htp.bin",
-            "vocab_path": "/opt/audio/models/whisper/vocab.bin",
-            "decoder_path": "/opt/audio/models/whisper/decoder_model_htp.bin",
-            "speech_path": "/opt/audio/models/whisper/speech_float.eai"
-          }
-        ]
-      },
-      "translation": {
-        "default_model": "opus-en-zh",
-        "models": [...]
-      },
-      "tts": {
-        "default_model": "melo-tts-en",
-        "models": [...]
-      }
-    }
-    ```
-    
-    For complete models.json documentation and examples, see the repository's `audio-analytics-server/engine/config/models.json` file.
-    
-    ## 📄 API Versioning
-    
-    Current version: **v1.0.0**
-    
-    The API follows semantic versioning:
-    - Major version: Breaking changes
-    - Minor version: New features (backward compatible)
-    - Patch version: Bug fixes (backward compatible)
-    
-    ## 🔔 Changelog
-    
-    ### Version 1.0.0 (Current)
-    - Initial release
-    - ASR with Whisper models
-    - Translation with Opus/NLLB models
-    - TTS with MeloTTS models
-    - WebSocket streaming support
-    - Multiple language support
-    
+
+    ## Authentication
+    None required.
+
+
+
   contact:
     name: "Qualcomm Support Forums"
     url: "https://mysupport.qualcomm.com/supportforums/s/"
@@ -361,23 +83,7 @@ paths:
     get:
       tags: ["Health"]
       summary: "Check service health"
-      description: |
-        Returns the current health status of the Audio Analytics service.
-        
-        Use this endpoint to:
-        - Verify the service is running
-        - Check uptime and active sessions
-        - Monitor service availability
-        
-        **Example Response:**
-        ```json
-        {
-          "status": "ok",
-          "uptime": 12345,
-          "active_sessions": 2,
-          "version": "1.0.0"
-        }
-        ```
+      description: "Returns the current health status, uptime, active session count, and version."
       operationId: "healthCheck"
       x-swagger-router-controller: Health
       responses:
@@ -409,29 +115,7 @@ paths:
     get:
       tags: ["Transcriptions"]
       summary: "List available audio input (recording) devices"
-      description: |
-        Returns a list of available audio input devices on the host system.
-
-        Use this endpoint to discover which microphones or recording devices are
-        available for on-device ASR audio capture.
-
-        **Example Response:**
-        ```json
-        [
-          {
-            "index": 0,
-            "name": "LEMANS-EVK: - (hw:0,0)",
-            "default_samplerate": 48000,
-            "max_input_channels": 2
-          },
-          {
-            "index": 2,
-            "name": "sysdefault",
-            "default_samplerate": 48000,
-            "max_input_channels": 128
-          }
-        ]
-        ```
+      description: "Returns available audio input devices (microphones) on the host system."
       operationId: "listTranscriptionDevices"
       x-swagger-router-controller: TranscriptionsDevices
       responses:
@@ -454,37 +138,7 @@ paths:
     get:
       tags: ["Transcriptions"]
       summary: "List available ASR models"
-      description: |
-        Returns a list of available Automatic Speech Recognition (ASR) models.
-        
-        Each model includes:
-        - Model name and display name
-        - Supported capabilities (streaming, file-based, language detection)
-        - Parameters (max file size, supported formats, sample rates)
-        - Version information
-        
-        **Example Response:**
-        ```json
-        [
-          {
-            "name": "whisper-small",
-            "display_name": "Whisper Small",
-            "version": "1.0.0",
-            "description": "OpenAI Whisper small model",
-            "capabilities": {
-              "streaming": true,
-              "file_based": true,
-              "real_time": true,
-              "language_detection": true
-            },
-            "parameters": {
-              "max_file_size_mb": 25,
-              "supported_formats": ["wav"],
-              "sample_rates": [16000]
-            }
-          }
-        ]
-        ```
+      description: "Returns available ASR models with capabilities and supported parameters."
       operationId: "listTranscriptionModels"
       x-swagger-router-controller: TranscriptionsModels
       responses:
@@ -535,19 +189,46 @@ paths:
         
         ## 3. Live Audio Streaming
         Stream audio chunks in real-time via WebSocket.
-        
+
         **Request:**
         - Content-Type: `application/json`
         - Include `model`, `stream=true` (no file)
-        
+
         **Response:**
         - Session ID for WebSocket connection
         - Send audio chunks via WebSocket
-        - Receive partial results in real-time
-        
+        - Receive events and partial results in real-time
+
+        ## Event Sequence (Live Streaming with VAD)
+
+        When streaming live audio with VAD/EPD enabled, the server emits the
+        following sequence of WebSocket messages for each utterance:
+
+        1. **`transcript.event` / `speech_start`** — speech first detected by VAD
+           ```json
+           { "session_id": "session123", "type": "transcript.event", "state": "speech_start" }
+           ```
+        2. **`transcript.text.delta`** — zero or more partial transcription results
+           ```json
+           { "session_id": "session123", "text": "Partial text...", "language": "en", "type": "transcript.text.delta", "state": "transcription" }
+           ```
+        3. **`transcript.event` / `speech_end`** — end-of-speech detected by VAD/EPD
+           ```json
+           { "session_id": "session123", "type": "transcript.event", "state": "speech_end" }
+           ```
+        4. **`transcript.text.done`** — final transcription for the utterance
+           ```json
+           { "session_id": "session123", "text": "Complete utterance text.", "language": "en", "type": "transcript.text.done", "state": "transcription" }
+           ```
+
+        After step 4 the engine resets and listens for the next utterance.
+        The session remains open until the client calls `/transcriptions/close`.
+        The client may also call `/transcriptions/flush` at any time to force
+        immediate processing of buffered audio.
+
         **Important - Session Timeout:**
-        When streaming audio, if no audio data is sent for a period of time (session timeout), 
-        the session will automatically close and the final transcription will be sent. This 
+        When streaming audio, if no audio data is sent for a period of time (session timeout),
+        the session will automatically close and the final transcription will be sent. This
         prevents sessions from remaining open indefinitely when audio streaming has stopped.
         
         ## Supported Audio Formats
@@ -635,14 +316,10 @@ paths:
       tags: ["Transcriptions"]
       summary: "Close active transcription session"
       description: |
-        Ends the current transcription session and releases resources.
-        
-        Use this endpoint to:
-        - Gracefully close a streaming session
-        - Free up server resources
-        - Finalize any pending transcription data
-        
-        **Note:** Sessions are automatically closed after a period of inactivity.
+        Ends the current transcription session and releases server resources.
+
+        Call this after receiving `transcript.text.done` to cleanly close the session.
+        Sessions are also automatically closed after a period of inactivity.
       operationId: "closeTranscription"
       x-swagger-router-controller: TranscriptionsClose
       responses:
@@ -663,46 +340,57 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+
+  /transcriptions/flush:
+    post:
+      tags: ["Transcriptions"]
+      summary: "Flush buffered audio and force immediate transcription"
+      description: |
+        Forces the ASR engine to process any audio currently buffered in the
+        VAD/silence-detection pipeline and emit a transcription result
+        immediately, without waiting for the next speech-end event.
+
+        Use this endpoint when you want to retrieve a partial result mid-stream
+        (e.g. the user pressed a "done speaking" button) without fully closing
+        the session.
+
+        The session remains open after a flush and can continue receiving audio.
+      operationId: "flushTranscription"
+      x-swagger-router-controller: TranscriptionsFlush
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session_id:
+                  type: string
+                  description: "Session ID to flush. If omitted, the only active session is used."
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: "Flush triggered successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "flushed"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /translations/models:
     get:
       tags: ["Translations"]
       summary: "List available translation models"
-      description: |
-        Returns a list of available translation models with their supported language pairs.
-        
-        Each model includes:
-        - Model name and display name
-        - Source language (input)
-        - Target language (output)
-        - Capabilities (batch translation, language detection)
-        - Parameters (max text length, max batch size)
-        
-        **Example Response:**
-        ```json
-        [
-          {
-            "name": "opus-en-zh",
-            "display_name": "English to Chinese",
-            "version": "1.0.0",
-            "description": "Translation from English to Chinese using Opus",
-            "source_language": {
-              "code": "en",
-              "name": "English"
-            },
-            "target_language": {
-              "code": "zh",
-              "name": "Chinese"
-            },
-            "capabilities": {
-              "batch_translation": true
-            },
-            "parameters": {
-              "max_text_length": 1024,
-              "max_batch_size": 100
-            }
-          }
-        ]
-        ```
+      description: "Returns available translation models with supported language pairs and parameters."
       operationId: "listTranslationModels"
       x-swagger-router-controller: TranslationsModels
       responses:
@@ -800,14 +488,7 @@ paths:
     post:
       tags: ["Translations"]
       summary: "Close active translation session"
-      description: |
-        Ends the current translation session and releases resources.
-
-        Use this endpoint to:
-        - Free up server resources
-        - Finalize any pending translation data
-
-        **Note:** Sessions are automatically closed after a period of inactivity.
+      description: "Ends the current translation session and releases server resources."
       operationId: "closeTranslation"
       x-swagger-router-controller: TranslationsClose
       responses:
@@ -832,29 +513,7 @@ paths:
     get:
       tags: ["TTS"]
       summary: "List available audio output (playback) devices"
-      description: |
-        Returns a list of available audio output devices on the host system.
-
-        Use this endpoint to discover which playback devices are available for
-        on-device TTS audio output (e.g. speakers, headphones, HDMI audio).
-
-        **Example Response:**
-        ```json
-        [
-          {
-            "index": 0,
-            "name": "LEMANS-EVK: - (hw:0,0)",
-            "default_samplerate": 48000,
-            "max_output_channels": 2
-          },
-          {
-            "index": 6,
-            "name": "default",
-            "default_samplerate": 48000,
-            "max_output_channels": 128
-          }
-        ]
-        ```
+      description: "Returns available audio output devices (speakers) on the host system."
       operationId: "listTTSDevices"
       x-swagger-router-controller: TTSDevices
       responses:
@@ -878,50 +537,8 @@ paths:
       tags: ["TTS"]
       summary: "List available TTS models and voices"
       description: |
-        Returns a list of available text-to-speech models with their voices.
-        
-        Each model includes:
-        - Model name and display name
-        - Available voices with language and characteristics
-        - Capabilities (gender, style, sample rate support)
-        - Parameters (max text length, supported sample rates)
-        
-        ## Query Parameters
-        - `language`: Filter by ISO 639-1 language code (e.g., 'en', 'es', 'zh')
-        
-        **Example Response:**
-        ```json
-        [
-          {
-            "name": "melo-tts-en",
-            "display_name": "MeloTTS English",
-            "version": "1.0.0",
-            "description": "MeloTTS model with English support",
-            "voices": [
-              {
-                "name": "default",
-                "display_name": "Default Voice",
-                "language": "en",
-                "language_name": "English",
-                "gender": "neutral",
-                "style": "neutral",
-                "sample_rate": 44100,
-                "description": "Default English voice"
-              }
-            ],
-            "capabilities": {
-              "supports_gender": false,
-              "supports_style": false,
-              "supports_sample_rate": true,
-              "supports_resampling": true
-            },
-            "parameters": {
-              "max_text_length": 2000,
-              "sample_rates": [44100, 22050, 16000]
-            }
-          }
-        ]
-        ```
+        Returns available TTS models with voices, capabilities, and supported sample rates.
+        Filter by language using the `language` query parameter.
       operationId: "listTTSModels"
       x-swagger-router-controller: TTSModels
       parameters:
@@ -1031,15 +648,7 @@ paths:
     post:
       tags: ["TTS"]
       summary: "Close active text-to-speech session"
-      description: |
-        Ends the current text-to-speech session and releases resources.
-
-        Use this endpoint to:
-        - Gracefully close a streaming session
-        - Free up server resources
-        - Finalize any pending text-to-speech data
-
-        **Note:** Sessions are automatically closed after a period of inactivity.
+      description: "Ends the current TTS session and releases server resources."
       operationId: "closeTTS"
       x-swagger-router-controller: TTSClose
       responses:
@@ -1064,13 +673,7 @@ paths:
     post:
       tags: ["TTS"]
       summary: "Cancel an active text-to-speech playback"
-      description: |
-        Cancels the current text-to-speech running.
-
-        Use this endpoint to:
-        - Finalize any pending text-to-speech data
-
-        **Note:** Sessions are automatically closed after a period of inactivity.
+      description: "Immediately stops an in-progress TTS synthesis or playback. The session remains open."
       operationId: "cancelTTS"
       x-swagger-router-controller: TTSCancel
       responses:
@@ -1115,26 +718,31 @@ paths:
           "data": "<BASE64_ENCODED_AUDIO>"
         }
         ```
-        
-        ## Server → Client (Transcription Results)
+
+        ## Server → Client (Event Sequence per Utterance)
+
+        **1. Speech detected:**
         ```json
-        {
-          "session_id": "session123",
-          "text": "Partial transcription text",
-          "language": "en",
-          "type": "transcript.text.delta"
-        }
+        { "session_id": "session123", "type": "transcript.event", "state": "speech_start" }
         ```
-        
-        ## Final Result
+
+        **2. Partial transcription (zero or more):**
         ```json
-        {
-          "session_id": "session123",
-          "text": "Complete transcription text",
-          "language": "en",
-          "type": "transcript.text.done"
-        }
+        { "session_id": "session123", "text": "Partial transcription text", "language": "en", "type": "transcript.text.delta", "state": "transcription" }
         ```
+
+        **3. End of speech detected:**
+        ```json
+        { "session_id": "session123", "type": "transcript.event", "state": "speech_end" }
+        ```
+
+        **4. Final transcription:**
+        ```json
+        { "session_id": "session123", "text": "Complete transcription text.", "language": "en", "type": "transcript.text.done", "state": "transcription" }
+        ```
+
+        After step 4 the engine resets and listens for the next utterance.
+        The session stays open until the client calls `/transcriptions/close`.
         
         ## Connection
         - Protocol: WebSocket (ws:// or wss://)
@@ -1299,6 +907,10 @@ components:
           default: false
           description: "If true, results will be streamed via WebSocket. If false, complete transcription returned in response."
           example: false
+        channels:
+          type: integer
+          description: "Number of audio channels in the input stream (1=mono, 2=stereo). Takes priority over the channels key inside the parameters array."
+          example: 1
         parameters:
           description: "Additional parameters for transcription (e.g., sampling_rate, channels)"
           oneOf:
@@ -1316,6 +928,8 @@ components:
               value: "16000"
             - key: "channels"
               value: "1"
+            - key: "server_timeout"
+              value: "60"
       required:
         - model
 
@@ -1331,6 +945,10 @@ components:
           type: string
           description: "Detected or specified language (ISO 639-1 code)"
           example: "en"
+        language_name:
+          type: string
+          description: "Detected language full name as returned by the ASR engine"
+          example: "English"
         type:
           type: string
           description: "Result type"
@@ -1358,7 +976,19 @@ components:
 
     TranscriptionStreamResponse:
       type: object
-      description: "Streaming transcription result (via WebSocket)"
+      description: |
+        Streaming transcription result or event delivered via WebSocket.
+
+        The `type` field determines the kind of message:
+        - `transcript.event` — a VAD/EPD lifecycle event (`state` = `speech_start` or `speech_end`)
+        - `transcript.text.delta` — a partial (incremental) transcription result
+        - `transcript.text.done` — the final transcription for the current utterance
+
+        **Full event sequence per utterance:**
+        1. `transcript.event` with `state: speech_start`
+        2. Zero or more `transcript.text.delta` messages
+        3. `transcript.event` with `state: speech_end`
+        4. `transcript.text.done` with the complete utterance text
       properties:
         session_id:
           type: string
@@ -1366,21 +996,33 @@ components:
           example: "session123"
         text:
           type: string
-          description: "Transcribed text (partial or complete)"
+          description: "Transcribed text (partial or complete). Present on transcript.text.delta and transcript.text.done. For transcript.event messages this field contains the event name (speech_start or speech_end)."
           example: "The sky is blue"
         language:
           type: string
-          description: "Detected language (ISO 639-1 code)"
+          description: "Detected language (ISO 639-1 code). Present on transcription messages."
           example: "en"
+        language_name:
+          type: string
+          description: "Detected language full name as returned by the ASR engine. Present on transcription messages."
+          example: "English"
         type:
           type: string
-          description: "Event type"
+          description: "Message type"
           enum:
+            - "transcript.event"
             - "transcript.text.delta"
             - "transcript.text.done"
           example: "transcript.text.delta"
+        state:
+          type: string
+          description: "State context. For transcript.event: speech_start or speech_end. For transcription messages: transcription."
+          enum:
+            - "speech_start"
+            - "speech_end"
+            - "transcription"
+          example: "transcription"
       required:
-        - text
         - type
 
     TranslationModel:

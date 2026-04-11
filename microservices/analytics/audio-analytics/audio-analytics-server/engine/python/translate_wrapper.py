@@ -16,11 +16,13 @@ import ctypes
 import os
 import sys
 import time
+import traceback
 import threading
-import asyncio 
-import logging
+from concurrent.futures import ThreadPoolExecutor
 import wrapper_utils as wu
 from translation_buffer_create import generate_model_blob_from_bytes
+
+T2T_MODEL_STORE_DIR = os.environ.get('T2T_MODEL_STORE_DIR', '/tmp/audio-cache')
 # ----------------------------------------------------------------------
 # Callback type definitions (match the C typedefs)
 # ----------------------------------------------------------------------
@@ -76,16 +78,9 @@ class TranslationCallbackManager:
         @OnResultFn
         def _global_on_result(user_data, result_ptr):
             """Global C callback that routes to the current result handler."""
-            # Print immediately to see if we even enter the callback
-            import sys
-            sys.stdout.write("[CALLBACK] _global_on_result ENTERED\n")
-            sys.stdout.flush()
-            
             # Acquire GIL since this might be called from a C++ thread
             gil_state = PyGILState_Ensure()
             try:
-                sys.stdout.write("[CALLBACK] GIL acquired\n")
-                sys.stdout.flush()
                 with self._lock:
                     handler = self._current_result_handler
                 
@@ -102,7 +97,6 @@ class TranslationCallbackManager:
                                 handler(result)
                             except Exception as decode_error:
                                 print(f"Error decoding result in callback: {decode_error}")
-                                import traceback
                                 traceback.print_exc()
                                 # Try to pass the raw bytes if decoding fails
                                 try:
@@ -113,11 +107,9 @@ class TranslationCallbackManager:
                             print("Warning: result_ptr is NULL in global callback")
                     except Exception as e:
                         print(f"Error in global result callback handler: {e}")
-                        import traceback
                         traceback.print_exc()
             except Exception as e:
                 print(f"Critical error in global result callback: {e}")
-                import traceback
                 traceback.print_exc()
             finally:
                 # Always release GIL
@@ -126,16 +118,9 @@ class TranslationCallbackManager:
         @OnDoneFn
         def _global_on_done(user_data):
             """Global C callback that routes to the current done handler."""
-            # Print immediately to see if we even enter the callback
-            import sys
-            sys.stdout.write("[CALLBACK] _global_on_done ENTERED\n")
-            sys.stdout.flush()
-            
             # Acquire GIL since this might be called from a C++ thread
             gil_state = PyGILState_Ensure()
             try:
-                sys.stdout.write("[CALLBACK] GIL acquired in done\n")
-                sys.stdout.flush()
                 with self._lock:
                     handler = self._current_done_handler
                 
@@ -144,11 +129,9 @@ class TranslationCallbackManager:
                         handler()
                     except Exception as e:
                         print(f"Error in global done callback handler: {e}")
-                        import traceback
                         traceback.print_exc()
             except Exception as e:
                 print(f"Critical error in global done callback: {e}")
-                import traceback
                 traceback.print_exc()
             finally:
                 # Always release GIL
@@ -168,11 +151,9 @@ class TranslationCallbackManager:
                         handler(error_code)
                     except Exception as e:
                         print(f"Error in global error callback handler: {e}")
-                        import traceback
                         traceback.print_exc()
             except Exception as e:
                 print(f"Critical error in global error callback: {e}")
-                import traceback
                 traceback.print_exc()
             finally:
                 # Always release GIL
@@ -282,7 +263,6 @@ class TranslationWrapper:
                 self.final_text.append(result)
             except Exception as e:
                 print(f"[Instance {self.instance_id}] Error in _on_result: {e}")
-                import traceback
                 traceback.print_exc()
         
         def _on_done():
@@ -297,33 +277,20 @@ class TranslationWrapper:
         self._instance_on_result = _on_result
         self._instance_on_done = _on_done
         self._instance_on_error = _on_error
-        
-        # Initialize the engine and callbacks
-        #check temp translation file exist otherwise load with buffer and create temp file 
-        input_code = self.get_language_code(input_lang)
-        output_code = self.get_language_code(output_lang)
-        t2t_temp_file = f"/tmp/translation/translation_{input_code}_{output_code}.qnn"
-        
-        if model_path:
-            print("load from model path")
-            self._initialize_engine_and_callbacks(model_path, input_lang, output_lang)
-        elif os.path.isfile(t2t_temp_file):
-            print("load from temp model path")
-            model_path = t2t_temp_file.encode("utf-8")
-            self._initialize_engine_and_callbacks(model_path, input_lang, output_lang)
-        else:
-            print("load from model buffer")
-            self._initialize_engine_and_callbacks_with_dir(model_dir, input_lang, output_lang)
+
+        # Always initialise from the model directory — init_dir() resolves
+        # whether to use the pre-built model_file or build from assets.
+        self.init_dir(model_dir, input_lang, output_lang)
     
-    def get_language_code(self,language_name: bytes) -> str:
+    def get_language_code(self, language_name: bytes) -> str:
         """Convert language name to language code for file naming."""
         # Decode bytes to string and normalize
         lang_str = language_name.decode('utf-8').lower()
-        
+
         # Language name to code mapping
         lang_map = {
             'english': 'en',
-            'chinese': 'zh', 
+            'chinese': 'zh',
             'spanish': 'es',
             'french': 'fr',
             'german': 'de',
@@ -334,21 +301,64 @@ class TranslationWrapper:
             'portuguese': 'pt',
             'italian': 'it'
         }
-        
+
         return lang_map.get(lang_str, lang_str)
-    
-    def _initialize_engine_and_callbacks_with_dir(self, model_dir: bytes, input_lang: bytes, output_lang: bytes):
-        """Initialize or reinitialize the translation engine and callbacks."""
 
-        print(f"[Instance {self.instance_id}] _initialize_engine_and_callbacks")
+    def init_dir(self, model_dir: str, input_lang: bytes, output_lang: bytes):
+        """
+        Initialise the translation engine from a model directory.
 
-        # 1. Create the global callback wrapper if it doesn't exist (class-level, shared)
+        Resolution order:
+          1. config.json has a ``model_file`` entry AND the file exists → fast path.
+          2. /tmp/translation/ has a cached .qnn file → fast path.
+          3. Otherwise build from individual asset files → slow path.
+        """
+        if not os.path.isdir(model_dir):
+            print(f"[Instance {self.instance_id}] init_dir: '{model_dir}' is not a valid directory")
+            return
+
+        print(f"[Instance {self.instance_id}] init_dir: {model_dir}")
+
+        config_file = "config.json"
+        if not wu.check_config(config_file, model_dir):
+            print(f"[Instance {self.instance_id}] init_dir: config.json not found in {model_dir}")
+            return
+        config_json = wu.get_config(config_file, model_dir)
+
+        input_code  = self.get_language_code(input_lang)
+        output_code = self.get_language_code(output_lang)
+
+        # Fast path 1: model_file in config.json
+        if "model_file" in config_json:
+            model_file_path = os.path.join(model_dir, config_json["model_file"])
+            if os.path.isfile(model_file_path):
+                print(f"[Instance {self.instance_id}] init_dir: using model_file from config: {model_file_path}")
+                self._initialize_engine_and_callbacks(model_file_path.encode("utf-8"), input_lang, output_lang)
+                return
+            else:
+                print(f"[Instance {self.instance_id}] init_dir: model_file not found, continuing")
+
+        # Fast path 2: cached /tmp file
+        t2t_temp_file = f"{T2T_MODEL_STORE_DIR}/translation_{input_code}_{output_code}.qnn"
+        if os.path.isfile(t2t_temp_file):
+            print(f"[Instance {self.instance_id}] init_dir: using cached temp file: {t2t_temp_file}")
+            self._initialize_engine_and_callbacks(t2t_temp_file.encode("utf-8"), input_lang, output_lang)
+            return
+
+        # Slow path: build from assets
+        print(f"[Instance {self.instance_id}] init_dir: building from assets")
+        self._initialize_engine_and_callbacks_with_dir(model_dir, input_lang, output_lang)
+
+    def _setup_engine_and_callback(self) -> object:
+        """Create/reuse the global callback handle, create a fresh engine, register callback.
+
+        Returns:
+            cpp_cb: the C++ callback pointer to pass to _finish_init.
+        """
+        # 1. Create the global callback handle if it doesn't exist (class-level, shared)
         if not TranslationWrapper._callback_initialized:
             print(f"[Instance {self.instance_id}] Creating global translation callback handle...")
-            
-            # Get the global C callback function pointers
             c_on_result, c_on_done, c_on_error = _global_translation_callback_manager.get_c_callbacks()
-            
             TranslationWrapper._shared_cb_handle = self._wrapper.create_translation_callback(
                 c_on_result,
                 c_on_done,
@@ -362,22 +372,18 @@ class TranslationWrapper:
         else:
             print(f"[Instance {self.instance_id}] Reusing global callback handle: {TranslationWrapper._shared_cb_handle}")
 
-        # 2. ALWAYS create a fresh translation engine for this instance
-        # Each instance gets its own engine handle
+        # 2. Create a fresh translation engine for this instance
         print(f"[Instance {self.instance_id}] Creating translation engine...")
         self._engine = self._wrapper.create_translation_engine()
         if not self._engine:
             raise RuntimeError(f"Failed to create translation engine for instance {self.instance_id}")
         print(f"[Instance {self.instance_id}] Engine handle created: {self._engine}")
 
-        # 3. CRITICAL: Register the callback BEFORE init()
-        # The C++ init() function checks mResultCallback for error reporting,
-        # so it must be set before calling init()
+        # 3. Get the cpp_cb pointer (with NULL recovery) and register BEFORE init()
         print("Registering global callback with engine BEFORE init()...")
         cpp_cb = self._wrapper.get_translation_result_callback(TranslationWrapper._shared_cb_handle)
         if not cpp_cb:
             print("WARNING: Got NULL C++ callback pointer, trying to recreate callback handle")
-            # Try to recreate the callback handle
             c_on_result, c_on_done, c_on_error = _global_translation_callback_manager.get_c_callbacks()
             TranslationWrapper._shared_cb_handle = self._wrapper.create_translation_callback(
                 c_on_result,
@@ -391,75 +397,134 @@ class TranslationWrapper:
             cpp_cb = self._wrapper.get_translation_result_callback(TranslationWrapper._shared_cb_handle)
             if not cpp_cb:
                 raise RuntimeError("Still got NULL C++ callback pointer after recreation")
-        
+
         print(f"Got C++ callback pointer: {cpp_cb}")
         self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
         print("Callback registered successfully BEFORE init()")
-        
-        # CRITICAL: Verify the callback was actually registered by checking if it's not null
-        # This is a sanity check to ensure the singleton engine has our callback
-        print("Verifying callback registration...")
-        # We can't directly check mResultCallback from Python, but we can try a test
-        # by processing an empty string and seeing if callbacks fire
-        # For now, we'll just log and continue
         print("Callback registration verification complete")
+        return cpp_cb
+
+    def _finish_init(self, init_ret, retry_fn, cpp_cb):
+        """Handle init error recovery, re-register callback, and activate handlers.
+
+        Args:
+            init_ret: return code from the first init call.
+            retry_fn: zero-argument callable that retries the init and returns the new code.
+            cpp_cb:   the C++ callback pointer returned by _setup_engine_and_callback.
+        """
+        if init_ret != 0:
+            error_msg = f"Engine initialization failed with code {init_ret}"
+            print(f"ERROR: {error_msg}")
+            print("The C++ wrapper already tried multiple recovery attempts")
+            print("This indicates a persistent DSP/RPC resource conflict")
+            print("Attempting Python-level recovery with longer delay...")
+            try:
+                print("Waiting 5 seconds for complete DSP resource release...")
+                time.sleep(5.0)
+                print("Final recovery attempt...")
+                final_ret = retry_fn()
+                print(f"Final recovery init returned: {final_ret}")
+                if final_ret == 0:
+                    print("Python-level recovery successful!")
+                else:
+                    print(f"Python-level recovery also failed with code {final_ret}")
+                    raise RuntimeError(f"All recovery attempts failed. Final error code: {final_ret}")
+            except Exception as recovery_error:
+                print(f"Recovery attempt failed: {recovery_error}")
+                raise RuntimeError(error_msg)
+        else:
+            print("Engine initialized successfully")
+
+        # Re-register callback AFTER init() (init may reset internal state)
+        print("Re-registering callback AFTER init() to ensure it's set...")
+        self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
+        print("Callback re-registered successfully AFTER init()")
+
+        # Activate this instance's handlers
+        _global_translation_callback_manager.set_handlers(
+            on_result=self._instance_on_result,
+            on_done=self._instance_on_done,
+            on_error=self._instance_on_error
+        )
+        print(f"[Instance {self.instance_id}] Set as active callback handler")
+
+    def _initialize_engine_and_callbacks_with_dir(self, model_dir: bytes, input_lang: bytes, output_lang: bytes):
+        """Initialize or reinitialize the translation engine and callbacks."""
+
+        print(f"[Instance {self.instance_id}] _initialize_engine_and_callbacks")
+
+        cpp_cb = self._setup_engine_and_callback()
 
         # 4. Initialize the engine with the model and languages AFTER callback registration
-        #check if config file exist
         config_file = "config.json"
-        if not wu.check_config(config_file,model_dir):
-            return 
-        
+        if not wu.check_config(config_file, model_dir):
+            return
+
         config_json = wu.get_config(config_file, model_dir)
-        
+
         input_code = self.get_language_code(input_lang)
         output_code = self.get_language_code(output_lang)
         model_files = {
-            "encoder_path":config_json["assets"].get("encoder_path"),
-            "decoder_path":config_json["assets"].get("decoder_path"), 
-            "tokenizer_path":config_json["assets"].get("tokenizer_path"),
-            "lookups_path":config_json["assets"].get("lookups_path")
+            "encoder_path": config_json["assets"].get("encoder_path"),
+            "decoder_path": config_json["assets"].get("decoder_path"),
+            "tokenizer_path": config_json["assets"].get("tokenizer_path"),
+            "lookups_path": config_json["assets"].get("lookups_path")
         }
-      
-        models_dict = wu.check_assests(config_json,model_files,model_dir)
-        
+
+        models_dict = wu.check_assests(config_json, model_files, model_dir)
+
         if not models_dict:
-            return 
-        #valid runtime 
-        if not wu.check_t2t_runtime(config_json,input_lang_code=input_code):
-            return 
+            return
+        if not wu.check_t2t_runtime(config_json, input_lang_code=input_code):
+            return
         runtimes = config_json["runtime"]
-        
-        f = open(models_dict.get("encoder_path"), 'rb')
-        encoder = f.read()
-        f.close()
 
-        f = open(models_dict.get("decoder_path"), 'rb')
-        decoder = f.read()
-        f.close()
+        print(f"[Instance {self.instance_id}] Loading model assets:")
+        for key, path in models_dict.items():
+            size = os.path.getsize(path) if os.path.isfile(path) else -1
+            print(f"[Instance {self.instance_id}]   {key}: {path} ({size} bytes)")
 
-        f = open(models_dict.get("tokenizer_path"), 'rb')
-        tokenizer = f.read()
-        f.close()
+        def _read(path):
+            with open(path, 'rb') as f:
+                return f.read()
 
-        f = open(models_dict.get("lookups_path"), 'rb')
-        tokenizer_auto_gen = f.read()
-        f.close()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_encoder   = pool.submit(_read, models_dict["encoder_path"])
+            f_decoder   = pool.submit(_read, models_dict["decoder_path"])
+            f_tokenizer = pool.submit(_read, models_dict["tokenizer_path"])
+            f_lookups   = pool.submit(_read, models_dict["lookups_path"])
+            encoder, decoder, tokenizer, tokenizer_auto_gen = (
+                f_encoder.result(), f_decoder.result(),
+                f_tokenizer.result(), f_lookups.result()
+            )
+
         model_buffer = generate_model_blob_from_bytes(
-            opus_encoder_model = encoder,
-            opus_decoder_model = decoder,
-            tokenizer_autogen = tokenizer,
-            tokenizer_autogen_lookups = tokenizer_auto_gen,
-            qnn_version_major = runtimes["qnn_version"].get("major"), 
-            qnn_version_minor=runtimes["qnn_version"].get("minor"), 
+            opus_encoder_model=encoder,
+            opus_decoder_model=decoder,
+            tokenizer_autogen=tokenizer,
+            tokenizer_autogen_lookups=tokenizer_auto_gen,
+            qnn_version_major=runtimes["qnn_version"].get("major"),
+            qnn_version_minor=runtimes["qnn_version"].get("minor"),
             qnn_version_patch=runtimes["qnn_version"].get("patch"),
             arch=runtimes.get("arch"),
-            enc_model_max_seq_len = runtimes.get("enc_model_max_seq_len"), 
-            dec_model_max_seq_len = runtimes.get("dec_model_max_seq_len"),
+            enc_model_max_seq_len=runtimes.get("enc_model_max_seq_len"),
+            dec_model_max_seq_len=runtimes.get("dec_model_max_seq_len"),
             rep_penalty=runtimes.get("rep_penalty"),
             model_lang=runtimes.get("model_lang"),
             scratch_mem_size_req=runtimes.get("scratch_mem_size_req"),
         )
+
+        # Start cache write immediately — runs concurrently with the 3-minute DSP init below
+        try:
+            cache_thread = threading.Thread(
+                target=self._write_cache_file,
+                args=(model_buffer, input_code, output_code),
+                daemon=True
+            )
+            cache_thread.start()
+            print("Background cache file creation started")
+        except Exception as e:
+            print(f"Could not start background cache creation: {e}")
 
         self._model_buf = ctypes.create_string_buffer(model_buffer)  # owns memory
         model_ptr = ctypes.cast(self._model_buf, ctypes.c_void_p)
@@ -473,163 +538,50 @@ class TranslationWrapper:
         )
         print(f"Engine init returned: {init_ret}")
 
-        #save buffer to tmp file
-        try:
-            # Create cache file in background thread
-            def create_cache_thread():
-                try:
-                    self.create_t2t_temp_file_sync(model_buffer, input_code, output_code)
-                    print("Cache file creation completed")
-                except Exception as e:
-                    print(f"Failed to create cache file: {e}")
-            
-            thread = threading.Thread(target=create_cache_thread, daemon=True)
-            thread.start()
-            print("Background cache file creation started")
-        except Exception as e:
-            print(f"Could not start background cache creation: {e}")
-        # Check if initialization actually succeeded
-        if init_ret != 0:
-            error_msg = f"Engine initialization failed with code {init_ret}"
-            print(f"ERROR: {error_msg}")
-            print("The C++ wrapper already tried multiple recovery attempts")
-            print("This indicates a persistent DSP/RPC resource conflict")
-            
-            # For now, let's try one more Python-level recovery
-            print("Attempting Python-level recovery with longer delay...")
-            try:
-                # Force a longer delay at Python level
-                import time
-                print("Waiting 5 seconds for complete DSP resource release...")
-                time.sleep(5.0)
-                
-                # Try one more time
-                print("Final recovery attempt...")
-                final_ret = self._wrapper.translation_engine_init_from_buffer(
-                        self._engine,
-                        model_ptr,
-                        model_size,
-                        input_lang,
-                        output_lang
-                    )
-                print(f"Final recovery init returned: {final_ret}")
-                
-                if final_ret == 0:
-                    print("Python-level recovery successful!")
-                    init_ret = 0  # Mark as successful
-                else:
-                    print(f"Python-level recovery also failed with code {final_ret}")
-                    raise RuntimeError(f"All recovery attempts failed. Final error code: {final_ret}")
-                    
-            except Exception as recovery_error:
-                print(f"Recovery attempt failed: {recovery_error}")
-                raise RuntimeError(error_msg)
-        else:
-            print("Engine initialized successfully")
-        
-        # CRITICAL: Re-register the callback AFTER init() as well
-        # The init() function might reset internal state, so we re-register to be safe
-        print("Re-registering callback AFTER init() to ensure it's set...")
-        self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
-        print("Callback re-registered successfully AFTER init()")
-            
+        self._finish_init(
+            init_ret,
+            lambda: self._wrapper.translation_engine_init_from_buffer(
+                self._engine, model_ptr, model_size, input_lang, output_lang
+            ),
+            cpp_cb
+        )
+
         # Update current model parameters for this instance
-        #self.current_model_path = model_path
         self.current_input_lang = input_lang
         self.current_output_lang = output_lang
-        
+
         # Update class-level tracking of what's loaded in the C++ engine
-        #TranslationWrapper._current_engine_model = model_path
         TranslationWrapper._current_engine_input_lang = input_lang
         TranslationWrapper._current_engine_output_lang = output_lang
-        
-        # Ensure default handlers are set
-        def _on_result(result):
-            try:
-                print(f"[Result] {result}")
-                self.final_text.append(result)
-            except Exception as e:
-                print(f"Error in _on_result: {e}")
-        
-        def _on_done():
-            print("[Done] Translation finished callback called.")
-        
-        def _on_error(error_code):
-            print(f"[Error] Callback called with code {error_code}")
-        
-        # Set this instance's handlers as the active ones
-        # Note: Only one instance can be actively processing at a time due to global callback
-        _global_translation_callback_manager.set_handlers(
-            on_result=self._instance_on_result,
-            on_done=self._instance_on_done,
-            on_error=self._instance_on_error
-        )
-        print(f"[Instance {self.instance_id}] Set as active callback handler")
 
-    async def create_t2t_temp_file(self,model_buffer,input_code, output_code):
-        #remove temp file in this dir
-        #write a new file 
-        t2t_tmp_dir = "/tmp/translation"
+    def _write_cache_file(self, model_buffer, input_code, output_code):
+        """Write model buffer to the cache directory (synchronous, run in a background thread)."""
+        t2t_tmp_dir = T2T_MODEL_STORE_DIR
         try:
-            #check if any file in this /tmp/translation dir, remove all the files and create a new one
-            #create dir if not exist
-            os.makedirs(t2t_tmp_dir,exist_ok=True)
-
-            #generate specific filename based on input output language
-            cache_filename = f"translation_{input_code}_{output_code}.qnn"
-            cache_file_path = os.path.join(t2t_tmp_dir, cache_filename)
-
-            #keep one temp file each time, reduce memory usage
-            self._cleanup_old_cached_file(t2t_tmp_dir)
-
-            # Write to temporary file first (atomic operation)
-            temp_file_path = cache_file_path + ".tmp" 
-
-            print(f"Creating cache file: {cache_file_path}")
-        
-            with open(temp_file_path, 'wb') as f:
-                f.write(model_buffer)
-            
-            # Atomic rename - ensures file is complete before it's available
-            os.rename(temp_file_path, cache_file_path)
-        
-        except Exception as e:
-            print(f"Failed to create tmp file: {e}")
-            # Clean up temp file if it exists
-            temp_file_path = os.path.join(t2t_tmp_dir, f"translation_{input_code}_{output_code}.qnn.tmp")
-            if os.path.exists(temp_file_path):
-                try:
-                    os.remove(temp_file_path)
-                except:
-                    pass
-
-    def create_t2t_temp_file_sync(self, model_buffer, input_code, output_code):
-        """Synchronous version of cache file creation"""
-        # Use /tmp directory for better cross-platform compatibility
-        t2t_tmp_dir = "/tmp/translation"
-        try:
-            # Create directory if it doesn't exist
             os.makedirs(t2t_tmp_dir, exist_ok=True)
 
-            # Generate specific filename based on input output language
             cache_filename = f"translation_{input_code}_{output_code}.qnn"
             cache_file_path = os.path.join(t2t_tmp_dir, cache_filename)
 
-            # Keep one temp file each time, reduce memory usage
-            self._cleanup_old_cached_file_sync(t2t_tmp_dir)
+            # Remove stale file for this language pair before writing
+            if os.path.exists(cache_file_path):
+                try:
+                    os.remove(cache_file_path)
+                except Exception as e:
+                    print(f"Could not remove old cache file {cache_file_path}: {e}")
 
             # Write to temporary file first (atomic operation)
-            temp_file_path = cache_file_path + ".tmp" 
+            temp_file_path = cache_file_path + ".tmp"
 
             print(f"Creating cache file: {cache_file_path}")
-        
+
             with open(temp_file_path, 'wb') as f:
                 f.write(model_buffer)
-            
+
             # Atomic rename - ensures file is complete before it's available
             os.rename(temp_file_path, cache_file_path)
             print(f"Cache file created successfully: {cache_file_path}")
-        
+
         except Exception as e:
             print(f"Failed to create cache file: {e}")
             # Clean up temp file if it exists
@@ -640,14 +592,9 @@ class TranslationWrapper:
                 except:
                     pass
 
-    
-    def _cleanup_old_cached_file(self,cache_dir:str):
-        """Remove old cache files from directory"""
+    def _cleanup_cache_dir(self, cache_dir: str):
+        """Remove old .qnn cache files from the cache directory."""
         try:
-            if not os.path.exists(cache_dir):
-                return
-                
-            # Get all .qnn files in the directory
             for filename in os.listdir(cache_dir):
                 if filename.endswith('.qnn') or filename.endswith('.qnn.tmp'):
                     file_path = os.path.join(cache_dir, filename)
@@ -656,95 +603,17 @@ class TranslationWrapper:
                         print(f"Removed old cache file: {file_path}")
                     except Exception as e:
                         print(f"Could not remove old cache file {file_path}: {e}")
-                        
+
         except Exception as e:
             print(f"Error during cache cleanup: {e}")
 
-    def _cleanup_old_cached_file_sync(self, cache_dir: str):
-        """Synchronous version: Remove old cache files from directory"""
-        try:
-            if not os.path.exists(cache_dir):
-                return
-                
-            # Get all .qnn files in the directory
-            for filename in os.listdir(cache_dir):
-                if filename.endswith('.qnn') or filename.endswith('.qnn.tmp'):
-                    file_path = os.path.join(cache_dir, filename)
-                    try:
-                        os.remove(file_path)
-                        print(f"Removed old cache file: {file_path}")
-                    except Exception as e:
-                        print(f"Could not remove old cache file {file_path}: {e}")
-                        
-        except Exception as e:
-            print(f"Error during cache cleanup: {e}")
 
     def _initialize_engine_and_callbacks(self, model_path: bytes, input_lang: bytes, output_lang: bytes):
         """Initialize or reinitialize the translation engine and callbacks."""
 
         print(f"[Instance {self.instance_id}] _initialize_engine_and_callbacks")
 
-        # 1. Create the global callback wrapper if it doesn't exist (class-level, shared)
-        if not TranslationWrapper._callback_initialized:
-            print(f"[Instance {self.instance_id}] Creating global translation callback handle...")
-            
-            # Get the global C callback function pointers
-            c_on_result, c_on_done, c_on_error = _global_translation_callback_manager.get_c_callbacks()
-            
-            TranslationWrapper._shared_cb_handle = self._wrapper.create_translation_callback(
-                c_on_result,
-                c_on_done,
-                c_on_error,
-                None  # user_data can be NULL or a pointer to custom data
-            )
-            if not TranslationWrapper._shared_cb_handle:
-                raise RuntimeError("Failed to create global translation callback")
-            TranslationWrapper._callback_initialized = True
-            print(f"[Instance {self.instance_id}] Global callback handle created: {TranslationWrapper._shared_cb_handle}")
-        else:
-            print(f"[Instance {self.instance_id}] Reusing global callback handle: {TranslationWrapper._shared_cb_handle}")
-
-        # 2. ALWAYS create a fresh translation engine for this instance
-        # Each instance gets its own engine handle
-        print(f"[Instance {self.instance_id}] Creating translation engine...")
-        self._engine = self._wrapper.create_translation_engine()
-        if not self._engine:
-            raise RuntimeError(f"Failed to create translation engine for instance {self.instance_id}")
-        print(f"[Instance {self.instance_id}] Engine handle created: {self._engine}")
-
-        # 3. CRITICAL: Register the callback BEFORE init()
-        # The C++ init() function checks mResultCallback for error reporting,
-        # so it must be set before calling init()
-        print("Registering global callback with engine BEFORE init()...")
-        cpp_cb = self._wrapper.get_translation_result_callback(TranslationWrapper._shared_cb_handle)
-        if not cpp_cb:
-            print("WARNING: Got NULL C++ callback pointer, trying to recreate callback handle")
-            # Try to recreate the callback handle
-            c_on_result, c_on_done, c_on_error = _global_translation_callback_manager.get_c_callbacks()
-            TranslationWrapper._shared_cb_handle = self._wrapper.create_translation_callback(
-                c_on_result,
-                c_on_done,
-                c_on_error,
-                None
-            )
-            if not TranslationWrapper._shared_cb_handle:
-                raise RuntimeError("Failed to recreate global translation callback")
-            print(f"Recreated global callback handle: {TranslationWrapper._shared_cb_handle}")
-            cpp_cb = self._wrapper.get_translation_result_callback(TranslationWrapper._shared_cb_handle)
-            if not cpp_cb:
-                raise RuntimeError("Still got NULL C++ callback pointer after recreation")
-        
-        print(f"Got C++ callback pointer: {cpp_cb}")
-        self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
-        print("Callback registered successfully BEFORE init()")
-        
-        # CRITICAL: Verify the callback was actually registered by checking if it's not null
-        # This is a sanity check to ensure the singleton engine has our callback
-        print("Verifying callback registration...")
-        # We can't directly check mResultCallback from Python, but we can try a test
-        # by processing an empty string and seeing if callbacks fire
-        # For now, we'll just log and continue
-        print("Callback registration verification complete")
+        cpp_cb = self._setup_engine_and_callback()
 
         # 4. Initialize the engine with the model and languages AFTER callback registration
         print(f"Initializing engine with model: {model_path}, input: {input_lang}, output: {output_lang}")
@@ -755,83 +624,26 @@ class TranslationWrapper:
             output_lang
         )
         print(f"Engine init returned: {init_ret}")
-        
-        # Check if initialization actually succeeded
-        if init_ret != 0:
-            error_msg = f"Engine initialization failed with code {init_ret}"
-            print(f"ERROR: {error_msg}")
-            print("The C++ wrapper already tried multiple recovery attempts")
-            print("This indicates a persistent DSP/RPC resource conflict")
-            
-            # For now, let's try one more Python-level recovery
-            print("Attempting Python-level recovery with longer delay...")
-            try:
-                # Force a longer delay at Python level
-                import time
-                print("Waiting 5 seconds for complete DSP resource release...")
-                time.sleep(5.0)
-                
-                # Try one more time
-                print("Final recovery attempt...")
-                final_ret = self._wrapper.translation_engine_init(
-                    self._engine,
-                    model_path,
-                    input_lang,
-                    output_lang
-                )
-                print(f"Final recovery init returned: {final_ret}")
-                
-                if final_ret == 0:
-                    print("Python-level recovery successful!")
-                    init_ret = 0  # Mark as successful
-                else:
-                    print(f"Python-level recovery also failed with code {final_ret}")
-                    raise RuntimeError(f"All recovery attempts failed. Final error code: {final_ret}")
-                    
-            except Exception as recovery_error:
-                print(f"Recovery attempt failed: {recovery_error}")
-                raise RuntimeError(error_msg)
-        else:
-            print("Engine initialized successfully")
-        
-        # CRITICAL: Re-register the callback AFTER init() as well
-        # The init() function might reset internal state, so we re-register to be safe
-        print("Re-registering callback AFTER init() to ensure it's set...")
-        self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
-        print("Callback re-registered successfully AFTER init()")
-            
+
+        self._finish_init(
+            init_ret,
+            lambda: self._wrapper.translation_engine_init(
+                self._engine, model_path, input_lang, output_lang
+            ),
+            cpp_cb
+        )
+
         # Update current model parameters for this instance
         self.current_model_path = model_path
         self.current_input_lang = input_lang
         self.current_output_lang = output_lang
-        
+
         # Update class-level tracking of what's loaded in the C++ engine
         TranslationWrapper._current_engine_model = model_path
         TranslationWrapper._current_engine_input_lang = input_lang
         TranslationWrapper._current_engine_output_lang = output_lang
-        
-        # Ensure default handlers are set
-        def _on_result(result):
-            try:
-                print(f"[Result] {result}")
-                self.final_text.append(result)
-            except Exception as e:
-                print(f"Error in _on_result: {e}")
-        
-        def _on_done():
-            print("[Done] Translation finished callback called.")
-        
-        def _on_error(error_code):
-            print(f"[Error] Callback called with code {error_code}")
-        
-        # Set this instance's handlers as the active ones
-        # Note: Only one instance can be actively processing at a time due to global callback
-        _global_translation_callback_manager.set_handlers(
-            on_result=self._instance_on_result,
-            on_done=self._instance_on_done,
-            on_error=self._instance_on_error
-        )
-        print(f"[Instance {self.instance_id}] Set as active callback handler")
+
+
 
     def _load_library(self, lib_path=None):
         """Load the translation shared library.
@@ -865,7 +677,6 @@ class TranslationWrapper:
                 )
                 raise FileNotFoundError("libtranslation_wrapper.so not found")
         else:
-            print(f"Error: {lib_path} not found!!!")
             # If explicit path provided but doesn't exist, raise
             if not os.path.isfile(lib_path):
                 sys.stderr.write(f"Error: {lib_path} not found\n")
@@ -1013,7 +824,6 @@ class TranslationWrapper:
             
             # Add delay to let DSP resources settle after model change
             print(f"[Instance {self.instance_id}] Waiting for DSP to settle after model change...")
-            import time
             time.sleep(2.0)
             print(f"[Instance {self.instance_id}] DSP settle delay complete")
             
@@ -1039,8 +849,6 @@ class TranslationWrapper:
         print(f"[Instance {self.instance_id}] process_with_cb called for model: {self.current_model_path}")
         print(f"[Instance {self.instance_id}] Languages: {self.current_input_lang} -> {self.current_output_lang}")
         
-        # This call is wrong - we should pass the EXPECTED model, not our stored model
-        # Remove this call since _ensure_correct_model should be called from the service level
         # Storage for error codes and state tracking
         error_code = [None]
         callback_state = {'result_received': False, 'done_received': False}
@@ -1067,11 +875,9 @@ class TranslationWrapper:
                         on_result_cb(result)
                     except Exception as e:
                         print(f"[Instance {self.instance_id}] Error in user result callback: {e}")
-                        import traceback
                         traceback.print_exc()
             except Exception as e:
                 print(f"[Instance {self.instance_id}] Error in result callback wrapper: {e}")
-                import traceback
                 traceback.print_exc()
         
         def _wrapped_on_done():
@@ -1082,7 +888,6 @@ class TranslationWrapper:
                     on_done_cb()
             except Exception as e:
                 print(f"[Instance {self.instance_id}] Error in done callback: {e}")
-                import traceback
                 traceback.print_exc()
         
         def _wrapped_on_error(err_code):
@@ -1093,7 +898,6 @@ class TranslationWrapper:
                     on_error_cb(err_code)
             except Exception as e:
                 print(f"[Instance {self.instance_id}] Error in error callback: {e}")
-                import traceback
                 traceback.print_exc()
         
         # Just ensure callback is registered before processing
@@ -1148,7 +952,6 @@ class TranslationWrapper:
             # Wait a bit longer to ensure callbacks are called
             # The C++ code processes in chunks and calls callbacks for each chunk
             print(f"[Instance {self.instance_id}] Waiting for callbacks to complete...")
-            import time
             max_wait = 5.0  # Maximum 5 seconds
             wait_interval = 0.1
             elapsed = 0.0
@@ -1199,9 +1002,8 @@ class TranslationWrapper:
             print(f"[Instance {self.instance_id}] Callback handlers cleared")
         except Exception as e:
             print(f"[Instance {self.instance_id}] Error clearing callback handlers: {e}")
-            import traceback
             traceback.print_exc()
-        
+
         # Step 2: Stop the engine
         try:
             if hasattr(self, '_engine') and self._engine:
@@ -1211,9 +1013,8 @@ class TranslationWrapper:
                 print(f"[Instance {self.instance_id}] Engine stopped")
         except Exception as e:
             print(f"[Instance {self.instance_id}] Error stopping engine: {e}")
-            import traceback
             traceback.print_exc()
-        
+
         # Step 3: Free the wrapper handle
         # Note: destroy_translation_engine will call deInit() on this instance's engine
         try:
@@ -1224,7 +1025,6 @@ class TranslationWrapper:
                 print(f"[Instance {self.instance_id}] Engine wrapper destroyed")
         except Exception as e:
             print(f"[Instance {self.instance_id}] Error destroying engine wrapper: {e}")
-            import traceback
             traceback.print_exc()
         
         # Step 4: Note - We do NOT destroy the global callback handle
@@ -1304,27 +1104,13 @@ class TranslationWrapper:
             self._wrapper.translation_engine_register_callback(self._engine, cpp_cb)
             print("Callback re-registered successfully AFTER reinit")
             
-            # Set up default handlers after re-registering callback
-            def _on_result(result):
-                try:
-                    print(f"[Result] {result}")
-                    self.final_text.append(result)
-                except Exception as e:
-                    print(f"Error in _on_result: {e}")
-            
-            def _on_done():
-                print("[Done] Translation finished callback called.")
-            
-            def _on_error(error_code):
-                print(f"[Error] Callback called with code {error_code}")
-            
             # Restore default handlers
             _global_translation_callback_manager.set_handlers(
-                on_result=_on_result,
-                on_done=_on_done,
-                on_error=_on_error
+                on_result=self._instance_on_result,
+                on_done=self._instance_on_done,
+                on_error=self._instance_on_error
             )
-            
+
             if init_ret != 0:
                 print(f"ERROR: Engine initialization failed with code {init_ret}")
                 print("The C++ wrapper already tried to recover, but init still failed")
@@ -1340,7 +1126,6 @@ class TranslationWrapper:
             return True
         except Exception as e:
             print(f"Error changing model: {e}")
-            import traceback
             traceback.print_exc()
             return False
     

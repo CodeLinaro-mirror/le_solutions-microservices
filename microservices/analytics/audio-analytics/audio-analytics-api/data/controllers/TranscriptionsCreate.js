@@ -15,9 +15,11 @@ module.exports.createTranscription = async function createTranscription (req, re
         
         // Extract parameters from body
         const model = body.model || 'whisper-1';
-        const language = body.language || 'en';
+        const language = body.language || null;
         const stream = body.stream === 'true' || body.stream === true || false;
-        const parameters = body.parameters ? JSON.parse(body.parameters) : '[]';
+        const parameters = body.parameters
+            ? (typeof body.parameters === 'string' ? JSON.parse(body.parameters) : body.parameters)
+            : [];
 
         console.log('   Model:', model);
         console.log('   Language:', language);
@@ -28,16 +30,6 @@ module.exports.createTranscription = async function createTranscription (req, re
 
         // Check to see if a file was uploaded
         if (req.files && req.files.length != 0) {
-            // Check file length
-            const fileSize = parseInt(req.headers['content-length']);
-            if (fileSize > 5 * 1024 * 1024) {
-                return res.status(413).json({error: {
-                    message: 'File Size is greater than 50MB',
-                    type: "server_error",
-                    param: null,
-                    code: null
-                }});
-            }
             let file = req.files[0];
             body.stream = body.stream == 'true' ? true : false;
             body.message_type = 'transcriptions_create';
@@ -57,10 +49,10 @@ module.exports.createTranscription = async function createTranscription (req, re
                 // Send Encoded Stream as message to message broker
                 // If model takes a long time to initialize, then do not respond to USER until an ACK is received
                 messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                    if (err) {return res.status(400).json({reason: err.message});}
+                    if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
                     else {
                         return res.status(200).json({
-                            session_id: data.session_id || "session123",
+                            session_id: data.session_id || "no_session_id",
                             text: "File Uploaded. Listen on WebSocket to get transcription output.",
                             language: "en",
                             type: "transcript.text.delta"
@@ -73,7 +65,7 @@ module.exports.createTranscription = async function createTranscription (req, re
                 // Send Encoded Stream as message to message broker
                 // Listen for Response from message broker
                 messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                    if (err) {res.status(400).json({reason: err.message});}
+                    if (err) {res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
                     else {
                         // Output Response in WebSocket if stream is enabled
                         res.status(200).json(data);
@@ -117,10 +109,11 @@ module.exports.createTranscription = async function createTranscription (req, re
             body.message_type = 'transcriptions_create';
             // If model takes a long time to initialize, then do not respond to USER until an ACK is received
             messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                if (err) {return res.status(400).json({reason: err.message});}
+                if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
                 else {
                     return res.status(200).json({
                         session_id: data.session_id || "session123",
+                        state: data.state || undefined,
                         text: "Successfully started Transcription Engine. Please connect to the WebSocket to send audio data & receive transcription output.",
                         language: "en",
                         type: "transcript.text.delta"
@@ -135,10 +128,11 @@ module.exports.createTranscription = async function createTranscription (req, re
             body.message_type = 'transcriptions_create';
             // If model takes a long time to initialize, then do not respond to USER until an ACK is received
             messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                if (err) {return res.status(400).json({reason: err.message});}
+                if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
                 else {
                     return res.status(200).json({
                         session_id: data.session_id || "session123",
+                        state: data.state || undefined,
                         text: "Successfully started Transcription Engine. Please connect to the WebSocket to send audio data & receive transcription output.",
                         language: "en",
                         type: "transcript.text.delta"

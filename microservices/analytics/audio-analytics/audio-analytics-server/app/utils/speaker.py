@@ -9,10 +9,17 @@ It includes device detection, queue-based audio data management, and persistent 
 playback that idles silently when no data is queued.
 """
 
-import sounddevice as sd
 import queue
-import numpy as np
 import threading
+
+try:
+    import sounddevice as sd
+    import numpy as np
+    AUDIO_AVAILABLE = True
+except (ImportError, OSError):
+    sd = None  # type: ignore
+    np = None  # type: ignore
+    AUDIO_AVAILABLE = False
 
 
 class Speaker:
@@ -35,6 +42,11 @@ class Speaker:
             name (str): Partial or full name of the output device to use
             dtype (str): Data type for audio samples (default: 'int16')
         """
+        if not AUDIO_AVAILABLE:
+            raise RuntimeError(
+                "Audio libraries (sounddevice/PortAudio/PulseAudio) are not available. "
+                "Rebuild the container with --build-arg INSTALL_PULSE_AUDIO=true to enable speaker support."
+            )
         if refresh:
             Speaker.refresh_devices()
         self.device_name = Speaker.get_speaker_by_name(name)
@@ -65,8 +77,12 @@ class Speaker:
                      sd._terminate() which would kill the active stream.
         
         Returns:
-            list: List of device information dictionaries with output capabilities only
+            list: List of device information dictionaries with output capabilities only,
+                  or empty list if audio is unavailable.
         """
+        if not AUDIO_AVAILABLE:
+            print("Audio libraries not available — no output devices to list.")
+            return []
         if refresh:
             Speaker.refresh_devices()
         print("\nAvailable Output Devices:")
@@ -94,8 +110,10 @@ class Speaker:
             key (str): Information key to retrieve (e.g., 'default_samplerate')
             
         Returns:
-            The requested device information, or None if not found
+            The requested device information, or None if audio is unavailable or not found.
         """
+        if not AUDIO_AVAILABLE:
+            return None
         try:
             # Use no-args form — sd.query_devices(name) can return a tuple in some
             # sounddevice versions, but the no-args form always yields dict-like objects
@@ -131,12 +149,14 @@ class Speaker:
                                or None/empty to use the system default.
 
         Returns:
-            str: Device name string if found, None otherwise
+            str: Device name string if found, None if audio is unavailable or not found.
 
         Example:
             get_speaker_by_name("pulse") might return "pulse" or the full device name
             get_speaker_by_name(None) returns the system default output device name
         """
+        if not AUDIO_AVAILABLE:
+            return None
         # No name supplied — return the system default output device
         if not name:
             try:
@@ -172,6 +192,8 @@ class Speaker:
         This is useful for detecting newly connected or disconnected devices.
         Terminates and reinitializes the PortAudio system.
         """
+        if not AUDIO_AVAILABLE:
+            return
         sd._terminate()
         sd._initialize()
 

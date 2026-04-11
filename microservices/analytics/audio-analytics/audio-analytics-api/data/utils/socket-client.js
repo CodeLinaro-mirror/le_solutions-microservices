@@ -16,8 +16,8 @@ class SocketClient {
         this.client = null;
         this.connected = false;
         this.channelHandlers = new Map(); // Channel -> Set of handlers
-        this.reconnectInterval = 1000; // 1 second
-        this.maxReconnectAttempts = 10;
+        this.reconnectInterval = 2000; // 2 seconds
+        this.maxReconnectAttempts = 30; // 60 seconds total
         this.reconnectAttempts = 0;
         // Guard against scheduling more than one reconnect timer at a time.
         // Both the 'error' and 'close' events fire on the same failed socket,
@@ -110,14 +110,16 @@ class SocketClient {
         }
 
         this.reconnectAttempts++;
-        console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+        // Exponential backoff: 2s, 4s, 8s ... capped at 15s
+        const delay = Math.min(this.reconnectInterval * Math.pow(2, this.reconnectAttempts - 1), 15000);
+        console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${delay}ms...`);
 
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             this.connect().catch(err => {
                 console.error(`Reconnect attempt failed: ${err.message}`);
             });
-        }, this.reconnectInterval);
+        }, delay);
     }
 
     async publish(channel, message) {

@@ -23,8 +23,9 @@ class ServiceCoordinator:
         self._active_service: Optional[str] = None
         self._coordinator_lock = asyncio.Lock()
         self._cleanup_callbacks: Dict[str, callable] = {}
-        self._tts_keep_alive: bool = True  # Track TTS keep_alive state
-        self._asr_keep_alive: bool = True  # Track ASR keep_alive state
+        self._tts_keep_alive: bool = False  # Track TTS keep_alive state
+        self._asr_keep_alive: bool = False  # Track ASR keep_alive state
+        self._t2t_keep_alive: bool = False  # Track T2T keep_alive state
         
     async def request_service_start(self, service_name: str, cleanup_callback) -> bool:
         """
@@ -66,6 +67,12 @@ class ServiceCoordinator:
                     logger.info(f"{service_name} requested, ASR keep_alive enabled — skipping ASR cleanup")
                     self._active_service = service_name
                     logger.info(f"{service_name} is now the active service (ASR kept alive)")
+                    return True
+
+                if other_service == 'T2T' and self._t2t_keep_alive:
+                    logger.info(f"{service_name} requested, T2T keep_alive enabled — skipping T2T cleanup")
+                    self._active_service = service_name
+                    logger.info(f"{service_name} is now the active service (T2T kept alive)")
                     return True
                 
                 # Background cleanup — switch active service immediately so the
@@ -183,6 +190,25 @@ class ServiceCoordinator:
             True if ASR should be kept alive, False otherwise
         """
         return self._asr_keep_alive
+
+    def set_t2t_keep_alive(self, keep_alive: bool):
+        """
+        Set the T2T keep_alive state.
+
+        Args:
+            keep_alive: True to keep T2T alive when other services start, False to cleanup normally
+        """
+        self._t2t_keep_alive = keep_alive
+        logger.info(f"T2T keep_alive set to: {keep_alive}")
+
+    def get_t2t_keep_alive(self) -> bool:
+        """
+        Get the current T2T keep_alive state.
+
+        Returns:
+            True if T2T should be kept alive, False otherwise
+        """
+        return self._t2t_keep_alive
     
 
 # Global singleton instance

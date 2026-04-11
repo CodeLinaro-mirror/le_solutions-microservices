@@ -1,12 +1,18 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-import redis.asyncio as redis
 import asyncio
 from typing import Callable, Dict, Optional, Any
 import json
 from .config import Config
 from .logger import get_logger
+
+try:
+    import redis.asyncio as redis
+    _REDIS_AVAILABLE = True
+except ImportError:
+    redis = None  # type: ignore
+    _REDIS_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -25,6 +31,11 @@ class RedisClient:
             host: Redis host (defaults to Config.REDIS_HOST)
             port: Redis port (defaults to Config.REDIS_PORT)
         """
+        if not _REDIS_AVAILABLE:
+            raise ImportError(
+                "The 'redis' package is required for Redis mode but is not installed. "
+                "Install it with: pip install redis"
+            )
         self.host = host or Config.REDIS_HOST
         self.port = port or Config.REDIS_PORT
         self.client: Optional[redis.Redis] = None
