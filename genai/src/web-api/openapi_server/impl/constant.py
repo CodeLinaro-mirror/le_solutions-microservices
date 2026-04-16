@@ -10,6 +10,24 @@ GENAI_INTERFACE_FILE = '/iot-user/app/site-packages/genai_interface.h'
 # Sampler config file path
 SAMPLER_CONFIG_PATH = '/iot-user/app/site-packages/sampler.json'
 
+# DEPRECATED: This threshold is no longer used in the new summarization logic (SDK 2.45+)
+# The new formula uses SUMMARIZATION_CONTEXT_THRESHOLD with system prompt overhead calculation.
+# Kept for backward compatibility only.
+SUMMARIZATION_THRESHOLD = float(os.getenv("GENAI_SUMMARIZATION_THRESHOLD", "0.7"))
+
+# New Summarization Constants (SDK 2.45+)
+# Context threshold: Trigger summarization when projected usage exceeds this percentage
+SUMMARIZATION_CONTEXT_THRESHOLD = 0.9  # 90% of context size
+
+# Summary size: Maximum tokens for generated summary as percentage of context size
+SUMMARIZATION_SUMMARY_SIZE_RATIO = 0.2  # 20% of context size
+
+# System prompt overhead multiplier: Accounts for formatting overhead in prompts
+SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD = 1.3  # 1.3x multiplier for system prompt tokens
+
+# Max completion tokens multiplier: Reduces weight of max_completion_tokens
+SUMMARIZATION_MAX_COMPLETION_MULTIPLIER = 0.5  # 50% weight for max_completion tokens
+
 class HttpStatusCodes:
     """
     Constants for HTTP status codes.
@@ -110,7 +128,11 @@ class LLMServiceQueryConstant:
     MAX_MESSAGE_COUNT = 12
     # Session and token management constants
     MAX_MESSAGE_PAIRS = 50  # Maximum conversation pairs (100 messages total)
-    DEFAULT_MAX_COMPLETION_TOKENS = 512  # Default if not provided by user
+
+    # We now dynamically determine this based on model context size (0.5x).
+    # Leaving this constant as a fallback.
+    DEFAULT_MAX_COMPLETION_TOKENS = 512
+
     CONTEXT_THRESHOLD_PERCENTAGE = 0.8  # 80% threshold for summarization
 
 class ErrorMessages:

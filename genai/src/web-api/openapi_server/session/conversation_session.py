@@ -68,6 +68,10 @@ class ConversationSession:
         self.summary_content = ""
         self.summary_token_count = 0
 
+        # System prompt tracking for new summarization formula
+        self.system_prompt_tokens = 0
+        self.system_prompt_content = ""
+
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
 
     def add_message(self, message: Dict, compact_images: bool = True) -> int:
@@ -81,6 +85,14 @@ class ConversationSession:
         Returns:
             Index of the added message
         """
+        # Track system prompt tokens for new summarization formula
+        if message.get('role') == 'system' and not self.system_prompt_content:
+            from openapi_server.session.token_counter import TokenCounter
+            content = message.get('content', '')
+            self.system_prompt_content = content if isinstance(content, str) else str(content)
+            self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
+            logger.info(f"Session {self.session_id}: System prompt set ({self.system_prompt_tokens} tokens)")
+
         self.messages.append(message)
         if compact_images and self._message_contains_base64_image(message):
             self._compact_historical_base64_images()
@@ -329,7 +341,8 @@ class ConversationSession:
                 if isinstance(previous_event, TextConversationEvent) and isinstance(event, TextConversationEvent):
                     logger.info("Performing Text-to-Text switch summarization...")
                     try:
-                        max_summary_tokens = int(previous_event.context_size * 0.2) # Allow larger summary for switches
+                        from openapi_server.impl.constant import SUMMARIZATION_SUMMARY_SIZE_RATIO
+                        max_summary_tokens = int(previous_event.context_size * SUMMARIZATION_SUMMARY_SIZE_RATIO)
                         summary_text, _ = previous_event.generate_summary(max_summary_tokens, messages_to_summarize=messages_for_summary, include_history_in_prompt=False)
                         self.summary_content = summary_text
                         event.inject_summary = True
@@ -346,23 +359,19 @@ class ConversationSession:
                     event.create_new_handle()
 
                     try:
-                        # Use the historical messages (excluding new ones) for summarization
-                        # This ensures we don't include the current question in the summary
-
-                        # Check token count against 50% of context size
-                        from openapi_server.session.token_counter import TokenCounter
-                        token_count = sum(TokenCounter.estimate_tokens(m.get('content', '')) for m in messages_for_summary)
-
-                        if token_count < (event.context_size * 0.5):
-                            max_summary_tokens = int(event.context_size * 0.1)
-                            summary_text, _ = event.generate_summary(max_summary_tokens, messages_to_summarize=messages_for_summary)
-                            self.summary_content = summary_text
-                            event.inject_summary = True
-                            # Reset handle to clear summarization context before main inference
-                            event._reset_handle()
-                            logger.info("Successfully generated summary with new handle.")
-                        else:
-                            logger.warning("Token count of recent history exceeds threshold, skipping summarization.")
+                        # Always summarize on model switch (removed 50% threshold check)
+                        from openapi_server.impl.constant import SUMMARIZATION_SUMMARY_SIZE_RATIO
+                        max_summary_tokens = int(event.context_size * SUMMARIZATION_SUMMARY_SIZE_RATIO)
+                        summary_text, summary_tokens = event.generate_summary(
+                            max_summary_tokens,
+                            messages_to_summarize=messages_for_summary
+                        )
+                        self.summary_content = summary_text
+                        self.summary_token_count = summary_tokens
+                        event.inject_summary = True
+                        # Reset handle to clear summarization context before main inference
+                        event._reset_handle()
+                        logger.info(f"Successfully generated summary with new handle ({summary_tokens} tokens)")
                     except Exception as e:
                         logger.error(f"Failed to generate summary for Vision-to-Text switch: {e}")
 

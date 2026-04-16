@@ -89,35 +89,46 @@ class TextEventHelpers:
                 "content": getattr(msg_obj, "content", "")
             })
 
-        # Build context for ADHOC_MODE (includes historical messages)
+        # Build context based on mode
         if ADHOC_MODE:
+            # ADHOC MODE: Build full conversation history in prompt
+            # KV cache is reset before each turn, so we must provide all context via prompt text
             messages_to_format = TextEventHelpers._build_context_for_adhoc_mode(
                 event_id, model_id, session, messages_to_format, is_tool_calling, tool_response_received
             )
-            logger.info(f"Event {event_id}: ADHOC_MODE - using {len(messages_to_format)} messages in prompt")
-        elif inject_summary:
-            # Non-ADHOC mode but summarization occurred (reset state)
-            logger.info(f"Event {event_id}: Rebuilding context after summarization")
+            logger.info(f"Event {event_id}: ADHOC_MODE - built prompt with {len(messages_to_format)} messages (full history)")
+        else:
+            # NON-ADHOC MODE: Rely on persistent KV cache
+            # Only send new messages since KV cache has previous context
 
-            rebuilt_messages = []
+            if inject_summary or not handle_borrowed:
+                # First turn or after reset (summarization): Include system prompt + summary + new messages
+                logger.info(f"Event {event_id}: Non-ADHOC mode - rebuilding context after reset/first turn")
 
-            # 1. System Prompt
-            system_msg = TextEventHelpers._find_system_prompt(session)
-            if system_msg:
-                rebuilt_messages.append(system_msg)
+                rebuilt_messages = []
 
-            # 2. Summary
-            if hasattr(session, 'summary_content') and session.summary_content:
-                summary_msg = {
-                    "role": "system",
-                    "content": f"Here is a summary of the conversation so far:\n{session.summary_content}"
-                }
-                rebuilt_messages.append(summary_msg)
+                # 1. System Prompt (always include on first turn or after reset)
+                system_msg = TextEventHelpers._find_system_prompt(session)
+                if system_msg:
+                    rebuilt_messages.append(system_msg)
 
-            # 3. Current Turn
-            rebuilt_messages.extend(messages_to_format)
+                # 2. Summary (if available after reset)
+                if inject_summary and hasattr(session, 'summary_content') and session.summary_content:
+                    summary_msg = {
+                        "role": "system",
+                        "content": f"Previous conversation summary:\n{session.summary_content}"
+                    }
+                    rebuilt_messages.append(summary_msg)
 
-            messages_to_format = rebuilt_messages
+                # 3. Current Turn Messages
+                rebuilt_messages.extend(messages_to_format)
+
+                messages_to_format = rebuilt_messages
+                logger.info(f"Event {event_id}: Non-ADHOC mode - using {len(messages_to_format)} messages (system + summary + new)")
+            else:
+                # Subsequent turns with borrowed handle: Only send new messages
+                # KV cache already has system prompt and previous conversation
+                logger.info(f"Event {event_id}: Non-ADHOC mode - using {len(messages_to_format)} messages (new only, relying on KV cache)")
 
         # Inject tools
         if include_tools and hasattr(request_data, 'tools') and request_data.tools:
@@ -231,12 +242,23 @@ class TextEventHelpers:
         logger.info(f"Event {event_id}: ADHOC_MODE context building - "
                    f"max_input: {max_input_tokens}, priority: {priority_tokens}, history_budget: {history_budget}")
 
-        # Build context from completed events (work backwards)
+        # Find the last summarization event to avoid duplicating information
+        last_summary_event = session.get_last_summarization_event()
+
+        # Build context from completed events AFTER last summarization (work backwards)
+        # Optimization: If we have a summary, it already contains everything before the summarization point,
+        # so we only need to include messages from events that occurred AFTER that point.
+        # This avoids redundancy and makes better use of the context window.
         history_messages = []
         accumulated_tokens = 0
         events_included = 0
 
         for event in reversed(session.events):
+            # Stop if we've reached the summarization point
+            if last_summary_event and event.event_id == last_summary_event.event_id:
+                logger.info(f"Event {event_id}: Reached last summarization point at event {event.event_id}, stopping history collection")
+                break
+
             event_messages = session.get_event_messages(event)
 
             # Filter messages - keep user/assistant, EXCLUDE system

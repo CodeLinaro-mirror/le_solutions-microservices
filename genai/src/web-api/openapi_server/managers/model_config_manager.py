@@ -72,10 +72,38 @@ class ModelConfigManager:
         os.makedirs(self.tmp_config_dir, exist_ok=True)
 
         for root, dirs, files in os.walk(self.models_dir):
-            if "model_config.json" in files:
+            if "metadata.json" in files:
                 bundle_path = root
                 bundle_name = os.path.basename(bundle_path)
-                model_config_path = os.path.join(bundle_path, "model_config.json")
+
+                try:
+                    # Process the bundle (copy configs, update paths)
+                    processed_config_dir = self._process_bundle(bundle_path, bundle_name)
+
+                    # Load the PROCESSED metadata.json (paths already made absolute)
+                    processed_metadata_path = os.path.join(processed_config_dir, "metadata.json")
+                    with open(processed_metadata_path, 'r') as f:
+                        metadata = json.load(f)
+
+                    model_id = metadata.get("model_id")
+                    if model_id:
+                        model_config = self._parse_metadata_json(metadata, bundle_path, processed_config_dir)
+                        aggregated_config["models"][model_id] = model_config
+
+                        # Set default model if not set
+                        if aggregated_config["default_model"] is None:
+                            aggregated_config["default_model"] = model_id
+
+                        logger.info(f"Loaded metadata model: {model_id} from bundle: {bundle_name}")
+                    else:
+                        logger.warning(f"No model_id found in metadata.json in bundle {bundle_name}")
+
+                except Exception as e:
+                    logger.error(f"Error processing metadata bundle {bundle_name} at {bundle_path}: {e}")
+
+            elif "model_config.json" in files:
+                bundle_path = root
+                bundle_name = os.path.basename(bundle_path)
 
                 try:
                     # Process the bundle (copy configs, update paths)
@@ -105,6 +133,137 @@ class ModelConfigManager:
 
         return aggregated_config
 
+    def _parse_metadata_json(self, metadata: dict, bundle_path: str, processed_config_dir: str) -> dict:
+        """
+        Parse metadata.json into internal model configuration format.
+        """
+        from openapi_server.impl.constant import SUMMARIZATION_THRESHOLD
+
+        genie = metadata.get("genie", {})
+        supports_vision = genie.get("supports_vision", False)
+        context_lengths = genie.get("context_lengths", [4096])
+        context_size = max(context_lengths) if context_lengths else 4096
+        pipeline_nodes = genie.get("pipeline", {}).get("nodes", {})
+
+        if supports_vision:
+            config_file = self._generate_vlm_genie_config(metadata, genie, pipeline_nodes, processed_config_dir)
+        else:
+            config_file = pipeline_nodes.get("textGenerator", os.path.join(processed_config_dir, "genie_config.json"))
+
+        memory_mb = self._calculate_memory_from_bin_files(bundle_path, metadata.get("model_files", {}))
+
+        model_config = {
+            "config_file": config_file,
+            "display_name": metadata.get("model_name", metadata.get("model_id", "Unknown")),
+            "memory_requirement_mb": memory_mb,
+            "chat_template": genie.get("chat_template", {}),
+            "max_tokens": context_size,
+            "supports_streaming": genie.get("supports_streaming", True),
+            "supports_vision": supports_vision,
+            "context": {
+                "size": context_size,
+                "summarization_threshold": SUMMARIZATION_THRESHOLD
+            }
+        }
+
+        vision_preprocessing = genie.get("vision_preprocessing")
+        if vision_preprocessing:
+            model_config["vision_preprocessing"] = vision_preprocessing
+
+        return model_config
+
+    def _generate_vlm_genie_config(self, metadata: dict, genie: dict, nodes: dict, processed_config_dir: str) -> str:
+        """
+        Generate a synthetic genie_config.json for VLM models.
+        Matches the structure vlm-service.cpp expects.
+        """
+        model_name = metadata.get("model_name", "VLM")
+
+        pipeline_nodes = {}
+        for key in ("imageEncoder", "lutEncoder", "textGenerator"):
+            if key in nodes:
+                pipeline_nodes[key] = nodes[key]
+
+        DYNAMIC_TYPES = {
+            "GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT",
+            "GENIE_NODE_TEXT_ENCODER_TEXT_INPUT",
+            "GENIE_NODE_TEXT_GENERATOR_TEXT_INPUT",
+        }
+
+        custom_inputs = []
+        for sample in genie.get("sample_inputs", []):
+            input_type = sample.get("input_type") or sample.get("node_io")
+            if input_type not in DYNAMIC_TYPES:
+                # Resolve file path to the absolute path in the original bundle directory
+                # We can deduce the bundle path from processed_config_dir which is /tmp/configs/bundle_name
+                bundle_name = os.path.basename(processed_config_dir)
+                original_bundle_path = os.path.join(self.models_dir, bundle_name)
+
+                # Make path absolute
+                file_path = sample.get("file")
+                if file_path and not os.path.isabs(file_path):
+                    file_path = os.path.join(original_bundle_path, file_path)
+
+                custom_inputs.append({
+                    "node": sample.get("node"),
+                    "input_type": input_type,
+                    "file": file_path
+                })
+
+        chat_template = genie.get("chat_template", {})
+
+        model_entry = {
+            "description": f"{model_name} Vision-Language Model",
+            "pipeline": {
+                "nodes": pipeline_nodes
+            },
+            "custom_inputs": custom_inputs
+        }
+
+        if "vision_start" in chat_template:
+            model_entry["vision_start_token"] = chat_template["vision_start"]
+        if "vision_end" in chat_template:
+            model_entry["vision_end_token"] = chat_template["vision_end"]
+
+        genie_config = {
+            model_name: model_entry
+        }
+
+        output_path = os.path.join(processed_config_dir, "generated_genie_config.json")
+        with open(output_path, 'w') as f:
+            json.dump(genie_config, f, indent=2)
+
+        logger.info(f"Generated VLM genie_config at: {output_path}")
+        return output_path
+
+    def _calculate_memory_from_bin_files(self, bundle_path: str, model_files: dict) -> int:
+        """
+        Calculate memory requirement from bin file sizes.
+        Returns total size of all .bin files * 1.25, in MB.
+        """
+        total_bytes = 0
+
+        if model_files:
+            for filename in model_files.keys():
+                file_path = os.path.join(bundle_path, filename)
+                if os.path.isfile(file_path):
+                    total_bytes += os.path.getsize(file_path)
+                else:
+                    logger.warning(f"Bin file not found: {file_path}")
+        else:
+            for f in os.listdir(bundle_path):
+                if f.endswith('.bin'):
+                    file_path = os.path.join(bundle_path, f)
+                    total_bytes += os.path.getsize(file_path)
+
+        if total_bytes == 0:
+            logger.warning(f"No bin files found in {bundle_path}, using default memory estimate")
+            return 4096
+
+        total_mb = int((total_bytes / (1024 * 1024)) * 1.25)
+        logger.info(f"Calculated memory requirement: {total_mb}MB from {total_bytes} bytes of bin files")
+        return total_mb
+
     def _process_bundle(self, bundle_path: str, bundle_name: str) -> str:
         """
         Process a single bundle: copy JSON configs to tmp dir and update paths.
@@ -118,6 +277,20 @@ class ModelConfigManager:
         """
         output_dir = os.path.join(self.tmp_config_dir, bundle_name)
         os.makedirs(output_dir, exist_ok=True)
+
+        # Determine LLM config filename from metadata.json if present
+        llm_config_filename = None
+        metadata_path = os.path.join(bundle_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    genie = metadata.get("genie", {})
+                    if not genie.get("supports_vision", False):
+                        pipeline_nodes = genie.get("pipeline", {}).get("nodes", {})
+                        llm_config_filename = pipeline_nodes.get("textGenerator")
+            except Exception:
+                pass
 
         # Find all JSON files in the bundle
         json_files = glob.glob(os.path.join(bundle_path, "*.json"))
@@ -137,6 +310,15 @@ class ModelConfigManager:
                     logger.warning(f"Failed to parse JSON file: {json_file}")
                     continue
 
+            # Normalize LLM dialog config: replace non-"dialog" root keys with "dialog"
+            if llm_config_filename and filename == llm_config_filename and "dialog" not in data and len(data) == 1:
+                old_key = next(iter(data.keys()))
+                data["dialog"] = data.pop(old_key)
+                logger.info(
+                    f"[LLM CONFIG NORMALIZATION] Replaced root key '{old_key}' with 'dialog' "
+                    f"in {bundle_name}/{filename} for Genie Dialog API compatibility"
+                )
+
             # NOTE: GenIE/qualla's sampler latches greedy mode at construction time when top-k == 1.
             # Runtime sampler updates via GenieSampler_applyConfig update temp/top-k/top-p, but do not
             # recompute the internal greedy flag. This means a model bundle with dialog.sampler.top-k=1
@@ -147,6 +329,9 @@ class ModelConfigManager:
 
             # Apply context capping if configured
             self._apply_context_capping(data, bundle_name, filename)
+
+            # Override QnnHtp polling behavior to false to prevent idle CPU usage in background service
+            self._patch_htp_polling_config(data, bundle_name, filename)
 
             # Update paths in the JSON data
             updated_data = self._update_paths(data, bundle_path, output_dir)
@@ -205,6 +390,32 @@ class ModelConfigManager:
 
         except Exception as e:
             logger.warning(f"Error applying context capping: {e}")
+
+    @staticmethod
+    def _patch_htp_polling_config(data: dict, bundle_name: str, filename: str) -> None:
+        """
+        Patch QnnHtp backend config to set 'poll: false'.
+        This prevents worker threads from busy-waiting and consuming 100% CPU while idle.
+        """
+        try:
+            # Check all known root node keys
+            for node_key in ("dialog", "text-generator", "text_generator", "textGenerator", "image-encoder", "imageEncoder", "lutEncoder", "text-encoder"):
+                node = data.get(node_key)
+                if isinstance(node, dict):
+                    engine = node.get("engine")
+                    if isinstance(engine, dict):
+                        backend = engine.get("backend")
+                        if isinstance(backend, dict):
+                            # The key could be "QnnHtp" or "qnnHtp" depending on version
+                            qnn_htp = backend.get("QnnHtp") or backend.get("qnnHtp")
+                            if isinstance(qnn_htp, dict) and qnn_htp.get("poll") is True:
+                                qnn_htp["poll"] = False
+                                logger.info(
+                                    f"[CPU OPTIMIZATION] Patched QnnHtp polling config from true to false "
+                                    f"in {bundle_name}/{filename} ({node_key}) to reduce idle CPU usage."
+                                )
+        except Exception as e:
+            logger.warning(f"Error patching HTP polling config in {bundle_name}/{filename}: {e}")
 
     @staticmethod
     def _patch_dialog_sampler_config(data: dict, bundle_name: str, filename: str) -> None:

@@ -93,7 +93,9 @@ fi
 # Fix ownership of the models working directory so iot-user can access it
 # ---------------------------------------------------------------------------
 echo "[entrypoint] Setting ownership of /mnt/work/models to iot-user..."
-chown -R iot-user:iot-user /mnt/work/models
+chown iot-user:iot-user /mnt/work/models
+chmod a+x /mnt /mnt/work /mnt/work/models
+chmod -R a+rX /mnt/work/models
 
 # ---------------------------------------------------------------------------
 # Drop privileges to iot-user and execute the container command

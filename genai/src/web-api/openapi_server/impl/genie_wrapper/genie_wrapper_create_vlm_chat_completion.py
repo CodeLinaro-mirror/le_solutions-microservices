@@ -308,15 +308,20 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             # Handle streaming vs non-streaming
             streaming = getattr(request_data, "stream", False)
 
+            # Determine max completion tokens fallback from context size
+            config_manager = ModelConfigManager()
+            context_size = config_manager.get_context_size(request_data.model)
+            default_max_completion_tokens = int(context_size * 0.5)
+
             if streaming:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, default_max_completion_tokens
                 )
             else:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_non_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, default_max_completion_tokens
                 )
 
         except Exception as e:
@@ -339,7 +344,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         completion_callback=None,
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
-        event_object=None
+        event_object=None,
+        default_max_completion_tokens: int = 300
     ) -> StreamingResponse:
         """Handle streaming response using VLMProcessManager."""
         created = int(time.time())
@@ -376,7 +382,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     prompt=prompt,
                     image_bytes=image_bytes,
                     streaming=True,
-                    max_tokens=request_data.max_completion_tokens or 300,
+                    max_tokens=request_data.max_completion_tokens or default_max_completion_tokens,
                     temperature=request_data.temperature or 0.7,
                     top_p=request_data.top_p or 0.9,
                     top_k=getattr(request_data, "top_k", None),
@@ -541,7 +547,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         completion_callback=None,
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
-        event_object=None
+        event_object=None,
+        default_max_completion_tokens: int = 300
     ) -> Union[CreateChatCompletionResponse, Error]:
         """Handle non-streaming response using VLMProcessManager."""
         try:
@@ -556,7 +563,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 prompt=prompt,
                 image_bytes=image_bytes,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or 300,
+                max_tokens=request_data.max_completion_tokens or default_max_completion_tokens,
                 temperature=request_data.temperature or 0.7,
                 top_p=request_data.top_p or 0.9,
                 top_k=getattr(request_data, "top_k", None),

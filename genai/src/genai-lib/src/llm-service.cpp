@@ -288,7 +288,8 @@ void Dialog::query(const std::string prompt, GenieDialog_SentenceCode_t sentencC
         GenieDialog_query(m_handle, prompt.c_str(), sentencCode, queryCallback, userData);
     if (GENIE_STATUS_WARNING_ABORTED == status) {
       std::cout << "Query Succesfully aborted" << std::endl;
-    } else if (GENIE_STATUS_SUCCESS != status) {
+    } else if (GENIE_STATUS_SUCCESS != status &&
+               status != GENIE_STATUS_WARNING_CONTEXT_EXCEEDED) {
       throw std::runtime_error("Failed to query.");
     }
 }
