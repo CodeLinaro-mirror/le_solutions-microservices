@@ -357,6 +357,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             last_token_timestamp = None
             inter_token_latencies = []
             completion_tokens = 0
+            stream_outcome = "pending"
+            stream_failure: Optional[Exception] = None
 
             try:
                 # First chunk: role
@@ -429,22 +431,24 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+                stream_outcome = "success"
 
                 logger.info(f"VLM Event {event_id}: Streaming completed")
 
+            except asyncio.CancelledError:
+                stream_outcome = "cancelled"
+                if event_object:
+                    event_object.is_cancelled = True
+                raise
             except Exception as e:
                 # Check if this error is due to cancellation
                 if event_object and getattr(event_object, 'is_cancelled', False):
+                    stream_outcome = "cancelled"
                     logger.info(f"VLM Event {event_id}: Stream terminated due to cancellation")
-                elif "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
-                    logger.info(f"VLM Event {event_id}: Stream terminated (likely due to cancellation)")
                 else:
+                    stream_outcome = "failure"
+                    stream_failure = e
                     logger.error(f"VLM Event {event_id}: Streaming error: {e}", exc_info=True)
-                    # Record failure for health monitoring (not for cancellations)
-                    try:
-                        MetricsManager.get_instance().record_inference_failure(model)
-                    except Exception:
-                        pass
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
                     status_code = GenieErrorMappings.get_http_status_code(error_msg)
@@ -471,9 +475,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     yield f"data: {json.dumps(error_payload)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                # Submit metrics to MetricsManager
                 try:
-                    if completion_tokens > 0:
+                    if stream_outcome == "success" and completion_tokens > 0:
                         total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
                         ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
                         avg_stream_latency_ms = (
@@ -496,6 +499,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             f"Total={total_pipeline_latency_ms:.1f}ms, "
                             f"Tokens={completion_tokens}"
                         )
+                    elif stream_outcome == "failure":
+                        MetricsManager.get_instance().record_inference_failure(model)
                 except Exception as metrics_err:
                     logger.error(f"VLM Event {event_id}: Failed to record metrics: {metrics_err}")
 
@@ -504,9 +509,12 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     try:
                         from openapi_server.events.conversation_event import EventState
                         if event_object.state == EventState.ACTIVE:
-                            if getattr(event_object, 'is_cancelled', False):
+                            if stream_outcome == "cancelled" or getattr(event_object, 'is_cancelled', False):
                                 logger.info(f"VLM Event {event_id}: Stream ended due to cancellation")
                                 event_object.cancel_turn()
+                            elif stream_outcome == "failure":
+                                logger.info(f"VLM Event {event_id}: Marking event as failed from streaming generator")
+                                event_object.fail_turn(stream_failure or Exception("Stream aborted or failed"))
                             else:
                                 logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
                                 event_object.complete_turn()
@@ -551,6 +559,8 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         default_max_completion_tokens: int = 300
     ) -> Union[CreateChatCompletionResponse, Error]:
         """Handle non-streaming response using VLMProcessManager."""
+        request_outcome = "pending"
+        request_failure: Optional[Exception] = None
         try:
             # Accumulate tokens from VLM process
             accumulated_content = []
@@ -609,10 +619,16 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             )
 
             logger.info(f"VLM Event {event_id}: Non-streaming completed, {len(full_content)} chars")
+            request_outcome = "success"
 
             return response
 
         except Exception as e:
+            if event_object and getattr(event_object, 'is_cancelled', False):
+                request_outcome = "cancelled"
+            else:
+                request_outcome = "failure"
+                request_failure = e
             logger.error(f"VLM non-streaming error: {e}", exc_info=True)
             return Error(
                 code="500",
@@ -621,14 +637,23 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 type=Parameters.INTERNAL_TYPE
             )
         finally:
+            if request_outcome == "failure":
+                try:
+                    MetricsManager.get_instance().record_inference_failure(request_data.model)
+                except Exception as metrics_err:
+                    logger.error(f"VLM Event {event_id}: Failed to record terminal inference failure: {metrics_err}")
+
             # Complete/cancel event before callback
             if event_object:
                 try:
                     from openapi_server.events.conversation_event import EventState
                     if event_object.state == EventState.ACTIVE:
-                        if getattr(event_object, 'is_cancelled', False):
+                        if request_outcome == "cancelled" or getattr(event_object, 'is_cancelled', False):
                             logger.info(f"VLM Event {event_id}: Non-streaming cancelled")
                             event_object.cancel_turn()
+                        elif request_outcome == "failure":
+                            logger.info(f"VLM Event {event_id}: Marking event as failed from non-streaming response")
+                            event_object.fail_turn(request_failure or Exception("VLM request failed"))
                         else:
                             logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
                             event_object.complete_turn()

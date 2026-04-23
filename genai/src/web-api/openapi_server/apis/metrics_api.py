@@ -42,16 +42,14 @@ router = APIRouter()
                                 "avg_ttft_ms": 120.5,
                                 "avg_tokens_per_second": 25.4,
                                 "avg_stream_latency_ms": 39.4,
-                                "avg_total_pipeline_latency_ms": 4500.0,
-                                "total_requests": 100
+                                "avg_total_pipeline_latency_ms": 4500.0
                             },
                             "llava-v1.5-7b": {
                                 "avg_preprocessing_time_ms": 18.3,
                                 "avg_ttft_ms": 210.7,
                                 "avg_tokens_per_second": 12.1,
                                 "avg_stream_latency_ms": 82.6,
-                                "avg_total_pipeline_latency_ms": 6200.0,
-                                "total_requests": 42
+                                "avg_total_pipeline_latency_ms": 6200.0
                             }
                         }
                     }
@@ -78,10 +76,11 @@ async def get_metrics() -> Dict:
     - `avg_tokens_per_second` — steady-state token generation rate
     - `avg_stream_latency_ms` — average inter-token stream latency
     - `avg_total_pipeline_latency_ms` — end-to-end total pipeline latency
-    - `total_requests` — total number of requests processed for this model
     """
     try:
         metrics = MetricsManager.get_instance().get_metrics()
+        for model_stats in metrics.get("models", {}).values():
+            model_stats.pop("consecutive_failures", None)
         logger.debug("Metrics snapshot retrieved")
         return metrics
     except Exception as e:

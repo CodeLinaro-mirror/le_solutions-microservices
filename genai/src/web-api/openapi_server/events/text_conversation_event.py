@@ -205,7 +205,10 @@ class TextConversationEvent(ConversationEvent):
 
             response_content = "".join(accumulated_content)
 
-            # Record non-streaming metrics (TPS approximated as total_tokens / total_time)
+            if not response_content or response_content.strip() == "":
+                raise ValueError("LLM returned empty response")
+
+            # Record non-streaming metrics only for successful completions.
             try:
                 if accumulated_content:
                     MetricsManager.get_instance().record_inference_metrics(
@@ -215,9 +218,6 @@ class TextConversationEvent(ConversationEvent):
                     )
             except Exception as metrics_err:
                 logger.error(f"Event {self.event_id}: Failed to record non-streaming metrics: {metrics_err}")
-
-            if not response_content or response_content.strip() == "":
-                raise ValueError("LLM returned empty response")
 
             # 4. Handle Response (Tool calls vs Regular)
             tool_calls = ToolHandler.parse_tool_response(response_content)
@@ -284,6 +284,8 @@ class TextConversationEvent(ConversationEvent):
 
             completion_tokens = 0
             full_response_content = []
+            stream_outcome = "pending"
+            stream_failure: Optional[Exception] = None
 
             has_tools = hasattr(request_data, 'tools') and request_data.tools
             is_potential_tool_call = False
@@ -488,9 +490,11 @@ class TextConversationEvent(ConversationEvent):
                     self.session.complete_current_event()
 
                 yield "data: [DONE]\n\n"
+                stream_outcome = "success"
 
             except asyncio.CancelledError:
                 # Client disconnected mid-stream; cancel event and stop the subprocess.
+                stream_outcome = "cancelled"
                 logger.info(f"Event {self.event_id}: Stream cancelled by client")
                 self.is_cancelled = True
                 try:
@@ -500,16 +504,14 @@ class TextConversationEvent(ConversationEvent):
                 raise
             except Exception as e:
                 # Check if this error is due to cancellation
-                if self.is_cancelled or "closed file" in str(e).lower() or isinstance(e, (EOFError, BrokenPipeError)):
+                if self.is_cancelled:
+                    stream_outcome = "cancelled"
                     logger.info(f"Event {self.event_id}: Stream terminated due to cancellation")
                     # Don't yield error chunk for cancelled requests
                 else:
+                    stream_outcome = "failure"
+                    stream_failure = e
                     logger.error(f"Error in stream generator: {e}", exc_info=True)
-                    # Record failure for health monitoring (not for cancellations)
-                    try:
-                        MetricsManager.get_instance().record_inference_failure(self.model_id)
-                    except Exception:
-                        pass
 
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
@@ -536,9 +538,8 @@ class TextConversationEvent(ConversationEvent):
                     }
                     yield f"data: {json.dumps(error_payload)}\n\n"
             finally:
-                # Submit metrics to MetricsManager
                 try:
-                    if completion_tokens > 0:
+                    if stream_outcome == "success" and completion_tokens > 0:
                         total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
                         ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
                         avg_stream_latency_ms = (
@@ -563,22 +564,24 @@ class TextConversationEvent(ConversationEvent):
                             f"Total={total_pipeline_latency_ms:.1f}ms, "
                             f"Tokens={completion_tokens}"
                         )
+                    elif stream_outcome == "failure":
+                        MetricsManager.get_instance().record_inference_failure(self.model_id)
                 except Exception as metrics_err:
                     logger.error(f"Event {self.event_id}: Failed to record metrics: {metrics_err}")
 
                 # Always ensure event is completed/cancelled/failed and callback triggered
                 if self.state == EventState.ACTIVE:
-                    if self.is_cancelled:
+                    if stream_outcome == "cancelled" or self.is_cancelled:
                         logger.info(f"Event {self.event_id}: Stream ended due to cancellation")
                         self.cancel_turn()
-                    elif self._is_tool_calling and not self._tool_response_received:
+                    elif stream_outcome == "success" and self._is_tool_calling and not self._tool_response_received:
                         logger.info(
                             f"Event {self.event_id}: Stream ended after tool call request; "
                             "keeping event ACTIVE for tool continuation"
                         )
                     else:
                         logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
-                        self.fail_turn(Exception("Stream aborted or failed"))
+                        self.fail_turn(stream_failure or Exception("Stream aborted or failed"))
 
                 if self._completion_callback:
                     logger.info(f"Event {self.event_id}: Triggering completion callback in finally block")
@@ -733,6 +736,11 @@ class TextConversationEvent(ConversationEvent):
                     return await self.execute_turn(request_data)
             except Exception as retry_error:
                 logger.error(f"Event {self.event_id}: Retry failed: {retry_error}")
+
+        try:
+            MetricsManager.get_instance().record_inference_failure(self.model_id)
+        except Exception as metrics_err:
+            logger.error(f"Event {self.event_id}: Failed to record terminal inference failure: {metrics_err}")
 
         # Avoid abrupt global kill for per-request failures.
         # Graceful shutdown lets the manager recover without force-killing the subprocess.

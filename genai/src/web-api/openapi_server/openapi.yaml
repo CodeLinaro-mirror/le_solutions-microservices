@@ -725,11 +725,6 @@ components:
           nullable: true
           description: >
             End-to-End — average total pipeline latency in ms.
-        total_requests:
-          type: integer
-          description: Total number of requests processed for this model (all time).
-      required:
-        - total_requests
 
     ChatCompletionCancelled:
       type: object

@@ -91,19 +91,28 @@ class ModelMetrics:
             self._total_requests += 1
             # Reset consecutive failures on success
             self._consecutive_failures = 0
+            logger.info(
+                f"Model {self.model_id}: request recorded — "
+                f"total_requests={self._total_requests}, "
+                f"total_failures={self._total_failures}, "
+                f"consecutive_failures={self._consecutive_failures}"
+            )
 
     def record_failure(self):
         """
         Record an inference failure for this model.
-        Increments both total_failures and consecutive_failures.
+        Increments consecutive_failures, total_failures, and total_requests.
         consecutive_failures is reset to 0 on the next successful request.
         """
         with self._lock:
-            self._total_failures += 1
             self._consecutive_failures += 1
-            logger.debug(
+            self._total_failures += 1
+            self._total_requests += 1
+            logger.info(
                 f"Model {self.model_id}: failure recorded — "
-                f"consecutive={self._consecutive_failures}, total={self._total_failures}"
+                f"total_requests={self._total_requests}, "
+                f"total_failures={self._total_failures}, "
+                f"consecutive_failures={self._consecutive_failures}"
             )
 
     def get_averages(self) -> Dict:
@@ -123,8 +132,6 @@ class ModelMetrics:
                 "avg_tokens_per_second": _avg(self._tokens_per_second_window),
                 "avg_stream_latency_ms": _avg(self._stream_latency_window),
                 "avg_total_pipeline_latency_ms": _avg(self._total_pipeline_latency_window),
-                "total_requests": self._total_requests,
-                "total_failures": self._total_failures,
                 "consecutive_failures": self._consecutive_failures,
             }
             return result
