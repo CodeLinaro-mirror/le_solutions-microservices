@@ -82,7 +82,13 @@ class TTSService(BaseService):
 
         # Service coordinator for managing resource conflicts with ASR and T2T
         self.coordinator = get_service_coordinator()
-        
+
+        # Language code mapping
+        self.TTS_LANGUAGE_CODE_MAPPING = {
+            "melo": Config.MELO_LANGUAGE_CODE_MAP,
+            "piper": Config.PIPER_LANGUAGE_CODE_MAP
+        }
+
         if not self.dev_mode:
             self.logger.info("Running in production mode - initializing TTS engine")
             try:
@@ -954,41 +960,9 @@ class TTSService(BaseService):
                 pitch = float(request.parameters.get("pitch", 0.0))
                 volume_gain = float(request.parameters.get("gain", 0.0))
             
-            # Map language to language code (default to English = 0)
-            language_code_map = {
-                "en": 0,  # melo_en
-                "zh": 1,  # melo_zh
-                "de": 2,  # melo_de
-                "es": 3,  # melo_es
-                "ru": 4,  # melo_ru
-                "ko": 5,  # melo_ko
-                "fr": 6,  # melo_fr
-                "ja": 7,  # melo_ja
-                "pt": 8,  # melo_pt
-                "tr": 9,  # melo_tr
-                "pl": 10, # melo_pl
-                "ca": 11, # melo_ca
-                "nl": 12, # melo_nl
-                "ar": 13, # melo_ar
-                "sv": 14, # melo_sv
-                "it": 15, # melo_it
-                "id": 16, # melo_id
-                "hi": 17, # melo_hi
-                "fi": 18, # melo_fi
-                "vi": 19, # melo_vi
-                "he": 20, # melo_he
-                "uk": 21, # melo_uk
-                "el": 22, # melo_el
-                "ms": 23, # melo_ms
-                "cs": 24, # melo_cs
-                "ro": 25, # melo_ro
-                "da": 26, # melo_da
-                "hu": 27, # melo_hu
-                "ta": 28, # melo_ta
-                "no": 29  # melo_no
-            }
-
-            language_code = language_code_map.get(request.language.lower() if request.language else "", 0)  # normalize to lowercase
+            # Get the appropriate language code map based on model type
+            language_code_map = self.TTS_LANGUAGE_CODE_MAPPING[model_config["model_type"]]
+            language_code = language_code_map.get(request.language.lower() if request.language else "", 0)
             
             # Get or create singleton TTS instance (only reinit if model changed)
             async with self.tts_instance_lock:
@@ -1041,8 +1015,14 @@ class TTSService(BaseService):
                 # Use the singleton instance
                 tts_instance = self.tts_instance
             
-            # TTS engine ALWAYS outputs at 44100 Hz regardless of the sample_rate parameter
-            engine_sample_rate = 44100
+            # Each model has its own required sample rates
+            model_sample_rate = {
+                "melo" : 44100,
+                "piper": 22050
+            }
+
+            # TTS engine sample rate based on model. Melo is 44100, Piper is 22050
+            engine_sample_rate = model_sample_rate[model_config["model_type"]]
             engine_channels = 1
             
             # Get requested sample rate (default to 44100 if not specified)

@@ -130,7 +130,12 @@
             "language_name": "English",
             "gender": "neutral",
             "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
             "sample_rate": 44100,
+            "language_code": 0,
             "description": "Default voice for English",
             "model_path": "/opt/audio/models/tts/melo_en.64_bit.qnn_v2.33.0.qnn"
           }
@@ -146,12 +151,12 @@
           "supports_resampling": false
         },
         "parameters": {
-          "max_text_length": 2000,
+          "max_text_length": 1024,
           "supported_formats": ["wav"],
           "sample_rates": [44100],
-          "speed_range": [1.0, 1.0],
-          "pitch_range": [1.0, 1.0],
-          "volume_range": [1.0, 1.0]
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
         },
         "loaded": false
       },
@@ -168,7 +173,12 @@
             "language_name": "Spanish",
             "gender": "neutral",
             "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
             "sample_rate": 44100,
+            "language_code": 2,
             "description": "Default voice for Spanish",
             "model_path": "/opt/audio/models/tts/melo_es.64_bit.qnn_v2.33.0.qnn"
           }
@@ -184,12 +194,12 @@
           "supports_resampling": false
         },
         "parameters": {
-          "max_text_length": 2000,
+          "max_text_length": 1024,
           "supported_formats": ["wav"],
           "sample_rates": [44100],
-          "speed_range": [1.0, 1.0],
-          "pitch_range": [1.0, 1.0],
-          "volume_range": [1.0, 1.0]
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
         },
         "loaded": false,
         "memory_usage_mb": 2048
@@ -207,7 +217,12 @@
             "language_name": "Chinese",
             "gender": "neutral",
             "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
             "sample_rate": 44100,
+            "language_code": 1,
             "description": "Default voice for Chinese",
             "model_path": "/opt/audio/models/tts/melo_zh.64_bit.qnn_v2.33.0.qnn"
           }
@@ -223,12 +238,55 @@
           "supports_resampling": false
         },
         "parameters": {
-          "max_text_length": 2000,
+          "max_text_length": 1024,
           "supported_formats": ["wav", "mp3"],
           "sample_rates": [44100],
-          "speed_range": [1.0, 1.0],
-          "pitch_range": [1.0, 1.0],
-          "volume_range": [1.0, 1.0]
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
+        },
+        "loaded": false
+      },
+      {
+        "name": "piper-tts-en",
+        "display_name": "Piper TTS English",
+        "version": "1.0.0",
+        "description": "Piper text-to-speech model for English",
+        "voices": [
+          {
+            "name": "default",
+            "display_name": "Default Voice",
+            "language": "en",
+            "language_name": "English",
+            "gender": "neutral",
+            "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
+            "sample_rate": 22050,
+            "language_code": 0,
+            "description": "Default voice for English using Piper",
+            "model_path": "/opt/audio/models/tts/piper_en.64_bit.qnn_v2.33.0.qnn"
+          }
+        ],
+        "capabilities": {
+          "supports_gender": false,
+          "supports_style": false,
+          "supports_sample_rate": false,
+          "supports_ssml": false,
+          "supports_speed_control": false,
+          "supports_pitch_control": false,
+          "supports_volume_control": false,
+          "supports_resampling": false
+        },
+        "parameters": {
+          "max_text_length": 1024,
+          "supported_formats": ["wav"],
+          "sample_rates": [22050],
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
         },
         "loaded": false
       }

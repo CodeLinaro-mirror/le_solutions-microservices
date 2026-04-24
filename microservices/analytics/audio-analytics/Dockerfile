@@ -217,9 +217,20 @@ USER root
 RUN mkdir -p /usr/src/engine/python /opt/audio/models /usr/src/engine/native /usr/src/engine/models/whisper
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/*.py /usr/src/server/
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/melo /usr/src/server/melo
+COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/piper /usr/src/server/piper
 
-# Pre-compile all melo dictionary modules so imports take <1s instead of ~27s
-RUN python3 -m compileall -q /usr/src/server/melo
+# Move .pyc files directly into their package dir (keeping cpython tag), remove __pycache__ and stub .py files.
+# Python can load .pyc files placed directly in the package directory without a .py source file.
+RUN find /usr/src/server/melo -name '__pycache__' | while read cache_dir; do \
+      pkg_dir=$(dirname "$cache_dir"); \
+      for pyc in "$cache_dir"/*.pyc; do \
+        [ -f "$pyc" ] || continue; \
+        base=$(basename "$pyc" | sed 's/\.cpython-[0-9]*\.pyc$/.pyc/'); \
+        mv "$pyc" "$pkg_dir/$base"; \
+      done; \
+      rm -rf "$cache_dir"; \
+    done && \
+    find /usr/src/server/melo -mindepth 2 -name '*.py' ! -name '__init__.py' -delete
 COPY --chown=root:root audio-analytics-server/engine/native/aarch64-oe-linux/*.so /usr/src/engine/native/
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/models/whisper/ /usr/src/engine/models/whisper/
 #COPY --chown=iot-user:iot-user audio-analytics-server/engine/config/models.json /opt/audio/models/models.json
@@ -239,7 +250,7 @@ ARG INSTALL_NATIVE_LIBS
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-      python3 supervisor ca-certificates && \
+      python3 supervisor ca-certificates curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -376,7 +387,7 @@ EOF
 EXPOSE 8085 8001 8000
 # Use python3 for healthcheck — eliminates the need for curl in the runtime image
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8085/audio-analytics/v1/api/health')" || exit 1
+  CMD curl -f http://localhost:8085/audio-analytics/v1/api/health || exit 1
 
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379

@@ -23,8 +23,8 @@ import sys
 import time
 import threading
 
-from melo.tts_melo_model_generation import generate_model, generate_packed_model_file
 import wrapper_utils as wu
+from tts_model_registry import get_model_config, is_model_registered, list_registered_models
 
 # Environment variable for model storage location
 TTS_MODEL_STORE_DIR = os.environ.get('TTS_MODEL_STORE_DIR', '/tmp/audio-cache')
@@ -271,8 +271,16 @@ class TTS:
     @staticmethod
     def _write_cache_files_bg(model_buffer, source_cache_location,
                               tmp_cache_location, store_location_dir,
-                              cancel_event: threading.Event):
+                              cancel_event: threading.Event, model_type):
         """Write packed .qnn cache files in a background thread."""
+        # Get the appropriate generator based on model type
+        try:
+            model_config = get_model_config(model_type)
+            generate_packed_model_file = model_config.generate_packed_file_func
+        except ValueError as e:
+            print(f"[cache_writer] Error: {e}")
+            return
+        
         # ── Write persistent cache (alongside model assets) ───────────────────
         if cancel_event.is_set():
             print(f"[cache_writer] Cancelled before persistent cache write")
@@ -393,22 +401,47 @@ class TTS:
                 print(f"No {model} found in {model_dir_location}")
                 return
 
-        model_files = {
-            "bert_model", 
-            "bert_tokenizer", 
-            "bert_normalizer", 
-            "melo_encoder", 
-            "melo_flow", 
-            "melo_decoder", 
-            "g2p_encoder", 
-            "g2p_decoder",
-            "sdp_model",
+        generic_model_files = {
+            # Generic keys (new config format for models down the line)
+            "model",
+            "tokenizer",
+            "normalizer",
+            "encoder",
+            "flow",
+            "decoder",
+            "sdp",
+
+            # Common keys (used by both Melo, Piper, and future models)
+            "g2p_encoder",
+            "g2p_decoder"
         }
+
+        legacy_melo_model_files = {
+            # Melo-specific keys (legacy format)
+            "bert_model",
+            "bert_tokenizer",
+            "bert_normalizer",
+            "melo_encoder",
+            "melo_flow",
+            "melo_decoder",
+            "sdp_model",
+            
+            # Common keys (used by both Melo, Piper, and future models)
+            "g2p_encoder",
+            "g2p_decoder"
+        }
+
+        # Detect model type from config or directory structure
+        model_type = config_json.get("model_type", "melo").lower()
+
+        model_files = legacy_melo_model_files if model_type == "melo" else generic_model_files
 
         # Some files are not required for the models. If they are not in the dir, it is not needed
         for model_file in model_files:
             if model_file not in models_dict:
                 models_dict[model_file] = None
+
+        print(f"Models Dict: {models_dict}")
 
         voices = config_json["voices"]
 
@@ -508,26 +541,55 @@ class TTS:
         model_version_major = 2 if is_model_quantized else 1
         model_version_minor = 0
 
-        model_buffer = generate_model(
-            bert_model              = models_dict.get("bert_model"),
-            bert_tokenizer          = models_dict.get("bert_tokenizer"),
-            bert_normalizer         = models_dict.get("bert_normalizer"),
-            melo_encoder_model      = models_dict.get("melo_encoder"),
-            melo_flow_model         = models_dict.get("melo_flow"),
-            melo_decoder_model      = models_dict.get("melo_decoder"),
-            g2p_enc_model           = models_dict.get("g2p_encoder"),
-            g2p_dec_model           = models_dict.get("g2p_decoder"),
-            model_version_major     = model_version_major,
-            model_version_minor     = model_version_minor,
-            qnn_version_major       = int(runtimes.get("qnn_version", {}).get("major")),
-            qnn_version_minor       = int(runtimes.get("qnn_version", {}).get("minor")),
-            qnn_version_patch       = int(runtimes.get("qnn_version", {}).get("patch")),
-            arch_bit                = int(runtimes.get("arch_bit")),
-            model_lang              = runtimes.get("language"),
-            scratch_mem_size_req    = int(runtimes.get("scratch_mem_size_req")),
-            is_model_quantized      = is_model_quantized,
-            melo_sdp_model          = models_dict.get("sdp_model")
-        )
+        print(f"[init_dir] Detected model type: {model_type}")
+
+        # Validate model type is registered
+        if not is_model_registered(model_type):
+            raise ValueError(
+                f"Unknown model type: {model_type}. "
+                f"Available types: {list_registered_models()}"
+            )
+        
+        # Get model configuration
+        model_config = get_model_config(model_type)
+        print(f"[init_dir] Using {model_config.name} model generator")
+        
+        # Prepare common model generation parameters
+        model_gen_params = {
+            "bert_model": models_dict.get("model") or models_dict.get("bert_model"),
+            "bert_tokenizer": models_dict.get("tokenizer") or models_dict.get("bert_tokenizer"),
+            "bert_normalizer": models_dict.get("normalizer") or models_dict.get("bert_normalizer"),
+            "g2p_enc_model": models_dict.get("g2p_encoder"),
+            "g2p_dec_model": models_dict.get("g2p_decoder"),
+            "model_version_major": model_version_major,
+            "model_version_minor": model_version_minor,
+            "qnn_version_major": int(runtimes.get("qnn_version", {}).get("major")),
+            "qnn_version_minor": int(runtimes.get("qnn_version", {}).get("minor")),
+            "qnn_version_patch": int(runtimes.get("qnn_version", {}).get("patch")),
+            "arch_bit": int(runtimes.get("arch_bit")),
+            "is_model_quantized": is_model_quantized,
+            "model_lang": runtimes.get("language"),
+            "scratch_mem_size_req": int(runtimes.get("scratch_mem_size_req"))
+        }
+        
+        # Add model-specific parameters based on model type
+        if model_type == "piper":
+            model_gen_params.update({
+                "piper_encoder_model": models_dict.get("encoder"),
+                "piper_sdp_model": models_dict.get("sdp"),
+                "piper_flow_model": models_dict.get("flow"),
+                "piper_decoder_model": models_dict.get("decoder"),
+            })
+        else: # Melo model
+            model_gen_params.update({
+                "melo_encoder_model": models_dict.get("encoder") or models_dict.get("melo_encoder"),
+                "melo_flow_model": models_dict.get("flow") or models_dict.get("melo_flow"),
+                "melo_decoder_model": models_dict.get("decoder") or models_dict.get("melo_decoder"),
+                "melo_sdp_model": models_dict.get("sdp") or models_dict.get("sdp_model"),
+            })
+
+        # Generate model buffer using the registered generator function
+        model_buffer = model_config.generate_model_func(**model_gen_params)
         print(f"[init_dir] generate_model() took {time.time() - t_gen:.2f}s")
 
         # ── Initialize immediately from the in-memory buffer ──────────────────
@@ -552,6 +614,7 @@ class TTS:
                 tmp_cache_location,
                 store_location_dir,
                 TTS._cache_writer_cancel,
+                model_type,
             ),
             daemon=True,
             name="tts-cache-writer",

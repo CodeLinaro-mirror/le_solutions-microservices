@@ -781,7 +781,7 @@ class ASRService(BaseService):
                         # Extract model paths from config
                         _model_dir = model_info.get("model_path", "")
                         _assets = model_info.get("assets", {})
-                        encoder_path = os.path.join(_model_dir, _assets.get("model_path", "")).encode("utf-8")
+                        encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
                         decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
                         vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
                         speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"
@@ -1347,7 +1347,7 @@ class ASRService(BaseService):
                 # Extract model paths from config
                 _model_dir = model_info.get("model_path", "")
                 _assets = model_info.get("assets", {})
-                encoder_path = os.path.join(_model_dir, _assets.get("model_path", "")).encode("utf-8")
+                encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
                 decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
                 vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
                 speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"

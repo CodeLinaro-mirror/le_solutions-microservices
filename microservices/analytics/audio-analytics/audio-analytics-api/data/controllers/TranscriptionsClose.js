@@ -15,7 +15,7 @@ module.exports.closeTranscription = async function closeTranscription (req, res,
         messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut,
             {message_type: 'transcriptions_close', session_id: sessionId},
             (err, data) => {
-                console.log(`[close] callback received — err=${err}, data=${JSON.stringify(data)}`);
+                console.log(`[close] callback received â€” err=${err}, data=${JSON.stringify(data)}`);
                 if (res.headersSent) return;
                 if (err) {
                     return res.status(500).json({
