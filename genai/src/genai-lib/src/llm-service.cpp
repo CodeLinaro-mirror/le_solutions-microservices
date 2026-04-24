@@ -6,6 +6,9 @@
 //=============================================================================
 
 #include "llm-service.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
 
 namespace {
 struct ReasoningMarkerPair {
@@ -104,6 +107,56 @@ std::string filterThinkBlocks(const std::string& chunk, QueryStruct* qmtx) {
 
     return out;
 }
+
+static void customGenieLogCallback(
+    const _GenieLog_Handle_t* handle,
+    const char* format,
+    GenieLog_Level_t level,
+    long unsigned int timestampOrSize,
+    va_list args) {
+    (void)handle;
+    (void)timestampOrSize;
+
+    const char* levelStr = "INFO";
+    if (level == GENIE_LOG_LEVEL_ERROR) {
+        levelStr = "ERROR";
+    } else if (level == GENIE_LOG_LEVEL_WARN) {
+        levelStr = "WARN";
+    } else if (level == GENIE_LOG_LEVEL_VERBOSE) {
+        levelStr = "VERBOSE";
+    }
+
+    char buffer[4096];
+    if (format) {
+        vsnprintf(buffer, sizeof(buffer), format, args);
+    } else {
+        buffer[0] = '\0';
+    }
+
+    std::fprintf(stdout, "[GenIE-SDK] [%s] %s\n", levelStr, buffer);
+    std::fflush(stdout);
+}
+
+static GenieLog_Level_t parseGenieLogLevel(const char* levelStr) {
+    if (!levelStr) {
+        return GENIE_LOG_LEVEL_INFO;
+    }
+    std::string level(levelStr);
+    std::transform(level.begin(), level.end(), level.begin(), ::tolower);
+    if (level == "error" || level == "err") {
+        return GENIE_LOG_LEVEL_ERROR;
+    }
+    if (level == "warn" || level == "warning") {
+        return GENIE_LOG_LEVEL_WARN;
+    }
+    if (level == "info") {
+        return GENIE_LOG_LEVEL_INFO;
+    }
+    if (level == "verbose" || level == "debug") {
+        return GENIE_LOG_LEVEL_VERBOSE;
+    }
+    return GENIE_LOG_LEVEL_INFO;
+}
 }  // namespace
 
 Profile::Profile() {
@@ -169,7 +222,24 @@ SamplerConfig::~SamplerConfig() {
     }
 }
 
-Dialog::Config::Config(const std::string& config, std::shared_ptr<Profile> profile) {
+Log::Log(GenieLog_Level_t logLevel) {
+    const int32_t status = GenieLog_create(
+        nullptr, customGenieLogCallback, logLevel, &m_handle);
+    if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
+        throw std::runtime_error("Failed to create the log handle.");
+    }
+}
+
+Log::~Log() {
+    const int32_t status = GenieLog_free(m_handle);
+    if (GENIE_STATUS_SUCCESS != status) {
+        std::cerr << "Failed to free the log handle." << std::endl;
+    }
+}
+
+Dialog::Config::Config(const std::string& config,
+                       std::shared_ptr<Profile> profile,
+                       std::shared_ptr<Log> log) {
     int32_t status = GenieDialogConfig_createFromJson(config.c_str(), &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
       throw std::runtime_error("Failed to create the dialog config.");
@@ -180,6 +250,13 @@ Dialog::Config::Config(const std::string& config, std::shared_ptr<Profile> profi
       status          = GenieDialogConfig_bindProfiler(m_handle, m_profileHandle);
       if (GENIE_STATUS_SUCCESS != status) {
         throw std::runtime_error("Failed to bind the profile handle with the dialog config.");
+      }
+    }
+
+    if (log) {
+      status = GenieDialogConfig_bindLogger(m_handle, (*log)());
+      if (GENIE_STATUS_SUCCESS != status) {
+        throw std::runtime_error("Failed to bind the log handle with the dialog config.");
       }
     }
 }
@@ -350,7 +427,16 @@ LLMObject::LLMObject(std::string model, std::string config_path, std::string sam
     std::cout << "Successfully loaded config for model: " << model << std::endl;
 
     sc_configPath = sampler_config_path.empty() ? "sampler.json" : sampler_config_path;
-    diag = new Dialog(Dialog::Config(config, profiler));
+    const char* logLevelEnv = std::getenv("LOG_LEVEL");
+    GenieLog_Level_t logLevel = parseGenieLogLevel(logLevelEnv);
+    logger = std::make_shared<Log>(logLevel);
+    std::cout << "[LLMObject] Genie log level: "
+              << (logLevel == GENIE_LOG_LEVEL_ERROR ? "ERROR" :
+                  logLevel == GENIE_LOG_LEVEL_WARN ? "WARN" :
+                  logLevel == GENIE_LOG_LEVEL_INFO ? "INFO" :
+                  "VERBOSE")
+              << std::endl;
+    diag = new Dialog(Dialog::Config(config, profiler, logger));
 }
 
 void LLMObject::resetDialog() {
