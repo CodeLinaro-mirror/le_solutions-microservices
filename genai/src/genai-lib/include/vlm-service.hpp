@@ -22,24 +22,9 @@
 
 #include "GeniePipeline.h"
 #include "GenieNode.h"
-#include "GenieProfile.h"
 #include "GenieLog.h"
 #include "GenieSampler.h"
 #include "llm-buffer.h"
-
-class Profile
-{
-    public:
-        std::string profilePath = "profile.txt";
-        Profile();
-        ~Profile();
-        void getJsonData();
-        GenieProfile_Handle_t getProfileHandle() { return m_handle; }
-        GenieProfile_Handle_t operator()() const { return m_handle; }
-
-    private:
-        GenieProfile_Handle_t m_handle = NULL;
-};
 
 class Log
 {
@@ -69,7 +54,7 @@ class Pipeline {
 public:
     class Config {
     public:
-        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile, std::shared_ptr<Log> log = nullptr);
+        Config(const std::string& jsonConfig, std::shared_ptr<Log> log = nullptr);
         ~Config();
         Config(const Config&) = delete;
         Config& operator=(const Config&) = delete;
@@ -111,7 +96,7 @@ class Node {
 public:
     class Config {
     public:
-        Config(const std::string& jsonConfig, std::shared_ptr<Profile> profile, std::shared_ptr<Log> log = nullptr);
+        Config(const std::string& jsonConfig, std::shared_ptr<Log> log = nullptr);
         ~Config();
         Config(const Config&) = delete;
         Config& operator=(const Config&) = delete;
@@ -202,7 +187,6 @@ public:
 
     /* OpenAI‑compatible query */
     std::unique_ptr<Query> query;
-    std::shared_ptr<Profile> profiler;
     std::shared_ptr<Log> logger;
 
     char id[256];
@@ -229,6 +213,8 @@ private:
     /* Per-request text prompt that must remain valid during async pipeline
      * execution. */
     std::string currentPromptData;
+    std::string currentPreVisionText;
+    std::string currentPostVisionText;
 
     /* Per-request static custom inputs that must remain valid during async pipeline
      * execution to avoid dangling pointers. */

@@ -52,6 +52,9 @@ class TextConversationEvent(ConversationEvent):
         config_manager = ModelConfigManager()
         self.context_size = config_manager.get_context_size(model_id)
 
+        # Determine max completion tokens fallback from context size
+        self.default_max_completion_tokens = int(self.context_size * 0.5)
+
         # Flag to track if we need to inject summary
         self.inject_summary = False
 
@@ -61,48 +64,69 @@ class TextConversationEvent(ConversationEvent):
 
         logger.info(f"Created TextConversationEvent {event_id} for model {model_id} (context: {self.context_size})")
 
-    def _should_summarize(self, projected_tokens: int, max_completion_tokens: int = 0) -> bool:
+    def _should_summarize(self, max_completion_tokens: int = 0) -> bool:
         """
-        Determine if summarization should be triggered.
+        Determine if summarization should be triggered using new SDK 2.45+ formula.
+
+        New Formula: (system_prompt_tokens * 1.3) + tokens_so_far + max_completion_tokens > 0.9 * context_size
+
+        This accounts for:
+        - System prompt overhead (1.3x multiplier for formatting)
+        - Cumulative tokens accumulated so far
+        - Reserved space for model completion
+        - 90% threshold (more aggressive than old 70%)
 
         Args:
-            projected_tokens: Estimated tokens for the new incoming message.
             max_completion_tokens: Maximum tokens the model may generate in this turn.
-                                   Including this ensures we reserve enough headroom in
-                                   the KV cache so the model doesn't crash mid-generation.
         """
         # Skip for tool continuations
         if self._is_tool_calling and self._tool_response_received:
             return False
 
-        # Get threshold from model config
-        config_manager = ModelConfigManager()
-        summary_threshold_ratio = config_manager.get_summarization_threshold(self.model_id)
-        threshold = self.context_size * summary_threshold_ratio
+        # Get system prompt tokens (with overhead for formatting)
+        from openapi_server.impl.constant import (
+            SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD,
+            SUMMARIZATION_CONTEXT_THRESHOLD,
+            SUMMARIZATION_MAX_COMPLETION_MULTIPLIER
+        )
 
+        system_tokens = self.session.system_prompt_tokens or 0
+        system_overhead = system_tokens * SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD
+
+        # Get summary tokens (if any)
+        summary_tokens = self.session.summary_token_count or 0
+
+        # Get tokens accumulated since last summarization
+        # This avoids counting tokens that were already summarized
         tokens_since_last_summary = self.session.calculate_tokens_since_last_summarization()
 
-        # Include max_completion_tokens so we trigger summarization before the model
-        # runs out of KV cache space during output generation (not just during input).
-        projected_total = tokens_since_last_summary + projected_tokens + max_completion_tokens
+        # Calculate projected total using new formula
+        # Apply multiplier to max_completion_tokens
+        projected_total = (
+            system_overhead +
+            summary_tokens +
+            tokens_since_last_summary +
+            (max_completion_tokens * SUMMARIZATION_MAX_COMPLETION_MULTIPLIER)
+        )
+
+        # Use configured context threshold
+        threshold = self.context_size * SUMMARIZATION_CONTEXT_THRESHOLD
 
         should_summarize = projected_total >= threshold
 
         if should_summarize:
-            logger.info(f"Event {self.event_id}: Summarization threshold reached: "
-                       f"tokens_since_last={tokens_since_last_summary}, "
-                       f"projected_new={projected_tokens}, "
-                       f"max_completion={max_completion_tokens}, "
-                       f"total_projected={projected_total}, "
-                       f"threshold={threshold}")
+            weighted_max_completion = max_completion_tokens * SUMMARIZATION_MAX_COMPLETION_MULTIPLIER
+            logger.info(
+                f"Event {self.event_id}: Summarization threshold reached (new formula):\n"
+                f"  System overhead: {system_overhead:.0f} tokens ({system_tokens} * {SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD})\n"
+                f"  Summary tokens: {summary_tokens}\n"
+                f"  Tokens since last summary: {tokens_since_last_summary}\n"
+                f"  Max completion (weighted): {weighted_max_completion:.0f} tokens ({max_completion_tokens} * {SUMMARIZATION_MAX_COMPLETION_MULTIPLIER})\n"
+                f"  Total projected: {projected_total:.0f}\n"
+                f"  Threshold ({SUMMARIZATION_CONTEXT_THRESHOLD * 100:.0f}%): {threshold:.0f}"
+            )
 
         return should_summarize
-
-    def _calculate_projected_tokens(self, request_data) -> int:
-        """Estimate tokens for the new message."""
-        last_msg = request_data.messages[-1]
-        content = last_msg.content
-        return TokenCounter.estimate_tokens_for_multimodal_content(content)
 
     async def execute_turn(self, request_data) -> dict:
         """
@@ -112,11 +136,11 @@ class TextConversationEvent(ConversationEvent):
         try:
             # 1. Summarization Check
             if not self._is_tool_calling and not self._tool_response_received:
-                projected_tokens = self._calculate_projected_tokens(request_data)
-                max_completion = request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS
+                max_completion = request_data.max_completion_tokens or self.default_max_completion_tokens
 
-                if self._should_summarize(projected_tokens, max_completion):
-                    max_summary_tokens = int(self.context_size * 0.1)
+                if self._should_summarize(max_completion):
+                    from openapi_server.impl.constant import SUMMARIZATION_SUMMARY_SIZE_RATIO
+                    max_summary_tokens = int(self.context_size * SUMMARIZATION_SUMMARY_SIZE_RATIO)
                     logger.info(f"Event {self.event_id}: Triggering summarization (max {max_summary_tokens} tokens)")
 
                     try:
@@ -170,7 +194,7 @@ class TextConversationEvent(ConversationEvent):
                 model=self.model_id,
                 prompt=prompt_content,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
+                max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                 top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
@@ -273,7 +297,7 @@ class TextConversationEvent(ConversationEvent):
                     model=self.model_id,
                     prompt=prompt_content,
                     streaming=True,
-                    max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
+                    max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
                     temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                     top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                     top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
@@ -611,7 +635,7 @@ class TextConversationEvent(ConversationEvent):
                 model=self.model_id,
                 prompt=formatted_content,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or QUERY_CONST.DEFAULT_MAX_COMPLETION_TOKENS,
+                max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                 top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),

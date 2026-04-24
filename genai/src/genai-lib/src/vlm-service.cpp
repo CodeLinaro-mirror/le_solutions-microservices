@@ -20,51 +20,6 @@
 #include <cstdlib>  // For std::getenv
 #include <cstdarg>  // For va_list, vsnprintf
 
-Profile::Profile() {
-    const int32_t status = GenieProfile_create(nullptr, &m_handle);
-    if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
-        throw std::runtime_error(
-            "Failed to create the profile handle.");
-    }
-}
-
-void Profile::getJsonData() {
-    const char* jsonData = nullptr;
-    const Genie_AllocCallback_t callback(
-        [](size_t size, const char** data) {
-            *data = (char*)malloc(size);
-            if (*data == nullptr) {
-                throw std::runtime_error(
-                    "Cannot allocate memory for JSON data");
-            }
-        });
-
-    const int32_t status = GenieProfile_getJsonData(
-        m_handle, callback, &jsonData);
-    if (GENIE_STATUS_SUCCESS != status) {
-        throw std::runtime_error("Failed to get the profile data");
-    }
-
-    std::ofstream outFile;
-    outFile.open(profilePath);
-    if (!outFile.good()) {
-        throw std::runtime_error(
-            "Cannot create profile output file with name:" +
-            profilePath);
-    }
-    outFile << jsonData;
-    outFile.close();
-    free((char*)jsonData);
-}
-
-Profile::~Profile() {
-    const int32_t status = GenieProfile_free(m_handle);
-    if (GENIE_STATUS_SUCCESS != status) {
-        std::cout << "Failed to free the profile handle."
-                  << std::endl;
-    }
-}
-
 static void customGenieLogCallback(
     const _GenieLog_Handle_t* handle,
     const char* format,
@@ -206,7 +161,6 @@ static GenieLog_Level_t parseGenieLogLevel(const char* levelStr) {
  *--------------------------------------------------------------------*/
 Pipeline::Config::Config(
     const std::string& jsonConfig,
-    std::shared_ptr<Profile> profile,
     std::shared_ptr<Log> log) : m_handle(nullptr) {
     const Genie_Status_t status =
         GeniePipelineConfig_createFromJson(
@@ -214,16 +168,6 @@ Pipeline::Config::Config(
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
         throw std::runtime_error(
             "Failed to create the pipeline config");
-    }
-    if (profile) {
-        const Genie_Status_t bindStatus =
-            GeniePipelineConfig_bindProfiler(
-                m_handle, (*profile)());
-        if (GENIE_STATUS_SUCCESS != bindStatus) {
-            throw std::runtime_error(
-                "Failed to bind the profile handle with the "
-                "pipeline config");
-        }
     }
     if (log) {
         const Genie_Status_t bindStatus =
@@ -301,7 +245,8 @@ inline void Pipeline::execute(void* userData) {
     // on a condition variable until all callbacks are completed).
     const Genie_Status_t status = GeniePipeline_execute(
         m_handle, userData);
-    if (GENIE_STATUS_SUCCESS != status) {
+    if (GENIE_STATUS_SUCCESS != status &&
+        status != GENIE_STATUS_WARNING_CONTEXT_EXCEEDED) {
         throw std::runtime_error("Failed to execute");
     }
 }
@@ -318,22 +263,12 @@ inline void Pipeline::reset() {
  *--------------------------------------------------------------------*/
 Node::Config::Config(
     const std::string& jsonConfig,
-    std::shared_ptr<Profile> profile,
     std::shared_ptr<Log> log) : m_handle(nullptr) {
     const Genie_Status_t status = GenieNodeConfig_createFromJson(
         jsonConfig.c_str(), &m_handle);
     if ((GENIE_STATUS_SUCCESS != status) || (!m_handle)) {
         throw std::runtime_error(
             "Failed to create the node config");
-    }
-    if (profile) {
-        const Genie_Status_t bindStatus =
-            GenieNodeConfig_bindProfiler(m_handle, (*profile)());
-        if (GENIE_STATUS_SUCCESS != bindStatus) {
-            throw std::runtime_error(
-                "Failed to bind the profile handle with the "
-                "node config");
-        }
     }
     if (log) {
         const Genie_Status_t bindStatus =
@@ -468,9 +403,6 @@ VLMObject::VLMObject(
         std::string modelName = model.empty() ? "Qwen2.5-VL-3B" : model;
         loadConfig(modelName);
     }
-
-    // Create profiler (shared with all configs)
-    profiler = std::make_shared<Profile>();
 
     const char* logLevelEnv = std::getenv("LOG_LEVEL");
     GenieLog_Level_t logLevel = parseGenieLogLevel(logLevelEnv);
@@ -615,13 +547,7 @@ void VLMObject::loadConfig(
              "position_ids_cos.raw"},
             {"imageEncoder",
              "GENIE_NODE_IMAGE_ENCODER_IMAGE_POS_SIN",
-             "position_ids_sin.raw"},
-            {"imageEncoder",
-             "GENIE_NODE_IMAGE_ENCODER_IMAGE_WINDOW_ATTN_MASK",
-             "window_attention_mask.raw"},
-            {"imageEncoder",
-             "GENIE_NODE_IMAGE_ENCODER_IMAGE_FULL_ATTN_MASK",
-             "full_attention_mask.raw"}
+             "position_ids_sin.raw"}
         };
     }
 }
@@ -633,7 +559,7 @@ void VLMObject::createPipelineAndNodes() {
     // Pipeline config (empty JSON string – we only need a handle
     // to bind profiler)
     auto pipelineCfg = std::make_shared<Pipeline::Config>(
-        "", profiler, logger);
+        "", logger);
     pipeline = std::make_shared<Pipeline>(std::move(*pipelineCfg));
 
     // Create image encoder node
@@ -648,7 +574,7 @@ void VLMObject::createPipelineAndNodes() {
         std::getline(f, imgCfgStr, '\0');
     }
     auto imgNodeCfg = std::make_shared<Node::Config>(
-        imgCfgStr, profiler, logger);
+        imgCfgStr, logger);
     imageEncoderNode = std::make_shared<Node>(std::move(*imgNodeCfg));
     pipeline->addNode(imageEncoderNode);
     std::cout << "Created image encoder node" << std::endl;
@@ -665,7 +591,7 @@ void VLMObject::createPipelineAndNodes() {
         std::getline(f, lutCfgStr, '\0');
     }
     auto lutNodeCfg = std::make_shared<Node::Config>(
-        lutCfgStr, profiler, logger);
+        lutCfgStr, logger);
     lutEncoderNode = std::make_shared<Node>(std::move(*lutNodeCfg));
     pipeline->addNode(lutEncoderNode);
 
@@ -681,7 +607,7 @@ void VLMObject::createPipelineAndNodes() {
         std::getline(f, txtGenCfgStr, '\0');
     }
     auto txtGenNodeCfg = std::make_shared<Node::Config>(
-        txtGenCfgStr, profiler, logger);
+        txtGenCfgStr, logger);
     textGeneratorNode = std::make_shared<Node>(std::move(*txtGenNodeCfg));
     pipeline->addNode(textGeneratorNode);
     std::cout << "Created text generator node" << std::endl;
@@ -910,11 +836,11 @@ void VLMObject::vlm_chat_completion_create() {
 
     if (startPos != std::string::npos && endPos != std::string::npos && endPos > startPos) {
         // --- Interleaved path: pre-vision text → image → post-vision text ---
-        std::string preVisionText  = userPrompt.substr(0, startPos + visionStart.length());
-        std::string postVisionText = userPrompt.substr(endPos);
+        currentPreVisionText  = userPrompt.substr(0, startPos + visionStart.length());
+        currentPostVisionText = userPrompt.substr(endPos);
 
         // (a) Pre-vision text → LUT encoder
-        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, preVisionText);
+        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPreVisionText);
 
         // (b) Image data → Image encoder
         if (!currentImageData.empty()) {
@@ -928,7 +854,7 @@ void VLMObject::vlm_chat_completion_create() {
         loadStaticCustomInputs();
 
         // (c) Post-vision text → LUT encoder
-        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, postVisionText);
+        lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPostVisionText);
     } else {
         // --- Non-interleaved path: set prompt as-is ---
         currentPromptData = userPrompt;
