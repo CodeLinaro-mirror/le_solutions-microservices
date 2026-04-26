@@ -28,6 +28,14 @@ SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD = 1.3  # 1.3x multiplier for system prompt 
 # Max completion tokens multiplier: Reduces weight of max_completion_tokens
 SUMMARIZATION_MAX_COMPLETION_MULTIPLIER = 0.5  # 50% weight for max_completion tokens
 
+# --- Max completion tokens cap (context overflow prevention) ---
+# Safety margin subtracted from the hard cap to absorb estimator error,
+# BOS/EOS markers, and chat template overhead not explicitly tracked.
+MAX_COMPLETION_SAFETY_MARGIN = 64
+
+# Reject requests that would leave too little space for a meaningful answer.
+MIN_USEFUL_COMPLETION_TOKENS = 64
+
 class HttpStatusCodes:
     """
     Constants for HTTP status codes.
@@ -149,6 +157,26 @@ class ErrorMessages:
     MODEL_NOT_FOUND = "Model '{model}' not found in configuration. Use GET /v1/models to see available models."
     MODEL_SWITCH_ERROR = "Error switching from model '{old_model}' to '{new_model}': {error}"
     MODEL_INIT_FAILED = "Failed to initialize model '{model}'. The model may be unavailable or incompatible with the current system."
+    CONTEXT_LENGTH_EXCEEDED = (
+        "max_completion_tokens={requested} exceeds the available budget for this model. "
+        "Reduce max_completion_tokens to {cap} or lower, or shorten your prompt. "
+        "Model context window: {context_size}."
+    )
+    CONTEXT_LENGTH_EXCEEDED_TOOL_RESPONSE = (
+        "The combined prompt and tool response exceed the available budget for this model. "
+        "Reduce max_completion_tokens to {cap} or lower, shorten your prompt, or return a smaller tool response. "
+        "Model context window: {context_size}."
+    )
+    PROMPT_TOO_LONG = (
+        "Prompt consumes nearly the entire {context_size}-token context window. "
+        "Only {cap} tokens remain for the response, which is below the minimum useful size. "
+        "Please shorten your prompt."
+    )
+    PROMPT_TOO_LONG_TOOL_RESPONSE = (
+        "The combined prompt and tool response consume nearly the entire {context_size}-token context window. "
+        "Only {cap} tokens remain for the response, which is below the minimum useful size. "
+        "Please shorten your prompt or return a smaller tool response."
+    )
 
 class LLMServiceKeys:
     """ LLM Service Keys. """
@@ -276,3 +304,7 @@ class GenieErrorMappings:
             return "Service temporarily unavailable. Please try again."
 
         return None
+
+
+# OpenAI-compatible error code for prompt/context overflows.
+ERROR_CODE_CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"

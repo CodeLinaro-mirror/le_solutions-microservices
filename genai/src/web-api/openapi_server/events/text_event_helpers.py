@@ -28,7 +28,7 @@ class TextEventHelpers:
         inject_summary: bool = False,
         is_tool_calling: bool = False,
         tool_response_received: bool = False,
-        include_tools: bool = True
+        include_tools: bool = True,
     ) -> str:
         """
         Build the prompt content for LLM inference.
@@ -94,7 +94,12 @@ class TextEventHelpers:
             # ADHOC MODE: Build full conversation history in prompt
             # KV cache is reset before each turn, so we must provide all context via prompt text
             messages_to_format = TextEventHelpers._build_context_for_adhoc_mode(
-                event_id, model_id, session, messages_to_format, is_tool_calling, tool_response_received
+                event_id,
+                model_id,
+                session,
+                messages_to_format,
+                is_tool_calling,
+                tool_response_received
             )
             logger.info(f"Event {event_id}: ADHOC_MODE - built prompt with {len(messages_to_format)} messages (full history)")
         else:
@@ -170,6 +175,12 @@ class TextEventHelpers:
     @staticmethod
     def _find_system_prompt(session) -> Optional[Dict[str, Any]]:
         """Find the most recent system prompt from conversation history."""
+        if getattr(session, 'system_prompt_content', None):
+            return {
+                "role": "system",
+                "content": session.system_prompt_content,
+            }
+
         if not session.events:
             return None
 
@@ -209,6 +220,15 @@ class TextEventHelpers:
 
         # 1. Identify Priority Components
         priority_messages = []
+        current_turn_body_messages = [
+            msg for msg in current_turn_messages
+            if msg.get('role', '') != 'system'
+        ]
+        if len(current_turn_body_messages) != len(current_turn_messages):
+            logger.info(
+                f"Event {event_id}: Ignoring system-role entries from current turn; "
+                "using session-level system prompt"
+            )
 
         # System Prompt
         system_message = TextEventHelpers._find_system_prompt(session)
@@ -224,7 +244,7 @@ class TextEventHelpers:
             priority_messages.append(summary_msg)
 
         # Current Turn
-        priority_messages.extend(current_turn_messages)
+        priority_messages.extend(current_turn_body_messages)
 
         # Estimate tokens for priority components
         priority_tokens = sum(
@@ -307,7 +327,7 @@ class TextEventHelpers:
             })
 
         final_context.extend(history_messages)
-        final_context.extend(current_turn_messages)
+        final_context.extend(current_turn_body_messages)
 
         logger.info(f"Event {event_id}: ADHOC_MODE context built - "
                    f"{len(history_messages)} historical messages from {events_included} events, "

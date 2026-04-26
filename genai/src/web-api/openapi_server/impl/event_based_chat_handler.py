@@ -67,6 +67,44 @@ class EventBasedChatHandler:
         return []
 
     @staticmethod
+    def _remove_session_messages(session, message_indices: List[int]) -> None:
+        """Remove the given message indices from the shared session history."""
+        for idx in sorted(message_indices, reverse=True):
+            if idx < len(session.messages):
+                session.messages.pop(idx)
+
+    @staticmethod
+    def _rollback_new_turn_preflight(
+        session,
+        event,
+        previous_model,
+        previous_system_prompt_content,
+        previous_system_prompt_tokens,
+    ) -> None:
+        """
+        Roll back a newly-created event when validation fails before any new
+        inference should become part of the session state.
+        """
+        EventBasedChatHandler._remove_session_messages(session, event.message_indices)
+        if session.current_event is event:
+            session.current_event = None
+        session.current_model = previous_model
+        session.system_prompt_content = previous_system_prompt_content
+        session.system_prompt_tokens = previous_system_prompt_tokens
+
+    @staticmethod
+    def _rollback_tool_continuation_preflight(session, event, added_message_indices: List[int]) -> None:
+        """
+        Roll back tool messages appended for Trip 2 when validation fails before
+        the continuation inference should be accepted.
+        """
+        EventBasedChatHandler._remove_session_messages(session, added_message_indices)
+        removed_indices = set(added_message_indices)
+        event.message_indices = [idx for idx in event.message_indices if idx not in removed_indices]
+        event.tool_info = None
+        event._tool_response_received = False
+
+    @staticmethod
     async def handle_chat_completion(
         request_data: CreateChatCompletionRequest,
         raw_json: dict = None,
@@ -220,11 +258,11 @@ class EventBasedChatHandler:
                         detail="Tool response timed out. Please retry the turn."
                     )
 
-                current_event.mark_tool_response_received()
-
                 tool_response_parts = []
+                added_tool_message_indices = []
                 for tool_msg in new_messages:
                     tool_msg_idx = session.add_message(tool_msg)
+                    added_tool_message_indices.append(tool_msg_idx)
                     current_event.message_indices.append(tool_msg_idx)
 
                     tool_call_id = tool_msg.get('tool_call_id', 'unknown')
@@ -238,7 +276,15 @@ class EventBasedChatHandler:
                 tool_response = "\n\n".join(tool_response_parts).strip()
 
                 # Continue turn with tool response (now async)
-                result = await current_event.continue_with_tool_response(tool_response, request_data)
+                try:
+                    result = await current_event.continue_with_tool_response(tool_response, request_data)
+                except HTTPException:
+                    EventBasedChatHandler._rollback_tool_continuation_preflight(
+                        session,
+                        current_event,
+                        added_tool_message_indices,
+                    )
+                    raise
 
                 if result['turn_complete']:
                     # Add assistant response to session
@@ -277,6 +323,9 @@ class EventBasedChatHandler:
                 logger.info("=== NEW TURN ===")
 
                 # Create new event
+                previous_model = session.current_model
+                previous_system_prompt_content = session.system_prompt_content
+                previous_system_prompt_tokens = session.system_prompt_tokens
                 event = session.create_event(
                     model_id=requested_model,
                     new_messages=new_messages,
@@ -307,6 +356,15 @@ class EventBasedChatHandler:
                 # Execute turn (now async) with error handling
                 try:
                     result = await event.execute_turn(request_data)
+                except HTTPException:
+                    EventBasedChatHandler._rollback_new_turn_preflight(
+                        session,
+                        event,
+                        previous_model,
+                        previous_system_prompt_content,
+                        previous_system_prompt_tokens,
+                    )
+                    raise
                 except RuntimeError as e:
                     # Handle model loading failures and resource unavailability
                     error_msg = str(e)

@@ -86,12 +86,12 @@ class ConversationSession:
             Index of the added message
         """
         # Track system prompt tokens for new summarization formula
-        if message.get('role') == 'system' and not self.system_prompt_content:
+        if message.get('role') == 'system':
             from openapi_server.session.token_counter import TokenCounter
             content = message.get('content', '')
             self.system_prompt_content = content if isinstance(content, str) else str(content)
             self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
-            logger.info(f"Session {self.session_id}: System prompt set ({self.system_prompt_tokens} tokens)")
+            logger.info(f"Session {self.session_id}: System prompt updated ({self.system_prompt_tokens} tokens)")
 
         self.messages.append(message)
         if compact_images and self._message_contains_base64_image(message):

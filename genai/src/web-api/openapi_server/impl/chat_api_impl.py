@@ -94,6 +94,12 @@ class ChatApiImpl(BaseChatApi):
             logger.error(f"HTTPException error in create_chat_completion: {http_exc}")
             from openapi_server.impl.constant import GenieErrorMappings
 
+            if isinstance(http_exc.detail, dict) and "message" in http_exc.detail:
+                return JSONResponse(
+                    status_code=http_exc.status_code,
+                    content={"error": http_exc.detail}
+                )
+
             error_str = str(http_exc.detail)
             layman_msg = GenieErrorMappings.get_layman_message(error_str)
             final_msg = layman_msg if layman_msg else error_str

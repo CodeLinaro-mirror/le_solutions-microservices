@@ -11,6 +11,7 @@ import time
 import json
 import asyncio
 from typing import Optional, Dict, Any
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from openapi_server.events.conversation_event import (
@@ -62,9 +63,166 @@ class TextConversationEvent(ConversationEvent):
         self.retry_count = 0
         self.max_retries = 2
 
+        # Exact tokens sent to the model for cap accounting.
+        # This is intentionally separate from prompt_tokens/completion_tokens,
+        # which remain the legacy usage fields used elsewhere in the service.
+        self._cap_prompt_tokens_total = 0
+        self._cap_completion_tokens_total = 0
+        self._cap_started_from_clean_kv = False
+
         logger.info(f"Created TextConversationEvent {event_id} for model {model_id} (context: {self.context_size})")
 
-    def _should_summarize(self, max_completion_tokens: int = 0) -> bool:
+    def _is_rebuild_path(self) -> bool:
+        """
+        Return True when the next execute_request() will run on a clean KV cache
+        and therefore must treat the prompt as self-contained.
+
+        Non-ADHOC Trip 2 tool continuations intentionally return False: they
+        continue on top of the active event's live KV state.
+        """
+        from openapi_server.impl.constant import ADHOC_MODE
+
+        if ADHOC_MODE:
+            return True
+
+        llm_manager = LLMProcessManager.get_instance()
+        process = getattr(llm_manager, "process", None)
+        if not process or process.poll() is not None:
+            return True
+
+        current_model = getattr(llm_manager, "current_model", None)
+        if current_model and current_model != self.model_id:
+            return True
+
+        current_session_id = getattr(llm_manager, "current_session_id", None)
+        if current_session_id and current_session_id != self.session.session_id:
+            return True
+
+        if self._is_tool_calling:
+            return False
+
+        if self.inject_summary:
+            return True
+
+        previous_event = self.session.get_last_completed_event()
+        if not previous_event:
+            return True
+
+        return previous_event.model_id != self.model_id
+
+    def _cap_cache_usage_tokens(self, started_from_clean_kv: Optional[bool] = None) -> float:
+        """
+        Tokens already resident in the live KV cache before the next
+        execute_request() call.
+        """
+        if started_from_clean_kv is None:
+            started_from_clean_kv = self._is_rebuild_path()
+
+        if started_from_clean_kv:
+            return 0
+
+        cached = 0.0
+        for event in reversed(self.session.events):
+            cached += getattr(event, "_cap_prompt_tokens_total", getattr(event, "prompt_tokens", 0))
+            cached += getattr(event, "_cap_completion_tokens_total", getattr(event, "completion_tokens", 0))
+
+            if getattr(event, "_cap_started_from_clean_kv", False):
+                break
+
+        if self._is_tool_calling:
+            cached += self._cap_prompt_tokens_total + self._cap_completion_tokens_total
+
+        return cached
+
+    def _resolve_max_completion_tokens(self, request_data, prompt_content: str):
+        """
+        Validate max_completion_tokens against the computed cap. Raises 400 on
+        over-cap or prompt-too-long; falls back to min(default, cap) when
+        omitted or zero. Also returns the prompt token estimate and rebuild
+        decision so callers can reuse them after a successful inference.
+        """
+        from openapi_server.impl.constant import (
+            HttpStatusCodes,
+            ErrorMessages,
+            MIN_USEFUL_COMPLETION_TOKENS,
+            MAX_COMPLETION_SAFETY_MARGIN,
+            ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+        )
+
+        started_from_clean_kv = self._is_rebuild_path()
+        prompt_tokens = TokenCounter.estimate_tokens(prompt_content or "")
+        cached_context_tokens = self._cap_cache_usage_tokens(started_from_clean_kv)
+        cap = max(int(
+            self.context_size - cached_context_tokens - prompt_tokens - MAX_COMPLETION_SAFETY_MARGIN
+        ), 0)
+
+        logger.info(
+            f"Event {self.event_id}: max_completion_tokens cap - "
+            f"cached_context={cached_context_tokens:.0f}, prompt_tokens={prompt_tokens}, "
+            f"safety_margin={MAX_COMPLETION_SAFETY_MARGIN}, cap={cap}"
+        )
+
+        requested = getattr(request_data, "max_completion_tokens", None)
+        if requested is not None and requested < 0:
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail={
+                    "message": "max_completion_tokens must be a non-negative integer.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_value",
+                    "param": "max_completion_tokens",
+                },
+            )
+        if requested == 0:
+            requested = None
+
+        # Trip 2 hint: when the tool output is at least half of the prompt,
+        # point the error message at that cause.
+        tool_response_tokens = TokenCounter.estimate_tokens(self.tool_info) if self.tool_info else 0
+        tool_response_dominates = (
+            tool_response_tokens > 0
+            and tool_response_tokens >= max(prompt_tokens - tool_response_tokens, 0)
+        )
+
+        if cap < MIN_USEFUL_COMPLETION_TOKENS:
+            template = (
+                ErrorMessages.PROMPT_TOO_LONG_TOOL_RESPONSE
+                if tool_response_dominates
+                else ErrorMessages.PROMPT_TOO_LONG
+            )
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail={
+                    "message": template.format(context_size=self.context_size, cap=cap),
+                    "type": "invalid_request_error",
+                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                    "param": "messages",
+                },
+            )
+
+        if requested is not None and requested > cap:
+            template = (
+                ErrorMessages.CONTEXT_LENGTH_EXCEEDED_TOOL_RESPONSE
+                if tool_response_dominates
+                else ErrorMessages.CONTEXT_LENGTH_EXCEEDED
+            )
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail={
+                    "message": template.format(
+                        requested=requested, cap=cap, context_size=self.context_size,
+                    ),
+                    "type": "invalid_request_error",
+                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                    "param": "max_completion_tokens",
+                },
+            )
+
+        if requested is not None:
+            return requested, prompt_tokens, started_from_clean_kv
+        return min(self.default_max_completion_tokens, cap), prompt_tokens, started_from_clean_kv
+
+    def _should_summarize(self, max_completion_tokens: int = 0, current_turn_tokens: int = 0) -> bool:
         """
         Determine if summarization should be triggered using new SDK 2.45+ formula.
 
@@ -78,6 +236,8 @@ class TextConversationEvent(ConversationEvent):
 
         Args:
             max_completion_tokens: Maximum tokens the model may generate in this turn.
+            current_turn_tokens: Current event conversational tokens not yet
+                reflected in completed session totals.
         """
         # Skip for tool continuations
         if self._is_tool_calling and self._tool_response_received:
@@ -106,6 +266,7 @@ class TextConversationEvent(ConversationEvent):
             system_overhead +
             summary_tokens +
             tokens_since_last_summary +
+            current_turn_tokens +
             (max_completion_tokens * SUMMARIZATION_MAX_COMPLETION_MULTIPLIER)
         )
 
@@ -121,6 +282,7 @@ class TextConversationEvent(ConversationEvent):
                 f"  System overhead: {system_overhead:.0f} tokens ({system_tokens} * {SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD})\n"
                 f"  Summary tokens: {summary_tokens}\n"
                 f"  Tokens since last summary: {tokens_since_last_summary}\n"
+                f"  Current turn conversation: {current_turn_tokens}\n"
                 f"  Max completion (weighted): {weighted_max_completion:.0f} tokens ({max_completion_tokens} * {SUMMARIZATION_MAX_COMPLETION_MULTIPLIER})\n"
                 f"  Total projected: {projected_total:.0f}\n"
                 f"  Threshold ({SUMMARIZATION_CONTEXT_THRESHOLD * 100:.0f}%): {threshold:.0f}"
@@ -134,35 +296,129 @@ class TextConversationEvent(ConversationEvent):
         May return tool_calls (turn not complete yet) or final response.
         """
         try:
+            from openapi_server.impl.constant import ADHOC_MODE
+
+            requested_max_completion = getattr(request_data, "max_completion_tokens", None)
+            if requested_max_completion is not None and requested_max_completion < 0:
+                from openapi_server.impl.constant import HttpStatusCodes
+                raise HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail={
+                        "message": "max_completion_tokens must be a non-negative integer.",
+                        "type": "invalid_request_error",
+                        "code": "invalid_value",
+                        "param": "max_completion_tokens",
+                    },
+                )
+            if requested_max_completion == 0:
+                requested_max_completion = None
+            if requested_max_completion is not None and requested_max_completion >= self.context_size:
+                from openapi_server.impl.constant import (
+                    ErrorMessages,
+                    ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                    HttpStatusCodes,
+                )
+                raise HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail={
+                        "message": ErrorMessages.CONTEXT_LENGTH_EXCEEDED.format(
+                            requested=requested_max_completion,
+                            cap=self.context_size - 1,
+                            context_size=self.context_size,
+                        ),
+                        "type": "invalid_request_error",
+                        "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                        "param": "max_completion_tokens",
+                    },
+                )
+
+            adhoc_summary_messages = None
+            current_turn_tokens = 0
+            if not self._is_tool_calling and not self._tool_response_received:
+                import copy
+
+                current_event_messages = [
+                    copy.deepcopy(self.session.messages[idx])
+                    for idx in self.message_indices
+                    if idx < len(self.session.messages)
+                ]
+                current_conversation_messages = []
+                for msg in current_event_messages:
+                    role = msg.get('role', '')
+                    if role not in ['user', 'assistant']:
+                        continue
+                    if role == 'assistant':
+                        has_content = msg.get('content') not in (None, '')
+                        has_only_tool_calls = msg.get('tool_calls') and not has_content
+                        if has_only_tool_calls:
+                            continue
+                    current_conversation_messages.append(msg)
+                current_turn_tokens = sum(
+                    TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+                    for msg in current_conversation_messages
+                )
+                if ADHOC_MODE:
+                    prior_session_messages = []
+                    current_message_indices = set(self.message_indices)
+                    for idx, msg in enumerate(self.session.messages):
+                        if idx in current_message_indices:
+                            continue
+                        role = msg.get('role', '')
+                        if role not in ['user', 'assistant']:
+                            continue
+                        if role == 'assistant':
+                            has_content = msg.get('content') not in (None, '')
+                            has_only_tool_calls = msg.get('tool_calls') and not has_content
+                            if has_only_tool_calls:
+                                continue
+                        prior_session_messages.append(copy.deepcopy(msg))
+                    if prior_session_messages:
+                        adhoc_summary_messages = prior_session_messages
             # 1. Summarization Check
             if not self._is_tool_calling and not self._tool_response_received:
-                max_completion = request_data.max_completion_tokens or self.default_max_completion_tokens
-
-                if self._should_summarize(max_completion):
+                max_completion_target = requested_max_completion or self.default_max_completion_tokens
+                should_summarize = self._should_summarize(
+                    max_completion_target,
+                    current_turn_tokens=current_turn_tokens,
+                )
+                if should_summarize:
                     from openapi_server.impl.constant import SUMMARIZATION_SUMMARY_SIZE_RATIO
                     max_summary_tokens = int(self.context_size * SUMMARIZATION_SUMMARY_SIZE_RATIO)
                     logger.info(f"Event {self.event_id}: Triggering summarization (max {max_summary_tokens} tokens)")
 
-                    try:
-                        summary_text, summary_tokens = await self.generate_summary(
-                            max_summary_tokens,
-                            include_history_in_prompt=False
+                    if ADHOC_MODE and not adhoc_summary_messages:
+                        logger.info(
+                            f"Event {self.event_id}: Skipping ADHOC summarization - "
+                            "no older history beyond the live request tail"
                         )
+                    else:
+                        try:
+                            if ADHOC_MODE:
+                                summary_text, summary_tokens = await self.generate_summary(
+                                    max_summary_tokens,
+                                    messages_to_summarize=adhoc_summary_messages,
+                                    include_history_in_prompt=True
+                                )
+                            else:
+                                summary_text, summary_tokens = await self.generate_summary(
+                                    max_summary_tokens,
+                                    include_history_in_prompt=False
+                                )
 
-                        self.session.summary_content = summary_text
-                        self.session.summary_token_count = summary_tokens
-                        self.session.total_cumulative_tokens += summary_tokens
-                        self.summarization_performed = True
-                        self.summary_tokens = summary_tokens
-                        self.inject_summary = True
+                            self.session.summary_content = summary_text
+                            self.session.summary_token_count = summary_tokens
+                            self.session.total_cumulative_tokens += summary_tokens
+                            self.summarization_performed = True
+                            self.summary_tokens = summary_tokens
+                            self.inject_summary = True
 
-                        # Reset the handle's state so it drops the old KV cache
-                        # and starts fresh with the summary + new prompt
-                        self._reset_handle()
-
-                        logger.info(f"Event {self.event_id}: Summarization complete, {summary_tokens} tokens")
-                    except Exception as e:
-                        logger.error(f"Event {self.event_id}: Summarization failed: {e}")
+                            # Summarization only compresses older completed
+                            # history; the live request remains verbatim in the
+                            # rebuilt prompt.
+                            self._reset_handle()
+                            logger.info(f"Event {self.event_id}: Summarization complete, {summary_tokens} tokens")
+                        except Exception as e:
+                            logger.error(f"Event {self.event_id}: Summarization failed: {e}")
 
             # 2. Build Prompt
             prompt_content = TextEventHelpers.build_prompt_content(
@@ -177,13 +433,23 @@ class TextConversationEvent(ConversationEvent):
                 tool_response_received=self._tool_response_received,
                 include_tools=True
             )
-
             # 3. Execute Inference
+            max_completion, prompt_tokens, started_from_clean_kv = self._resolve_max_completion_tokens(
+                request_data,
+                prompt_content,
+            )
             llm_manager = LLMProcessManager.get_instance()
             is_streaming = getattr(request_data, 'stream', False)
 
             if is_streaming and not self._is_tool_calling and not self._tool_response_received:
-                return await self._execute_streaming_inference(llm_manager, prompt_content, request_data)
+                return await self._execute_streaming_inference(
+                    llm_manager,
+                    prompt_content,
+                    request_data,
+                    max_completion,
+                    prompt_tokens,
+                    started_from_clean_kv,
+                )
 
             # Accumulate non-streaming response
             accumulated_content = []
@@ -194,7 +460,7 @@ class TextConversationEvent(ConversationEvent):
                 model=self.model_id,
                 prompt=prompt_content,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
+                max_tokens=max_completion,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                 top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
@@ -207,6 +473,10 @@ class TextConversationEvent(ConversationEvent):
 
             if not response_content or response_content.strip() == "":
                 raise ValueError("LLM returned empty response")
+
+            self._cap_started_from_clean_kv = started_from_clean_kv
+            self._cap_prompt_tokens_total += prompt_tokens
+            self._cap_completion_tokens_total += TokenCounter.estimate_tokens(response_content or "")
 
             # Record non-streaming metrics only for successful completions.
             try:
@@ -257,7 +527,15 @@ class TextConversationEvent(ConversationEvent):
                 }
             return await self._handle_error(e, request_data)
 
-    async def _execute_streaming_inference(self, llm_manager: LLMProcessManager, prompt_content: str, request_data) -> dict:
+    async def _execute_streaming_inference(
+        self,
+        llm_manager: LLMProcessManager,
+        prompt_content: str,
+        request_data,
+        max_completion: int,
+        prompt_tokens: int,
+        started_from_clean_kv: bool,
+    ) -> dict:
         """Execute streaming inference with tool detection."""
 
         async def stream_generator():
@@ -299,7 +577,7 @@ class TextConversationEvent(ConversationEvent):
                     model=self.model_id,
                     prompt=prompt_content,
                     streaming=True,
-                    max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
+                    max_tokens=max_completion,
                     temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                     top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                     top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
@@ -369,6 +647,9 @@ class TextConversationEvent(ConversationEvent):
 
                 # Stream complete
                 final_response = "".join(full_response_content)
+                self._cap_started_from_clean_kv = started_from_clean_kv
+                self._cap_prompt_tokens_total += prompt_tokens
+                self._cap_completion_tokens_total += TokenCounter.estimate_tokens(final_response or "")
                 parsed_tool_calls = None if not is_potential_tool_call else ToolHandler.parse_tool_response(final_response)
 
                 if parsed_tool_calls:
@@ -602,7 +883,6 @@ class TextConversationEvent(ConversationEvent):
                 raise RuntimeError(f"Event {self.event_id}: Not in tool calling state")
 
             self.tool_info = tool_response
-            self.mark_tool_response_received()
 
             logger.info(f"Event {self.event_id}: Generating final answer after tool call")
 
@@ -629,6 +909,11 @@ class TextConversationEvent(ConversationEvent):
             )
 
             # Execute Inference
+            max_completion, prompt_tokens, _ = self._resolve_max_completion_tokens(
+                request_data,
+                formatted_content,
+            )
+            self.mark_tool_response_received()
             llm_manager = LLMProcessManager.get_instance()
             accumulated_content = []
 
@@ -638,7 +923,7 @@ class TextConversationEvent(ConversationEvent):
                 model=self.model_id,
                 prompt=formatted_content,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or self.default_max_completion_tokens,
+                max_tokens=max_completion,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
                 top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
@@ -651,6 +936,9 @@ class TextConversationEvent(ConversationEvent):
 
             if not final_response or final_response.strip() == "":
                 raise ValueError("LLM returned empty response after tool call")
+
+            self._cap_prompt_tokens_total += prompt_tokens
+            self._cap_completion_tokens_total += TokenCounter.estimate_tokens(final_response or "")
 
             self.assistant_message = final_response
             self._is_tool_calling = False
@@ -724,6 +1012,9 @@ class TextConversationEvent(ConversationEvent):
 
     async def _handle_error(self, error: Exception, request_data) -> dict:
         """Handle error with retry logic."""
+        if isinstance(error, HTTPException):
+            raise error
+
         self.retry_count += 1
         logger.error(f"Event {self.event_id}: Error (attempt {self.retry_count}/{self.max_retries}): {error}")
 
@@ -734,6 +1025,8 @@ class TextConversationEvent(ConversationEvent):
                     return await self.continue_with_tool_response(self.tool_info, request_data)
                 else:
                     return await self.execute_turn(request_data)
+            except HTTPException:
+                raise
             except Exception as retry_error:
                 logger.error(f"Event {self.event_id}: Retry failed: {retry_error}")
 
