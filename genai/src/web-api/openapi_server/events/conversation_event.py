@@ -127,6 +127,10 @@ class ConversationEvent(ABC):
         self.retry_count = 0
         self.max_retries = 2
 
+        # Retry replay metadata
+        self.request_signature: Optional[str] = None
+        self.replay_result: Optional[dict] = None
+
         # Internal state (tool calling)
         self._is_tool_calling = False
         self._pending_tool_calls: List[dict] = []

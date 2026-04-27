@@ -57,6 +57,11 @@ class ConversationSession:
         # Current model being used
         self.current_model: Optional[str] = None
 
+        # Hashes used for session continuation / retry lookup
+        self.continuation_hash: Optional[str] = None
+        self.retry_candidate_hash: Optional[str] = None
+        self.last_completed_event_id: Optional[str] = None
+
         # Session metadata
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
@@ -418,17 +423,36 @@ class ConversationSession:
             # Add to events list
             self.events.append(self.current_event)
 
-            # UPDATE SESSION HASH MAPPING (n-1)
-            # Now that turn is complete and in history, update the hash mapping so
-            # future requests (which will include this turn) can find this session.
+            self.last_completed_event_id = self.current_event.event_id
+
+            # Update live continuation / retry-candidate hashes for this session.
             try:
                 full_hash = self.calculate_hash(exclude_last_pair=False)
-                if full_hash:
-                    from openapi_server.managers.session_manager import SessionManager
-                    session_manager = SessionManager.get_instance()
-                    with session_manager._lock:
-                        session_manager._hash_to_session[full_hash] = self.session_id
-                    logger.info(f"Session {self.session_id}: Updated hash mapping for {full_hash}")
+                from openapi_server.managers.session_manager import SessionManager
+                session_manager = SessionManager.get_instance()
+                with session_manager._lock:
+                    old_retry_hash = self.retry_candidate_hash
+                    old_continuation_hash = self.continuation_hash
+
+                    if old_retry_hash and session_manager._hash_to_session.get(old_retry_hash) == self.session_id:
+                        del session_manager._hash_to_session[old_retry_hash]
+
+                    if old_continuation_hash and session_manager._hash_to_session.get(old_continuation_hash) == self.session_id:
+                        del session_manager._hash_to_session[old_continuation_hash]
+
+                    self.retry_candidate_hash = old_continuation_hash
+                    self.continuation_hash = full_hash or None
+
+                    if self.retry_candidate_hash:
+                        session_manager._hash_to_session[self.retry_candidate_hash] = self.session_id
+
+                    if self.continuation_hash:
+                        session_manager._hash_to_session[self.continuation_hash] = self.session_id
+
+                logger.info(
+                    f"Session {self.session_id}: Updated hash mapping "
+                    f"(retry={self.retry_candidate_hash}, continuation={self.continuation_hash})"
+                )
             except Exception as e:
                 logger.error(f"Session {self.session_id}: Failed to update hash mapping: {e}")
 

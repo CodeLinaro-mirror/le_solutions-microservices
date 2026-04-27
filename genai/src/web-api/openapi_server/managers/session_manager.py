@@ -6,10 +6,11 @@ SessionManager: Singleton to manage all conversation sessions.
 Handles session creation, lookup, and cleanup.
 """
 
+import json
 import time
 import threading
 import uuid
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 from openapi_server.session.conversation_session import ConversationSession
 from openapi_server.logger.logger_config import LoggerConfig
@@ -129,11 +130,30 @@ class SessionManager:
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
         return session
 
+    @staticmethod
+    def build_request_signature(request_data, raw_json: Optional[dict], messages: List[Dict]) -> str:
+        """Build a deterministic signature for an incoming request."""
+        if raw_json:
+            request_payload = dict(raw_json)
+        elif request_data is not None and hasattr(request_data, "model_dump"):
+            request_payload = request_data.model_dump(exclude_none=True)
+        else:
+            request_payload = {}
+
+        request_payload.pop("stream", None)
+        request_payload.pop("user", None)
+        request_payload.pop("store", None)
+        request_payload["messages"] = messages
+
+        return json.dumps(request_payload, sort_keys=True, separators=(",", ":"), default=str)
+
     def find_or_create_session(
         self,
         user_id: str,
-        messages: List[Dict]
-    ) -> Tuple[ConversationSession, bool]:
+        messages: List[Dict],
+        request_data=None,
+        raw_json: dict = None
+    ) -> Tuple[ConversationSession, bool, Optional[Any]]:
         """
         Find existing session by hash or create new one.
 
@@ -142,7 +162,7 @@ class SessionManager:
             messages: Message history from request
 
         Returns:
-            Tuple of (ConversationSession, is_new)
+            Tuple of (ConversationSession, is_new, replay_event)
         """
         from openapi_server.session.conversation_utils import ConversationUtils
 
@@ -150,55 +170,14 @@ class SessionManager:
             # No messages - create new session
             chat_completion_id = f"chat-{uuid.uuid4()}"
             session = self.create_session(chat_completion_id, user_id)
-            return session, True
+            return session, True, None
 
-        # Calculate hash using n-2 logic (exclude last pair) to find previous state
-        hash_key = ConversationUtils.calculate_conversation_hash(messages, exclude_last_pair=True)
-
-        # Also calculate n-1 hash (include last pair) for storing new session state
-        # This handles case where client sends only 1 message (n-2 hash is empty)
+        # Calculate full completed-pairs hash only.
+        # This is used for both continuation and retry-candidate lookup.
         full_hash_key = ConversationUtils.calculate_conversation_hash(messages, exclude_last_pair=False)
 
         with self._lock:
-            def should_reuse_session(candidate_session: ConversationSession, match_type: str, key: str) -> bool:
-                incoming_count = len(messages)
-                existing_count = len(candidate_session.messages)
-
-                if incoming_count < existing_count:
-                    current_event = candidate_session.get_current_event()
-                    is_active_tool_turn = (
-                        current_event and
-                        current_event.is_active() and
-                        getattr(current_event, '_is_tool_calling', False)
-                    )
-                    if not is_active_tool_turn:
-                        logger.debug(
-                            f"Skipping {match_type} match {key}: session {candidate_session.session_id} has newer history "
-                            f"(incoming_messages={incoming_count}, session_messages={existing_count})"
-                        )
-                        return False
-
-                return True
-
-            # 1. Try to find by hash (n-2) - standard lookup for continuing conversations
-            if hash_key and hash_key in self._hash_to_session:
-                session_id = self._hash_to_session[hash_key]
-                if session_id in self._sessions:
-                    session = self._sessions[session_id]
-                    if should_reuse_session(session, "hash", hash_key):
-                        logger.info(f"Found existing session {session_id} by hash {hash_key}")
-                        return session, False
-
-            # 2. Try full hash (n-1) - for retries or identical requests
-            if full_hash_key and full_hash_key in self._hash_to_session:
-                session_id = self._hash_to_session[full_hash_key]
-                if session_id in self._sessions:
-                    session = self._sessions[session_id]
-                    if should_reuse_session(session, "full hash", full_hash_key):
-                        logger.info(f"Found existing session {session_id} by full hash {full_hash_key}")
-                        return session, False
-
-            # 3. Try tool calling map - for in-progress tool calls
+            # 1. Try tool calling map - for in-progress tool calls
             # Calculate hash of ONLY user messages to match the registration logic
             # This ensures stability even if assistant messages vary slightly or are missing in client request
             user_messages = [msg for msg in messages if msg.get('role') == 'user']
@@ -209,12 +188,12 @@ class SessionManager:
                     if session_id in self._sessions:
                         session = self._sessions[session_id]
                         logger.info(f"Found existing session {session_id} by tool calling hash {tool_call_hash[:8]}...")
-                        return session, False
+                        return session, False, None
                     else:
                         # Stale entry
                         del self._tool_calling_map[tool_call_hash]
 
-                # 4. Try timed-out tool calling map - for late tool responses
+                # 2. Try timed-out tool calling map - for late tool responses
                 is_tool_response_request = ConversationUtils.safe_get(messages[-1], "role") == "tool"
                 if is_tool_response_request and tool_call_hash in self._timed_out_tool_call_map:
                     session_id, expires_at = self._timed_out_tool_call_map[tool_call_hash]
@@ -223,33 +202,42 @@ class SessionManager:
                     elif session_id in self._sessions:
                         session = self._sessions[session_id]
                         logger.info(f"Found timed-out tool session {session_id} by hash {tool_call_hash[:8]}...")
-                        return session, False
+                        return session, False, None
                     else:
                         del self._timed_out_tool_call_map[tool_call_hash]
+
+            # 3. Try full hash against the current live session tip / retry candidate
+            if full_hash_key and full_hash_key in self._hash_to_session:
+                session_id = self._hash_to_session[full_hash_key]
+                if session_id in self._sessions:
+                    session = self._sessions[session_id]
+                    if full_hash_key == session.continuation_hash:
+                        logger.info(f"Found existing session {session_id} by continuation hash {full_hash_key}")
+                        return session, False, None
+
+                    if full_hash_key == session.retry_candidate_hash:
+                        replay_event = session.get_last_completed_event()
+                        if replay_event and replay_event.request_signature and replay_event.replay_result:
+                            incoming_signature = self.build_request_signature(request_data, raw_json, messages)
+                            if incoming_signature == replay_event.request_signature:
+                                logger.info(f"Found retry replay for session {session_id} by hash {full_hash_key}")
+                                return session, False, replay_event
+
+                    if (
+                        full_hash_key != session.continuation_hash and
+                        full_hash_key != session.retry_candidate_hash
+                    ):
+                        # Stale hash entry from older behavior
+                        del self._hash_to_session[full_hash_key]
+                else:
+                    del self._hash_to_session[full_hash_key]
 
             # Create new session
             chat_completion_id = f"chat-{uuid.uuid4()}"
             session = self.create_session(chat_completion_id, user_id)
+            logger.info(f"Created new session {chat_completion_id} (hashes will be stored after turn completion)")
 
-            # Store hash mapping using the n-2 hash (so next request can find it)
-            # Wait, if we create a new session with [Msg1], n-2 is empty.
-            # Next request comes with [Msg1, Msg2]. n-2 hash of that is hash([Msg1]).
-            # So we should store the hash of the CURRENT state of the session.
-            # But find_or_create_session doesn't know the future state.
-            # It only knows the current messages.
-            # If this is a NEW session, it likely has 1 user message. n-2 hash is empty.
-            # We don't store empty hash.
-            # We should store the hash AFTER the turn completes.
-
-            # However, if the request has history that we don't know about (e.g. client restart),
-            # we might want to store the full hash so exact retries work.
-            if full_hash_key:
-                self._hash_to_session[full_hash_key] = chat_completion_id
-                logger.info(f"Created new session {chat_completion_id} with full hash {full_hash_key}")
-            else:
-                logger.info(f"Created new session {chat_completion_id} (no hash stored yet)")
-
-            return session, True
+            return session, True, None
 
     def get_session(self, session_id: str) -> Optional[ConversationSession]:
         """
@@ -393,10 +381,10 @@ class SessionManager:
                     except Exception as e:
                         logger.error(f"Error releasing handle during cleanup: {e}")
 
-                # Remove from hash mapping
-                hash_key = session.calculate_hash()
-                if hash_key in self._hash_to_session:
-                    del self._hash_to_session[hash_key]
+                # Remove all hash mappings for this session
+                hash_keys_to_remove = [k for k, v in self._hash_to_session.items() if v == session_id]
+                for k in hash_keys_to_remove:
+                    del self._hash_to_session[k]
 
                 # Remove from tool calling maps
                 tool_keys_to_remove = [k for k, v in self._tool_calling_map.items() if v == session_id]
@@ -428,10 +416,10 @@ class SessionManager:
                         except Exception as e:
                             logger.error(f"Error releasing handle during capacity cleanup: {e}")
 
-                    # Remove from hash mapping
-                    hash_key = session.calculate_hash()
-                    if hash_key in self._hash_to_session:
-                        del self._hash_to_session[hash_key]
+                    # Remove all hash mappings for this session
+                    hash_keys_to_remove = [k for k, v in self._hash_to_session.items() if v == session_id]
+                    for k in hash_keys_to_remove:
+                        del self._hash_to_session[k]
 
                     # Remove from tool calling maps
                     tool_keys_to_remove = [k for k, v in self._tool_calling_map.items() if v == session_id]

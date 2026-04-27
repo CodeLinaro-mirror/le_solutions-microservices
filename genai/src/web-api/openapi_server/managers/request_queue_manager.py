@@ -185,7 +185,12 @@ class RequestQueueManager:
         )
 
         session_manager = SessionManager.get_instance()
-        session, is_new = session_manager.find_or_create_session(user_id, messages)
+        session, is_new, _ = session_manager.find_or_create_session(
+            user_id,
+            messages,
+            request_data,
+            raw_json
+        )
 
         return session.session_id
 

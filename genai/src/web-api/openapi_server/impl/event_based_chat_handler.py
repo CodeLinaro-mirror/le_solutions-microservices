@@ -258,6 +258,8 @@ class EventBasedChatHandler:
                         detail="Tool response timed out. Please retry the turn."
                     )
 
+                current_event.request_signature = session_mgr.build_request_signature(request_data, raw_json, messages)
+
                 tool_response_parts = []
                 added_tool_message_indices = []
                 for tool_msg in new_messages:
@@ -297,6 +299,10 @@ class EventBasedChatHandler:
 
                     # Update legacy fields
                     current_event.assistant_message = result['response']
+                    current_event.replay_result = {
+                        'response': result['response'],
+                        'finish_reason': result['finish_reason'],
+                    }
 
                     # Unregister from tool calling map since tool calling is complete
                     # Use ONLY user messages for hash (same as registration)
@@ -336,6 +342,8 @@ class EventBasedChatHandler:
                 user_msgs = [m for m in new_messages if m.get('role') == 'user']
                 if user_msgs:
                     event.user_message = user_msgs[-1]['content']
+
+                event.request_signature = session_mgr.build_request_signature(request_data, raw_json, messages)
 
                 # CRITICAL: Register completion callback BEFORE execute_turn()
                 # This ensures the callback is available when VLM/LLM handlers need it
@@ -417,6 +425,10 @@ class EventBasedChatHandler:
 
                     # Update legacy field
                     event.assistant_message = result['response']
+                    event.replay_result = {
+                        'response': result['response'],
+                        'finish_reason': result['finish_reason'],
+                    }
 
                     # Complete the event AFTER adding assistant message
                     event.complete_turn()

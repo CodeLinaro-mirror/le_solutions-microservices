@@ -62,7 +62,21 @@ class ChatApiImpl(BaseChatApi):
             )
 
             session_manager = SessionManager.get_instance()
-            session, is_new = session_manager.find_or_create_session(user_id, messages)
+            session, is_new, replay_event = session_manager.find_or_create_session(
+                user_id,
+                messages,
+                create_chat_completion_request,
+                raw_json
+            )
+
+            if replay_event:
+                logger.info(f"Resolved retry replay: session={session.session_id}, event={replay_event.event_id}")
+                return EventBasedChatHandler._create_response(
+                    replay_event.replay_result,
+                    replay_event,
+                    create_chat_completion_request,
+                    session.session_id
+                )
 
             logger.info(f"Resolved session: {session.session_id} (new={is_new})")
 
