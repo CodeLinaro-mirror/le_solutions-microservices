@@ -347,35 +347,44 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         event_object=None,
         default_max_completion_tokens: int = 300
     ) -> StreamingResponse:
-        """Handle streaming response using VLMProcessManager."""
+        """Handle streaming response using VLMProcessManager via decoupled Producer/Consumer."""
         created = int(time.time())
         model = request_data.model
 
-        async def stream_generator():
+        token_queue: asyncio.Queue = asyncio.Queue()
+        _DONE_SENTINEL = object()
+
+        async def _inference_producer():
+            """
+            Runs VLM inference and puts pre-formatted SSE chunks into token_queue.
+            Releases the DSP lock (via completion_callback) as soon as inference
+            completes, independent of client network speed.
+            """
             stream_start_time = time.time()
             ttft_timestamp = None
             last_token_timestamp = None
             inter_token_latencies = []
             completion_tokens = 0
+            full_response_content = []
             stream_outcome = "pending"
             stream_failure: Optional[Exception] = None
 
-            try:
-                # First chunk: role
-                first_chunk = {
-                    "id": session_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": None},
-                        "finish_reason": None,
-                        "logprobs": None
-                    }]
-                }
-                yield f"data: {json.dumps(first_chunk)}\n\n"
+            # First chunk: role
+            first_chunk = {
+                "id": session_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": None},
+                    "finish_reason": None,
+                    "logprobs": None
+                }]
+            }
+            await token_queue.put(f"data: {json.dumps(first_chunk)}\n\n")
 
+            try:
                 # Stream tokens from VLM process
                 async for token in vlm_manager.execute_request(
                     event_id=event_id or f"vlm-{uuid.uuid4()}",
@@ -392,14 +401,22 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     frequency_penalty=request_data.frequency_penalty or 0.0
                 ):
                     now = time.time()
-                    # Capture TTFT on first token
                     if ttft_timestamp is None:
                         ttft_timestamp = now
-                    # Capture inter-token latency for subsequent tokens
                     if last_token_timestamp is not None:
                         inter_token_latencies.append((now - last_token_timestamp) * 1000)
                     last_token_timestamp = now
                     completion_tokens += 1
+                    full_response_content.append(token)
+
+                    # Notify watchdog that subprocess is still producing output
+                    try:
+                        from openapi_server.impl.constant import ADHOC_MODE
+                        if ADHOC_MODE:
+                            from openapi_server.managers.request_queue_manager import RequestQueueManager
+                            RequestQueueManager.get_instance().update_inference_heartbeat()
+                    except Exception:
+                        pass
 
                     # Content chunk
                     content_chunk = {
@@ -414,7 +431,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             "logprobs": None
                         }]
                     }
-                    yield f"data: {json.dumps(content_chunk)}\n\n"
+                    await token_queue.put(f"data: {json.dumps(content_chunk)}\n\n")
 
                 # Final chunk with stop reason
                 final_chunk = {
@@ -429,19 +446,30 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                         "logprobs": None
                     }]
                 }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
+                await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
+
+                # Append text directly to the assistant content to aid downstream processing
+                if event_object:
+                    event_object.assistant_message = "".join(full_response_content)
+
+                await token_queue.put("data: [DONE]\n\n")
                 stream_outcome = "success"
 
-                logger.info(f"VLM Event {event_id}: Streaming completed")
+                logger.info(f"VLM Event {event_id}: Streaming completed (inference producer)")
 
             except asyncio.CancelledError:
                 stream_outcome = "cancelled"
                 if event_object:
                     event_object.is_cancelled = True
+                    try:
+                        from openapi_server.events.conversation_event import EventState
+                        if event_object.state == EventState.ACTIVE:
+                            event_object.terminate_handle(force=True)
+                    except Exception as cancel_err:
+                        logger.error(f"VLM Event {event_id}: Error terminating handle on cancel: {cancel_err}")
                 raise
+
             except Exception as e:
-                # Check if this error is due to cancellation
                 if event_object and getattr(event_object, 'is_cancelled', False):
                     stream_outcome = "cancelled"
                     logger.info(f"VLM Event {event_id}: Stream terminated due to cancellation")
@@ -456,7 +484,6 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     if layman_msg:
                         final_msg = layman_msg
                     else:
-                        # Strip internal technical prefixes before showing to user
                         clean_msg = error_msg
                         for prefix in ("LLM subprocess error: ", "VLM subprocess error: "):
                             if clean_msg.startswith(prefix):
@@ -472,8 +499,11 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             "code": status_code
                         }
                     }
-                    yield f"data: {json.dumps(error_payload)}\n\n"
-                yield "data: [DONE]\n\n"
+                    try:
+                        token_queue.put_nowait(f"data: {json.dumps(error_payload)}\n\n")
+                        token_queue.put_nowait("data: [DONE]\n\n")
+                    except Exception:
+                        pass
             finally:
                 try:
                     if stream_outcome == "success" and completion_tokens > 0:
@@ -513,10 +543,10 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                                 logger.info(f"VLM Event {event_id}: Stream ended due to cancellation")
                                 event_object.cancel_turn()
                             elif stream_outcome == "failure":
-                                logger.info(f"VLM Event {event_id}: Marking event as failed from streaming generator")
+                                logger.info(f"VLM Event {event_id}: Marking event as failed from inference producer")
                                 event_object.fail_turn(stream_failure or Exception("Stream aborted or failed"))
                             else:
-                                logger.info(f"VLM Event {event_id}: Completing event from streaming generator")
+                                logger.info(f"VLM Event {event_id}: Completing event from inference producer")
                                 event_object.complete_turn()
                                 event_object.calculate_event_hash()
                                 if hasattr(event_object, 'session') and event_object.session:
@@ -525,13 +555,65 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     except Exception as e:
                         logger.error(f"VLM Event {event_id}: Error completing/cancelling event: {e}", exc_info=True)
 
-                # Trigger completion callback
+                # Trigger callback explicitly inside the producer to release DSP lock
+                # immediately, regardless of slow network readers.
                 if completion_callback:
-                    logger.info(f"VLM Event {event_id}: Triggering completion callback")
+                    logger.info(f"VLM Event {event_id}: Triggering completion callback from inference producer")
                     try:
-                        await completion_callback(event_id, event_state)
-                    except Exception as e:
-                        logger.error(f"VLM Event {event_id}: Error in streaming completion callback: {e}", exc_info=True)
+                        current_state = event_object.state if event_object else event_state
+                        await completion_callback(event_id, current_state)
+                    except asyncio.CancelledError:
+                        logger.info(f"VLM Event {event_id}: Task cancelled, scheduling callback as background task")
+                        try:
+                            current_state = event_object.state if event_object else event_state
+                            asyncio.create_task(completion_callback(event_id, current_state))
+                        except Exception as _task_err:
+                            logger.error(f"VLM Event {event_id}: Error scheduling background callback: {_task_err}")
+                    except RuntimeError:
+                        try:
+                            current_state = event_object.state if event_object else event_state
+                            asyncio.create_task(completion_callback(event_id, current_state))
+                        except Exception as _task_err:
+                            logger.error(f"VLM Event {event_id}: Error scheduling fallback callback: {_task_err}")
+                    except Exception as _cb_err:
+                        logger.error(f"VLM Event {event_id}: Error in completion callback: {_cb_err}")
+
+                try:
+                    token_queue.put_nowait(_DONE_SENTINEL)
+                except Exception:
+                    pass
+
+        # Start the inference as a background task, completely isolated from network yielding
+        producer_task = asyncio.create_task(_inference_producer())
+
+        async def stream_generator():
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(token_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        if producer_task.done() and token_queue.empty():
+                            break
+                        continue
+
+                    if item is _DONE_SENTINEL:
+                        break
+                    yield item
+            except asyncio.CancelledError:
+                if not producer_task.done():
+                    producer_task.cancel()
+                    try:
+                        await producer_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
+            finally:
+                if not producer_task.done():
+                    producer_task.cancel()
+                    try:
+                        await producer_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
         response_headers = {
             "Cache-Control": "no-cache",
@@ -580,6 +662,14 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 presence_penalty=request_data.presence_penalty or 0.0,
                 frequency_penalty=request_data.frequency_penalty or 0.0
             ):
+                # Notify watchdog that subprocess is still producing output
+                try:
+                    from openapi_server.impl.constant import ADHOC_MODE
+                    if ADHOC_MODE:
+                        from openapi_server.managers.request_queue_manager import RequestQueueManager
+                        RequestQueueManager.get_instance().update_inference_heartbeat()
+                except Exception:
+                    pass
                 accumulated_content.append(token)
 
             # Record non-streaming metrics (TPS approximated as total_tokens / total_time)
@@ -623,6 +713,17 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
 
             return response
 
+        except asyncio.CancelledError:
+            request_outcome = "cancelled"
+            logger.info(f"VLM Event {event_id}: Non-streaming request cancelled by client")
+            if event_object:
+                event_object.is_cancelled = True
+                if event_object.state == EventState.ACTIVE:
+                    try:
+                        event_object.terminate_handle(force=True)
+                    except Exception as cancel_err:
+                        logger.error(f"VLM Event {event_id}: Error terminating handle on cancel: {cancel_err}")
+            raise
         except Exception as e:
             if event_object and getattr(event_object, 'is_cancelled', False):
                 request_outcome = "cancelled"
@@ -664,10 +765,12 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 except Exception as e:
                     logger.error(f"VLM Event {event_id}: Error completing/cancelling event: {e}", exc_info=True)
 
-            # Trigger completion callback
+            # Trigger completion callback with the CURRENT (post-completion) state,
+            # not the stale ACTIVE state captured at call time.
             if completion_callback:
                 logger.info(f"VLM Event {event_id}: Triggering completion callback")
                 try:
-                    await completion_callback(event_id, event_state)
+                    current_state = event_object.state if event_object else event_state
+                    await completion_callback(event_id, current_state)
                 except Exception as e:
                     logger.error(f"VLM Event {event_id}: Error in non-streaming completion callback: {e}", exc_info=True)

@@ -6,6 +6,7 @@ VisionConversationEvent: Concrete implementation for VLM (Vision Language Model)
 Handles one complete turn with image support via optimized direct CFFI execution with pipeline reuse.
 """
 
+import asyncio
 import time
 from typing import Optional, Dict, Any
 from fastapi.responses import StreamingResponse
@@ -135,6 +136,10 @@ class VisionConversationEvent(ConversationEvent):
                 "is_streaming": False
             }
 
+        except asyncio.CancelledError:
+            logger.info(f"Event {self.event_id}: VLM turn cancelled by client")
+            self.is_cancelled = True
+            raise
         except Exception as e:
             logger.error(f"Event {self.event_id}: VLM execution failed: {e}")
             self.terminate_handle(force=True)
@@ -253,7 +258,6 @@ class VisionConversationEvent(ConversationEvent):
             # They are only destroyed when switching to a different VLM model
             logger.debug(f"Event {self.event_id}: VLM handle kept alive for reuse (ADHOC_MODE)")
 
-            # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
-            if self._completion_callback:
-                import asyncio
-                asyncio.create_task(self._trigger_completion_callback())
+            # NOTE: Do NOT trigger the completion callback here.
+            # The VLM handler's finally block calls it after the subprocess
+            # sends its final signal, ensuring the DSP is truly idle.

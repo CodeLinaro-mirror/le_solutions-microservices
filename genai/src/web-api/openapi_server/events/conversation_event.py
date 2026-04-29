@@ -369,9 +369,15 @@ class ConversationEvent(ABC):
                 except Exception as e:
                     logger.error(f"Event {self.event_id}: Error cleaning up handle in ADHOC_MODE: {e}")
 
-            # Trigger completion callback asynchronously (for ADHOC_MODE lock management)
-            if self._completion_callback:
-                asyncio.create_task(self._trigger_completion_callback())
+            # NOTE: Do NOT trigger the completion callback here.
+            # For streaming responses, the callback is called from the generator's
+            # finally block AFTER the subprocess sends its final READY signal,
+            # guaranteeing the DSP is truly idle before the next request starts.
+            # Triggering it here (via create_task) would release the DSP lock
+            # prematurely — before the subprocess finishes — causing the next
+            # request to receive "A prompt is already being processed".
+            # For non-streaming, _process_request_with_lock_held calls the callback
+            # directly after detecting event.is_completed().
 
     def cancel_turn(self):
         """Mark turn as cancelled (due to explicit client cancellation)."""
@@ -387,6 +393,10 @@ class ConversationEvent(ABC):
                     self.release_handle()
                 except Exception as e:
                     logger.error(f"Event {self.event_id}: Error releasing handle on cancel: {e}")
+
+            # Trigger completion callback so the DSP lock is always released
+            if self._completion_callback:
+                asyncio.create_task(self._trigger_completion_callback())
 
     def fail_turn(self, error: Exception):
         """Mark turn as failed."""
@@ -410,6 +420,10 @@ class ConversationEvent(ABC):
                     self.release_handle()
                 except Exception as e:
                     logger.error(f"Event {self.event_id}: Error releasing handle: {e}")
+
+            # Trigger completion callback so the DSP lock is always released
+            if self._completion_callback:
+                asyncio.create_task(self._trigger_completion_callback())
 
     def calculate_turn_hash(self) -> str:
         """Calculate hash for this turn."""

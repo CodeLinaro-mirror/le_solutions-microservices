@@ -514,6 +514,16 @@ class TextConversationEvent(ConversationEvent):
                     "turn_complete": True,
                 }
 
+        except asyncio.CancelledError:
+            logger.info(f"Event {self.event_id}: Non-streaming request cancelled by client")
+            self.is_cancelled = True
+            if self.state == EventState.ACTIVE:
+                try:
+                    self.terminate_handle(force=True)
+                except Exception as cancel_err:
+                    logger.error(f"Event {self.event_id}: Error terminating handle on cancel: {cancel_err}")
+                self.cancel_turn()
+            raise
         except Exception as e:
             # If cancelled, don't retry — just mark as cancelled and return
             if self.is_cancelled:
@@ -536,14 +546,32 @@ class TextConversationEvent(ConversationEvent):
         prompt_tokens: int,
         started_from_clean_kv: bool,
     ) -> dict:
-        """Execute streaming inference with tool detection."""
+        """Execute streaming inference with tool detection, decoupled from network I/O via asyncio.Queue."""
 
-        async def stream_generator():
+        token_queue: asyncio.Queue = asyncio.Queue()
+        _DONE_SENTINEL = object()
+
+        async def _inference_producer():
+            """
+            Runs LLM inference and puts pre-formatted SSE chunks into token_queue.
+            Releases the DSP lock (via _completion_callback) as soon as inference
+            completes, independent of client network speed.
+            """
             created_time = int(time.time())
             stream_start_time = time.time()
-            ttft_timestamp = None          # Time of first token
-            last_token_timestamp = None    # For inter-token latency
-            inter_token_latencies = []     # Collect per-token latencies
+            ttft_timestamp = None
+            last_token_timestamp = None
+            inter_token_latencies = []
+
+            completion_tokens = 0
+            full_response_content = []
+            stream_outcome = "pending"
+            stream_failure: Optional[Exception] = None
+
+            has_tools = hasattr(request_data, 'tools') and request_data.tools
+            is_potential_tool_call = False
+            tool_check_buffer = []
+            tool_check_completed = not has_tools
 
             # Yield role chunk immediately
             first_chunk = {
@@ -558,17 +586,7 @@ class TextConversationEvent(ConversationEvent):
                     "logprobs": None
                 }]
             }
-            yield f"data: {json.dumps(first_chunk)}\n\n"
-
-            completion_tokens = 0
-            full_response_content = []
-            stream_outcome = "pending"
-            stream_failure: Optional[Exception] = None
-
-            has_tools = hasattr(request_data, 'tools') and request_data.tools
-            is_potential_tool_call = False
-            tool_check_buffer = []
-            tool_check_completed = not has_tools
+            await token_queue.put(f"data: {json.dumps(first_chunk)}\n\n")
 
             try:
                 async for token in llm_manager.execute_request(
@@ -585,22 +603,28 @@ class TextConversationEvent(ConversationEvent):
                     frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
                 ):
                     now = time.time()
-                    # Capture TTFT on first token
                     if ttft_timestamp is None:
                         ttft_timestamp = now
-                    # Capture inter-token latency for subsequent tokens
                     if last_token_timestamp is not None:
                         inter_token_latencies.append((now - last_token_timestamp) * 1000)
                     last_token_timestamp = now
 
+                    # Notify watchdog
+                    from openapi_server.impl.constant import ADHOC_MODE
+                    if ADHOC_MODE:
+                        try:
+                            from openapi_server.managers.request_queue_manager import RequestQueueManager
+                            RequestQueueManager.get_instance().update_inference_heartbeat()
+                        except Exception:
+                            pass
+
                     completion_tokens += 1
                     full_response_content.append(token)
 
-                    # Buffering logic to detect tool calls during streaming
+                    # Tool call detection buffering
                     if not tool_check_completed:
                         tool_check_buffer.append(token)
                         current_text = "".join(tool_check_buffer).lstrip()
-
                         if current_text:
                             if current_text.startswith('{'):
                                 is_potential_tool_call = True
@@ -609,43 +633,31 @@ class TextConversationEvent(ConversationEvent):
                             elif len(current_text) > 20:
                                 is_potential_tool_call = False
                                 tool_check_completed = True
-                                # Flush buffer
                                 for buf_token in tool_check_buffer:
                                     chunk = {
                                         "id": self.session.session_id,
                                         "object": "chat.completion.chunk",
                                         "created": created_time,
                                         "model": self.model_id,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": buf_token},
-                                            "finish_reason": None,
-                                            "logprobs": None
-                                        }]
+                                        "choices": [{"index": 0, "delta": {"content": buf_token}, "finish_reason": None, "logprobs": None}]
                                     }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
+                                    await token_queue.put(f"data: {json.dumps(chunk)}\n\n")
                                 tool_check_buffer = []
                         continue
 
                     if is_potential_tool_call:
                         continue
                     else:
-                        # Regular content streaming
                         chunk = {
                             "id": self.session.session_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
                             "model": self.model_id,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": token},
-                                "finish_reason": None,
-                                "logprobs": None
-                            }]
+                            "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None, "logprobs": None}]
                         }
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await token_queue.put(f"data: {json.dumps(chunk)}\n\n")
 
-                # Stream complete
+                # Inference complete
                 final_response = "".join(full_response_content)
                 self._cap_started_from_clean_kv = started_from_clean_kv
                 self._cap_prompt_tokens_total += prompt_tokens
@@ -653,11 +665,9 @@ class TextConversationEvent(ConversationEvent):
                 parsed_tool_calls = None if not is_potential_tool_call else ToolHandler.parse_tool_response(final_response)
 
                 if parsed_tool_calls:
-                    # Valid tool call
                     self._is_tool_calling = True
                     self._pending_tool_calls = parsed_tool_calls
 
-                    # Send tool calls data
                     tc_chunk = {
                         "id": self.session.session_id,
                         "object": "chat.completion.chunk",
@@ -671,10 +681,7 @@ class TextConversationEvent(ConversationEvent):
                                         "index": idx,
                                         "id": tc.id,
                                         "type": tc.type,
-                                        "function": {
-                                            "name": tc.function.name,
-                                            "arguments": tc.function.arguments
-                                        }
+                                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
                                     } for idx, tc in enumerate(parsed_tool_calls)
                                 ]
                             },
@@ -682,26 +689,19 @@ class TextConversationEvent(ConversationEvent):
                             "logprobs": None
                         }]
                     }
-                    yield f"data: {json.dumps(tc_chunk)}\n\n"
+                    await token_queue.put(f"data: {json.dumps(tc_chunk)}\n\n")
 
                     finish_chunk = {
                         "id": self.session.session_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
                         "model": self.model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls",
-                            "logprobs": None
-                        }]
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls", "logprobs": None}]
                     }
-                    yield f"data: {json.dumps(finish_chunk)}\n\n"
+                    await token_queue.put(f"data: {json.dumps(finish_chunk)}\n\n")
 
-                    # Register in tool map (don't complete event yet)
                     from openapi_server.session.conversation_utils import ConversationUtils
                     from openapi_server.managers.session_manager import SessionManager
-
                     user_message_indices = [idx for idx in self.message_indices if self.session.messages[idx].get('role') == 'user']
                     user_messages = [self.session.messages[idx] for idx in user_message_indices]
                     event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
@@ -709,9 +709,7 @@ class TextConversationEvent(ConversationEvent):
                     self.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
 
                 else:
-                    # Regular content or failed tool parse
                     if is_potential_tool_call:
-                        # Flush buffered content
                         chunk_size = 100
                         for i in range(0, len(final_response), chunk_size):
                             chunk = {
@@ -719,95 +717,71 @@ class TextConversationEvent(ConversationEvent):
                                 "object": "chat.completion.chunk",
                                 "created": created_time,
                                 "model": self.model_id,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": final_response[i:i+chunk_size]},
-                                    "finish_reason": None,
-                                    "logprobs": None
-                                }]
+                                "choices": [{"index": 0, "delta": {"content": final_response[i:i+chunk_size]}, "finish_reason": None, "logprobs": None}]
                             }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            await token_queue.put(f"data: {json.dumps(chunk)}\n\n")
                     elif tool_check_buffer:
-                        # Short non-tool responses may never cross the in-loop
-                        # threshold that flushes tool_check_buffer. Flush them now.
                         for buf_token in tool_check_buffer:
                             chunk = {
                                 "id": self.session.session_id,
                                 "object": "chat.completion.chunk",
                                 "created": created_time,
                                 "model": self.model_id,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": buf_token},
-                                    "finish_reason": None,
-                                    "logprobs": None
-                                }]
+                                "choices": [{"index": 0, "delta": {"content": buf_token}, "finish_reason": None, "logprobs": None}]
                             }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            await token_queue.put(f"data: {json.dumps(chunk)}\n\n")
                         tool_check_buffer = []
 
-                    # Final stop chunk
                     final_chunk = {
                         "id": self.session.session_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
                         "model": self.model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                            "logprobs": None
-                        }]
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]
                     }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
 
-                    # Complete event
                     self.assistant_message = final_response
                     assistant_idx = self.session.add_message({'role': 'assistant', 'content': final_response})
                     self.message_indices.append(assistant_idx)
-
                     self.complete_turn()
                     self.calculate_event_hash()
                     self.session.complete_current_event()
 
-                yield "data: [DONE]\n\n"
+                await token_queue.put("data: [DONE]\n\n")
                 stream_outcome = "success"
 
             except asyncio.CancelledError:
-                # Client disconnected mid-stream; cancel event and stop the subprocess.
                 stream_outcome = "cancelled"
                 logger.info(f"Event {self.event_id}: Stream cancelled by client")
                 self.is_cancelled = True
-                try:
-                    self.terminate_handle(force=True)
-                except Exception as cancel_err:
-                    logger.error(f"Event {self.event_id}: Error terminating handle on cancel: {cancel_err}")
+                if self.state == EventState.ACTIVE:
+                    try:
+                        self.terminate_handle(force=True)
+                    except Exception as cancel_err:
+                        logger.error(f"Event {self.event_id}: Error terminating handle on cancel: {cancel_err}")
+                else:
+                    logger.info(f"Event {self.event_id}: Client cancelled after inference completed (state={self.state.name}) — not killing subprocess")
                 raise
+
             except Exception as e:
-                # Check if this error is due to cancellation
                 if self.is_cancelled:
                     stream_outcome = "cancelled"
                     logger.info(f"Event {self.event_id}: Stream terminated due to cancellation")
-                    # Don't yield error chunk for cancelled requests
                 else:
                     stream_outcome = "failure"
                     stream_failure = e
-                    logger.error(f"Error in stream generator: {e}", exc_info=True)
+                    logger.error(f"Error in inference producer: {e}", exc_info=True)
 
                     from openapi_server.impl.constant import GenieErrorMappings
                     error_msg = str(e)
                     layman_msg = GenieErrorMappings.get_layman_message(error_msg)
                     status_code = GenieErrorMappings.get_http_status_code(error_msg, default_status=500)
-                    if layman_msg:
-                        final_msg = layman_msg
-                    else:
-                        # Strip internal technical prefixes before showing to user
-                        clean_msg = error_msg
-                        for prefix in ("LLM subprocess error: ", "VLM subprocess error: "):
-                            if clean_msg.startswith(prefix):
-                                clean_msg = clean_msg[len(prefix):]
-                                break
-                        final_msg = clean_msg
+                    final_msg = layman_msg if layman_msg else error_msg
+                    for prefix in ("LLM subprocess error: ", "VLM subprocess error: "):
+                        if final_msg.startswith(prefix):
+                            final_msg = final_msg[len(prefix):]
+                            break
 
                     error_payload = {
                         "error": {
@@ -817,8 +791,14 @@ class TextConversationEvent(ConversationEvent):
                             "code": status_code
                         }
                     }
-                    yield f"data: {json.dumps(error_payload)}\n\n"
+                    try:
+                        token_queue.put_nowait(f"data: {json.dumps(error_payload)}\n\n")
+                        token_queue.put_nowait("data: [DONE]\n\n")
+                    except Exception:
+                        pass
+
             finally:
+                # Record metrics
                 try:
                     if stream_outcome == "success" and completion_tokens > 0:
                         total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
@@ -834,39 +814,92 @@ class TextConversationEvent(ConversationEvent):
                             ttft_ms=ttft_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                         )
-                        ttft_display = f"{ttft_ms:.1f}ms" if ttft_ms is not None else "n/a"
-                        stream_latency_display = (
-                            f"{avg_stream_latency_ms:.1f}ms" if avg_stream_latency_ms is not None else "n/a"
-                        )
-                        logger.debug(
-                            f"Event {self.event_id}: LLM metrics — "
-                            f"TTFT={ttft_display}, "
-                            f"StreamLatency={stream_latency_display}, "
-                            f"Total={total_pipeline_latency_ms:.1f}ms, "
-                            f"Tokens={completion_tokens}"
-                        )
                     elif stream_outcome == "failure":
                         MetricsManager.get_instance().record_inference_failure(self.model_id)
                 except Exception as metrics_err:
                     logger.error(f"Event {self.event_id}: Failed to record metrics: {metrics_err}")
 
-                # Always ensure event is completed/cancelled/failed and callback triggered
+                # Ensure event state is set
                 if self.state == EventState.ACTIVE:
                     if stream_outcome == "cancelled" or self.is_cancelled:
                         logger.info(f"Event {self.event_id}: Stream ended due to cancellation")
                         self.cancel_turn()
                     elif stream_outcome == "success" and self._is_tool_calling and not self._tool_response_received:
-                        logger.info(
-                            f"Event {self.event_id}: Stream ended after tool call request; "
-                            "keeping event ACTIVE for tool continuation"
-                        )
+                        logger.info(f"Event {self.event_id}: Stream ended after tool call request; keeping event ACTIVE for tool continuation")
                     else:
                         logger.warning(f"Event {self.event_id}: Stream ended without completion, marking as failed")
+                        if self.state == EventState.ACTIVE:
+                            try:
+                                self.terminate_handle(force=True)
+                            except Exception as _term_err:
+                                logger.error(f"Event {self.event_id}: Error terminating handle on unexpected exit: {_term_err}")
                         self.fail_turn(stream_failure or Exception("Stream aborted or failed"))
 
+                # *** KEY CHANGE: Release DSP lock HERE (in inference producer), not in network generator ***
+                # This ensures the lock is released as soon as inference is done,
+                # regardless of how fast the client reads the HTTP stream.
                 if self._completion_callback:
-                    logger.info(f"Event {self.event_id}: Triggering completion callback in finally block")
-                    await self._completion_callback(self.event_id, self.state)
+                    logger.info(f"Event {self.event_id}: Triggering completion callback from inference producer")
+                    try:
+                        await self._completion_callback(self.event_id, self.state)
+                    except asyncio.CancelledError:
+                        logger.info(f"Event {self.event_id}: Task cancelled, scheduling callback as background task")
+                        try:
+                            asyncio.create_task(self._completion_callback(self.event_id, self.state))
+                        except Exception as _task_err:
+                            logger.error(f"Event {self.event_id}: Error scheduling background callback: {_task_err}")
+                    except RuntimeError:
+                        try:
+                            asyncio.create_task(self._completion_callback(self.event_id, self.state))
+                        except Exception as _task_err:
+                            logger.error(f"Event {self.event_id}: Error scheduling fallback callback: {_task_err}")
+                    except Exception as _cb_err:
+                        logger.error(f"Event {self.event_id}: Error in completion callback: {_cb_err}")
+
+                # Signal consumer that inference is done
+                try:
+                    token_queue.put_nowait(_DONE_SENTINEL)
+                except Exception:
+                    pass
+
+        # Start inference as a background task, decoupled from network I/O
+        producer_task = asyncio.create_task(_inference_producer())
+
+        async def stream_generator():
+            """
+            Consumes pre-formatted SSE chunks from the queue and yields them to the client.
+            Network I/O is completely decoupled from inference speed.
+            """
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(token_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        # Check if producer is done and queue is empty
+                        if producer_task.done() and token_queue.empty():
+                            break
+                        continue
+
+                    if item is _DONE_SENTINEL:
+                        break
+                    yield item
+
+            except asyncio.CancelledError:
+                # Client disconnected - cancel the inference producer if still running
+                if not producer_task.done():
+                    producer_task.cancel()
+                    try:
+                        # Don't block network exit waiting for producer to clean up,
+                        # it will clean up asynchronously
+                        pass
+                    except Exception:
+                        pass
+                raise
+
+            finally:
+                # Ensure producer is cleaned up if still running
+                if not producer_task.done():
+                    producer_task.cancel()
 
         return {
             "response": StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}),
@@ -945,6 +978,14 @@ class TextConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Turn completed after tool calling")
 
+            # Explicitly trigger completion callback to release DSP lock
+            # because tool continuation bypasses the streaming generator
+            if self._completion_callback:
+                try:
+                    await self._completion_callback(self.event_id, EventState.COMPLETED)
+                except Exception as cb_err:
+                    logger.error(f"Event {self.event_id}: Error in tool continuation callback: {cb_err}")
+
             return {
                 "response": final_response,
                 "finish_reason": "stop",
@@ -952,6 +993,16 @@ class TextConversationEvent(ConversationEvent):
                 "turn_complete": True
             }
 
+        except asyncio.CancelledError:
+            logger.info(f"Event {self.event_id}: Tool continuation request cancelled by client")
+            self.is_cancelled = True
+            if self.state == EventState.ACTIVE:
+                try:
+                    self.terminate_handle(force=True)
+                except Exception as cancel_err:
+                    logger.error(f"Event {self.event_id}: Error terminating handle on cancel: {cancel_err}")
+                self.cancel_turn()
+            raise
         except Exception as e:
             return await self._handle_error(e, request_data)
 
@@ -1011,24 +1062,17 @@ class TextConversationEvent(ConversationEvent):
         return summary_text, summary_tokens
 
     async def _handle_error(self, error: Exception, request_data) -> dict:
-        """Handle error with retry logic."""
+        """
+        Handle inference error by failing immediately.
+
+        Server-side retry has been removed: retrying on the server keeps the DSP
+        lock held longer and causes the request queue to grow when multiple clients
+        are waiting. Clients are responsible for their own retry logic.
+        """
         if isinstance(error, HTTPException):
             raise error
 
-        self.retry_count += 1
-        logger.error(f"Event {self.event_id}: Error (attempt {self.retry_count}/{self.max_retries}): {error}")
-
-        if isinstance(error, (TimeoutError, ConnectionError, ValueError)) and self.retry_count < self.max_retries:
-            logger.info(f"Event {self.event_id}: Retrying...")
-            try:
-                if self._tool_response_received:
-                    return await self.continue_with_tool_response(self.tool_info, request_data)
-                else:
-                    return await self.execute_turn(request_data)
-            except HTTPException:
-                raise
-            except Exception as retry_error:
-                logger.error(f"Event {self.event_id}: Retry failed: {retry_error}")
+        logger.error(f"Event {self.event_id}: Error: {error}")
 
         try:
             MetricsManager.get_instance().record_inference_failure(self.model_id)
@@ -1087,8 +1131,9 @@ class TextConversationEvent(ConversationEvent):
                        f"completion: {self.completion_tokens}, "
                        f"total: {self.total_turn_tokens} tokens")
 
-            if self._completion_callback:
-                asyncio.create_task(self._trigger_completion_callback())
+            # NOTE: Do NOT trigger the completion callback here.
+            # The streaming generator's finally block calls it after the subprocess
+            # sends READY, ensuring the DSP is truly idle before the next request.
 
     def _calculate_prompt_tokens(self) -> int:
         tokens = 0

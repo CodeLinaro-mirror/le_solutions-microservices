@@ -18,6 +18,7 @@ for optimal performance.
 """
 
 import asyncio
+import os
 import threading
 import time
 from typing import Optional, Dict, Any
@@ -38,6 +39,14 @@ logger = LoggerConfig.get_logger(__name__)
 MAX_QUEUE_SIZE = 50  # 2x expected concurrent requests (25) for buffer
 REQUEST_TIMEOUT = 300  # 5 minutes
 CLEANUP_DELAY = 0.5  # seconds between requests for resource cleanup
+
+# Watchdog: maximum silence (no token produced by the subprocess) before the
+# session is considered unresponsive and the DSP lock is force-released.
+# A model that is legitimately generating a long response keeps updating the
+# heartbeat on every token, so the watchdog never fires for it.
+# Configurable via TOKEN_SILENCE_TIMEOUT env var (seconds). Default: 180s.
+TOKEN_SILENCE_TIMEOUT = int(os.getenv("TOKEN_SILENCE_TIMEOUT", "180"))
+LOCK_WATCHDOG_INTERVAL = 15  # check every 15 seconds
 
 # Priority Levels
 PRIORITY_TOOL_CONTINUATION = 0  # Highest - tool responses
@@ -81,8 +90,14 @@ class RequestQueueManager:
 
             # Worker task
             self.worker_task: Optional[asyncio.Task] = None
+            self.watchdog_task: Optional[asyncio.Task] = None
             self.enabled = ADHOC_MODE
             self._request_counter = 0
+
+            # Heartbeat timestamp: updated on every token produced by the active
+            # subprocess.  Initialized when the lock is acquired.  The watchdog
+            # fires when no token has been seen for TOKEN_SILENCE_TIMEOUT seconds.
+            self._last_token_at: Optional[float] = None
 
             self._initialized = True
             logger.info(f"RequestQueueManager initialized (enabled={self.enabled})")
@@ -143,6 +158,7 @@ class RequestQueueManager:
             if can_proceed:
                 # Immediately mark as active BEFORE releasing lock
                 self.active_session_id = session_id
+                self._last_token_at = time.time()  # initialise heartbeat
                 logger.info(f"🔒 Session {session_id} acquired DSP lock")
 
         # Step 3: Process or queue
@@ -229,6 +245,7 @@ class RequestQueueManager:
                                 )
                                 self.active_session_id = None
                                 self.active_event_id = None
+                                self._last_token_at = None
                             else:
                                 # Event still active (shouldn't happen in callback, but handle it)
                                 logger.info(
@@ -285,8 +302,19 @@ class RequestQueueManager:
                     logger.warning(f"⚠️  No current event for session {session_id}")
                     self.active_session_id = None
                     self.active_event_id = None
+                    self._last_token_at = None
 
             return result
+
+        except asyncio.CancelledError:
+            # Always release lock on cancellation
+            async with self.active_lock:
+                if self.active_session_id == session_id:
+                    logger.warning(f"⚠️  Request cancelled, releasing lock")
+                    self.active_session_id = None
+                    self.active_event_id = None
+                    self._last_token_at = None
+            raise
 
         except Exception as e:
             # Always release lock on error
@@ -295,6 +323,14 @@ class RequestQueueManager:
                     logger.error(f"❌ Error processing request, releasing lock: {e}")
                     self.active_session_id = None
                     self.active_event_id = None
+                    self._last_token_at = None
+
+            # DSP initialization failure: kill the subprocess and drain the queue
+            # so all waiting clients get an immediate user-friendly error instead
+            # of queuing up and failing one-by-one.
+            if self._is_dsp_init_failure(e):
+                await self._handle_dsp_failure(e, session_id)
+
             raise
 
     async def _queue_and_wait(self, request_data, raw_json, session):
@@ -419,7 +455,7 @@ class RequestQueueManager:
 
                 session_id = session.session_id
 
-                # Check if request has already timed out
+                # Check if request has already timed out or was cancelled by client
                 wait_time = time.time() - timestamp
                 if wait_time > REQUEST_TIMEOUT:
                     logger.warning(f"⏱️  Request expired in queue (waited {wait_time:.1f}s)")
@@ -427,6 +463,11 @@ class RequestQueueManager:
                         future.set_exception(
                             HTTPException(504, "Request expired in queue")
                         )
+                    self.request_queue.task_done()
+                    continue
+
+                if future.done():
+                    logger.warning(f"⚠️  Request already cancelled or completed, skipping (waited {wait_time:.1f}s)")
                     self.request_queue.task_done()
                     continue
 
@@ -442,6 +483,7 @@ class RequestQueueManager:
                         if can_proceed:
                             # Acquire lock for this session
                             self.active_session_id = session_id
+                            self._last_token_at = time.time()  # initialise heartbeat
                             break
 
                     # Can't proceed yet - wait a bit
@@ -483,10 +525,172 @@ class RequestQueueManager:
                 logger.error(f"Worker error: {e}", exc_info=True)
                 await asyncio.sleep(1)  # Prevent tight error loop
 
+    @staticmethod
+    def _is_dsp_init_failure(error: Exception) -> bool:
+        """
+        Return True when the error indicates a DSP/NPU initialization failure.
+
+        These errors mean the hardware is in a bad state and every subsequent
+        request will fail with the same error until the DSP is freed.
+        """
+        msg = str(error).lower()
+        return any(keyword in msg for keyword in (
+            "process failed to initialize",
+            "failed to create llm handle",
+            "failed to create vlm handle",
+            "failed to create the dialog",
+            "sdk code",
+            "device creation failure",
+        ))
+
+    def update_inference_heartbeat(self):
+        """
+        Record that the active subprocess just produced output (a token).
+
+        Called by streaming generators on every token and by non-streaming
+        handlers when the first token arrives.  Resets the silence timer so
+        the watchdog does not consider the subprocess unresponsive.
+        """
+        self._last_token_at = time.time()
+
+    async def _handle_dsp_failure(self, error: Exception, failed_session_id: str):
+        """
+        Handle a DSP/NPU initialization failure:
+        1. Force-kill the failed subprocess to free DSP resources for recovery.
+        2. Drain all queued requests with a user-friendly 503 so clients can
+           retry immediately rather than waiting in a queue that will keep failing.
+        """
+        logger.error(
+            f"🔴 DSP initialization failure for session {failed_session_id} — "
+            "killing subprocess and draining queue"
+        )
+
+        # Force-kill the subprocess to free DSP/NPU resources
+        try:
+            from openapi_server.managers.session_manager import SessionManager
+            session = SessionManager.get_instance().get_session(failed_session_id)
+            if session:
+                if session.current_event and session.current_event.is_active():
+                    logger.info(
+                        f"🔴 Force-killing subprocess for event "
+                        f"{session.current_event.event_id}"
+                    )
+                    session.current_event.terminate_handle(force=True)
+                elif session.events:
+                    last_event = session.events[-1]
+                    logger.info(
+                        f"🔴 Force-killing subprocess for last event {last_event.event_id}"
+                    )
+                    last_event.terminate_handle(force=True)
+        except Exception as kill_err:
+            logger.error(f"🔴 Error killing subprocess for {failed_session_id}: {kill_err}")
+
+        # Drain all queued requests with a user-friendly message
+        user_message = "Service temporarily unavailable. Please try again in a moment."
+        drained = 0
+        while not self.request_queue.empty():
+            try:
+                _, _, item = self.request_queue.get_nowait()
+                future = item['future']
+                if not future.done():
+                    future.set_exception(
+                        HTTPException(status_code=503, detail=user_message)
+                    )
+                self.request_queue.task_done()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+            except Exception as drain_err:
+                logger.error(f"🔴 Error draining queue item: {drain_err}")
+                break
+
+        if drained:
+            logger.warning(
+                f"🔴 Drained {drained} queued request(s) due to DSP initialization failure"
+            )
+
+    async def _watchdog(self):
+        """
+        Background watchdog that force-releases stale DSP locks.
+
+        Triggered when the active subprocess has produced NO output for
+        TOKEN_SILENCE_TIMEOUT seconds — indicating it is unresponsive (e.g.
+        the client disconnected mid-stream and the generator/subprocess are
+        deadlocked on a full output buffer).
+
+        A model that is legitimately generating a long response keeps calling
+        update_inference_heartbeat() on every token, so the watchdog never
+        fires for it regardless of total elapsed time.
+        """
+        logger.info(
+            f"🐕 RequestQueueManager watchdog started "
+            f"(TOKEN_SILENCE_TIMEOUT={TOKEN_SILENCE_TIMEOUT}s)"
+        )
+        while True:
+            try:
+                await asyncio.sleep(LOCK_WATCHDOG_INTERVAL)
+
+                stale_session_id = None
+                async with self.active_lock:
+                    if self.active_session_id and self._last_token_at is not None:
+                        silence = time.time() - self._last_token_at
+                        if silence > TOKEN_SILENCE_TIMEOUT:
+                            stale_session_id = self.active_session_id
+                            logger.warning(
+                                f"⏰ Watchdog: subprocess for session {stale_session_id} "
+                                f"has been silent for {silence:.1f}s "
+                                f"(>{TOKEN_SILENCE_TIMEOUT}s) — "
+                                "force-releasing lock (unresponsive subprocess)"
+                            )
+                            self.active_session_id = None
+                            self.active_event_id = None
+                            self._last_token_at = None
+
+                # Kill the subprocess and cancel the event outside the lock
+                if stale_session_id:
+                    try:
+                        from openapi_server.managers.session_manager import SessionManager
+                        session = SessionManager.get_instance().get_session(stale_session_id)
+                        if session:
+                            event = session.current_event
+                            if event:
+                                # Always force-kill the subprocess to free DSP resources,
+                                # regardless of event state (ACTIVE, FAILED, etc.)
+                                logger.info(
+                                    f"⏰ Watchdog: force-killing subprocess for event "
+                                    f"{event.event_id} (state={event.state.name})"
+                                )
+                                try:
+                                    event.terminate_handle(force=True)
+                                except Exception as kill_err:
+                                    logger.error(f"⏰ Watchdog: error killing subprocess: {kill_err}")
+
+                                # If still ACTIVE, do a full cancel (rolls back messages, etc.)
+                                if event.is_active():
+                                    logger.info(
+                                        f"⏰ Watchdog: cancelling active event "
+                                        f"{event.event_id} for session {stale_session_id}"
+                                    )
+                                    session.cancel_active_event()
+                            else:
+                                logger.info(
+                                    f"⏰ Watchdog: no current event for session "
+                                    f"{stale_session_id} — lock released, nothing to kill"
+                                )
+                    except Exception as cancel_err:
+                        logger.error(f"⏰ Watchdog: error handling stale session {stale_session_id}: {cancel_err}")
+
+            except asyncio.CancelledError:
+                logger.info("Watchdog task cancelled - shutting down")
+                break
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}", exc_info=True)
+
     async def start_worker(self):
         """Start the background worker task."""
         if self.enabled and self.worker_task is None:
             self.worker_task = asyncio.create_task(self._worker())
+            self.watchdog_task = asyncio.create_task(self._watchdog())
             logger.info("✓ RequestQueueManager worker task created")
 
     async def shutdown(self):
@@ -504,12 +708,19 @@ class RequestQueueManager:
             except asyncio.TimeoutError:
                 logger.warning("Queue drain timed out")
 
-            # Cancel worker
+            # Cancel worker and watchdog
             self.worker_task.cancel()
             try:
                 await self.worker_task
             except asyncio.CancelledError:
                 pass
+
+            if self.watchdog_task:
+                self.watchdog_task.cancel()
+                try:
+                    await self.watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
             logger.info("RequestQueueManager shutdown complete")
 
@@ -572,6 +783,7 @@ class RequestQueueManager:
                 logger.info(f"🔓 Session {session_id} is actively executing — releasing DSP lock")
                 self.active_session_id = None
                 self.active_event_id = None
+                self._last_token_at = None
                 return True
 
         # Case 2: Scan the queue and remove the matching entry

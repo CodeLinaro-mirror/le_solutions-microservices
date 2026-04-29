@@ -18,12 +18,11 @@ import logging
 from typing import Optional
 from cffi import FFI
 
-# Setup logging to separate file
+# Setup logging to stdout (captured by parent)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('vlm_process.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )

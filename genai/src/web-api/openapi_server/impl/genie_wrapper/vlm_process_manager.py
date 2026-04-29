@@ -9,6 +9,7 @@ Manages VLM subprocess lifecycle and provides execute_request() interface.
 Singleton instance for VLM inference delegation.
 """
 
+import asyncio
 import base64
 import threading
 from typing import AsyncGenerator, Dict, Any, Optional, Tuple
@@ -143,37 +144,45 @@ class VLMProcessManager(InferenceProcessManager):
         Yields:
             Generated tokens
         """
-        # Get model config path
-        config_path = CommonUtils.get_model_config_path(model)
-        sampler_config = SAMPLER_CONFIG_PATH
+        # Lazily initialize the async lock on the running event loop.
+        # This serializes concurrent calls to execute_request() so that
+        # only one request interacts with the subprocess socket at a time,
+        # preventing race conditions in non-ADHOC (non-queued) mode.
+        if not hasattr(self, '_async_lock'):
+            self._async_lock = asyncio.Lock()
 
-        # Ensure process is running with correct model/session
-        self._ensure_process_running(model, config_path, sampler_config, session_id)
+        async with self._async_lock:
+            # Get model config path
+            config_path = CommonUtils.get_model_config_path(model)
+            sampler_config = SAMPLER_CONFIG_PATH
 
-        # Encode image data if provided
-        image_data_b64 = None
-        if image_bytes:
-            image_data_b64 = base64.b64encode(image_bytes).decode('utf-8')
-            logger.info(f"Event {event_id}: Encoded image data ({len(image_bytes)} bytes -> {len(image_data_b64)} chars)")
+            # Ensure process is running with correct model/session
+            self._ensure_process_running(model, config_path, sampler_config, session_id)
 
-        # Create EXECUTE command
-        execute_cmd = self._create_execute_command(
-            event_id=event_id,
-            prompt=prompt,
-            streaming=streaming,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            image_data_b64=image_data_b64,
-            image_size=image_size
-        )
+            # Encode image data if provided
+            image_data_b64 = None
+            if image_bytes:
+                image_data_b64 = base64.b64encode(image_bytes).decode('utf-8')
+                logger.info(f"Event {event_id}: Encoded image data ({len(image_bytes)} bytes -> {len(image_data_b64)} chars)")
 
-        # Execute and yield tokens
-        async for token in self._execute_request_internal(event_id, execute_cmd):
-            yield token
+            # Create EXECUTE command
+            execute_cmd = self._create_execute_command(
+                event_id=event_id,
+                prompt=prompt,
+                streaming=streaming,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                image_data_b64=image_data_b64,
+                image_size=image_size
+            )
+
+            # Execute and yield tokens
+            async for token in self._execute_request_internal(event_id, execute_cmd):
+                yield token
 
     async def _execute_request_internal(
         self,

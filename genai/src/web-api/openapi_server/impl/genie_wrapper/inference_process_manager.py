@@ -273,7 +273,11 @@ class InferenceProcessManager(ABC):
             env = os.environ.copy()
             env.update({
                 f"{self.process_type.upper()}_SOCKET_FD": str(child_fd),
-                "PYTHONUNBUFFERED": "1"  # Ensure logs are flushed immediately
+                "PYTHONUNBUFFERED": "1",  # Ensure logs are flushed immediately
+                # Force GenIE SDK (libllmservice.so / libvlmservice.so) to WARN level
+                # in the subprocess regardless of the parent process LOG_LEVEL setting.
+                # This suppresses the verbose per-token QnnGraph_execute INFO lines.
+                "LOG_LEVEL": "warn",
             })
 
             # Define preexec_fn to set resource limits for child process
@@ -445,7 +449,9 @@ class InferenceProcessManager(ABC):
             self._send_command(reset_cmd)
 
             # Wait for the matching RESET response and drain any late stream output.
-            deadline = time.time() + 10.0
+            # 30s timeout gives the hardware enough time to finish post-execution
+            # cleanup (e.g. htpPerfInfrastructureSetPowerConfig) before responding.
+            deadline = time.time() + 30.0
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:

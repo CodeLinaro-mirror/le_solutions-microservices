@@ -54,9 +54,6 @@ services:
     environment:
       - LOG_LEVEL=ERROR
       - GENAI_PORT=${GENAI_PORT:-9001}
-      - VLM_LIBRARY_PATH=${VLM_LIBRARY_PATH:-/iot-user/app/site-packages/libvlmservice.so}
-      - LLM_LIBRARY_PATH=${LLM_LIBRARY_PATH:-/iot-user/app/site-packages/libllmservice.so}
-      - GENAI_INTERFACE_FILE=${GENAI_INTERFACE_FILE:-/usr/include/genai_interface.h}
       - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
       - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
     devices:
