@@ -120,8 +120,7 @@ FROM ubuntu:24.04 AS genai-llm-vlm-service
 RUN apt-get update                                                                              && \
     apt-get install -y                                                                             \
     python3                                                                                        \
-    libjsoncpp25 libatomic1                                                                        \
-    coreutils passwd util-linux libc-bin                                                        && \
+    libjsoncpp25 libatomic1                                                                     && \
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
@@ -131,17 +130,13 @@ RUN apt-get update                                                              
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
-# Create groups for fastrpc and dmaheap with placeholder GIDs.
-# The real GIDs are set at container startup by entrypoint.sh.
-RUN groupadd --gid 1500 fastrpc && \
-    groupadd --gid 1501 dmaheap
-
-# Create iot-user and add to the placeholder groups
-RUN useradd --create-home --shell /bin/bash \
-            --groups fastrpc,dmaheap iot-user
+# Create directory structure for application and make it world-accessible
+# Setting HOME to /tmp prevents KeyError: getpwuid() when running as arbitrary unnamed UID
+ENV HOME=/tmp
 
 # create directory
-RUN mkdir -p /iot-user/app/site-packages
+RUN mkdir -p /iot-user/app/site-packages  && \
+    chmod -R 777 /iot-user
 
 # Copy the virtual environment with web-api package installed with dependencies
 COPY --from=genai-llm-vlm-service-builder /mnt/work/venv /mnt/work/venv
@@ -182,12 +177,10 @@ ENV GENAI_INTERFACE_FILE=/usr/include/genai_interface.h
 
 ENV VLM_SITE_PACKAGES_PATH=/iot-user/app/site-packages/
 
-# Copy entrypoint script and make it executable
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Copy the Python entrypoint and make it executable
+COPY entrypoint.py /entrypoint.py
+RUN chmod +x /entrypoint.py
 
 WORKDIR /mnt/work/models
 
-# Container starts as root so entrypoint.sh can adjust group IDs,
-# then drops to iot-user before executing the application command.
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python3", "/entrypoint.py"]
