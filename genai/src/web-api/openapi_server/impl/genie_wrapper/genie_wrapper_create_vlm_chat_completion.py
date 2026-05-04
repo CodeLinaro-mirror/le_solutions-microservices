@@ -34,6 +34,7 @@ from openapi_server.models.error import Error
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import Parameters
 from openapi_server.session.conversation_utils import ConversationUtils
+from openapi_server.session.token_counter import TokenCounter
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.managers.metrics_manager import MetricsManager
@@ -513,10 +514,11 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             sum(inter_token_latencies) / len(inter_token_latencies)
                             if inter_token_latencies else None
                         )
+
                         MetricsManager.get_instance().record_inference_metrics(
                             model_id=model,
                             total_pipeline_latency_ms=total_pipeline_latency_ms,
-                            tokens_generated=completion_tokens,
+                            tokens_generated=TokenCounter.estimate_tokens("".join(full_response_content)),
                             ttft_ms=ttft_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                             preprocessing_time_ms=preprocessing_time_ms if preprocessing_time_ms > 0 else None,
@@ -647,6 +649,9 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             # Accumulate tokens from VLM process
             accumulated_content = []
             non_stream_start = time.time()
+            ttft_timestamp = None
+            last_token_timestamp = None
+            inter_token_latencies = []
 
             async for token in vlm_manager.execute_request(
                 event_id=event_id or f"vlm-{uuid.uuid4()}",
@@ -662,6 +667,13 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 presence_penalty=request_data.presence_penalty or 0.0,
                 frequency_penalty=request_data.frequency_penalty or 0.0
             ):
+                now = time.time()
+                if ttft_timestamp is None:
+                    ttft_timestamp = now
+                if last_token_timestamp is not None:
+                    inter_token_latencies.append((now - last_token_timestamp) * 1000)
+                last_token_timestamp = now
+
                 # Notify watchdog that subprocess is still producing output
                 try:
                     from openapi_server.impl.constant import ADHOC_MODE
@@ -675,10 +687,18 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             # Record non-streaming metrics (TPS approximated as total_tokens / total_time)
             try:
                 if accumulated_content:
+                    ttft_ms = (ttft_timestamp - non_stream_start) * 1000 if ttft_timestamp else None
+                    avg_stream_latency_ms = (
+                        sum(inter_token_latencies) / len(inter_token_latencies)
+                        if inter_token_latencies else None
+                    )
+
                     MetricsManager.get_instance().record_inference_metrics(
                         model_id=request_data.model,
                         total_pipeline_latency_ms=(time.time() - non_stream_start) * 1000,
-                        tokens_generated=len(accumulated_content),
+                        tokens_generated=TokenCounter.estimate_tokens("".join(accumulated_content)),
+                        ttft_ms=ttft_ms,
+                        avg_stream_latency_ms=avg_stream_latency_ms,
                         preprocessing_time_ms=preprocessing_time_ms if preprocessing_time_ms > 0 else None,
                     )
             except Exception as metrics_err:

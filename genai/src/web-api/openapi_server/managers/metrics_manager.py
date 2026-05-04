@@ -72,10 +72,21 @@ class ModelMetrics:
             preprocessing_time_ms     : Image encode/resize time in ms (VLM only)
         """
         with self._lock:
-            # Tokens/sec (steady-state: exclude TTFT from denominator when available)
+            # Tokens/sec calculation
             if total_pipeline_latency_ms > 0 and tokens_generated > 0:
-                tps = (tokens_generated / total_pipeline_latency_ms) * 1000.0
-                self._tokens_per_second_window.append(tps)
+                # Default to overall pipeline TPS for non-streaming or edge cases
+                generation_time_ms = total_pipeline_latency_ms
+
+                # If streamed cleanly, use steady-state TPS (exclude TTFT)
+                if ttft_ms is not None and avg_stream_latency_ms is not None and ttft_ms < total_pipeline_latency_ms:
+                    steady_state_time = total_pipeline_latency_ms - ttft_ms
+                    # Avoid division by near-zero if stream dumped all at once
+                    if steady_state_time >= 50.0:
+                        generation_time_ms = steady_state_time
+
+                if generation_time_ms > 0:
+                    tps = (tokens_generated / generation_time_ms) * 1000.0
+                    self._tokens_per_second_window.append(tps)
 
             if ttft_ms is not None:
                 self._ttft_window.append(ttft_ms)
