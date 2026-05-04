@@ -6,6 +6,7 @@ from fastapi import HTTPException
 import io
 import base64
 import os
+import re
 from PIL import Image
 import numpy as np
 
@@ -33,6 +34,11 @@ class ImageApiImpl(BaseImageApi):
                 logger.error("Prompt is missing or empty.")
                 raise HTTPException(status_code = HttpStatusCodes.BAD_REQUEST,
                                     detail = ErrorMessages.INCORRECT_CONTENT)
+
+            if not re.search(r'[a-zA-Z]', request.prompt):
+                logger.error(f"Prompt contains no alphabetic characters. Received: {request.prompt}")
+                raise HTTPException(status_code = HttpStatusCodes.BAD_REQUEST,
+                                    detail = ErrorMessages.INVALID_PROMPT)
 
             # Default model is the first model listed in the 'models' section of models_config.json
             default_model = model_config_manager.get_default_model()
