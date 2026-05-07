@@ -345,6 +345,13 @@ class SessionManager:
                     f"Removed {len(timed_out_tool_keys_to_remove)} timed-out tool mappings for session {session_id}"
                 )
 
+                # Clear cached VLM images for this session
+                try:
+                    from openapi_server.utils.image_cache import clear_session_images
+                    clear_session_images(session_id)
+                except Exception as e:
+                    logger.debug(f"Error clearing image cache for session {session_id}: {e}")
+
                 # Delete the session
                 del self._sessions[session_id]
                 logger.info(f"Successfully deleted session {session_id} with complete resource cleanup")
@@ -397,6 +404,13 @@ class SessionManager:
                 for k in timed_out_tool_keys_to_remove:
                     del self._timed_out_tool_call_map[k]
 
+                # Clear cached VLM images for this session
+                try:
+                    from openapi_server.utils.image_cache import clear_session_images
+                    clear_session_images(session_id)
+                except Exception as e:
+                    logger.debug(f"Error clearing image cache during TTL cleanup: {e}")
+
                 del self._sessions[session_id]
                 logger.info(f"Removed inactive session {session_id} (TTL exceeded)")
 
@@ -431,6 +445,13 @@ class SessionManager:
                     ]
                     for k in timed_out_tool_keys_to_remove:
                         del self._timed_out_tool_call_map[k]
+
+                    # Clear cached VLM images for this session
+                    try:
+                        from openapi_server.utils.image_cache import clear_session_images
+                        clear_session_images(session_id)
+                    except Exception as e:
+                        logger.debug(f"Error clearing image cache during capacity cleanup: {e}")
 
                     del self._sessions[session_id]
                     logger.info(f"Removed old session {session_id} (capacity limit)")
@@ -483,6 +504,13 @@ class SessionManager:
                         session.current_event.release_handle()
                     except Exception as e:
                         logger.error(f"Error releasing handle during clear: {e}")
+
+            # Clear all cached VLM images
+            try:
+                from openapi_server.utils.image_cache import get_image_cache
+                get_image_cache().clear_all()
+            except Exception as e:
+                logger.debug(f"Error clearing image cache during clear_all_sessions: {e}")
 
             self._sessions.clear()
             self._hash_to_session.clear()
