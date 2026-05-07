@@ -70,12 +70,18 @@ def preprocess_image(img: Image.Image, vision_config: dict = None) -> Preprocess
     # Extract parameters from vision_config or use defaults
     if vision_config:
         patch_size = vision_config.get('patch_size', DEFAULT_PATCH_SIZE)
-        merge_size = vision_config.get('merge_size', DEFAULT_MERGE_SIZE)
+        merge_size = vision_config.get('merge_size', vision_config.get('spatial_merge_size', DEFAULT_MERGE_SIZE))
         temporal_patch_size = vision_config.get('temporal_patch_size', DEFAULT_TEMPORAL_PATCH_SIZE)
-        target_width = vision_config.get('target_width', DEFAULT_TARGET_WIDTH)
-        target_height = vision_config.get('target_height', DEFAULT_TARGET_HEIGHT)
-        image_mean = np.array(vision_config.get('image_mean', DEFAULT_IMAGE_MEAN), dtype=np.float32)
-        image_std = np.array(vision_config.get('image_std', DEFAULT_IMAGE_STD), dtype=np.float32)
+        target_width = vision_config.get('target_width', vision_config.get('image_width', DEFAULT_TARGET_WIDTH))
+        target_height = vision_config.get('target_height', vision_config.get('image_height', DEFAULT_TARGET_HEIGHT))
+        image_mean = np.array(
+            vision_config.get('image_mean', vision_config.get('normalize_mean', DEFAULT_IMAGE_MEAN)),
+            dtype=np.float32
+        )
+        image_std = np.array(
+            vision_config.get('image_std', vision_config.get('normalize_std', DEFAULT_IMAGE_STD)),
+            dtype=np.float32
+        )
     else:
         patch_size = DEFAULT_PATCH_SIZE
         merge_size = DEFAULT_MERGE_SIZE
