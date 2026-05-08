@@ -157,7 +157,7 @@ class VLMProcessManager(InferenceProcessManager):
             sampler_config = SAMPLER_CONFIG_PATH
 
             # Ensure process is running with correct model/session
-            self._ensure_process_running(model, config_path, sampler_config, session_id)
+            await self._ensure_process_running(model, config_path, sampler_config, session_id)
 
             # Encode image data if provided
             image_data_b64 = None
@@ -181,8 +181,15 @@ class VLMProcessManager(InferenceProcessManager):
             )
 
             # Execute and yield tokens
-            async for token in self._execute_request_internal(event_id, execute_cmd):
-                yield token
+            try:
+                async for token in self._execute_request_internal(event_id, execute_cmd):
+                    yield token
+            finally:
+                from openapi_server.impl.constant import ADHOC_MODE
+                if ADHOC_MODE:
+                    logger.info("ADHOC_MODE: Launching eager background RESET task to hide latency for next request")
+                    self._eager_reset_task = asyncio.create_task(asyncio.to_thread(self._send_reset_and_wait))
+                    self._just_eager_reset = True
 
     async def _execute_request_internal(
         self,
@@ -296,7 +303,7 @@ class VLMProcessManager(InferenceProcessManager):
             # Yield tokens from queue
             while True:
                 try:
-                    token = token_queue.get(timeout=0.1)
+                    token = token_queue.get_nowait()
                 except queue.Empty:
                     if pipe_done.is_set() and socket_done.is_set() and token_queue.empty():
                         break

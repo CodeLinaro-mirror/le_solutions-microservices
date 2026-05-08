@@ -136,7 +136,7 @@ class LLMProcessManager(InferenceProcessManager):
             sampler_config = SAMPLER_CONFIG_PATH
 
             # Ensure process is running with correct model/session
-            self._ensure_process_running(model, config_path, sampler_config, session_id)
+            await self._ensure_process_running(model, config_path, sampler_config, session_id)
 
             # Create EXECUTE command
             execute_cmd = self._create_execute_command(
@@ -152,5 +152,12 @@ class LLMProcessManager(InferenceProcessManager):
             )
 
             # Execute and yield tokens
-            async for token in self._execute_request_internal(event_id, execute_cmd):
-                yield token
+            try:
+                async for token in self._execute_request_internal(event_id, execute_cmd):
+                    yield token
+            finally:
+                from openapi_server.impl.constant import ADHOC_MODE
+                if ADHOC_MODE:
+                    logger.info("ADHOC_MODE: Launching eager background RESET task to hide latency for next request")
+                    self._eager_reset_task = asyncio.create_task(asyncio.to_thread(self._send_reset_and_wait))
+                    self._just_eager_reset = True

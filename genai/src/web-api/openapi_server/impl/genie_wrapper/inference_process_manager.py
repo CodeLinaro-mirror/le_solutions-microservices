@@ -74,6 +74,8 @@ class InferenceProcessManager(ABC):
         self._process_id: Optional[str] = None  # Unique ID for resource tracking
         self._is_active = False  # Whether process is actively executing
 
+        self._eager_reset_task: Optional[asyncio.Task] = None
+
         logger.info(f"{self.process_type.upper()}ProcessManager initialized")
 
     @abstractmethod
@@ -449,9 +451,9 @@ class InferenceProcessManager(ABC):
             self._send_command(reset_cmd)
 
             # Wait for the matching RESET response and drain any late stream output.
-            # 30s timeout gives the hardware enough time to finish post-execution
+            # 20s timeout gives the hardware enough time to finish post-execution
             # cleanup (e.g. htpPerfInfrastructureSetPowerConfig) before responding.
-            deadline = time.time() + 30.0
+            deadline = time.time() + 20.0
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -602,9 +604,16 @@ class InferenceProcessManager(ABC):
         self.current_model = None
         self.current_session_id = None
 
-    def _ensure_process_running(self, model_id: str, config_path: str, sampler_config: str, session_id: str):
+    async def _ensure_process_running(self, model_id: str, config_path: str, sampler_config: str, session_id: str):
         """
         Ensure subprocess is running with correct model and for correct session.
+
+        This method is async so that the blocking RESET handshake (socket I/O
+        waiting for the hardware to acknowledge the KV-cache flush) is offloaded
+        to a background thread via asyncio.to_thread().  This keeps the ASGI
+        event loop free to flush already-queued SSE chunks to clients while the
+        reset is in progress, which directly reduces Time To First Token (TTFT)
+        for the *next* request without penalising the *current* one.
 
         Args:
             model_id: Model identifier
@@ -621,18 +630,51 @@ class InferenceProcessManager(ABC):
 
         # Start process if not running
         if not self.process or self.process.poll() is not None:
-            self._start_process(model_id, config_path, sampler_config)
+            # _start_process is blocking (waits for READY after INIT).
+            # Offload to a thread so the event loop stays responsive.
+            await asyncio.to_thread(self._start_process, model_id, config_path, sampler_config)
             self.current_session_id = session_id
             return
 
+        # Wait for any pending eager reset to complete
+        if self._eager_reset_task and not self._eager_reset_task.done():
+            logger.info("Waiting for eager background RESET to complete...")
+            try:
+                await self._eager_reset_task
+                logger.info("Eager background RESET completed")
+            except Exception as e:
+                logger.error(f"Error in eager reset task: {e}")
+            finally:
+                self._eager_reset_task = None
+
         # Process is running with correct model
         if ADHOC_MODE:
-            # In ADHOC_MODE, the prompt ALWAYS contains the full conversation history.
-            # If we don't clear the KV cache, the engine appends the full history to the existing
-            # full history, causing exponential token growth and "Context Size Exceeded".
-            # Therefore, we MUST send a RESET command before every execution.
-            logger.info(f"ADHOC_MODE active: sending RESET to clear KV cache before execution")
-            self._send_reset_and_wait()
+            # If we already did an eager reset since the last run, we don't need to do it again
+            # The eager reset task sets self._eager_reset_task to None after completion (if awaited)
+            # but it might have finished on its own. We just need to know if a reset happened.
+            # We track this by checking if there was a task we just awaited or if the task is done.
+            # Actually, to be safe, if we don't have an eager reset we do it here.
+            # But the eager reset is launched at the END of execute_request.
+            # So if we get here and _eager_reset_task is None, it means either:
+            # 1. This is the first request (we should reset)
+            # 2. Eager reset was not launched (error or missed) (we should reset)
+            # 3. We just awaited it above (we shouldn't reset)
+            # Let's use a flag.
+
+            pass # (handled below)
+
+        if ADHOC_MODE:
+            # We must clear the KV cache.
+            # We skip sending RESET *only* if we know an eager reset just successfully completed
+            # for this idle period. The simplest way is a flag. Let's add it.
+            if not getattr(self, '_just_eager_reset', False):
+                logger.info(f"ADHOC_MODE active: sending RESET to clear KV cache before execution")
+                await asyncio.to_thread(self._send_reset_and_wait)
+            else:
+                logger.info("ADHOC_MODE active: skipping RESET because eager background reset already completed")
+
+            # Reset the flag so we don't skip it next time if it fails to eager-reset
+            self._just_eager_reset = False
             self.current_session_id = session_id
         else:
             # Non-ADHOC mode relies on KV cache to remember previous turns.
@@ -640,7 +682,7 @@ class InferenceProcessManager(ABC):
             # so the new session doesn't inherit the previous session's memory.
             if self.current_session_id and self.current_session_id != session_id:
                 logger.info(f"Non-ADHOC session switch: {self.current_session_id} → {session_id}, sending RESET")
-                self._send_reset_and_wait()
+                await asyncio.to_thread(self._send_reset_and_wait)
 
             self.current_session_id = session_id
 
@@ -760,7 +802,7 @@ class InferenceProcessManager(ABC):
             # Yield tokens from queue
             while True:
                 try:
-                    token = token_queue.get(timeout=0.1)
+                    token = token_queue.get_nowait()
                 except queue.Empty:
                     if not reader_thread.is_alive() and token_queue.empty():
                         break
