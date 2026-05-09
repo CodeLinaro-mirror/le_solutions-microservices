@@ -454,6 +454,10 @@ class TextConversationEvent(ConversationEvent):
             # Accumulate non-streaming response
             accumulated_content = []
             non_stream_start = time.time()
+            ttft_timestamp = None
+            last_token_timestamp = None
+            inter_token_latencies = []
+
             async for token in llm_manager.execute_request(
                 event_id=self.event_id,
                 session_id=self.session.session_id,
@@ -467,6 +471,12 @@ class TextConversationEvent(ConversationEvent):
                 presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
                 frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
             ):
+                now = time.time()
+                if ttft_timestamp is None:
+                    ttft_timestamp = now
+                if last_token_timestamp is not None:
+                    inter_token_latencies.append((now - last_token_timestamp) * 1000)
+                last_token_timestamp = now
                 accumulated_content.append(token)
 
             response_content = "".join(accumulated_content)
@@ -481,10 +491,17 @@ class TextConversationEvent(ConversationEvent):
             # Record non-streaming metrics only for successful completions.
             try:
                 if accumulated_content:
+                    ttft_ms = (ttft_timestamp - non_stream_start) * 1000 if ttft_timestamp else None
+                    avg_stream_latency_ms = (
+                        sum(inter_token_latencies) / len(inter_token_latencies)
+                        if inter_token_latencies else None
+                    )
                     MetricsManager.get_instance().record_inference_metrics(
                         model_id=self.model_id,
                         total_pipeline_latency_ms=(time.time() - non_stream_start) * 1000,
-                        tokens_generated=len(accumulated_content),
+                        tokens_generated=TokenCounter.estimate_tokens(response_content),
+                        ttft_ms=ttft_ms,
+                        avg_stream_latency_ms=avg_stream_latency_ms,
                     )
             except Exception as metrics_err:
                 logger.error(f"Event {self.event_id}: Failed to record non-streaming metrics: {metrics_err}")
@@ -810,7 +827,7 @@ class TextConversationEvent(ConversationEvent):
                         MetricsManager.get_instance().record_inference_metrics(
                             model_id=self.model_id,
                             total_pipeline_latency_ms=total_pipeline_latency_ms,
-                            tokens_generated=completion_tokens,
+                            tokens_generated=TokenCounter.estimate_tokens("".join(full_response_content)),
                             ttft_ms=ttft_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                         )
