@@ -33,9 +33,9 @@ from openapi_server.models.create_chat_completion_response_choices_inner import 
 from openapi_server.models.error import Error
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import Parameters
-from openapi_server.session.conversation_utils import ConversationUtils
 from openapi_server.session.token_counter import TokenCounter
 from openapi_server.utils.common_utils import CommonUtils
+from openapi_server.utils.image_cache import get_image_cache
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.managers.metrics_manager import MetricsManager
 from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
@@ -154,6 +154,92 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         return image_input, text_content
 
     @staticmethod
+    def search_all_messages_for_image_with_index(
+        messages: list,
+        raw_json: dict = None
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Search all messages newest-first for a reusable image.
+
+        Short strings are treated as compacted placeholders and skipped because
+        they cannot be decoded or preprocessed.
+        """
+        compaction_threshold = 256
+        if raw_json and 'messages' in raw_json:
+            source_messages = raw_json['messages']
+        else:
+            source_messages = messages
+
+        if not source_messages:
+            return None, None
+
+        for idx in range(len(source_messages) - 1, -1, -1):
+            msg = source_messages[idx]
+            if isinstance(msg, dict):
+                content = msg.get('content', [])
+            else:
+                content = getattr(msg, 'content', [])
+
+            if not isinstance(content, list):
+                continue
+
+            for item in content:
+                url = None
+                if isinstance(item, dict):
+                    if item.get('type') != 'image_url':
+                        continue
+                    image_url_data = item.get('image_url', {})
+                    if isinstance(image_url_data, dict):
+                        url = image_url_data.get('url', '')
+                    else:
+                        url = str(image_url_data)
+                elif hasattr(item, 'type'):
+                    if item.type != 'image_url':
+                        continue
+                    image_url_obj = getattr(item, 'image_url', None)
+                    if hasattr(image_url_obj, 'url'):
+                        url = image_url_obj.url
+                    elif isinstance(image_url_obj, dict):
+                        url = image_url_obj.get('url', '')
+                else:
+                    continue
+
+                if not url:
+                    continue
+
+                if url.startswith(('http://', 'https://')):
+                    logger.info(f"History scan: found usable HTTP URL in message[{idx}]")
+                    return url, idx
+
+                lowered_url = url.lower()
+                if lowered_url.startswith('data:image') and ';base64,' in lowered_url:
+                    _, payload = url.split(',', 1)
+                    if len(payload) <= compaction_threshold:
+                        logger.debug(f"History scan: skipping compacted data:image URL in message[{idx}]")
+                        continue
+                    logger.info(f"History scan: found usable data:image URL in message[{idx}]")
+                    return url, idx
+
+                if len(url) <= compaction_threshold:
+                    logger.debug(f"History scan: skipping short string in message[{idx}], likely compacted")
+                    continue
+
+                logger.info(f"History scan: found usable raw base64 in message[{idx}] ({len(url)} chars)")
+                return url, idx
+
+        logger.info("History scan: no usable image found in any message")
+        return None, None
+
+    @staticmethod
+    def _describe_image_source(image_input: str) -> str:
+        """Return a bounded image-source description for logs/cache metadata."""
+        if image_input.startswith(('http://', 'https://')):
+            return image_input[:80] + ('...' if len(image_input) > 80 else '')
+        if image_input.startswith('data:image'):
+            return "base64 (data URL)"
+        return f"base64 (raw, {len(image_input)} chars)"
+
+    @staticmethod
     async def preprocess_image_from_input(image_input: str, model_id: str = None) -> bytes:
         """
         Preprocess an image from URL or base64 input.
@@ -249,12 +335,9 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             else:
                 logger.info(f"Using session_id from raw_json: {session_id}")
 
-            # Calculate conversation hash for session tracking
-            conversation_hash = ConversationUtils.calculate_conversation_hash(
-                request_data.messages,
-                exclude_last_pair=False
-            )
-            logger.info(f"Conversation hash (session ID): {conversation_hash}")
+            model_id = request_data.model
+            image_cache_key = f"{session_id}:{model_id or 'unknown-model'}"
+            image_cache = get_image_cache()
 
             # Extract image and text from current message
             image_input, text_prompt = GenieWrapperCreateVLMChatCompletionIntegrated.extract_image_and_text_from_messages(
@@ -269,28 +352,85 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     type=Parameters.INTERNAL_TYPE
                 )
 
-            # Check for image in current message
-            if not image_input:
+            preprocessed_image_bytes = None
+            preprocessing_time_ms = 0.0
+
+            if image_input:
+                image_source_desc = GenieWrapperCreateVLMChatCompletionIntegrated._describe_image_source(image_input)
+                logger.info(f"Tier 1: Image found in current message, preprocessing from {image_source_desc}...")
+                preprocessing_start = time.time()
+                try:
+                    preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(
+                        image_input,
+                        model_id=model_id
+                    )
+                    preprocessing_time_ms = (time.time() - preprocessing_start) * 1000
+                    logger.info(
+                        f"Tier 1: Image preprocessed: {len(preprocessed_image_bytes)} bytes "
+                        f"in {preprocessing_time_ms:.2f}ms"
+                    )
+                    image_cache.set(image_cache_key, preprocessed_image_bytes, image_source_desc)
+                except Exception as e:
+                    logger.error(f"Tier 1: Failed to preprocess image: {e}")
+                    return Error(
+                        code="400",
+                        message=f"Failed to process image: {str(e)}",
+                        param=Parameters.INTERNAL_TYPE,
+                        type=Parameters.INTERNAL_TYPE
+                    )
+            else:
+                cached_bytes = image_cache.get(image_cache_key)
+                if cached_bytes:
+                    preprocessed_image_bytes = cached_bytes
+                    logger.info(
+                        f"Tier 2: Cache hit for {image_cache_key}, "
+                        f"reusing cached image ({len(cached_bytes)} bytes)"
+                    )
+                else:
+                    logger.info(f"Tier 3: Cache miss for {image_cache_key}, scanning message history...")
+                    history_image, history_idx = GenieWrapperCreateVLMChatCompletionIntegrated.search_all_messages_for_image_with_index(
+                        request_data.messages,
+                        raw_json
+                    )
+                    if history_image:
+                        image_source_desc = GenieWrapperCreateVLMChatCompletionIntegrated._describe_image_source(history_image)
+                        logger.info(f"Tier 3: Found image in message[{history_idx}]: {image_source_desc}")
+                        preprocessing_start = time.time()
+                        try:
+                            preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(
+                                history_image,
+                                model_id=model_id
+                            )
+                            preprocessing_time_ms = (time.time() - preprocessing_start) * 1000
+                            logger.info(
+                                f"Tier 3: Image preprocessed: {len(preprocessed_image_bytes)} bytes "
+                                f"in {preprocessing_time_ms:.2f}ms"
+                            )
+                            image_cache.set(image_cache_key, preprocessed_image_bytes, image_source_desc)
+                        except Exception as e:
+                            logger.error(f"Tier 3: Failed to preprocess historical image: {e}")
+                            return Error(
+                                code="400",
+                                message=f"Failed to process historical image: {str(e)}",
+                                param=Parameters.INTERNAL_TYPE,
+                                type=Parameters.INTERNAL_TYPE
+                            )
+                    else:
+                        logger.warning(
+                            f"Tier 4: No image found in current message, cache, or history for {image_cache_key}"
+                        )
+                        return Error(
+                            code="400",
+                            message="No image found in current message or conversation history. "
+                                    "Please include an image in your request.",
+                            param=Parameters.INTERNAL_TYPE,
+                            type=Parameters.INTERNAL_TYPE
+                        )
+
+            if not preprocessed_image_bytes:
                 return Error(
                     code="400",
-                    message="No image found in current message. Each VLM request must include an image.",
-                    param=Parameters.INTERNAL_TYPE,
-                    type=Parameters.INTERNAL_TYPE
-                )
-
-            # Process the image from current request and measure preprocessing time
-            logger.info("Processing image from current request...")
-            preprocessing_start = time.time()
-            try:
-                preprocessed_image_bytes = await GenieWrapperCreateVLMChatCompletionIntegrated.preprocess_image_from_input(image_input, model_id=request_data.model)
-                preprocessing_time_ms = (time.time() - preprocessing_start) * 1000
-                logger.info(f"Image preprocessed successfully: {len(preprocessed_image_bytes)} bytes in {preprocessing_time_ms:.2f}ms")
-
-            except Exception as e:
-                logger.error(f"Failed to preprocess image: {e}")
-                return Error(
-                    code="400",
-                    message=f"Failed to process image: {str(e)}",
+                    message="Failed to resolve image data for VLM request.",
                     param=Parameters.INTERNAL_TYPE,
                     type=Parameters.INTERNAL_TYPE
                 )
@@ -300,7 +440,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 messages=request_data.messages,
                 text_prompt=text_prompt,
                 has_image=True,
-                model_id=request_data.model
+                model_id=model_id
             )
 
             # Get VLM process manager
@@ -311,7 +451,7 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
 
             # Determine max completion tokens fallback from context size
             config_manager = ModelConfigManager()
-            context_size = config_manager.get_context_size(request_data.model)
+            context_size = config_manager.get_context_size(model_id)
             default_max_completion_tokens = int(context_size * 0.5)
 
             if streaming:
