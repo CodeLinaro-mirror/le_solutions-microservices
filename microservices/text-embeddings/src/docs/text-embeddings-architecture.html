@@ -1,0 +1,764 @@
+<!--
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Text Embeddings Service Architecture</title>
+<style>
+  /* ============================================================
+     DESIGN TOKENS
+     Centralised colour palette and shared values.
+     ============================================================ */
+  :root {
+    /* Background surfaces */
+    --bg:        #0b1020;
+    --panel:     #121a33;
+    --panel2:    #182343;
+
+    /* Text */
+    --txt:       #eaf0ff;   /* primary text – high contrast on dark */
+    --muted:     #b0c4e8;   /* secondary text – improved from #9eb0d9 for legibility */
+
+    /* Accent colours (used for swim-lane tints and labels) */
+    --f:         #7af0c1;   /* clients / frontend – green */
+    --b:         #63b3ff;   /* service / backend – blue */
+    --m:         #ffcf6e;   /* inference / model – amber */
+    --s:         #9b87ff;   /* assets / storage – purple */
+    --o:         #ff8fb1;   /* observability / ops – pink */
+
+    /* Structural */
+    --line:      rgba(255, 255, 255, 0.10);
+    --radius-lg: 20px;
+    --radius-md: 16px;
+    --radius-sm: 10px;
+  }
+
+  /* ============================================================
+     RESET AND BOX MODEL
+     ============================================================ */
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  /* ============================================================
+     BASE DOCUMENT
+     ============================================================ */
+  body {
+    margin: 0;
+    font-family: Inter, "Segoe UI", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    background: linear-gradient(180deg, #09101d, #0b1020);
+    color: var(--txt);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ============================================================
+     PAGE WRAPPER
+     ============================================================ */
+  .page {
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 28px 24px;
+  }
+
+  /* ============================================================
+     CARD – primary content container
+     ============================================================ */
+  .card {
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  /* ============================================================
+     LAYOUT HELPERS
+     ============================================================ */
+
+  /* Two-column hero layout */
+  .hero {
+    display: grid;
+    grid-template-columns: 1.2fr 0.8fr;
+    gap: 20px;
+  }
+
+  /* Two- and three-column grids for panels */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+  }
+
+  /* Inset panel inside a card */
+  .panel {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    padding: 18px;
+  }
+
+  /* ============================================================
+     TYPOGRAPHY
+     ============================================================ */
+  h1 {
+    margin: 0 0 12px;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+    color: var(--txt);
+  }
+
+  h2 {
+    margin: 0 0 12px;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--txt);
+  }
+
+  h3 {
+    margin: 0 0 10px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--txt);
+  }
+
+  p {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.65;
+  }
+
+  ul {
+    margin: 10px 0 0 22px;
+    padding: 0;
+    color: var(--muted);
+    line-height: 1.65;
+  }
+
+  li + li {
+    margin-top: 7px;
+  }
+
+  /* Utility: small / caption text */
+  .small {
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  /* ============================================================
+     INLINE CODE BADGE
+     ============================================================ */
+  .code {
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    font-size: 12.5px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    color: #c8e8ff;
+    white-space: nowrap;
+  }
+
+  /* ============================================================
+     CALLOUT / NOTE BOX
+     ============================================================ */
+  .note {
+    margin-top: 14px;
+    padding: 13px 16px;
+    border-radius: var(--radius-md);
+    background: rgba(99, 179, 255, 0.08);
+    border: 1px solid rgba(99, 179, 255, 0.25);
+    color: #d7e9ff;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  /* ============================================================
+     PILL TAGS
+     ============================================================ */
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .pill {
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--muted);
+    letter-spacing: 0.01em;
+  }
+
+  /* ============================================================
+     LEGEND (colour key)
+     ============================================================ */
+  .legend {
+    display: grid;
+    gap: 11px;
+    margin-top: 12px;
+  }
+
+  .legend div {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  /* Colour swatch square */
+  .sw {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+  }
+
+  /* ============================================================
+     SVG DIAGRAMS
+     ============================================================ */
+  svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: linear-gradient(180deg, rgba(8, 13, 28, 0.72), rgba(8, 13, 28, 0.94));
+    margin-top: 14px;
+  }
+
+  /* ============================================================
+     DATA TABLES
+     ============================================================ */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 14px;
+    font-size: 14px;
+  }
+
+  th,
+  td {
+    text-align: left;
+    vertical-align: top;
+    padding: 13px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  th {
+    color: var(--txt);
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  td {
+    color: var(--muted);
+    line-height: 1.6;
+  }
+
+  /* ============================================================
+     FOOTER
+     ============================================================ */
+  .foot {
+    font-size: 12px;
+    color: rgba(158, 176, 217, 0.55);
+    margin-top: 8px;
+    padding-bottom: 16px;
+  }
+
+  /* ============================================================
+     RESPONSIVE BREAKPOINT
+     Collapse multi-column layouts on narrow viewports.
+     ============================================================ */
+  @media (max-width: 1100px) {
+    .hero,
+    .grid-2,
+    .grid-3 {
+      grid-template-columns: 1fr;
+    }
+
+    h1 {
+      font-size: 24px;
+    }
+
+    h2 {
+      font-size: 18px;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ===== HERO ===== -->
+<section class="hero">
+  <div class="card">
+    <h1>Text Embeddings Service</h1>
+    <p>Architecture, end-to-end flow, and interface documentation for the
+    <span class="code">microservices/text-embeddings</span> service. The service exposes an
+    OpenAI-compatible embeddings API, resolves model assets from configuration, tokenizes input text,
+    executes a QNN-backed embedding graph, and returns vectors plus usage metadata to callers.</p>
+    <div class="pills">
+      <span class="pill">FastAPI / OpenAPI server</span>
+      <span class="pill">OpenAI-compatible API</span>
+      <span class="pill">Model config driven</span>
+      <span class="pill">Tokenizer auto-discovery</span>
+      <span class="pill">QNN binary execution</span>
+      <span class="pill">Threaded inference path</span>
+      <span class="pill">Structured logging</span>
+    </div>
+    <div class="note">
+      Live request path:
+      <span class="code">EmbeddingsApiImpl.create_embeddings()</span> &#8594;
+      <span class="code">_get_embeddings_from_component()</span> &#8594;
+      <span class="code">SimpleQnnEmbeddingApp.from_model_path()</span> &#8594;
+      <span class="code">embed_texts()</span> &#8594;
+      <span class="code">_run_single()</span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Legend</h2>
+    <div class="legend">
+      <div><span class="sw" style="background:var(--f)"></span>Clients and external boundary</div>
+      <div><span class="sw" style="background:var(--b)"></span>Service API and orchestration</div>
+      <div><span class="sw" style="background:var(--m)"></span>Tokenizer and QNN inference runtime</div>
+      <div><span class="sw" style="background:var(--s)"></span>Configuration, models, and assets</div>
+      <div><span class="sw" style="background:var(--o)"></span>Logging and observability</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== ARCHITECTURE OVERVIEW ===== -->
+<section class="card">
+  <h2>1. Architecture Overview</h2>
+  <div class="grid-3">
+    <div class="panel">
+      <h3>API Layer</h3>
+      <p>Hosted by the generated OpenAPI / FastAPI server in
+      <span class="code">src/web-api/openapi_server</span>. The external contract is the embeddings
+      endpoint implemented by <span class="code">EmbeddingsApiImpl</span>. Additional endpoints
+      (<span class="code">/models</span>, <span class="code">/health</span>,
+      <span class="code">/ping</span>) are provided by their respective implementations.</p>
+    </div>
+    <div class="panel">
+      <h3>Inference Layer</h3>
+      <p>The active embeddings runtime is <span class="code">SimpleQnnEmbeddingApp</span> in
+      <span class="code">impl/text_embed_qnn.py</span>. It loads tokenizer assets, inspects QNN binary
+      metadata, creates input and output tensors, executes the graph, and decodes the output vector.
+      A secondary runtime, <span class="code">QnnSampleApp</span>, exists in
+      <span class="code">impl/qnn_runtime/sample_app.py</span> but is not used by the live API path.</p>
+    </div>
+    <div class="panel">
+      <h3>Configuration Layer</h3>
+      <p>Model identity and binary selection are resolved through
+      <span class="code">model_config_manager</span> from
+      <span class="code">configs/models_config.json</span>, combined with runtime environment variables:
+      <span class="code">MODELS_PATH</span>, <span class="code">TOKENIZER_DIR</span>,
+      <span class="code">QNN_BACKEND_LIB</span>, <span class="code">QNN_SYSTEM_LIB</span>, and
+      optional <span class="code">QNN_*</span> overrides.</p>
+    </div>
+  </div>
+  <div class="note">
+    This microservice is an embeddings generator only. It does not contain a vector database,
+    document index, or semantic search engine. Its responsibility is request handling, model resolution,
+    inference execution, and response formatting.
+  </div>
+</section>
+
+<!-- ===== COMPONENT DIAGRAM ===== -->
+<section class="card">
+  <h2>2. Runtime Component Diagram</h2>
+  <p>Major runtime components and service boundaries for a single embeddings request.</p>
+  <svg viewBox="0 0 1400 680" aria-label="Runtime architecture diagram">
+    <defs>
+      <marker id="ab" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#63b3ff"/></marker>
+      <marker id="ag" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#7af0c1"/></marker>
+      <marker id="am" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#ffcf6e"/></marker>
+      <marker id="as" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#9b87ff"/></marker>
+      <marker id="ao" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#ff8fb1"/></marker>
+    </defs>
+    <!-- swim-lane backgrounds -->
+    <rect x="20" y="60" width="200" height="590" rx="18" fill="rgba(122,240,193,.06)" stroke="rgba(122,240,193,.35)"/>
+    <rect x="235" y="60" width="330" height="590" rx="18" fill="rgba(99,179,255,.06)" stroke="rgba(99,179,255,.35)"/>
+    <rect x="580" y="60" width="300" height="590" rx="18" fill="rgba(255,207,110,.06)" stroke="rgba(255,207,110,.35)"/>
+    <rect x="895" y="60" width="240" height="590" rx="18" fill="rgba(155,135,255,.06)" stroke="rgba(155,135,255,.35)"/>
+    <rect x="1150" y="60" width="220" height="590" rx="18" fill="rgba(255,143,177,.06)" stroke="rgba(255,143,177,.35)"/>
+    <!-- lane labels -->
+    <text x="35" y="40" fill="#7af0c1" font-size="16" font-weight="700">Clients</text>
+    <text x="250" y="40" fill="#63b3ff" font-size="16" font-weight="700">Service</text>
+    <text x="595" y="40" fill="#ffcf6e" font-size="16" font-weight="700">Inference Runtime</text>
+    <text x="910" y="40" fill="#9b87ff" font-size="16" font-weight="700">Assets / Config</text>
+    <text x="1165" y="40" fill="#ff8fb1" font-size="16" font-weight="700">Observability</text>
+    <!-- client boxes -->
+    <rect x="38" y="90" width="164" height="75" rx="12" fill="#123328" stroke="#7af0c1"/>
+    <text x="56" y="118" font-size="14" font-weight="700">REST Client</text>
+    <text x="56" y="138" class="small" fill="#cdeedf">POST /v1/embeddings</text>
+    <rect x="38" y="185" width="164" height="75" rx="12" fill="#123328" stroke="#7af0c1"/>
+    <text x="56" y="213" font-size="14" font-weight="700">SDK / CLI / Tests</text>
+    <text x="56" y="233" class="small" fill="#cdeedf">automation callers</text>
+    <!-- service boxes -->
+    <rect x="253" y="90" width="294" height="80" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="271" y="118" font-size="14" font-weight="700">FastAPI / OpenAPI Server</text>
+    <text x="271" y="138" class="small" fill="#c9dcff">routing, validation, HTTP response</text>
+    <rect x="253" y="190" width="294" height="80" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="271" y="218" font-size="14" font-weight="700">EmbeddingsApiImpl</text>
+    <text x="271" y="238" class="small" fill="#c9dcff">model checks, input normalization, usage</text>
+    <rect x="253" y="290" width="294" height="80" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="271" y="318" font-size="14" font-weight="700">Async Worker Boundary</text>
+    <text x="271" y="338" class="small" fill="#c9dcff">asyncio.to_thread(_work)</text>
+    <rect x="253" y="390" width="294" height="80" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="271" y="418" font-size="14" font-weight="700">Response Formatter</text>
+    <text x="271" y="438" class="small" fill="#c9dcff">float/base64, Embedding objects, usage</text>
+    <!-- inference boxes -->
+    <rect x="598" y="90" width="264" height="80" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="616" y="118" font-size="14" font-weight="700">SimpleQnnEmbeddingApp</text>
+    <text x="616" y="138" class="small" fill="#f4ddb2">live runtime used by the service</text>
+    <rect x="598" y="190" width="264" height="80" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="616" y="218" font-size="14" font-weight="700">Tokenizer Resolution</text>
+    <text x="616" y="238" class="small" fill="#f4ddb2">tokenizer.json / .model / custom .py</text>
+    <rect x="598" y="290" width="264" height="80" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="616" y="318" font-size="14" font-weight="700">QNN Binary + Tensor Setup</text>
+    <text x="616" y="338" class="small" fill="#f4ddb2">load binary, resolve graph, build tensors</text>
+    <rect x="598" y="390" width="264" height="80" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="616" y="418" font-size="14" font-weight="700">graphExecute()</text>
+    <text x="616" y="438" class="small" fill="#f4ddb2">run graph, decode vector, count tokens</text>
+    <!-- asset boxes -->
+    <rect x="913" y="90" width="204" height="75" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="931" y="118" font-size="14" font-weight="700">models_config.json</text>
+    <text x="931" y="138" class="small" fill="#d8ccff">model ID to binary filename</text>
+    <rect x="913" y="185" width="204" height="75" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="931" y="213" font-size="14" font-weight="700">Model Assets</text>
+    <text x="931" y="233" class="small" fill="#d8ccff">MODELS_PATH, QNN binary, tokenizer</text>
+    <rect x="913" y="280" width="204" height="85" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="931" y="308" font-size="14" font-weight="700">Environment Variables</text>
+    <text x="931" y="328" class="small" fill="#d8ccff">TOKENIZER_DIR, QNN_BACKEND_LIB,</text>
+    <text x="931" y="344" class="small" fill="#d8ccff">QNN_SYSTEM_LIB, QNN_* overrides</text>
+    <rect x="913" y="385" width="204" height="75" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="931" y="413" font-size="14" font-weight="700">Native Providers</text>
+    <text x="931" y="433" class="small" fill="#d8ccff">QnnLibrary, QnnProvider, SystemProvider</text>
+    <!-- observability boxes -->
+    <rect x="1168" y="90" width="184" height="75" rx="12" fill="#3e1830" stroke="#ff8fb1"/>
+    <text x="1186" y="118" font-size="14" font-weight="700">LoggerConfig</text>
+    <text x="1186" y="138" class="small" fill="#ffd2e2">Python logging, service logs</text>
+    <rect x="1168" y="185" width="184" height="90" rx="12" fill="#3e1830" stroke="#ff8fb1"/>
+    <text x="1186" y="213" font-size="14" font-weight="700">utils_dump</text>
+    <text x="1186" y="233" class="small" fill="#ffd2e2">tensor dumps to</text>
+    <text x="1186" y="249" class="small" fill="#ffd2e2">/tmp/log_qnn-python.txt</text>
+    <rect x="1168" y="295" width="184" height="75" rx="12" fill="#3e1830" stroke="#ff8fb1"/>
+    <text x="1186" y="323" font-size="14" font-weight="700">Container Logs</text>
+    <text x="1186" y="343" class="small" fill="#ffd2e2">stdout / stderr</text>
+    <!-- arrows: clients to service -->
+    <line x1="202" y1="128" x2="253" y2="128" stroke="#7af0c1" stroke-width="2.5" marker-end="url(#ag)"/>
+    <line x1="202" y1="222" x2="253" y2="222" stroke="#7af0c1" stroke-width="2.5" marker-end="url(#ag)"/>
+    <!-- service internal -->
+    <line x1="400" y1="170" x2="400" y2="190" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#ab)"/>
+    <line x1="400" y1="270" x2="400" y2="290" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#ab)"/>
+    <!-- service to inference -->
+    <line x1="547" y1="330" x2="598" y2="128" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#am)"/>
+    <!-- inference internal -->
+    <line x1="730" y1="170" x2="730" y2="190" stroke="#ffcf6e" stroke-width="2.5" marker-end="url(#am)"/>
+    <line x1="730" y1="270" x2="730" y2="290" stroke="#ffcf6e" stroke-width="2.5" marker-end="url(#am)"/>
+    <line x1="730" y1="370" x2="730" y2="390" stroke="#ffcf6e" stroke-width="2.5" marker-end="url(#am)"/>
+    <!-- inference back to service -->
+    <line x1="598" y1="430" x2="547" y2="430" stroke="#ffcf6e" stroke-width="2.5" marker-end="url(#ab)"/>
+    <!-- service response to client -->
+    <line x1="253" y1="430" x2="202" y2="128" stroke="#63b3ff" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#ag)"/>
+    <!-- assets to service/inference -->
+    <line x1="913" y1="128" x2="547" y2="230" stroke="#9b87ff" stroke-width="2" marker-end="url(#ab)"/>
+    <line x1="913" y1="222" x2="862" y2="128" stroke="#9b87ff" stroke-width="2" marker-end="url(#am)"/>
+    <line x1="913" y1="322" x2="862" y2="238" stroke="#9b87ff" stroke-width="2" marker-end="url(#am)"/>
+    <line x1="913" y1="422" x2="862" y2="338" stroke="#9b87ff" stroke-width="2" marker-end="url(#am)"/>
+    <!-- observability -->
+    <line x1="547" y1="230" x2="1168" y2="128" stroke="#ff8fb1" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ao)"/>
+    <line x1="862" y1="430" x2="1168" y2="230" stroke="#ff8fb1" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ao)"/>
+    <!-- edge labels -->
+    <text x="210" y="118" class="small" fill="#7af0c1">HTTP JSON</text>
+    <text x="410" y="184" class="small" fill="#63b3ff">validated request</text>
+    <text x="410" y="284" class="small" fill="#63b3ff">to_thread</text>
+    <text x="548" y="290" class="small" fill="#63b3ff">invoke runtime</text>
+    <text x="740" y="184" class="small" fill="#ffcf6e">tokenize</text>
+    <text x="740" y="284" class="small" fill="#ffcf6e">build tensors</text>
+    <text x="740" y="384" class="small" fill="#ffcf6e">execute</text>
+    <text x="548" y="420" class="small" fill="#ffcf6e">vector + counts</text>
+    <text x="210" y="340" class="small" fill="#63b3ff">response</text>
+    <text x="920" y="118" class="small" fill="#9b87ff">model lookup</text>
+    <text x="1050" y="148" class="small" fill="#ff8fb1">service logs</text>
+    <text x="1050" y="420" class="small" fill="#ff8fb1">tensor dumps</text>
+  </svg>
+</section>
+
+<!-- ===== END-TO-END FLOW ===== -->
+<section class="card">
+  <h2>3. End-to-End Flow</h2>
+  <p>Request-to-response execution sequence for the currently active embeddings path.</p>
+  <svg viewBox="0 0 1400 520" aria-label="End-to-end flow diagram">
+    <defs>
+      <marker id="fa" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#63b3ff"/></marker>
+    </defs>
+    <!-- row 1: request path -->
+    <text x="40" y="36" font-size="15" font-weight="700" fill="#eaf0ff">Request Path</text>
+    <rect x="40" y="50" width="120" height="64" rx="12" fill="#123328" stroke="#7af0c1"/>
+    <text x="58" y="76" font-size="13" font-weight="700">1 Client</text>
+    <text x="58" y="96" class="small" fill="#cdeedf">POST /v1/embeddings</text>
+    <rect x="190" y="50" width="140" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="208" y="76" font-size="13" font-weight="700">2 Route Handling</text>
+    <text x="208" y="96" class="small" fill="#c9dcff">FastAPI / OpenAPI</text>
+    <rect x="360" y="50" width="150" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="378" y="76" font-size="13" font-weight="700">3 Validate Model</text>
+    <text x="378" y="96" class="small" fill="#c9dcff">model_config_manager</text>
+    <rect x="540" y="50" width="150" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="558" y="76" font-size="13" font-weight="700">4 Normalize Input</text>
+    <text x="558" y="96" class="small" fill="#c9dcff">string / list handling</text>
+    <rect x="720" y="50" width="150" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="738" y="76" font-size="13" font-weight="700">5 Worker Thread</text>
+    <text x="738" y="96" class="small" fill="#c9dcff">asyncio.to_thread</text>
+    <rect x="900" y="50" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="918" y="76" font-size="13" font-weight="700">6 Create QNN App</text>
+    <text x="918" y="96" class="small" fill="#f4ddb2">from_model_path()</text>
+    <rect x="1090" y="50" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="1108" y="76" font-size="13" font-weight="700">7 Load Assets</text>
+    <text x="1108" y="96" class="small" fill="#f4ddb2">binary + tokenizer</text>
+    <line x1="160" y1="82" x2="190" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="330" y1="82" x2="360" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="510" y1="82" x2="540" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="690" y1="82" x2="720" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="870" y1="82" x2="900" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="1060" y1="82" x2="1090" y2="82" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <!-- row 2: inference path -->
+    <text x="40" y="176" font-size="15" font-weight="700" fill="#eaf0ff">Inference Path</text>
+    <rect x="40" y="190" width="160" height="64" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="58" y="216" font-size="13" font-weight="700">8 Resolve Binary</text>
+    <text x="58" y="236" class="small" fill="#d8ccff">MODELS_PATH + config</text>
+    <rect x="230" y="190" width="160" height="64" rx="12" fill="#241a45" stroke="#9b87ff"/>
+    <text x="248" y="216" font-size="13" font-weight="700">9 Resolve Tokenizer</text>
+    <text x="248" y="236" class="small" fill="#d8ccff">TOKENIZER_DIR lookup</text>
+    <rect x="420" y="190" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="438" y="216" font-size="13" font-weight="700">10 Tokenize Text</text>
+    <text x="438" y="236" class="small" fill="#f4ddb2">ids, masks, counts</text>
+    <rect x="610" y="190" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="628" y="216" font-size="13" font-weight="700">11 Build Tensors</text>
+    <text x="628" y="236" class="small" fill="#f4ddb2">inputs, outputs, buffers</text>
+    <rect x="800" y="190" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="818" y="216" font-size="13" font-weight="700">12 graphExecute</text>
+    <text x="818" y="236" class="small" fill="#f4ddb2">QNN inference</text>
+    <rect x="990" y="190" width="160" height="64" rx="12" fill="#3a2c08" stroke="#ffcf6e"/>
+    <text x="1008" y="216" font-size="13" font-weight="700">13 Decode Vector</text>
+    <text x="1008" y="236" class="small" fill="#f4ddb2">float32 / float16</text>
+    <rect x="1180" y="190" width="160" height="64" rx="12" fill="#3e1830" stroke="#ff8fb1"/>
+    <text x="1198" y="216" font-size="13" font-weight="700">14 Tensor Dump</text>
+    <text x="1198" y="236" class="small" fill="#ffd2e2">utils_dump / log file</text>
+    <line x1="200" y1="222" x2="230" y2="222" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="390" y1="222" x2="420" y2="222" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="580" y1="222" x2="610" y2="222" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="770" y1="222" x2="800" y2="222" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="960" y1="222" x2="990" y2="222" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="1150" y1="222" x2="1180" y2="222" stroke="#ff8fb1" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#fa)"/>
+    <!-- row 3: response path -->
+    <text x="40" y="316" font-size="15" font-weight="700" fill="#eaf0ff">Response Path</text>
+    <rect x="40" y="330" width="200" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="58" y="356" font-size="13" font-weight="700">15 Apply Dimensions / Encoding</text>
+    <text x="58" y="376" class="small" fill="#c9dcff">truncate or base64 encode</text>
+    <rect x="270" y="330" width="200" height="64" rx="12" fill="#132947" stroke="#63b3ff"/>
+    <text x="288" y="356" font-size="13" font-weight="700">16 Build Response Objects</text>
+    <text x="288" y="376" class="small" fill="#c9dcff">Embedding, Usage, Response</text>
+    <rect x="500" y="330" width="200" height="64" rx="12" fill="#123328" stroke="#7af0c1"/>
+    <text x="518" y="356" font-size="13" font-weight="700">17 Return HTTP Response</text>
+    <text x="518" y="376" class="small" fill="#cdeedf">JSON payload to caller</text>
+    <line x1="240" y1="362" x2="270" y2="362" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <line x1="470" y1="362" x2="500" y2="362" stroke="#63b3ff" stroke-width="2.5" marker-end="url(#fa)"/>
+    <!-- key I/O box -->
+    <rect x="40" y="440" width="1310" height="60" rx="12" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.10)"/>
+    <text x="60" y="464" font-size="14" font-weight="700">Key I/O</text>
+    <text x="60" y="484" class="small" fill="#c9dcff">Inputs: model ID, text string(s), optional dimensions, optional encoding_format. Outputs: embedding vectors (float list or base64), token counts, usage object.</text>
+  </svg>
+</section>
+
+<!-- ===== INTERFACE SECTION ===== -->
+<section class="card">
+  <h2>4. Interface</h2>
+  <p>Service boundaries, request and response shapes, dependencies, and interactions with adjacent components.</p>
+
+  <div class="grid-2" style="margin-top:14px">
+    <div class="panel">
+      <h3>External Boundary</h3>
+      <ul>
+        <li>Primary external interface: HTTP JSON embeddings API.</li>
+        <li>Client-facing implementation: <span class="code">EmbeddingsApiImpl.create_embeddings()</span>.</li>
+        <li>The service accepts a model identifier and one or more text inputs.</li>
+        <li>The service returns embedding vectors and token usage counts.</li>
+        <li>The service does not expose native QNN details to callers.</li>
+        <li>Additional endpoints: <span class="code">GET /models</span>, <span class="code">GET /health</span>, <span class="code">GET /ping</span>.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Internal Boundary</h3>
+      <ul>
+        <li>API layer delegates inference to <span class="code">SimpleQnnEmbeddingApp</span>.</li>
+        <li>Blocking inference is isolated in a worker thread via <span class="code">asyncio.to_thread()</span>.</li>
+        <li>Model lookup is delegated to <span class="code">model_config_manager</span>.</li>
+        <li>Tokenizer resolution depends on filesystem assets and environment variables.</li>
+        <li>QNN execution depends on native provider libraries being available at runtime.</li>
+        <li>Tensor dump logging writes to <span class="code">/tmp/log_qnn-python.txt</span> via <span class="code">utils_dump.dump_tensors()</span>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th style="width:18%">Category</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Request Inputs</td>
+        <td>
+          <span class="code">model</span> (string, required),
+          <span class="code">input</span> (string or list of strings, required),
+          <span class="code">dimensions</span> (integer, optional, truncates output vector),
+          <span class="code">encoding_format</span> (&#34;float&#34; or &#34;base64&#34;, optional, default &#34;float&#34;).
+        </td>
+      </tr>
+      <tr>
+        <td>Derived Inputs</td>
+        <td>
+          Model binary path from <span class="code">MODELS_PATH</span> and
+          <span class="code">models_config.json</span>. Tokenizer assets from
+          <span class="code">TOKENIZER_DIR</span>. Backend and system libraries from
+          <span class="code">QNN_BACKEND_LIB</span> and <span class="code">QNN_SYSTEM_LIB</span>.
+          Optional graph, input, and output name overrides from <span class="code">QNN_GRAPH_NAME</span>,
+          <span class="code">QNN_INPUT_NAME</span>, <span class="code">QNN_OUTPUT_NAME</span>.
+          Padding token from <span class="code">QNN_PAD_TOKEN</span>.
+          Verbose mode from <span class="code">QNN_VERBOSE</span>.
+        </td>
+      </tr>
+      <tr>
+        <td>Response Outputs</td>
+        <td>
+          <span class="code">object</span> (&#34;list&#34;),
+          <span class="code">data</span> (list of Embedding objects, each with index and embedding vector),
+          <span class="code">model</span> (echoed model ID),
+          <span class="code">usage</span> (prompt_tokens and total_tokens).
+          Embedding vectors are float lists or base64-encoded float32 byte strings depending on
+          <span class="code">encoding_format</span>.
+        </td>
+      </tr>
+      <tr>
+        <td>Error Responses</td>
+        <td>
+          HTTP 400 if the requested model is not in <span class="code">models_config.json</span>.
+          HTTP 500 for unexpected runtime errors. Errors are logged via
+          <span class="code">LoggerConfig</span> before being returned.
+        </td>
+      </tr>
+      <tr>
+        <td>Dependencies</td>
+        <td>
+          <span class="code">libQnnHtp.so</span> (or override), <span class="code">libQnnSystem.so</span> (or override),
+          QNN binary model file, tokenizer assets (tokenizer.json, *.model, or custom .py),
+          Python packages: fastapi, pydantic, tokenizers or sentencepiece (optional), numpy (optional).
+        </td>
+      </tr>
+      <tr>
+        <td>Tokenizer Discovery</td>
+        <td>
+          Auto-discovery order: (1) <span class="code">tokenizer.json</span> (HuggingFace format),
+          (2) <span class="code">*.model</span> (SentencePiece), (3) <span class="code">*.py</span>
+          with an <span class="code">encode(text)</span> function (custom). All resolved from
+          <span class="code">TOKENIZER_DIR</span>.
+        </td>
+      </tr>
+      <tr>
+        <td>Logging</td>
+        <td>
+          Service-level logging via <span class="code">LoggerConfig</span> (Python standard logging,
+          INFO level, stdout/stderr). Tensor-level debug logging via
+          <span class="code">utils_dump.dump_tensors()</span>, which appends to
+          <span class="code">/tmp/log_qnn-python.txt</span> using the
+          <span class="code">print_to_log</span> decorator. Tensor dumps are written before and after
+          <span class="code">graphExecute()</span> in <span class="code">_run_single()</span>.
+        </td>
+      </tr>
+      <tr>
+        <td>Concurrency</td>
+        <td>
+          The FastAPI event loop handles HTTP concurrency. Each embeddings request spawns a worker
+          thread via <span class="code">asyncio.to_thread()</span>. A new
+          <span class="code">SimpleQnnEmbeddingApp</span> instance is created per request and closed
+          after use. Multiple input strings within a single request are processed sequentially inside
+          the worker thread.
+        </td>
+      </tr>
+      <tr>
+        <td>Interactions with Other Components</td>
+        <td>
+          The service is self-contained and does not call other microservices at runtime. It is
+          consumed by external callers (RAG pipelines, search services, analytics) that POST text and
+          use the returned vectors. It is deployed via Docker Compose using the compose files in
+          <span class="code">deploy/</span> and <span class="code">src/docker-compose.yaml</span>.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ===== COMPONENT FILE MAP ===== -->
+<section class="card">
+  <h2>5. Source File Map</h2>
+  <div class="grid-2">
+    <div class="panel">
+      <h3>API and Orchestration</h3>
+      <table>
+        <thead><tr><th>File</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><span class="code">main.py</span></td><td>FastAPI application entry point</td></tr>
+          <tr><td><span class="code">impl/embeddings_api_impl.py</span></td><td>Embeddings endpoint implementation</td></tr>
+          <tr><td><span class="code">impl/models_api_impl.py</span></td><td>Model listing endpoint</td></tr>
+          <tr><td><span class="code">impl/health_api_impl.py</span></td><td>Health check endpoint</td></tr>
+          <tr><td><span class="code">managers/model_config_manager.py</span></td><td>Model config loading and lookup</td></tr>
+          <tr><td><span class="code">configs/models_config.json</span></td><td>Model ID to binary filename mapping</td></tr>
+          <tr><td><span class="code">logger/logger_config.py</span></td><td>Centralized logging configuration</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Inference Runtime</h3>
+      <table>
+        <thead><tr><th>File</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><span class="code">impl/text_embed_qnn.py</span></td><td>Live embeddings runtime (SimpleQnnEmbeddingApp)</td></tr>
+          <tr><td><span class="code">impl/qnn_runtime/lib_provider.py</span></td><td>QNN library loading and provider wrappers</td></tr>
+          <tr><td><span class="code">impl/qnn_runtime/qnn_types.py</span></td><td>QNN ctypes struct definitions</td></tr>
+          <tr><td><span class="code">impl/qnn_runtime/system_structs.py</span></td><td>QNN system context structs</td></tr>
+          <tr><td><span class="code">impl/qnn_runtime/utils_dump.py</span></td><td>Tensor dump logging to /tmp/log_qnn-python.txt</td></tr>
+          <tr><td><span class="code">impl/qnn_runtime/sample_app.py</span></td><td>Alternative QNN app (not used by live API)</td></tr>
+          <tr><td><span class="code">impl/litert_backend/backend.py</span></td><td>Encoding format normalization helper</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<div class="foot">Artifact: microservices/text-embeddings/src/docs/text-embeddings-architecture.html</div>
+</div>
+</body>
+</html>
