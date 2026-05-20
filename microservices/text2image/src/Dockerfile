@@ -92,20 +92,16 @@ FROM debian:trixie-slim AS service
 # (stat/chown from coreutils, groupmod/usermod/runuser from
 # passwd and util-linux, getent from libc-bin)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libatomic1 coreutils passwd util-linux libc-bin  && \
+    apt-get install -y --no-install-recommends libatomic1                                       && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
-# Create groups for fastrpc and dmaheap with placeholder GIDs.
-# The real GIDs are set at container startup by entrypoint.sh.
-RUN groupadd --gid 1500 fastrpc                                                                 && \
-    groupadd --gid 1501 dmaheap
-
-# Create iot-user and add to the placeholder groups
-RUN useradd --create-home --shell /bin/bash                                                        \
-        --groups fastrpc,dmaheap iot-user
+# Create directory structure for application and make it world-accessible
+# Setting HOME to /tmp prevents KeyError: getpwuid() when running as arbitrary unnamed UID
+ENV HOME=/tmp
 
 # Create directory
-RUN mkdir -p /root/app/site-packages
+RUN mkdir -p /iot-user/app/site-packages                                                        && \
+    chmod -R 777 /iot-user
 
 # Copy the virtual environment with web-api package installed with dependencies
 COPY --from=builder /mnt/work/venv /mnt/work/venv
@@ -129,9 +125,10 @@ COPY --from=builder /usr/local /usr/local
 
 ENV PATH=/mnt/work/venv/bin:$PATH
 
-# Copy entrypoint script and make it executable
-COPY --chmod=755 entrypoint.sh /entrypoint.sh
+# Copy the Python entrypoint and make it executable
+COPY entrypoint.py /entrypoint.py
+RUN chmod +x /entrypoint.py
 
 # Container starts as root so entrypoint.sh can adjust group IDs,
 # then drops to iot-user before executing the application command.
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python3", "/entrypoint.py"]
