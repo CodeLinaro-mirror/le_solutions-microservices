@@ -8,8 +8,26 @@ from ctypes import (
     c_int, c_uint32, c_uint8, c_size_t, c_void_p, c_char_p,
     POINTER, byref,
 )
+
+# Programmatically configure the native C-level environment for LiteRT auto-registration.
+# In Python, os.environ changes are not always mirrored to the process's native C environment.
+# Since libLiteRt.so and npu_registry.cc call getenv() at the C/C++ level, we must use ctypes
+# to call setenv() in the C standard library directly.
+try:
+    _libc = ctypes.CDLL(None)
+    _libc.setenv(b"LITERT_DISPATCH_DIR", b"/usr/lib", 1)
+    _libc.setenv(b"LITERT_COMPILER_PLUGIN_DIR", b"/usr/lib", 1)
+    # Ensure ADSP_LIBRARY_PATH is also set at C-level so FastRPC can resolve CDSP skeleton files
+    _libc.setenv(b"ADSP_LIBRARY_PATH", b"/usr/lib/rfsa/adsp", 1)
+    _libc.setenv(b"CDSP_LIBRARY_PATH", b"/usr/lib/rfsa/adsp", 1)
+except Exception:
+    pass
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from openapi_server.impl.litert_backend.logger import get_logger
+
+_log = get_logger(__name__)
 
 # Opaque handles / typedefs
 LiteRtStatus = c_int
@@ -31,6 +49,41 @@ HW_GPU = 2
 HW_NPU = 4
 HW_ALL = HW_CPU | HW_GPU | HW_NPU
 
+# LiteRT environment option tags/types from litert/c/litert_environment_options.h
+# and litert/c/litert_any.h. These are required to mirror the working run_model
+# invocation:
+#   --accelerator npu --dispatch_library_dir /usr/lib/ --compiler_plugin_library_dir /usr/lib/
+LITERT_ANY_TYPE_INT = 2
+LITERT_ANY_TYPE_STRING = 8
+
+LITERT_ENV_OPTION_TAG_COMPILER_PLUGIN_LIBRARY_DIR = 0
+LITERT_ENV_OPTION_TAG_DISPATCH_LIBRARY_DIR = 1
+LITERT_ENV_OPTION_TAG_AUTO_REGISTER_ACCELERATORS = 24
+
+
+class LiteRtAnyValue(ctypes.Union):
+    _fields_ = [
+        ("bool_value", ctypes.c_bool),
+        ("int_value", ctypes.c_int64),
+        ("real_value", ctypes.c_double),
+        ("str_value", c_char_p),
+        ("ptr_value", c_void_p),
+    ]
+
+
+class LiteRtAny(ctypes.Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("value", LiteRtAnyValue),
+    ]
+
+
+class LiteRtEnvOption(ctypes.Structure):
+    _fields_ = [
+        ("tag", c_int),
+        ("value", LiteRtAny),
+    ]
+
 
 def _proto_eager(dll: ctypes.CDLL) -> Dict[str, Any]:
     f: Dict[str, Any] = {}
@@ -48,7 +101,7 @@ def _proto_eager(dll: ctypes.CDLL) -> Dict[str, Any]:
     bind("LiteRtCreateOptions", LiteRtStatus, [POINTER(c_void_p)])
     bind("LiteRtDestroyOptions", None, [c_void_p])
 
-    bind("LiteRtCreateEnvironment", LiteRtStatus, [c_int, POINTER(c_void_p), POINTER(c_void_p)])
+    bind("LiteRtCreateEnvironment", LiteRtStatus, [c_int, POINTER(LiteRtEnvOption), POINTER(c_void_p)])
     bind("LiteRtDestroyEnvironment", None, [c_void_p])
 
     bind("LiteRtSetOptionsHardwareAccelerators", LiteRtStatus, [c_void_p, c_int])
@@ -114,17 +167,40 @@ def _status_to_str(fns: Dict[str, Any], status: int) -> str:
     return f"LiteRtStatus({int(status)})"
 
 
-def _check_ok(fns: Dict[str, Any], status: int, where: str, verbose: bool = True):
+def _check_ok(fns: Dict[str, Any], status: int, where: str, verbose: bool = False):
     if int(status) != 0:
-        raise RuntimeError(f"{where} failed: {_status_to_str(fns, status)}")
+        msg = f"{where} failed: {_status_to_str(fns, status)}"
+        _log.error(msg)
+        raise RuntimeError(msg)
     if verbose:
-        print(f"{where} success: {_status_to_str(fns, status)}")
+        _log.debug("%s success: %s", where, _status_to_str(fns, status))
 
 
 class LiteRtLibProvider:
-    def __init__(self, runtime_lib: str = "libLiteRt.so"):
-        self.runtime_lib = runtime_lib
-        self.dll = ctypes.CDLL(runtime_lib, mode=ctypes.RTLD_GLOBAL)
+    def __init__(self, runtime_lib: str = "/usr/lib/libLiteRt.so"):
+        # Enforce the exact hardcoded /usr/lib paths to ensure NPU execution
+        self.runtime_lib = "/usr/lib/libLiteRt.so"
+        _log.info("Loading hardcoded LiteRT runtime library: %r", self.runtime_lib)
+        try:
+            import os
+            # Pre-load compiler and dispatch plugins globally into the process namespace
+            # so that LiteRT's own runtime can resolve all vendor-specific symbols.
+            for path in [
+                "/usr/lib/libLiteRtCompilerPlugin_Qualcomm.so",
+                "/usr/lib/libLiteRtDispatch_Qualcomm.so",
+            ]:
+                if os.path.exists(path):
+                    _log.info("Globally loading hardcoded plugin: %s", path)
+                    try:
+                        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                    except Exception as e:
+                        _log.warning("Optional plugin load warning: %s: %s", path, e)
+
+            self.dll = ctypes.CDLL(self.runtime_lib, mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            _log.error("Failed to load runtime library %r: %s", self.runtime_lib, exc)
+            raise
+        _log.info("Runtime library loaded: %r", self.runtime_lib)
         self.fns = _proto_eager(self.dll)
 
     def get(self, name: str):
@@ -213,6 +289,10 @@ class LiteRtInterpreter:
         hw_mask: int = HW_CPU,
         compile_on_init: bool = True,
     ):
+        _log.info(
+            "LiteRtInterpreter.__init__: model=%r runtime_lib=%r hw_mask=0x%x compile_on_init=%s",
+            model_path, runtime_lib, hw_mask, compile_on_init,
+        )
         self.debug = debug
         self.p = LiteRtLibProvider(runtime_lib)
         self.fns = self.p.fns
@@ -231,8 +311,10 @@ class LiteRtInterpreter:
         self._npu_compiled = False
         self._last_hw_mask = int(hw_mask)
 
+        _log.debug("Reading model file: %r (%d bytes)", model_path, 0)
         with open(model_path, "rb") as f:
             data = f.read()
+        _log.debug("Model file read: %r (%d bytes)", model_path, len(data))
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
 
         st = self.fns["LiteRtCreateModelFromBuffer"](
@@ -245,15 +327,41 @@ class LiteRtInterpreter:
         st = self.fns["LiteRtCreateOptions"](byref(self.options))
         _check_ok(self.fns, st, "LiteRtCreateOptions")
 
-        null_opts = POINTER(c_void_p)()
-        st = self.fns["LiteRtCreateEnvironment"](c_int(0), null_opts, byref(self.environment))
+        # Match LiteRT run_model's environment construction exactly:
+        #   EnvironmentOptions::Tag::kAutoRegisterAccelerators = CPU|NPU for "--accelerator npu"
+        #   EnvironmentOptions::Tag::kDispatchLibraryDir = "/usr/lib/"
+        #   EnvironmentOptions::Tag::kCompilerPluginLibraryDir = "/usr/lib/"
+        #
+        # Passing these as real LiteRtEnvOption values is required. Environment variables alone
+        # are not equivalent to run_model and leave auto-registration without the explicit
+        # dispatch/compiler paths, causing kLiteRtStatusErrorInvalidArgument and CPU fallback.
+        self._env_dispatch_dir_buf = ctypes.create_string_buffer(b"/usr/lib/")
+        self._env_compiler_plugin_dir_buf = ctypes.create_string_buffer(b"/usr/lib/")
+        env_options = (LiteRtEnvOption * 3)()
+
+        env_options[0].tag = LITERT_ENV_OPTION_TAG_AUTO_REGISTER_ACCELERATORS
+        env_options[0].value.type = LITERT_ANY_TYPE_INT
+        env_options[0].value.value.int_value = int(HW_CPU | HW_NPU)
+
+        env_options[1].tag = LITERT_ENV_OPTION_TAG_DISPATCH_LIBRARY_DIR
+        env_options[1].value.type = LITERT_ANY_TYPE_STRING
+        env_options[1].value.value.str_value = ctypes.cast(self._env_dispatch_dir_buf, c_char_p)
+
+        env_options[2].tag = LITERT_ENV_OPTION_TAG_COMPILER_PLUGIN_LIBRARY_DIR
+        env_options[2].value.type = LITERT_ANY_TYPE_STRING
+        env_options[2].value.value.str_value = ctypes.cast(self._env_compiler_plugin_dir_buf, c_char_p)
+
+        self._env_options = env_options
+        st = self.fns["LiteRtCreateEnvironment"](c_int(3), self._env_options, byref(self.environment))
         _check_ok(self.fns, st, "LiteRtCreateEnvironment")
 
         st = self.fns["LiteRtSetOptionsHardwareAccelerators"](self.options, c_int(int(hw_mask)))
         _check_ok(self.fns, st, "LiteRtSetOptionsHardwareAccelerators")
 
         if compile_on_init:
+            _log.debug("Compiling model on init (hw_mask=0x%x)", hw_mask)
             self._recompile_or_raise()
+            _log.info("Model compiled successfully (hw_mask=0x%x)", hw_mask)
 
     def capabilities(self) -> Dict[str, bool]:
         return {
@@ -273,9 +381,11 @@ class LiteRtInterpreter:
         return tmp
 
     def _recompile_or_raise(self):
+        _log.debug("_recompile_or_raise: hw_mask=0x%x", self._last_hw_mask)
         new_compiled = self._create_compiled()
         old = self.compiled
         self.compiled = new_compiled
+        _log.debug("_recompile_or_raise: new compiled handle obtained")
         try:
             if old and self.fns.get("LiteRtDestroyCompiledModel"):
                 self.fns["LiteRtDestroyCompiledModel"](old)
@@ -299,20 +409,35 @@ class LiteRtInterpreter:
         self._last_hw_mask = int(hw_mask)
 
     def enable_npu_htp(self, qualcomm_opts: Optional[QualcommOptions], require_npu: bool = False) -> bool:
+        _log.info(
+            "enable_npu_htp: qualcomm_opts=%s require_npu=%s baseline_hw=0x%x",
+            qualcomm_opts is not None, require_npu, self._last_hw_mask,
+        )
         baseline_compiled = self.compiled
         baseline_npu = self._npu_compiled
         baseline_hw = self._last_hw_mask
+
+        def _restore_baseline():
+            """Restore compiled model and re-sync options to baseline hw_mask."""
+            self.compiled = baseline_compiled
+            self._npu_compiled = baseline_npu
+            # Re-create options with baseline hw_mask so options stay in sync
+            # with the compiled model (avoids options/compiled desync).
+            try:
+                self._reset_options(baseline_hw)
+            except Exception:
+                self._last_hw_mask = baseline_hw
 
         # Try NPU-only first
         try:
             self._reset_options(HW_NPU)
             self._recompile_or_raise()
             npu_possible = True
-        except Exception:
+            _log.debug("enable_npu_htp: NPU-only compilation succeeded")
+        except Exception as _npu_exc:
+            _log.warning("enable_npu_htp: NPU-only compilation failed (%s); restoring baseline", _npu_exc)
             npu_possible = False
-            self.compiled = baseline_compiled
-            self._npu_compiled = baseline_npu
-            self._last_hw_mask = baseline_hw
+            _restore_baseline()
 
         if npu_possible:
             try:
@@ -321,30 +446,45 @@ class LiteRtInterpreter:
                     qualcomm_opts.attach_to_litert_options(self.options)
                     self._recompile_or_raise()
                 self._npu_compiled = True
+                _log.info("enable_npu_htp: HTP/NPU enabled with Qualcomm options")
                 return True
-            except Exception:
-                # Still allow plain HW_NPU
-                self._reset_options(HW_NPU)
-                self._recompile_or_raise()
-                self._npu_compiled = True
-                return True
+            except Exception as _qopt_exc:
+                _log.warning(
+                    "enable_npu_htp: Qualcomm options failed (%s); retrying plain HW_NPU", _qopt_exc
+                )
+                # Qualcomm options failed; fall back to plain HW_NPU
+                try:
+                    self._reset_options(HW_NPU)
+                    self._recompile_or_raise()
+                    self._npu_compiled = True
+                    _log.info("enable_npu_htp: HTP/NPU enabled (plain, no Qualcomm options)")
+                    return True
+                except Exception as _plain_exc:
+                    _log.warning("enable_npu_htp: plain HW_NPU also failed (%s); restoring baseline", _plain_exc)
+                    _restore_baseline()
+                    npu_possible = False
 
         if require_npu:
+            _log.error("enable_npu_htp: HTP/NPU required but unavailable on this system")
             raise RuntimeError("HTP/NPU requested but HW_NPU compilation is not possible on this system.")
 
-        # Fallback
+        # Fallback: try HW_ALL then HW_CPU
         try:
             self._reset_options(HW_ALL)
             self._recompile_or_raise()
             self._npu_compiled = False
+            _log.info("enable_npu_htp: fell back to HW_ALL (CPU+GPU+NPU partitioning)")
             return False
-        except Exception:
+        except Exception as _all_exc:
+            _log.warning("enable_npu_htp: HW_ALL failed (%s); falling back to CPU-only", _all_exc)
             self._reset_options(HW_CPU)
             self._recompile_or_raise()
             self._npu_compiled = False
+            _log.info("enable_npu_htp: fell back to CPU-only")
             return False
 
     def allocate_tensors(self, signature_index: int = 0):
+        _log.debug("allocate_tensors: signature_index=%d", signature_index)
         sig = LiteRtSignature(None)
         st = self.fns["LiteRtGetModelSignature"](self.model, LiteRtParamIndex(signature_index), byref(sig))
         _check_ok(self.fns, st, "LiteRtGetModelSignature")
@@ -357,6 +497,10 @@ class LiteRtInterpreter:
         st = self.fns["LiteRtGetNumSignatureOutputs"](sig, byref(n_out))
         _check_ok(self.fns, st, "LiteRtGetNumSignatureOutputs")
 
+        _log.debug(
+            "allocate_tensors: n_in=%d n_out=%d",
+            int(n_in.value), int(n_out.value),
+        )
         self._in_bufs, self._out_bufs = [], []
         self._in_req_sizes, self._out_req_sizes = [], []
 
@@ -459,6 +603,10 @@ class LiteRtInterpreter:
         return data
 
     def invoke(self, signature_index: int = 0):
+        _log.debug(
+            "invoke: signature_index=%d n_in=%d n_out=%d",
+            signature_index, len(self._in_bufs), len(self._out_bufs),
+        )
         in_arr = (LiteRtTensorBuffer * len(self._in_bufs))(*self._in_bufs)
         out_arr = (LiteRtTensorBuffer * len(self._out_bufs))(*self._out_bufs)
         st = self.fns["LiteRtRunCompiledModel"](
@@ -468,10 +616,12 @@ class LiteRtInterpreter:
             c_size_t(len(self._out_bufs)), out_arr,
         )
         _check_ok(self.fns, st, "LiteRtRunCompiledModel")
+        _log.debug("invoke: completed successfully")
 
     def close(self):
         if self._closed:
             return
+        _log.info("LiteRtInterpreter.close: releasing all native handles")
         self._closed = True
 
         destroy_tb = self.fns.get("LiteRtDestroyTensorBuffer")
@@ -512,5 +662,9 @@ class LiteRtInterpreter:
             import sys
             if getattr(sys, "is_finalizing", lambda: False)():
                 return
+        except Exception:
+            pass
+        try:
+            self.close()
         except Exception:
             pass

@@ -18,6 +18,7 @@ from ctypes import (
 )
 
 from openapi_server.impl.qnn_runtime.lib_provider import QnnLibrary, QnnProvider, SystemProvider, CORE_LOG_CB
+from openapi_server.impl.embedding_backend import EmbeddingBackend
 from openapi_server.impl.qnn_runtime.qnn_types import (
     Qnn_Tensor_t,
     QNN_DATATYPE_FLOAT_16,
@@ -244,7 +245,22 @@ TOKEN_NAMES_FALLBACK = {
 }
 
 
-class SimpleQnnEmbeddingApp:
+class SimpleQnnEmbeddingApp(EmbeddingBackend):
+    """
+    QNN binary (.bin) embedding backend.
+
+    Implements :class:`EmbeddingBackend` so it can be used interchangeably
+    with :class:`~openapi_server.impl.litert_backend.backend.NomicEmbedBackend`
+    inside ``EmbeddingsApiImpl._get_embeddings_from_component``.
+
+    Typical usage
+    -------------
+    ::
+
+        backend = SimpleQnnEmbeddingApp.from_model_path("/opt/embed_gen/model.bin")
+        vectors = backend.embed_texts(["hello world"])
+        backend.close()
+    """
 
     def __init__(
         self,
@@ -384,10 +400,13 @@ class SimpleQnnEmbeddingApp:
         self.logger_handle = c_void_p()
 
     def _init_backend(self):
-        null_cfg = POINTER(c_void_p)()
+        # Pass a null POINTER(POINTER(c_void_p)) — equivalent to NULL const T** in C.
+        # Using byref(POINTER(c_void_p)()) would pass a non-null pointer-to-null-pointer,
+        # which is technically incorrect per the QNN API contract.
+        null_cfg = POINTER(POINTER(c_void_p))()
         rc = self.provider.backendCreate(
             self.logger_handle,
-            ctypes.byref(null_cfg),
+            null_cfg,
             ctypes.byref(self.backend_handle)
         )
         if rc != 0:
@@ -395,10 +414,10 @@ class SimpleQnnEmbeddingApp:
 
         # optional device
         try:
-            null_dev_cfg = POINTER(c_void_p)()
+            null_dev_cfg = POINTER(POINTER(c_void_p))()
             rc2 = self.provider.deviceCreate(
                 self.logger_handle,
-                ctypes.byref(null_dev_cfg),
+                null_dev_cfg,
                 ctypes.byref(self.device_handle)
             )
             if rc2 != 0:
@@ -500,11 +519,12 @@ class SimpleQnnEmbeddingApp:
         return gname, (n_in, in_ptr, in_names), (n_out, out_ptr, out_names), input_name, output_name
 
     def _create_context(self, binary_buf, binary_size):
-        null_ctx_cfg = POINTER(c_void_p)()
+        # Pass a null POINTER(POINTER(c_void_p)) for configs — equivalent to NULL const T** in C.
+        null_ctx_cfg = POINTER(POINTER(c_void_p))()
         rc = self.provider.contextCreateFromBinary(
             self.backend_handle,
             self.device_handle,
-            ctypes.byref(null_ctx_cfg),
+            null_ctx_cfg,
             ctypes.cast(binary_buf, c_void_p),
             c_size_t(binary_size),
             ctypes.byref(self.context_handle),
@@ -522,19 +542,36 @@ class SimpleQnnEmbeddingApp:
         if rc != 0:
             raise RuntimeError(f"graphRetrieve('{graph_name}') failed rc={rc}")
 
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+    # ------------------------------------------------------------------
+    # EmbeddingBackend interface
+    # ------------------------------------------------------------------
 
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed *texts* via QNN HTP and return one float32 vector per text.
+
+        Implements :meth:`EmbeddingBackend.embed_texts`.
+        """
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not available.")
 
         vectors = []
-
         for text in texts:
             tokens = self.tokenizer.encode(text)
             vec = self._run_single(tokens)
             vectors.append(vec)
 
         return vectors
+
+    def encode_tokens(self, text: str) -> List[int]:
+        """
+        Tokenise *text* and return token IDs (no padding).
+
+        Implements :meth:`EmbeddingBackend.encode_tokens`.
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not available.")
+        return self.tokenizer.encode(text)
 
     def _run_single(self, tokens: List[int]) -> List[float]:
 
