@@ -18,5 +18,7 @@ services:
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
     volumes:
+      - /sys/firmware/devicetree/base/model:/run/device-model
+      - /usr/share/qcom:/usr/share/qcom
       - ${MODELS_PATH:-/opt/image_gen}:/opt/image_gen/
     command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:9090"]
