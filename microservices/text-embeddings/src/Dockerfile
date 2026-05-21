@@ -99,8 +99,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends libatomic1 && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
 
+# Create directory structure for application and make it world-accessible
+# Setting HOME to /tmp prevents KeyError: getpwuid() when running as arbitrary unnamed UID
+ENV HOME=/tmp
+
 # Create directory
-RUN mkdir -p /root/app/site-packages
+RUN mkdir -p /iot-user/app/site-packages                                                        && \
+    chmod -R 777 /iot-user
 
 # Copy the virtual environment with web-api package installed with dependencies
 COPY --from=builder /venv /venv
@@ -121,3 +126,11 @@ COPY --from=builder /usr/local /usr/local
 RUN cp /venv/lib/python3.10/site-packages/ai_edge_litert/libLiteRt.so /usr/lib/.
 
 ENV PATH=/venv/bin:$PATH
+
+# Copy the Python entrypoint and make it executable
+COPY entrypoint.py /entrypoint.py
+RUN chmod +x /entrypoint.py
+
+# Container starts as root so entrypoint.py can adjust group IDs,
+# then drops to iot-user before executing the application command.
+ENTRYPOINT ["python3", "/entrypoint.py"]
