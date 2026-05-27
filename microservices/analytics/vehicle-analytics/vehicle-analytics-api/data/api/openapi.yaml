@@ -1,0 +1,944 @@
+# Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+openapi: 3.0.3
+info:
+  title: Vehicle Analytics API
+  description: |
+    This API enables the management of vehicle analytics alerts and the configuration of alert
+    triggers based on monitoring conditions within a camera's field of view or a specified region.
+
+    It is a service that consumes the AI Workflow for vehicle detection, and generates alerts based
+    on triggers defined through this API. The service is specialized for analyzing vehicle
+    behavior, including:
+
+    - Vehicle count (number of vehicles in view or region)
+    - Vehicle dwell time (how long a vehicle remains in a location)
+    - (Optional) Vehicle attributes or accessories, if supported by the detection model
+
+    Alerts are triggered at most once per second.
+    Alert history is stored by the service and can be retrieved by polling the API.
+
+    As an example, to get started on an alert for a region, a client would:
+        * POST to /config/region to define a region for a camera using its monitorId.
+        * POST to /config/alerts/region to define a new trigger to generate alerts.
+        * Periodically GET from /alerts/region to observe new alerts.
+
+  contact:
+    name: Qualcomm Support Forums
+    url: https://mysupport.qualcomm.com/supportforums/s/
+  license:
+    name: BSD-3-Clause-Clear
+  version: '1.0.0'
+servers:
+  - url: https://{device-address}/vehicle-analytics/v1/api
+    description: Server URL
+    variables:
+      device-address:
+        description: IP address (and port) of the host of the Vehicle Analytics API ingress.
+        default: your.device.ip.here:8084
+
+x-string-constants:
+  - timestamp:       &TIMESTAMP_EXAMPLE   1729118760.000 # Epoch time in seconds. May optionally provide fractional seconds
+  - later_timestamp: &TIMESTAMP_2_EXAMPLE 1729118780.999 # A later time; example shows 999 milliseconds past the second.
+  - monitor: &MONITOR_EXAMPLE "camera1"
+  - region_id: &REGION_ID_EXAMPLE "{unique-region-id}"
+  - trigger_id: &TRIGGER_ID_EXAMPLE "{unique-trigger-id}"
+  - alert_uuid: &ALERT_UUID_EXAMPLE "{unique-alert-uuid}"
+
+tags:
+  - name: alerts
+    description: Poll historical alerts
+  - name: config
+    description: Configure triggers which generate alerts as well as microservice settings
+  - name: analytics
+    description: Query analytics data
+  - name: health
+    description: Health checks for API service.
+security: []
+paths:
+  /health:
+    get:
+      tags:
+        - util
+      summary: Check server health
+      description: Responds health of the server and its connections.
+      operationId: getHealth
+      responses:
+        '200':
+          description: OK
+        '501':
+          description: Server unhealthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: Health
+
+  /alerts:
+    get:
+      tags:
+        - alerts
+      summary: Retrieve all vehicle alerts within field of view
+      description: |
+        Returns all vehicle alerts detected within the field of view (FOV) for all active monitors in list of monitorIds.
+      operationId: getAllVehicleAlerts
+      parameters:
+        - name: monitorIds
+          in: query
+          required: true
+          description: Alerts on these monitors are returned.
+          schema:
+            type: array
+            items:
+              type: string
+              example: *MONITOR_EXAMPLE
+          
+        - name: fromTime
+          in: query
+          required: true
+          description: Earliest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: Latest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+
+      responses:
+        '200':
+          description: Response contains alerts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alerts'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleAlerts
+
+  /alerts/region:
+    get:
+      tags:
+        - alerts
+      summary: Retrieve all vehicle alerts for specified region
+      description: |
+        Returns all vehicle alerts from a list of monitors within a specified region and time range.
+      operationId: getAllVehicleAlertsRegion
+      parameters:
+        - name: regionId
+          in: query
+          required: true
+          description: Alerts on this region are returned.
+          schema:
+            type: string
+            example: *REGION_ID_EXAMPLE
+          
+        - name: fromTime
+          in: query
+          required: true
+          description: Earliest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: Latest alert to return
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+
+      responses:
+        '200':
+          description: Response contains alerts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alerts'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleAlertsRegion
+
+  /config/alerts:
+    post:
+      tags:
+        - config
+      summary: Create a new alert trigger for the field of view for specific camera by their monitor_id.
+      description: Configures a new trigger attached to a region which will generate alerts given conditions.
+      operationId: configTriggerCreate
+      requestBody:
+        description: |
+          Creates a new alert trigger for vehicle analytics within a defined region. Triggers are attached to regions using a monitor_id, and generate alerts based on vehicle count or dwell conditions.
+
+          This API supports threshold-based triggers such as:
+
+            * 'vehicle_count_changed': Alert when vehicle count changes
+            * 'vehicle_count_over': Alert when vehicle count exceeds a threshold
+            * 'vehicle_count_under': Alert when vehicle count drops below a threshold
+            * 'vehicle_dwell_over': Alert when a vehicle remains in the region beyond a specified dwell time (in milliseconds)
+
+          The 'vehicle_count_changed' ccondition will trigger whenever there is a change in the number of vehicles detected within the region.
+          This condition does not require a params field.
+
+          The 'vehicle_count_over' and 'vehicle_count_under' conditions require a params field of:
+            `["name": "threshold", "value": "<count>"]`
+          Where <count> is the numeric threshold for the condition.
+            * A trigger with 'vehicle_count_over' and a threshold of "3" will generate an alert when the number of vehicles becomes greater than 3.
+            * A trigger with 'vehicle_count_under' and a threshold of "2" will generate an alert when the number of vehicles becomes less than 2.
+          Alerts will not be re-triggered until the vehicle count crosses back over the threshold in the opposite direction.
+
+          The 'vehicle_dwell_over' condition requires a params field of:
+            `[{ "name": "threshold", "value": "<value>" }]``
+          Where <value> is the dwell time threshold in milliseconds.
+          For example, a trigger with 'vehicle_dwell_over' and a threshold of "300000" (5 minutes) will generate an alert when a vehicle remains in the region for more than 5 minutes.
+
+          The params field is required for all threshold-based vehicle trigger conditions and must be tailored to the selected condition.
+          See examples for each condition type to ensure correct configuration.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Trigger'
+            examples:
+              Vehicle Count Over:
+                $ref: '#/components/examples/vehicleCountOver'
+              Vehicle Count Under:
+                $ref: '#/components/examples/vehicleCountUnder'
+              Vehicle Count Changed:
+                $ref: '#/components/examples/vehicleCountChanged'
+              
+      responses:
+        '200':
+          description: New trigger was successfully configured.
+        default:
+          description: Error configuring trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTrigger
+    delete:
+      tags:
+        - config
+      summary: Deletes an existing trigger by trigger ID
+      description: Deletes a trigger configuration using its unique identifier.
+      operationId: configTriggerDelete
+      parameters:
+      - name: triggerId
+        in: query
+        required: true
+        description: Trigger ID to delete.
+        schema:
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+      responses:
+        '200':
+          description: Trigger was successfully deleted.
+        '400':
+          description: Error deleting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTrigger
+    get:
+      tags:
+        - config
+      summary: Retrieve all configured triggers
+      description: Returns a list of all configured alert triggers within the field of view (FOV) for specified monitorId.
+      operationId: configTriggerGet
+      parameters:
+      - name: monitorId
+        in: query
+        required: true
+        description: Monitor ID whose triggers are listed.
+        schema:
+          type: string
+          example: *MONITOR_EXAMPLE
+      responses:
+        '200':
+          description: List of triggers in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triggers'
+        '400':
+          description: Error retrieving triggers with specified monitor ID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTrigger
+
+  /config/alerts/region:
+    post:
+      tags:
+        - config
+      summary: Create a new alert trigger for specified region
+      description: Configures a new trigger attached to a region which will generate alerts given conditions.
+      operationId: configTriggerRegionCreate
+      requestBody:
+        description: |
+          Creates a new alert trigger for vehicle analytics within a defined region. Triggers are attached to regions using a region_id, and generate alerts based on vehicle count or dwell conditions.
+
+          This API supports threshold-based triggers such as:
+
+            * 'vehicle_count_changed': Alert when vehicle count changes
+            * 'vehicle_count_over': Alert when vehicle count exceeds a threshold
+            * 'vehicle_count_under': Alert when vehicle count drops below a threshold
+            * 'vehicle_dwell_over': Alert when a vehicle remains in the region beyond a specified dwell time (in milliseconds)
+
+          The 'vehicle_count_changed' ccondition will trigger whenever there is a change in the number of vehicles detected within the region.
+          This condition does not require a params field.
+
+          The 'vehicle_count_over' and 'vehicle_count_under' conditions require a params field of:
+            `["name": "threshold", "value": "<count>"]`
+          Where <count> is the numeric threshold for the condition.
+            * A trigger with 'vehicle_count_over' and a threshold of "3" will generate an alert when the number of vehicles becomes greater than 3.
+            * A trigger with 'vehicle_count_under' and a threshold of "2" will generate an alert when the number of vehicles becomes less than 2.
+          Alerts will not be re-triggered until the vehicle count crosses back over the threshold in the opposite direction.
+
+          The 'vehicle_dwell_over' condition requires a params field of:
+            `[{ "name": "threshold", "value": "<value>" }]``
+          Where <value> is the dwell time threshold in milliseconds.
+          For example, a trigger with 'vehicle_dwell_over' and a threshold of "300000" (5 minutes) will generate an alert when a vehicle remains in the region for more than 5 minutes.
+
+          The params field is required for all threshold-based vehicle trigger conditions and must be tailored to the selected condition.
+          See examples for each condition type to ensure correct configuration.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Trigger'
+            examples:
+              Vehicle Count Over:
+                $ref: '#/components/examples/vehicleCountOver'
+              Vehicle Count Under:
+                $ref: '#/components/examples/vehicleCountUnder'
+              Vehicle Count Changed:
+                $ref: '#/components/examples/vehicleCountChanged'
+              
+      responses:
+        '200':
+          description: New trigger was successfully configured.
+        default:
+          description: Error configuring trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTriggerRegion
+    delete:
+      tags:
+        - config
+      summary: Deletes an existing trigger by trigger ID
+      description: Deletes a trigger configuration using its unique identifier.
+      operationId: configTriggerRegionDelete
+      parameters:
+      - name: triggerId
+        in: query
+        required: true
+        description: Trigger ID to delete.
+        schema:
+          type: string
+          example: *TRIGGER_ID_EXAMPLE
+      responses:
+        '200':
+          description: Trigger was successfully deleted.
+        '400':
+          description: Error deleting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTriggerRegion
+    get:
+      tags:
+        - config
+      summary: Retrieve all configured triggers for specified region
+      description: Returns a list of all configured alert triggers for a specific region.
+      operationId: configTriggerRegionGet
+      parameters:
+      - name: regionId
+        in: query
+        required: true
+        description: Region ID whose triggers are listed.
+        schema:
+          type: string
+          example: *REGION_ID_EXAMPLE
+      responses:
+        '200':
+          description: List of triggers in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Triggers'
+        '400':
+          description: Error getting trigger.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigTriggerRegion
+
+  /config/region:
+    post:
+      tags:
+        - config
+      summary: Create a new region with unique region-id
+      description: Create a new region with unique region-id
+      operationId: configRegionCreate
+      requestBody:
+        description: |
+          Defines a polygonal region on a monitor by giving coordinates of its vertices using normalized coordinates.
+
+          A region is a polygon of at least two vertices. The `coordinates` field is a
+          list of `Coord` {x,y} objects that define the vertices of a polygon. The values
+          of x and y range from 0.0 to 1.0, with {x: 0.0, y: 0.0} defined as the top-left
+          corner of the monitor.
+          
+          The region is interpreted as a polygon whose edges connect `coordinates[0..N]` like so:
+          - The first edge is the line from `coordinates[0]` to `coordinates[1]`.
+          - The next edge is the line from `coordinates[1]` to `coordinates[2]`.
+          - ...
+          - The penultimate edge is the line from `coordinates[N-1]` to `coordinates[N]`.
+          - The final edge is the line from `coordinates[N]` to `coordinates[0]`, closing
+            the polygon.
+
+          Legal regions:
+          - Must have at least two vertices.
+          - Must not have crossing lines, including the final line from vertex N to vertex 0.
+
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Region'
+            examples:
+              Top-left triangle:
+                $ref: '#/components/examples/regionTopLeftTriangle'
+              Bottom-right quadrant:
+                $ref: '#/components/examples/regionBottomRightQuadrant'
+              ILLEGAL!! Two-vertex non-region:
+                $ref: '#/components/examples/illegalRegionTwoVertex'
+              ILLEGAL!! Region with intersecting lines:
+                $ref: '#/components/examples/illegalRegionIntersecting'
+              
+      responses:
+        '200':
+          description: New region was successfully configured.
+        default:
+          description: Error configuring region.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigRegion
+    delete:
+      tags:
+        - config
+      summary: Delete an existing region by region-id
+      description: Deletes a region configuration using its unique identifier.
+      operationId: configRegionDelete
+      parameters:
+      - name: regionId
+        in: query
+        required: true
+        description: Region ID to delete.
+        schema:
+          type: string
+          example: *REGION_ID_EXAMPLE
+      responses:
+        '200':
+          description: Region was successfully deleted.
+        default:
+          description: Error deleting region.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigRegion
+    get:
+      tags:
+        - config
+      summary: Get regions
+      description: Return list of regions on a given monitor ID.
+      operationId: configRegionGet
+      parameters:
+      - name: monitorId
+        in: query
+        required: true
+        description: Monitor ID whose regions are listed.
+        schema:
+          type: string
+          example: *MONITOR_EXAMPLE
+      responses:
+        '200':
+          description: List of regions in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Regions'
+        default:
+          description: Error getting regions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleConfigRegion
+
+  /analytics/count:
+    get:
+      tags:
+        - analytics
+      summary: Retrieve analytics count for vehicles within field of view
+      description: |
+        Returns the total number of vehicle detection events—referred to as vehicle count—observed
+        within the field of view for the specified monitors during a given time range.
+
+        The minimum interval is 5 minutes.
+      operationId: getVehicleAnalyticsCount
+      parameters:
+        - name: monitorId
+          in: query
+          required: true
+          description: Unique monitorId
+          schema:
+            type: string
+            example: *MONITOR_EXAMPLE
+        - name: fromTime
+          in: query
+          required: true
+          description: Start of time range
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: End of time range
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+      responses:
+        '200':
+          description: Vehicle count returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleCount'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleAnalyticsCount
+
+  /analytics/count/region:
+    get:
+      tags:
+        - analytics
+      summary: Retrieve analytics count for vehicles for specified region
+      description: |
+        Returns the total number of vehicle detection events—referred to as vehicle count—observed within
+        the specified region for the specified monitors during a given time range.
+
+        The minimum interval is 5 minutes.
+      operationId: getVehicleAnalyticsCountRegion
+      parameters:
+        - name: regionId
+          in: query
+          required: true
+          description: Region identifier
+          schema:
+            type: string
+            example: *REGION_ID_EXAMPLE
+        - name: fromTime
+          in: query
+          required: true
+          description: Start of time range
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+        - name: toTime
+          in: query
+          required: true
+          description: End of time range
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+      responses:
+        '200':
+          description: Vehicle analytics count returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleCount'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleAnalyticsCountRegion
+
+  /analytics/heatmap:
+    get:
+      tags: 
+        - analytics
+      summary: Retrieve analytics heatmap for vehicles within field of view.
+      description: Returns a heatmap visualization of vehicle activity detected within the field of view for a specified camera, identified by its monitorId. The heatmap represents spatial vehicle density over time using a 64x64 grid. 
+                  This endpoint is useful for applications such as traffic monitoring, smart parking, and urban mobility planning.
+      operationId: getVehicleAnalyticsHeatmap
+      parameters:
+        - name: monitorId
+          in: query
+          required: true
+          schema:
+            type: string
+            example: *MONITOR_EXAMPLE
+            description: ID of the camera or monitor.
+        - name: fromTime
+          in: query
+          required: true
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_EXAMPLE
+            description: Start of time range.
+        - name: toTime
+          in: query
+          required: true
+          schema:
+            type: number
+            format: double
+            example: *TIMESTAMP_2_EXAMPLE
+            description: End of time range.
+      responses:
+        '200':
+          description: Heatmap data returned.
+          content:
+            application/json:
+              schema: 
+                $ref: '#/components/schemas/Heatmap'
+        '400': 
+          description: Invalid input.
+          content: 
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      x-swagger-router-controller: VehicleAnalyticsHeatmap
+
+components:
+  schemas:
+    Heatmap:
+      type: object
+      description: A analytics heatmap for vehicles in the field of view.
+      properties:
+        rows:
+          type: integer
+          example: 64
+        cols:
+          type: integer
+          example: 64
+        data:
+          type: array
+          description:  64x64 array representing vehicle density grid
+          minItems: 64
+          maxItems: 64
+          items:
+            type: array
+            minItems: 64
+            maxItems: 64
+            items:
+              type: integer
+              description: vehicle count for this grid cell.
+
+    Alerts:
+      type: array
+      description: An array of Alert objects that were triggered by configured conditions typically based on vehicle count or dwell time events.
+      items:
+        $ref: "#/components/schemas/Alert"
+
+    Alert:
+      type: object
+      description: Represents an alert generated by a configured trigger. Alerts may be related to accessory violations or occupancy events.
+      properties:
+        source_trigger:
+          $ref: "#/components/schemas/Trigger"
+        alert_id:
+          type: string
+          format: uuid
+          description: Unique identifier for the alert (UUID)
+          example: *ALERT_UUID_EXAMPLE
+        time:
+          type: number
+          format: double
+          description: Timestamp when the alert was generated (epoch seconds)
+          example: *TIMESTAMP_EXAMPLE
+        end_time:
+          type: number
+          format: double
+          description: (Optional) Timestamp when the alert was cleared. This is 0 if the alert has not been cleared.
+          example: *TIMESTAMP_2_EXAMPLE
+        type:
+          type: string
+          description: Alert type (e.g. "count" or "dwell")
+        vehicles:
+          type: array
+          description: List of vehicles within frame or region at time of trigger
+          items:
+            $ref: "#/components/schemas/Vehicle"
+      required:
+        - alert_id
+        - source_trigger
+        - time
+
+    Vehicle:
+      type: object
+      description: Represents a single vehicle detected in the scene.
+      properties:
+        vehicle_id:
+          type: string
+          description: Unique ID of the vehicle if available or 0 by default
+        bounding_box:
+          $ref: "#/components/schemas/BoundingBox"
+        dwell_time:
+          type: number
+          description: Time the vehicle has been in frame (milliseconds)
+        attributes:
+          type: array
+          description: (Optional) List of vehicle attributes as name/value pairs
+          items:
+            $ref: "#/components/schemas/Param"
+
+    VehicleCount:
+      type: object
+      description: Represents summarized statistics for the number of vehicles detected within a defined scene or region over a specified time interval. Useful for traffic analysis, occupancy monitoring, or trend reporting.
+      properties:
+        min:
+          type: integer
+          description: The lowest number of vehicles detected during the time range.
+        max:
+          type: integer
+          description: The highest number of vehicles detected during the time range.
+        average:
+          type: integer
+          description: The mean number of vehicles observed across all detection intervals within the time range.
+
+    Triggers:
+      type: array
+      description: List of Trigger objects that define alert conditions based on count or dwell events.
+      items:
+        $ref: "#/components/schemas/Trigger"
+
+    Trigger:
+      type: object
+      description: Defines a trigger that generates alerts based on accessory or occupancy conditions.
+      properties:
+        monitor_id:
+          type: string
+          description: Monitor where the trigger is placed
+        region_id:
+          type: string
+          description: Optional Region on which to place trigger. Defaults to null when no region_id is provided and assumed trigger is for whole fov.
+          example: *REGION_ID_EXAMPLE
+        trigger_id:
+          type: string
+          description: Globally unique identifier for the trigger
+        trigger_name:
+          type: string
+          description: Human-readable name for the trigger
+        trigger_condition:
+          type: string
+          description: Condition type (e.g., vehicle_count_changed, vehicle_count_over, etc.)
+        params:
+          type: array
+          description: List of name/value pairs for condition parameters (Param)
+          items:
+            $ref: "#/components/schemas/Param"
+      required:
+        - monitor_id
+        - trigger_id
+        - trigger_name
+        - trigger_condition
+
+    Region:
+      type: object
+      description: Define a new region in a monitor by giving the coordinates of its vertices.
+      properties:
+        monitor_id:
+          type: string
+          description: Identifier for the monitoring source
+          example: *MONITOR_EXAMPLE
+        region_id:
+          type: string
+          description: Unique ID for the region
+          example: *REGION_ID_EXAMPLE
+        region_name:
+          type: string
+          description: Human-readable name for the region
+        coordinates:
+          type: array
+          description: Coordinates defining the region
+          items:
+            $ref: "#/components/schemas/Coord"
+
+    Regions:
+      description: List of Region objects
+      type: array
+      items:
+        $ref: "#/components/schemas/Region"
+
+    BoundingBox:
+      type: object
+      description: Defines a rectangular area using two coordinates.
+      properties:
+        top_left:
+          $ref: "#/components/schemas/Coord"
+        bottom_right:
+          $ref: "#/components/schemas/Coord"
+
+    Coord:
+      type: object
+      description: A normalized coordinate in the monitor view.
+      properties:
+        x:
+          type: number
+          description: Horizontal position (0.0 = left, 1.0 = right)
+        y:
+          type: number
+          description: Vertical position (0.0 = top, 1.0 = bottom)
+
+    Param:
+      type: object
+      description: A generic name-value pair used to define configuration parameters. This schema is reusable across different contexts, such as trigger conditions or vehicle attributes.
+      properties:
+        name:
+          type: string
+          description: Name of the parameter or attribute (e.g., "threshold", "vehicle_type")
+        value:
+          type: string
+          description: Value assigned to the parameter or attribute (e.g., "10", "sedan")
+
+    Error:
+      type: object
+      description: Returned when an error occurs in the API.
+      properties:
+        reason:
+          type: string
+          description: Explanation of the error
+
+  examples:
+      regionTopLeftTriangle:
+        value:
+          monitor_id: *MONITOR_EXAMPLE
+          region_id: *REGION_ID_EXAMPLE
+          region_name: "Triangle covering top-left diagonal half of monitor"
+          coordinates:
+            - x: 0.0 # top-left
+              y: 0.0
+            - x: 1.0 # top-right
+              y: 0.0
+            - x: 0.0 # bottom-left
+              y: 1.0
+
+      regionBottomRightQuadrant:
+        value:
+          monitor_id: *MONITOR_EXAMPLE
+          region_id: *REGION_ID_EXAMPLE
+          region_name: "Square covering bottom-right quadrant of monitor"
+          coordinates:
+            - x: 0.5 # middle of monitor = top-left of quadrant
+              y: 0.5
+            - x: 1.0 # middle-right of monitor = top-right of quadrant
+              y: 0.5
+            - x: 1.0 # bottom-right of monitor = bottom-right of quadrant
+              y: 1.0
+            - x: 0.5 # bottom-middle of monitor = bottom-left of quadrant
+              y: 1.0
+
+      illegalRegionTwoVertex:
+        value:
+          monitor_id: *MONITOR_EXAMPLE
+          region_id: *REGION_ID_EXAMPLE
+          region_name: "ILLEGAL!! Only has 2 vertices, does not describe region"
+          coordinates:
+            - x: 0.1
+              y: 0.2
+            - x: 0.3
+              y: 0.4
+
+      illegalRegionIntersecting:
+        value:
+          monitor_id: *MONITOR_EXAMPLE
+          region_id: *REGION_ID_EXAMPLE
+          region_name: "ILLEGAL!! Line between vertices 0 and 1 is crossed by line between vertices 2 and 3"
+          coordinates:
+            - x: 0.0 # middle-left...
+              y: 0.5
+            - x: 1.0 # to middle-right = horizonal line across monitor.
+              y: 0.5
+            - x: 0.5 # bottom-middle..
+              y: 1.0
+            - x: 0.5 # ..to top-middle = vertical line across monitor, crossing horizontal line.
+              y: 0.0
+
+      vehicleCountOver:
+          value:
+            monitor_id: *MONITOR_EXAMPLE
+            trigger_id: *TRIGGER_ID_EXAMPLE
+            trigger_name: "Trigger an alert whenever vehicle count changes from <= 2 to >= 3."
+            trigger_condition: "vehicle_count_over"
+            params:
+              - name: "threshold"
+                value: "2"
+
+      vehicleCountUnder:
+          value:
+            monitor_id: *MONITOR_EXAMPLE
+            trigger_id: *TRIGGER_ID_EXAMPLE
+            trigger_name: "Trigger an alert whenever vehicle count changes from >= 3 to <= 2."
+            trigger_condition: "vehicle_count_under"
+            params:
+              - name: "threshold"
+                value: "3"
+
+      vehicleCountChanged:
+          value:
+            monitor_id: *MONITOR_EXAMPLE
+            trigger_id: *TRIGGER_ID_EXAMPLE
+            trigger_name: "Alert each time vehicle ocunt changes in frame; no params needed."
+            trigger_condition: "vehicle_count_changed"
+
+      triggerDwellOver:
+          value:
+            monitor_id: *MONITOR_EXAMPLE
+            trigger_id: *TRIGGER_ID_EXAMPLE
+            trigger_name: "Vehicle has not moved for more than 5 minutes."
+            trigger_condition: "vehicle_dwell_over"
+            params:
+              - name: "threshold"
+                value: "300000"

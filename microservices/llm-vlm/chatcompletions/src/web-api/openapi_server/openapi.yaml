@@ -1,0 +1,791 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+openapi: 3.0.3
+info:
+  title: LLM-VLM GenAI Microservice APIs
+  description: These REST APIs provide the capability to run inference on Qualcomm Dragonwing devices.
+  version: '1.0.0'
+servers:
+  - url: /
+paths:
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      tags:
+        - Chat
+      summary: Creates a chat conversation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateChatCompletionRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateChatCompletionResponse"
+
+  /v1/chat/completions/{completion_id}:
+    delete:
+      operationId: deleteChatCompletion
+      tags:
+        - Chat
+      summary: Delete a stored chat completion
+      description: Deletes a chat completion by ID, cleaning up all associated resources.
+      parameters:
+        - name: completion_id
+          in: path
+          required: true
+          description: The ID of the chat completion to delete
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The chat completion was deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionDeleted"
+        "404":
+          description: The chat completion with the specified ID was not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                    description: Error message describing why the completion was not found
+
+  /v1/health:
+    get:
+      tags:
+        - Health
+      summary: Check the health of microservice
+      description: >
+        Health check for container orchestration (Docker Swarm / Kubernetes).
+        Returns HTTP 200 when healthy, HTTP 503 when unhealthy.
+        Unhealthy conditions: any model has >= 3 consecutive inference failures
+        (DSP/FastRPC fault), or available system memory < 100 MB.
+      operationId: healthcheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service is unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /v1/ping:
+    get:
+      tags:
+        - Ping
+      summary: Check if server is accessible to the client
+      description: Ping the server to check it's alive and well. Ping will return Pong if you provide the correct BearerToken
+      operationId: ping
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PingResponse'
+
+  /v1/cancel/{completion_id}:
+    post:
+      operationId: cancelChatCompletion
+      tags:
+        - Chat
+      summary: Cancel an active chat completion
+      description: Cancels an actively executing chat completion by terminating the subprocess and rolling back session state.
+      parameters:
+        - name: completion_id
+          in: path
+          required: true
+          description: The ID of the chat completion to cancel
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The chat completion was cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionCancelled"
+        "404":
+          description: The chat completion with the specified ID was not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+        "400":
+          description: No active event to cancel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+
+  /v1/metrics:
+    get:
+      operationId: getMetrics
+      tags:
+        - Metrics
+      summary: Get system and model inference metrics
+      description: >
+        Returns a unified snapshot of live system resource metrics (CPU, memory)
+        and per-model moving averages for all pipeline stages (last 100 requests).
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+
+  /v1/models:
+    get:
+      operationId: listModels
+      tags:
+        - Models
+      summary: Lists the currently available models
+      description: Lists the currently available models, and provides basic information about each one such as the owner and availability.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListModelsResponse'
+
+components:
+  schemas:
+    CreateChatCompletionRequest:
+      type: object
+      properties:
+        messages:
+          type: array
+          description: A list of messages comprising the conversation so far. Depending on the model you use, different message types (modalities) are supported, like text, images, and audio.
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ChatCompletionRequestMessage"
+          example:
+            - role: "system"
+              content: "You are a helpful assistant."
+            - role: "user"
+              content: [
+                {
+                  "type": "text",
+                  "text": "What is in this image?"
+                },
+                {
+                  "type": "image_url",
+                  "image_url": {
+                    "url": "https://images.pexels.com/photos/210186/pexels-photo-210186.jpeg?cs=srgb&dl=cascade-clouds-cool-wallpaper-210186.jpg&fm=jpg%22"
+                  }
+                }
+              ]
+        model:
+          type: string
+          description: Model ID used to generate the response.
+          example: "qwen2.5-vl-3b"
+        frequency_penalty:
+          type: number
+          default: 0
+          minimum: -2
+          maximum: 2
+          nullable: true
+          description: Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim.
+        max_completion_tokens:
+          type: integer
+          nullable: true
+          description: An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.
+        presence_penalty:
+          type: number
+          default: 0
+          minimum: -2
+          maximum: 2
+          nullable: true
+          description: Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.
+        safety_identifier:
+          type: string
+          nullable: true
+          description: A stable identifier used to help detect users of your application that may be violating OpenAI's usage policies. The IDs should be a string that uniquely identifies each user.
+        seed:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          nullable: true
+          example: 42
+          description: If specified, our system will make a best effort to sample deterministically, such that repeated requests with the same seed and parameters should return the same result.
+        stream:
+          type: boolean
+          nullable: true
+          default: false
+          description: If set to true, the model response data will be streamed to the client as it is generated using server-sent events.
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 1
+          nullable: true
+          description: What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 1
+          nullable: true
+          description: An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.
+        top_k:
+          type: integer
+          minimum: 1
+          default: 40
+          nullable: true
+          description: Top-k sampling parameter. If specified, the sampler considers only the k most likely next tokens at each step. If omitted, the model's configured sampler defaults are used.
+      required:
+        - messages
+        - model
+
+    CreateChatCompletionResponse:
+      type: object
+      description: Represents a chat completion response returned by model, based on the provided input.
+      properties:
+        id:
+          type: string
+          description: A unique identifier for the chat completion.
+        choices:
+          type: array
+          description: A list of chat completion choices. Can be more than one if n is greater than 1.
+          items:
+            type: object
+            required:
+              - finish_reason
+              - index
+              - message
+              - logprobs
+            properties:
+              finish_reason:
+                type: string
+                description: The reason the model stopped generating tokens.
+                enum:
+                  - stop
+                  - length
+                  - tool_calls
+                  - content_filter
+                  - function_call
+              index:
+                type: integer
+                description: The index of the choice in the list of choices.
+              message:
+                $ref: "#/components/schemas/ChatCompletionResponseMessage"
+        created:
+          type: integer
+          description: The Unix timestamp (in seconds) of when the chat completion was created.
+        model:
+          type: string
+          description: The model used for the chat completion.
+        object:
+          type: string
+          description: The object type, which is always chat.completion.
+          enum:
+            - chat.completion
+        usage:
+          $ref: "#/components/schemas/CompletionUsage"
+      required:
+        - choices
+        - created
+        - id
+        - object
+
+    ChatCompletionRequestMessage:
+      oneOf:
+        - $ref: "#/components/schemas/ChatCompletionRequestSystemMessage"
+        - $ref: "#/components/schemas/ChatCompletionRequestUserMessage"
+        - $ref: "#/components/schemas/ChatCompletionRequestAssistantMessage"
+        - $ref: "#/components/schemas/ChatCompletionRequestToolMessage"
+      discriminator:
+        propertyName: role
+        mapping:
+          system: "#/components/schemas/ChatCompletionRequestSystemMessage"
+          user: "#/components/schemas/ChatCompletionRequestUserMessage"
+          assistant: "#/components/schemas/ChatCompletionRequestAssistantMessage"
+          tool: "#/components/schemas/ChatCompletionRequestToolMessage"
+
+    ChatCompletionRequestSystemMessage:
+      type: object
+      title: System message
+      properties:
+        content:
+          type: string
+          description: The contents of the system message.
+        role:
+          type: string
+          enum:
+            - system
+          description: The role of the messages author, in this case system.
+        name:
+          type: string
+          description: An optional name for the participant.
+      required:
+        - content
+        - role
+
+    ChatCompletionRequestUserMessage:
+      type: object
+      title: User message
+      properties:
+        content:
+          oneOf:
+            - type: string
+              description: The text contents of the message.
+            - type: array
+              description: An array of content parts with a defined type.
+              items:
+                $ref: "#/components/schemas/ChatCompletionRequestMessageContentPart"
+              minItems: 1
+              example:
+                - type: "text"
+                  text: "What is in this image?"
+                - type: "image_url"
+                  image_url:
+                    url: "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+        role:
+          type: string
+          enum:
+            - user
+          description: The role of the messages author, in this case user.
+        name:
+          type: string
+          description: An optional name for the participant.
+      required:
+        - content
+        - role
+      example:
+        role: "user"
+        content: [
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+            }
+          }
+        ]
+
+    ChatCompletionRequestAssistantMessage:
+      type: object
+      title: Assistant message
+      properties:
+        content:
+          nullable: true
+          type: string
+          description: The contents of the assistant message.
+        role:
+          type: string
+          enum:
+            - assistant
+          description: The role of the messages author, in this case assistant.
+        name:
+          type: string
+          description: An optional name for the participant.
+        tool_calls:
+          type: array
+          description: The tool calls generated by the model, such as function calls.
+          items:
+            $ref: "#/components/schemas/ChatCompletionMessageToolCall"
+      required:
+        - role
+
+    ChatCompletionRequestMessageContentPart:
+      oneOf:
+        - $ref: "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+        - $ref: "#/components/schemas/ChatCompletionRequestMessageContentPartImage"
+
+    ChatCompletionRequestMessageContentPartText:
+      type: object
+      title: Text content part
+      properties:
+        type:
+          type: string
+          enum:
+            - text
+          description: The type of the content part.
+        text:
+          type: string
+          description: The text content.
+      required:
+        - type
+        - text
+
+    ChatCompletionRequestMessageContentPartImage:
+      type: object
+      title: Image content part
+      properties:
+        type:
+          type: string
+          enum:
+            - image_url
+          description: The type of the content part.
+        image_url:
+          type: object
+          properties:
+            url:
+              type: string
+              description: Either a URL of the image or the base64 encoded image data.
+              format: uri
+            detail:
+              type: string
+              description: Specifies the detail level of the image.
+              enum:
+                - auto
+                - low
+                - high
+              default: auto
+          required:
+            - url
+      required:
+        - type
+        - image_url
+
+    ChatCompletionResponseMessage:
+      type: object
+      description: A chat completion message generated by the model.
+      properties:
+        content:
+          type: string
+          description: The contents of the message.
+          nullable: true
+        role:
+          type: string
+          enum:
+            - assistant
+          description: The role of the author of this message.
+        tool_calls:
+          type: array
+          description: The tool calls generated by the model, such as function calls.
+          items:
+            $ref: "#/components/schemas/ChatCompletionMessageToolCall"
+      required:
+        - role
+        - content
+
+    CompletionUsage:
+      type: object
+      description: Usage statistics for the completion request.
+      properties:
+        completion_tokens:
+          type: integer
+          default: 0
+          description: Number of tokens in the generated completion.
+        prompt_tokens:
+          type: integer
+          default: 0
+          description: Number of tokens in the prompt.
+        total_tokens:
+          type: integer
+          default: 0
+          description: Total number of tokens used in the request (prompt + completion).
+      required:
+        - prompt_tokens
+        - completion_tokens
+        - total_tokens
+
+    UsageRead:
+      type: object
+      required:
+        - userid
+        - date_bin
+        - total_input_tokens
+        - total_output_tokens
+        - total_tokens
+        - total_generation_time
+      properties:
+        date_bin:
+          type: string
+          format: date-time
+        total_generation_time:
+          type: number
+          format: float
+        total_input_tokens:
+          type: integer
+          format: int32
+        total_output_tokens:
+          type: integer
+          format: int32
+        total_tokens:
+          type: integer
+          format: int32
+        userid:
+          type: string
+
+    PingResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+
+    ListModelsResponse:
+      type: object
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: The object type, which is always "list"
+        data:
+          type: array
+          description: List of model objects
+          items:
+            $ref: "#/components/schemas/Model"
+      required:
+        - object
+        - data
+
+    Model:
+      type: object
+      title: Model
+      description: Describes an OpenAI model offering that can be used with the API.
+      properties:
+        id:
+          type: string
+          description: The model identifier, which can be referenced in the API endpoints.
+        created:
+          type: integer
+          description: The Unix timestamp (in seconds) when the model was created.
+        object:
+          type: string
+          description: The object type, which is always "model".
+          enum:
+            - model
+        owned_by:
+          type: string
+          description: The organization that owns the model.
+      required:
+        - id
+        - object
+        - created
+        - owned_by
+
+    ChatCompletionRequestToolMessage:
+      type: object
+      title: Tool message
+      properties:
+        role:
+          type: string
+          enum:
+            - tool
+          description: The role of the messages author, in this case tool.
+        content:
+          type: string
+          description: The contents of the tool message.
+        tool_call_id:
+          type: string
+          description: Tool call that this message is responding to.
+      required:
+        - role
+        - content
+        - tool_call_id
+
+    ChatCompletionMessageToolCall:
+      type: object
+      title: Tool call
+      properties:
+        id:
+          type: string
+          description: The ID of the tool call.
+        type:
+          type: string
+          enum:
+            - function
+          description: The type of the tool. Currently, only function is supported.
+        function:
+          type: object
+          description: The function that the model called.
+          properties:
+            name:
+              type: string
+              description: The name of the function to call.
+            arguments:
+              type: string
+              description: The arguments to call the function with, as generated by the model in JSON format.
+          required:
+            - name
+            - arguments
+      required:
+        - id
+        - type
+        - function
+
+    MetricsResponse:
+      type: object
+      title: Metrics Response
+      description: Unified snapshot of system resource metrics and per-model inference metrics.
+      properties:
+        system:
+          $ref: '#/components/schemas/SystemMetrics'
+        models:
+          type: object
+          description: >
+            Map of model ID to its moving-average inference metrics.
+            Empty object if no requests have been processed yet.
+          additionalProperties:
+            $ref: '#/components/schemas/ModelInferenceMetrics'
+      required:
+        - system
+        - models
+
+    SystemMetrics:
+      type: object
+      title: System Metrics
+      description: Live system resource utilization.
+      properties:
+        cpu_usage_percent:
+          type: number
+          format: float
+          description: Current CPU utilization (0–100).
+        memory_total_gb:
+          type: number
+          format: float
+          description: Total system memory in GB.
+        memory_used_gb:
+          type: number
+          format: float
+          description: Used system memory in GB.
+        memory_free_gb:
+          type: number
+          format: float
+          description: Available system memory in GB.
+        memory_usage_percent:
+          type: number
+          format: float
+          description: Memory utilization percentage (0–100).
+      required:
+        - cpu_usage_percent
+        - memory_total_gb
+        - memory_used_gb
+        - memory_free_gb
+        - memory_usage_percent
+
+    ModelInferenceMetrics:
+      type: object
+      title: Model Inference Metrics
+      description: >
+        Moving-average pipeline-stage metrics for a single model (last 100 requests).
+        All avg_* fields are null until at least one request has been processed.
+      properties:
+        avg_preprocessing_time_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            Pre-processing stage — average image encode/resize time in ms.
+            Present only for VLM models; null for LLM models.
+        avg_ttft_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            VLM/LLM Inference Start — average Time to First Token in ms.
+        avg_tokens_per_second:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            VLM/LLM Inference Steady-State — average token generation rate (tokens/sec).
+        avg_stream_latency_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            Token Streaming — average inter-token stream latency in ms.
+        avg_total_pipeline_latency_ms:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            End-to-End — average total pipeline latency in ms.
+
+    ChatCompletionCancelled:
+      type: object
+      title: Chat completion cancelled
+      description: Represents the cancellation confirmation of an active chat completion.
+      properties:
+        id:
+          type: string
+          description: The ID of the cancelled chat completion.
+        object:
+          type: string
+          description: The object type, which is always "chat.completion.cancelled".
+          enum:
+            - chat.completion.cancelled
+        cancelled:
+          type: boolean
+          description: Whether the chat completion was successfully cancelled.
+        message:
+          type: string
+          description: Additional information about the cancellation.
+      required:
+        - id
+        - object
+        - cancelled
+
+    HealthResponse:
+      type: object
+      title: Health Response
+      description: Health check response for container orchestration.
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - unhealthy
+          description: Overall health status of the service.
+        reason:
+          type: string
+          description: >
+            Present only when status is "unhealthy". Describes the reason
+            for the unhealthy state.
+      required:
+        - status
+
+    ChatCompletionDeleted:
+      type: object
+      title: Chat completion deleted
+      description: Represents the deletion confirmation of a chat completion.
+      properties:
+        id:
+          type: string
+          description: The ID of the deleted chat completion.
+        object:
+          type: string
+          description: The object type, which is always "chat.completion.deleted".
+          enum:
+            - chat.completion.deleted
+        deleted:
+          type: boolean
+          description: Whether the chat completion was successfully deleted.
+      required:
+        - id
+        - object
+        - deleted

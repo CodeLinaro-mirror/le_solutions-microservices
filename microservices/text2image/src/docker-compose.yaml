@@ -1,0 +1,26 @@
+services:
+  genai_t2i:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai_service_t2i
+    container_name: genai_service_t2i
+    hostname: genai_t2i
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: service
+    ports:
+      - "${GENAI_T2I_PORT:-9090}:${GENAI_T2I_PORT:-9090}"
+    environment:
+      - GENAI_T2I_PORT=${GENAI_T2I_PORT:-9090}
+      - VARIANT=${VARIANT:-2.1}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH}
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
+    volumes:
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${MODELS_PATH:-/opt/image_gen}:/opt/image_gen/
+    command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2I_PORT} --reload"

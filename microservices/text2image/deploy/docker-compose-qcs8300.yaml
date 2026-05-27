@@ -1,0 +1,23 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+services:
+  genai_t2i:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai_service_t2i
+    container_name: genai_service_t2i
+    hostname: genai_t2i
+    ports:
+      - "${GENAI_T2I_PORT:-9090}:9090"
+    environment:
+      - GENAI_T2I_PORT=9090
+      - VARIANT=${VARIANT:-2.1}
+      - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH}
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+    volumes:
+      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${MODELS_PATH:-/opt/image_gen}:/opt/image_gen/
+    command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:9090"]

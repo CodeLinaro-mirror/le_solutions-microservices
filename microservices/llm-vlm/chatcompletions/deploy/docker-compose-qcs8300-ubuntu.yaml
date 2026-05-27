@@ -1,0 +1,40 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+services:
+  genai-llm-vlm-service:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: artifacts.codelinaro.org/iot-solutions-microservices/genai-llm-vlm-service:latest
+    container_name: genai-llm-vlm-service
+    hostname: genai-chatcompletion
+    working_dir: /mnt/work/models
+    user: root
+    ports:
+      - "${GENAI_PORT:-9001}:${GENAI_PORT:-9001}"
+    environment:
+      - LOG_LEVEL=ERROR
+      - GENAI_PORT=${GENAI_PORT:-9001}
+      - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-2048}
+      - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-2}
+    # Memory and resource limits for VLM model loading
+    deploy:
+      resources:
+        limits:
+          memory: 12G  # VLM models typically need 8-12GB+ for loading and inference
+        reservations:
+          memory: 8G   # Reserve at least 8GB
+    # Alternative memory limit syntax (use if deploy.resources doesn't work)
+    mem_limit: 12g
+    memswap_limit: 12g
+    # Prevent OOM killer from terminating the container
+    oom_kill_disable: false
+    # Increase shared memory size for model loading
+    shm_size: 2g
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+    volumes:
+      - /usr/lib/aarch64-linux-gnu/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
+      - /usr/lib/aarch64-linux-gnu/libcdsprpc.so:/usr/lib/libcdsprpc.so
+      - ${GENAI_MODEL_DIR:-/opt/models/}:/mnt/work/models/
+    command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:${GENAI_PORT:-9001}"]
