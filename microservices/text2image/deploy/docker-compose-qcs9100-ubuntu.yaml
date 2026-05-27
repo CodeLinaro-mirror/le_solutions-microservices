@@ -3,7 +3,7 @@
 services:
   genai_t2i:
     platform: ${TARGET_ARCH:-linux/arm64}
-    image: genai_service_t2i
+    image: artifacts.codelinaro.org/iot-solutions-microservices/genai-t2i-service:latest
     container_name: genai_service_t2i
     hostname: genai_t2i
     ports:
