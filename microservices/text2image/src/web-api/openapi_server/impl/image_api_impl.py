@@ -42,10 +42,10 @@ class ImageApiImpl(BaseImageApi):
 
             # Default model is the first model listed in the 'models' section of models_config.json
             default_model = model_config_manager.get_default_model()
-            
+
             # Determine which model to use
             requested_model = request.model or default_model
-            
+
             # Validate that the requested model exists in config
             if not model_config_manager.is_model_available(requested_model):
                 logger.error(f"Requested model '{requested_model}' not found in configuration.")
@@ -54,10 +54,10 @@ class ImageApiImpl(BaseImageApi):
                     status_code=HttpStatusCodes.BAD_REQUEST,
                     detail=f"Model '{requested_model}' is not available. Available models: {available_model_ids}"
                 )
-            
+
             # Extract variant from model ID using the config manager
             variant = model_config_manager.extract_variant_from_model_id(requested_model)
-            
+
             logger.info(f"Using model: {requested_model}, variant: {variant}")
 
             if request.quality == "low":
@@ -68,7 +68,7 @@ class ImageApiImpl(BaseImageApi):
                 steps_for_model = 100
 
             #Fetch environment variable for models_path
-            models_path = os.getenv("MODELS_PATH", "/opt/image_gen")
+            models_path = os.getenv("T2I_MODEL_DIR", "/mnt/work/models")
 
             # Get model file names from config manager
             model_info = model_config_manager.get_model_info(requested_model)

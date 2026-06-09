@@ -145,6 +145,8 @@ ENV PATH=/mnt/work/venv/bin:$PATH
 COPY entrypoint.py /entrypoint.py
 RUN chmod +x /entrypoint.py
 
+WORKDIR /mnt/work/models
+
 # Container starts as root so entrypoint.sh can adjust group IDs,
 # then drops to iot-user before executing the application command.
 ENTRYPOINT ["python3", "/entrypoint.py"]

@@ -48,7 +48,7 @@ def main():
     # 2. Detect target UID/GID from models directory, or fallback to 10000
     TARGET_UID = 10000
     TARGET_GID = 10000
-    models_dir = "/opt/image_gen"
+    models_dir = "/mnt/work/models"
     if os.path.exists(models_dir):
         stat_info = os.stat(models_dir)
         TARGET_UID = stat_info.st_uid
