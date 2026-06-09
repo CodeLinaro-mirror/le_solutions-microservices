@@ -228,7 +228,7 @@ class ImageGenerationRequest(BaseModel):
             "output_compression": obj.get("output_compression") if obj.get("output_compression") is not None else 100,
             "output_format": obj.get("output_format") if obj.get("output_format") is not None else 'png',
             "partial_images": obj.get("partial_images") if obj.get("partial_images") is not None else 0,
-            "quality": obj.get("quality") if obj.get("quality") is not None else 'auto',
+            "quality": obj.get("quality") if obj.get("quality") is not None else 'low',
             "response_format": obj.get("response_format") if obj.get("response_format") is not None else 'url',
             "size": obj.get("size") if obj.get("size") is not None else '512x512',
             "stream": obj.get("stream") if obj.get("stream") is not None else False,

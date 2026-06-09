@@ -28,7 +28,7 @@ ENV T2I_QNN_LIB_PATH=${T2I_DOWNLOAD_DIR}/qairt/${T2I_QNP_VER}/lib
 ENV T2I_QNN_BIN_PATH=${T2I_DOWNLOAD_DIR}/qairt/${T2I_QNP_VER}/bin
 ENV T2I_QNP_SDK=v${T2I_QNP_VER}.zip
 
-RUN wget -t 2 -T 30 -P ${T2I_DOWNLOAD_DIR}                                                         \
+RUN wget -t 2 -T 30 --no-check-certificate -P ${T2I_DOWNLOAD_DIR}                                  \
         https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${T2I_QNP_VER}/${T2I_QNP_SDK} && \
     cd ${T2I_DOWNLOAD_DIR}                                                                      && \
     unzip ${T2I_QNP_SDK}                                                                        && \
@@ -126,11 +126,6 @@ COPY --from=builder /mnt/work/venv /mnt/work/venv
 COPY --from=builder /mnt/work/deploy/usr /usr
 COPY --from=fastrpc-builder /usr/lib/libcdsprpc.so* /usr/lib/
 COPY --from=fastrpc-builder /usr/lib/aarch64-linux-gnu/libyaml* /usr/lib/
-
-# Copy default model configuration (used when GENAI_MODELS_CONFIG_PATH is not set)
-RUN mkdir -p /app/default_configs
-COPY --chmod=644 --from=builder /mnt/work/src/web-api/openapi_server/configs/models_config.json \
-    /app/default_configs/models_config.json
 
 # Install python3 as a dependency of hypercorn and SWaggerUI web api
 RUN apt-get update && apt-get install -y python3 python3-pip && \
