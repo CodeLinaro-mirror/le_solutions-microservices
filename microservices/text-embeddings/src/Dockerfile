@@ -358,6 +358,8 @@ ENV T2E_REQUIRE_HTP=1
 COPY entrypoint.py /entrypoint.py
 RUN chmod +x /entrypoint.py
 
+WORKDIR /mnt/work/models
+
 # Container starts as root so entrypoint.py can adjust group IDs,
 # then drops to iot-user before executing the application command.
 ENTRYPOINT ["python3", "/entrypoint.py"]

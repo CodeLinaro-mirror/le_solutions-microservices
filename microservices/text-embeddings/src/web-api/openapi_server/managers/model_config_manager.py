@@ -13,12 +13,13 @@ logger = LoggerConfig.get_logger(__name__)
 class ModelConfigManager:
     """
     Singleton manager for loading and caching model configuration.
-    Reads from the models_config.json file specified by GENAI_MODELS_CONFIG_PATH.
+    Looks for models_config.json in the mounted models directory
+    (/mnt/work/models/models_config.json), falling back to the
+    baked-in default (openapi_server/configs/models_config.json).
     """
 
     _instance: Optional['ModelConfigManager'] = None
     _config: Optional[Dict[str, Any]] = None
-    _config_path: Optional[str] = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -26,12 +27,25 @@ class ModelConfigManager:
         return cls._instance
 
     def _load_config(self) -> Dict[str, Any]:
-        """Load configuration from file."""
-        config_path = os.getenv("GENAI_MODELS_CONFIG_PATH", "/opt/embed_gen/models_config.json")
+        """Load configuration from file.
 
-        if not config_path:
-            logger.error("GENAI_MODELS_CONFIG_PATH is not set.")
-            raise ValueError("Environment variable GENAI_MODELS_CONFIG_PATH is not set.")
+        Lookup order:
+          1. /mnt/work/models/models_config.json  (auto-discovered from mounted models dir)
+          2. openapi_server/configs/models_config.json  (baked-in fallback)
+        """
+        models_dir_config = "/mnt/work/models/models_config.json"
+        fallback_config = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "configs",
+            "models_config.json"
+        )
+
+        if os.path.isfile(models_dir_config):
+            config_path = models_dir_config
+            logger.info(f"Found models_config.json in models directory. Loading from: {config_path}")
+        else:
+            config_path = fallback_config
+            logger.info(f"models_config.json not found in models directory. Using default: {config_path}")
 
         try:
             with open(config_path, "r") as f:
@@ -58,12 +72,9 @@ class ModelConfigManager:
         Returns:
             Dictionary containing the model configuration.
         """
-        current_config_path = os.getenv("GENAI_MODELS_CONFIG_PATH", "/opt/embed_gen/models_config.json")
-
-        # Reload if forced, config not loaded, or config path changed
-        if force_reload or self._config is None or self._config_path != current_config_path:
+        # Reload if forced or config not yet loaded
+        if force_reload or self._config is None:
             self._config = self._load_config()
-            self._config_path = current_config_path
 
         return self._config
 
