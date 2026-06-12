@@ -59,47 +59,31 @@ class Tokenizer:
 
 class HFTokenizer(Tokenizer):
     """
-    Robust local HuggingFace tokenizer loader.
-    Works if tokenizer_dir contains tokenizer.json.
+    HuggingFace tokenizer loader using the lightweight ``tokenizers`` library.
+
+    Loads ``tokenizer.json`` directly from *tokenizer_dir* — no ``transformers``
+    dependency required.  This is the same approach used by
+    :class:`~openapi_server.impl.text_embed_qnn.HFTokenizerJSON`.
     """
+
     def __init__(self, tokenizer_dir: str):
-        self.tokenizer_dir = tokenizer_dir
-        self.tok = None
+        from tokenizers import Tokenizer as HFTok
 
-        # Try standard AutoTokenizer first (if config exists)
-        try:
-            from transformers import AutoTokenizer
-            self.tok = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True, use_fast=True)
-            return
-        except Exception:
-            pass
-
-        # Fallback: tokenizer.json directly
         tok_json = os.path.join(tokenizer_dir, "tokenizer.json")
-        if os.path.exists(tok_json):
-            from transformers import PreTrainedTokenizerFast
-            self.tok = PreTrainedTokenizerFast(tokenizer_file=tok_json)
-            return
-
-        raise ValueError(
-            f"Tokenizer dir '{tokenizer_dir}' is not a valid HF tokenizer folder. "
-            f"Expected tokenizer.json or a standard HF tokenizer layout."
-        )
+        if not os.path.exists(tok_json):
+            raise ValueError(
+                f"Tokenizer dir '{tokenizer_dir}' does not contain tokenizer.json. "
+                f"Expected a HuggingFace tokenizer saved with save_pretrained() or "
+                f"tokenizer.save('tokenizer.json')."
+            )
+        self.tok = HFTok.from_file(tok_json)
 
     def encode_batch(self, texts: List[str], seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-        enc = self.tok(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=int(seq_len),
-            return_tensors="np",
-        )
-        input_ids = enc["input_ids"].astype(np.int32, copy=False)
-        attn = enc.get("attention_mask")
-        if attn is None:
-            attn = (input_ids != 0).astype(np.int32, copy=False)
-        else:
-            attn = attn.astype(np.int32, copy=False)
+        self.tok.enable_padding(pad_id=0, pad_token="[PAD]", length=int(seq_len))
+        self.tok.enable_truncation(max_length=int(seq_len))
+        encodings = self.tok.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encodings], dtype=np.int32)
+        attn = np.array([e.attention_mask for e in encodings], dtype=np.int32)
 
         # Sanity check: huge ids usually mean mismatched tokenizer/vocab
         if input_ids.size and int(input_ids.max()) > 10_000_000:
@@ -110,13 +94,9 @@ class HFTokenizer(Tokenizer):
 
     def encode(self, text: str) -> List[int]:
         """Tokenise a single string and return token IDs without padding."""
-        enc = self.tok(
-            text,
-            truncation=True,
-            max_length=512,
-            return_tensors="np",
-        )
-        return enc["input_ids"].flatten().tolist()
+        self.tok.no_padding()
+        enc = self.tok.encode(text)
+        return list(enc.ids)
 
 
 class SafePadTokenizer(Tokenizer):
@@ -357,6 +337,26 @@ class NomicEmbedBackend(EmbeddingBackend):
     def embed(self, texts: List[str]) -> np.ndarray:
         _log.debug("embed: n_texts=%d", len(texts))
         ids, mask = self.tokenizer.encode_batch(texts, self.cfg.seq_len)
+
+        # ── Diagnostic: log tensor shapes vs buffer requirements ──────────
+        _log.info(
+            "embed: ids.shape=%s ids.dtype=%s  mask.shape=%s mask.dtype=%s",
+            ids.shape, ids.dtype, mask.shape, mask.dtype,
+        )
+        _log.info(
+            "embed: input_req_sizes=%s  output_req_sizes=%s",
+            self.io.input_req_sizes, self.io.output_req_sizes,
+        )
+        _log.info(
+            "embed: ids[0] bytes=%d  mask[0] bytes=%d  "
+            "req[0]=%d  req[1]=%s",
+            ids[0:1].nbytes,
+            mask[0:1].nbytes,
+            self.io.input_req_sizes[0] if self.io.input_req_sizes else -1,
+            self.io.input_req_sizes[1] if len(self.io.input_req_sizes) > 1 else "N/A",
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         embs: List[np.ndarray] = []
         for i in range(ids.shape[0]):
             self._write_inputs(ids[i:i+1], mask[i:i+1])

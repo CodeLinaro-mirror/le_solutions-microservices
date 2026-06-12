@@ -139,21 +139,6 @@ class TokenizerAdapter:
         raise NotImplementedError
 
 
-class SentencePieceTokenizer(TokenizerAdapter):
-    def __init__(self, model_path: str):
-        try:
-            import sentencepiece as spm
-        except Exception as e:
-            raise RuntimeError(f"sentencepiece not installed: {e}")
-
-        self.sp = spm.SentencePieceProcessor()
-        if not self.sp.Load(model_path):
-            raise RuntimeError(f"Failed to load SentencePiece model: {model_path}")
-
-    def encode(self, text: str) -> list[int]:
-        return list(self.sp.EncodeAsIds(text))
-
-
 class HFTokenizerJSON(TokenizerAdapter):
     def __init__(self, json_path: str):
         try:
@@ -199,26 +184,20 @@ def load_tokenizer_auto() -> TokenizerAdapter:
     if not os.path.isdir(tok_dir):
         raise RuntimeError(f"TOKENIZER_DIR does not exist: {tok_dir}")
 
-    # 1. HF tokenizer.json
+    # 1. HF tokenizer.json (primary — used by Nomic Embed Text and most HF models)
     json_path = os.path.join(tok_dir, "tokenizer.json")
     if os.path.exists(json_path):
         return HFTokenizerJSON(json_path)
 
-    # 2. SentencePiece *.model
-    for fn in os.listdir(tok_dir):
-        if fn.endswith(".model"):
-            return SentencePieceTokenizer(os.path.join(tok_dir, fn))
-
-    # 3. Custom tokenizer: look for a .py file
+    # 2. Custom tokenizer: look for a .py file with an encode() function
     for fn in os.listdir(tok_dir):
         if fn.endswith(".py"):
             module_path = os.path.join(tok_dir, fn)
-            # default function name "encode"
             return CustomTokenizer(module_path, "encode")
 
     raise RuntimeError(
         f"No tokenizer found in {tok_dir}. "
-        "Expected tokenizer.json, *.model, or custom .py"
+        "Expected tokenizer.json (HuggingFace format) or a custom .py with an encode() function."
     )
 
 
