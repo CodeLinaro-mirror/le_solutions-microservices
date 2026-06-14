@@ -24,7 +24,7 @@ ENV T2E_DEPLOY_DIR="/mnt/work/deploy"
 ENV T2E_ADSP_DIR=${T2E_DEPLOY_DIR}/usr/lib/rfsa/adsp
 
 # qnp-sdk: fetch and copy the needed headers and libraries
-ENV T2E_QNP_VER=2.40.0.251030
+ENV T2E_QNP_VER=2.42.0.251225
 ENV T2E_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV T2E_QNN_LIB_PATH=${T2E_DOWNLOAD_DIR}/qairt/${T2E_QNP_VER}/lib
 ENV T2E_QNN_BIN_PATH=${T2E_DOWNLOAD_DIR}/qairt/${T2E_QNP_VER}/bin
