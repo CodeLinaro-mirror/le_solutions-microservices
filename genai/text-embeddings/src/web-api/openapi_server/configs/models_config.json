@@ -1,0 +1,10 @@
+{
+  "models": {
+    "nomic-embed-text": {
+      "model_file": "nomic_embed_text.bin",
+      "display_name": "Nomic-Embed-Text",
+      "max_tokens": 128
+    }
+  },
+  "default_model": "nomic-embed-text"
+}
