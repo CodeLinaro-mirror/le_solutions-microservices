@@ -68,7 +68,7 @@ RUN pip install --no-cache-dir .
 # Stage 2: Runtime Stage
 #########################
 
-FROM python:3.10-slim AS service
+FROM debian:trixie-slim AS service
 WORKDIR /root/app/site-packages
 
 #Installing Runtime dependencies
@@ -84,6 +84,13 @@ COPY --from=builder /venv /venv
 
 # Copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr
+
+# Install python3 as a dependency of hypercorn and SWaggerUI web api
+RUN apt-get update && apt-get install -y python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy installed site-packages from builder
+COPY --from=builder /usr/local /usr/local
 
 # Copy the libLiteRT.so, dependency of LiteRT python API, to /usr/lib
 RUN cp /venv/lib/python3.10/site-packages/ai_edge_litert/libLiteRt.so /usr/lib/.
