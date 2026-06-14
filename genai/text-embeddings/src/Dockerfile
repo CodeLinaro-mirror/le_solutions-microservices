@@ -17,18 +17,9 @@ ENV PATH="/venv/bin:$PATH"
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Copy source code
-COPY . .
-
-# Install web-api server as python package
-RUN pip install --no-cache-dir .
-
 # Environment variables for build and deploy directories
 ENV T2E_BUILD_DIR="/mnt/work/build"
 ENV T2E_DEPLOY_DIR="/mnt/work/deploy"
-
-ADD . ${T2E_BUILD_DIR}/
-WORKDIR ${T2E_BUILD_DIR}/
 
 ENV T2E_ADSP_DIR=${T2E_DEPLOY_DIR}/usr/lib/rfsa/adsp
 
@@ -59,6 +50,20 @@ RUN wget -t 2 -T 30 -P ${T2E_DOWNLOAD_DIR} \
     cp ${T2E_QNN_BIN_PATH}/aarch64-oe-linux-gcc11.2/* ${T2E_DEPLOY_DIR}/usr/bin/ && \
     rm -rf ${T2E_DOWNLOAD_DIR}/qairt
 
+# Install ai-edge-litert to get libLiteRt.so
+RUN python3 -m pip install "ai-edge-litert==2.1.2"
+
+# Install dependencies of tokenizer
+RUN python3 -m pip install "sentencepiece==0.2.1"
+RUN python3 -m pip install "transformers==4.57.6"
+RUN python3 -m pip install "huggingface-hub==0.36.1"
+
+# Copy source code
+COPY . .
+
+# Install web-api server as python package
+RUN pip install --no-cache-dir .
+
 #########################
 # Stage 2: Runtime Stage
 #########################
@@ -79,5 +84,8 @@ COPY --from=builder /venv /venv
 
 # Copy all libraries
 COPY --from=builder /mnt/work/deploy/usr /usr
+
+# Copy the libLiteRT.so, dependency of LiteRT python API, to /usr/lib
+RUN cp /venv/lib/python3.10/site-packages/ai_edge_litert/libLiteRt.so /usr/lib/.
 
 ENV PATH=/venv/bin:$PATH

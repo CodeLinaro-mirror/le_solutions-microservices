@@ -13,6 +13,7 @@ services:
     environment:
       - GENAI_T2E_PORT=${GENAI_T2E_PORT:-9090}
       - GENAI_MODELS_CONFIG_PATH=${GENAI_MODELS_CONFIG_PATH:-/opt/embed_gen/models_config.json}
+      - TOKENIZER_DIR=/opt/embed_gen/nomic_tokenizer
     devices:
       - /dev/dma_heap/system
       - /dev/dma_heap/qcom,system
