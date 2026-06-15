@@ -1,0 +1,18 @@
+[package]
+name = "qai-forge"
+version = "1.0.0"
+edition = "2021"
+description = "Rust bindings for qai-forge Layer 2 (ChatOrchestrator)"
+license = "BSD-3-Clause-Clear"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[build-dependencies]
+# build.rs links libqai_forge.so
+
+[[example]]
+name = "chat"
+path = "examples/main.rs"

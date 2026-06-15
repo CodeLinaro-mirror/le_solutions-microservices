@@ -1,0 +1,21 @@
+{
+  "_comment": "MCP server registry for the Responses API server.",
+  "_comment2": "Set RESPONSES_MCP_CONFIG env var to point to this file, or place it next to the binary.",
+  "_comment3": "Remove the _comment fields before deploying.",
+  "mcp_servers": [
+    {
+      "_example": "stdio transport — spawns a local MCP server subprocess",
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "/usr/local/bin/mcp-server-filesystem",
+      "args": ["/mnt/work/data"],
+      "env": {}
+    },
+    {
+      "_example2": "http transport — connects to a remote MCP server",
+      "name": "calculator",
+      "transport": "http",
+      "url": "http://localhost:3001"
+    }
+  ]
+}
