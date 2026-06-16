@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConventionalWorkerManager — Layer 3 subprocess manager for conventional AI
+// PredictiveWorkerManager — Layer 3 subprocess manager for Predictive AI
 //
 // Manages qnn-inference-worker and snpe-inference-worker subprocesses.
 // Uses the same fork/exec + Unix socket IPC pattern as InferenceWorkerManager,
 // with a different message protocol (EXECUTE/RESULT instead of TOKEN/DONE).
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "qai_forge/worker/ConventionalWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/utils/Logger.h"
 
 #include <sys/socket.h>
@@ -86,21 +86,21 @@ static std::vector<uint8_t> base64Decode(const std::string& s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConventionalWorkerManager
+// PredictiveWorkerManager
 // ─────────────────────────────────────────────────────────────────────────────
 
-ConventionalWorkerManager::ConventionalWorkerManager(
+PredictiveWorkerManager::PredictiveWorkerManager(
     const std::string& worker_binary,
     const std::string& process_type)
     : worker_binary_(worker_binary)
     , process_type_(process_type)
 {}
 
-ConventionalWorkerManager::~ConventionalWorkerManager() {
+PredictiveWorkerManager::~PredictiveWorkerManager() {
     cleanupWorker(true);
 }
 
-std::string ConventionalWorkerManager::generateSocketPath(
+std::string PredictiveWorkerManager::generateSocketPath(
     const std::string& model_id,
     const std::string& process_type)
 {
@@ -111,7 +111,7 @@ std::string ConventionalWorkerManager::generateSocketPath(
     return oss.str();
 }
 
-void ConventionalWorkerManager::ensureWorkerRunning(
+void PredictiveWorkerManager::ensureWorkerRunning(
     const std::string& model_id,
     const json&        init_params)
 {
@@ -122,7 +122,7 @@ void ConventionalWorkerManager::ensureWorkerRunning(
     }
 }
 
-void ConventionalWorkerManager::startWorker(
+void PredictiveWorkerManager::startWorker(
     const std::string& model_id,
     const json&        init_params)
 {
@@ -131,13 +131,13 @@ void ConventionalWorkerManager::startWorker(
     // Create Unix socket pair for IPC
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
-        throw std::runtime_error("[ConventionalWorkerManager] socketpair failed: "
+        throw std::runtime_error("[PredictiveWorkerManager] socketpair failed: "
                                  + std::string(strerror(errno)));
 
     pid_t pid = fork();
     if (pid < 0) {
         close(sv[0]); close(sv[1]);
-        throw std::runtime_error("[ConventionalWorkerManager] fork failed");
+        throw std::runtime_error("[PredictiveWorkerManager] fork failed");
     }
 
     if (pid == 0) {
@@ -165,7 +165,7 @@ void ConventionalWorkerManager::startWorker(
             throw std::runtime_error("Expected READY, got: " + msg.dump());
     } catch (const std::exception& e) {
         cleanupWorker(true);
-        throw std::runtime_error(std::string("[ConventionalWorkerManager] worker startup failed: ")
+        throw std::runtime_error(std::string("[PredictiveWorkerManager] worker startup failed: ")
                                  + e.what());
     }
 
@@ -181,7 +181,7 @@ void ConventionalWorkerManager::startWorker(
         if (msg.value("type", "") != "READY") {
             std::string err = msg.value("message", "unknown error");
             cleanupWorker(true);
-            throw std::runtime_error("[ConventionalWorkerManager] INIT failed: " + err);
+            throw std::runtime_error("[PredictiveWorkerManager] INIT failed: " + err);
         }
     } catch (const std::exception& e) {
         cleanupWorker(true);
@@ -189,11 +189,11 @@ void ConventionalWorkerManager::startWorker(
     }
 
     current_model_id_ = model_id;
-    LOG_INFO("[ConventionalWorkerManager] Worker started for model: " << model_id
+    LOG_INFO("[PredictiveWorkerManager] Worker started for model: " << model_id
              << " (pid=" << worker_pid_ << ")");
 }
 
-void ConventionalWorkerManager::cleanupWorker(bool force) {
+void PredictiveWorkerManager::cleanupWorker(bool force) {
     if (worker_pid_ > 0) {
         if (force) {
             kill(worker_pid_, SIGKILL);
@@ -212,14 +212,14 @@ void ConventionalWorkerManager::cleanupWorker(bool force) {
     current_model_id_.clear();
 }
 
-void ConventionalWorkerManager::sendMessage(const json& msg) {
+void PredictiveWorkerManager::sendMessage(const json& msg) {
     std::string line = msg.dump() + "\n";
     ssize_t written = write(sock_fd_, line.c_str(), line.size());
     if (written != (ssize_t)line.size())
-        throw std::runtime_error("[ConventionalWorkerManager] write failed");
+        throw std::runtime_error("[PredictiveWorkerManager] write failed");
 }
 
-json ConventionalWorkerManager::readMessage(int timeout_seconds) {
+json PredictiveWorkerManager::readMessage(int timeout_seconds) {
     std::string line;
     char ch;
 
@@ -234,13 +234,13 @@ json ConventionalWorkerManager::readMessage(int timeout_seconds) {
 
         int ret = select(sock_fd_ + 1, &fds, nullptr, nullptr, &tv);
         if (ret == 0)
-            throw std::runtime_error("[ConventionalWorkerManager] read timeout");
+            throw std::runtime_error("[PredictiveWorkerManager] read timeout");
         if (ret < 0)
-            throw std::runtime_error("[ConventionalWorkerManager] select error");
+            throw std::runtime_error("[PredictiveWorkerManager] select error");
 
         ssize_t n = read(sock_fd_, &ch, 1);
         if (n <= 0)
-            throw std::runtime_error("[ConventionalWorkerManager] worker disconnected");
+            throw std::runtime_error("[PredictiveWorkerManager] worker disconnected");
 
         if (ch == '\n') break;
         line += ch;
@@ -249,11 +249,11 @@ json ConventionalWorkerManager::readMessage(int timeout_seconds) {
     return json::parse(line);
 }
 
-void ConventionalWorkerManager::executeInfer(
+void PredictiveWorkerManager::executeInfer(
     const std::string&            event_id,
     const TensorInferenceRequest& request,
-    ConventionalResultCallback    on_result,
-    ConventionalErrorCallback     on_error)
+    PredictiveResultCallback    on_result,
+    PredictiveErrorCallback     on_error)
 {
     // Build EXECUTE command with base64-encoded input tensors
     json inputs_json = json::array();
@@ -327,20 +327,20 @@ void ConventionalWorkerManager::executeInfer(
     }
 }
 
-void ConventionalWorkerManager::terminateWorker(bool force) {
+void PredictiveWorkerManager::terminateWorker(bool force) {
     cleanupWorker(force);
 }
 
-void ConventionalWorkerManager::shutdown() {
+void PredictiveWorkerManager::shutdown() {
     cleanupWorker(false);
 }
 
-bool ConventionalWorkerManager::isWorkerRunning() const {
+bool PredictiveWorkerManager::isWorkerRunning() const {
     if (worker_pid_ <= 0 || sock_fd_ < 0) return false;
     // Check if process is still alive
     return kill(worker_pid_, 0) == 0;
 }
 
-std::string ConventionalWorkerManager::getCurrentModelId() const {
+std::string PredictiveWorkerManager::getCurrentModelId() const {
     return current_model_id_;
 }

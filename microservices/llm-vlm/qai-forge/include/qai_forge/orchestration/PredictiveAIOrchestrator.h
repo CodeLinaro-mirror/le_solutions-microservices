@@ -7,7 +7,7 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConventionalAIOrchestrator — Layer 2 orchestrator for conventional AI
+// PredictiveAIOrchestrator — Layer 2 orchestrator for Predictive AI
 //
 // Routes tensor inference requests to the correct IInferenceBackend based on
 // the model's "runtime" field in metadata.json:
@@ -25,12 +25,12 @@
 // See docs/unified-inference-service.md for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ConventionalAIOrchestrator {
+class PredictiveAIOrchestrator {
 public:
-    static ConventionalAIOrchestrator& getInstance();
+    static PredictiveAIOrchestrator& getInstance();
 
     /**
-     * Run conventional AI inference.
+     * Run Predictive AI inference.
      *
      * @param request  Input tensors (raw bytes) + model ID + output names
      * @return         Output tensors (raw bytes) + inference stats
@@ -39,7 +39,7 @@ public:
     TensorInferenceResponse handleInfer(const TensorInferenceRequest& request);
 
 private:
-    ConventionalAIOrchestrator() = default;
-    ConventionalAIOrchestrator(const ConventionalAIOrchestrator&) = delete;
-    ConventionalAIOrchestrator& operator=(const ConventionalAIOrchestrator&) = delete;
+    PredictiveAIOrchestrator() = default;
+    PredictiveAIOrchestrator(const PredictiveAIOrchestrator&) = delete;
+    PredictiveAIOrchestrator& operator=(const PredictiveAIOrchestrator&) = delete;
 };

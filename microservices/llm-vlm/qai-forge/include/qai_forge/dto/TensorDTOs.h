@@ -8,9 +8,9 @@
 #include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TensorDTOs — Transport-agnostic DTOs for conventional AI inference
+// TensorDTOs — Transport-agnostic DTOs for Predictive AI inference
 //
-// These DTOs sit at the Layer 1 / Layer 2 boundary for conventional AI models
+// These DTOs sit at the Layer 1 / Layer 2 boundary for Predictive AI models
 // (classification, detection, segmentation). They mirror the KFServing v2
 // inference protocol wire format but contain raw bytes — no base64, no HTTP
 // multipart. The transport layer (Layer 1) handles encoding/decoding.
@@ -105,7 +105,7 @@ struct InferenceStats {
 };
 
 /**
- * Conventional AI inference request.
+ * Predictive AI inference request.
  * Parsed from HTTP/gRPC/D-Bus by Layer 1, passed to Layer 2.
  * Layer 2 NEVER touches HTTP, gRPC, or D-Bus.
  */
@@ -117,7 +117,7 @@ struct TensorInferenceRequest {
 };
 
 /**
- * Conventional AI inference response.
+ * Predictive AI inference response.
  * Returned by Layer 2 to Layer 1.
  * Layer 1 formats this into the KFServing v2 JSON wire format.
  */

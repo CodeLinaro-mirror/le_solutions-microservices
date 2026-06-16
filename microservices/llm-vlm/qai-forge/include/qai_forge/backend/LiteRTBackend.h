@@ -9,9 +9,9 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTBackend — IInferenceBackend implementation for LiteRT conventional AI
+// LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
 //
-// Wraps ConventionalWorkerManager to manage the litert-inference-worker
+// Wraps PredictiveWorkerManager to manage the litert-inference-worker
 // subprocess. Supports .tflite models with NPU acceleration (Qualcomm QNN
 // dispatch) and CPU fallback via the LiteRT CompiledModel API.
 //
@@ -27,7 +27,7 @@
 //   LITERT_COMPILER_PLUGIN_DIR — compiler plugin directory
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ConventionalWorkerManager;
+class PredictiveWorkerManager;
 
 class LiteRTBackend : public IInferenceBackend {
 public:
@@ -48,6 +48,6 @@ private:
     LiteRTBackend(const LiteRTBackend&)            = delete;
     LiteRTBackend& operator=(const LiteRTBackend&) = delete;
 
-    std::unique_ptr<ConventionalWorkerManager> worker_;
+    std::unique_ptr<PredictiveWorkerManager> worker_;
     std::string current_model_id_;
 };

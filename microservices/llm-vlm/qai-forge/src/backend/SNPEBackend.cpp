@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/backend/SNPEBackend.h"
-#include "qai_forge/worker/ConventionalWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <stdexcept>
@@ -14,7 +14,7 @@ static const char* DEFAULT_SNPE_WORKER = "/usr/local/bin/snpe-inference-worker";
 SNPEBackend::SNPEBackend() {
     const char* binary = std::getenv("SNPE_WORKER_BINARY");
     if (!binary) binary = DEFAULT_SNPE_WORKER;
-    worker_ = std::make_unique<ConventionalWorkerManager>(binary, "snpe");
+    worker_ = std::make_unique<PredictiveWorkerManager>(binary, "snpe");
 }
 
 SNPEBackend& SNPEBackend::getInstance() {

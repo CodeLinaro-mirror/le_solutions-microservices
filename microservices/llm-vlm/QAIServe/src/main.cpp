@@ -20,9 +20,18 @@ int main() {
     qai_forge::utils::drop_privileges_and_bind_devices();
 
     // Step 2: Read port from environment variable (default 9002)
-    const char* port_env = std::getenv("QAIServe_PORT");
+    const char* port_env = std::getenv("QAISERVE_PORT");
     if (!port_env) port_env = std::getenv("RESPONSES_PORT"); // fallback
     int port = port_env ? std::stoi(port_env) : 9002;
+
+    // Log admin token status (never log the token value itself)
+    const char* admin_token = std::getenv("QAISERVE_ADMIN_TOKEN");
+    if (admin_token && admin_token[0] != '\0') {
+        std::cout << "[main] Admin model management: ENABLED (X-Admin-Token required)" << std::endl;
+    } else {
+        std::cout << "[main] Admin model management: DISABLED "
+                  << "(set QAISERVE_ADMIN_TOKEN to enable /admin/models/* endpoints)" << std::endl;
+    }
 
     std::cout << "[main] Starting QAIServe unified inference server on port " << port << std::endl;
 
@@ -61,7 +70,7 @@ int main() {
 
             // ── Step 3c: Load and connect MCP servers ─────────────────────────
             // Determine config file path:
-            //   1. QAIServe_MCP_CONFIG or RESPONSES_MCP_CONFIG env var (explicit path)
+            //   1. QAISERVE_MCP_CONFIG or RESPONSES_MCP_CONFIG env var (explicit path)
             //   2. ./mcp_servers.json (same directory as binary)
             //   3. /etc/QAIServe/mcp_servers.json (system-wide config)
             auto& mcp_registry = McpClientRegistry::getInstance();
@@ -74,7 +83,7 @@ int main() {
                 mcp_registry.registerServer(native_cfg);
             }
 
-            const char* mcp_config_env = std::getenv("QAIServe_MCP_CONFIG");
+            const char* mcp_config_env = std::getenv("QAISERVE_MCP_CONFIG");
             if (!mcp_config_env) mcp_config_env = std::getenv("RESPONSES_MCP_CONFIG");
 
             std::string mcp_config_path;
@@ -95,7 +104,7 @@ int main() {
                 std::cout << "[main] MCP servers connected." << std::endl;
             } else {
                 std::cout << "[main] No MCP servers configured "
-                          << "(set QAIServe_MCP_CONFIG or create ./mcp_servers.json "
+                          << "(set QAISERVE_MCP_CONFIG or create ./mcp_servers.json "
                           << "to enable MCP tool support)." << std::endl;
             }
 

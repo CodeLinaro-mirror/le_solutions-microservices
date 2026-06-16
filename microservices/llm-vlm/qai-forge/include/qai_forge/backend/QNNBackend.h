@@ -9,9 +9,9 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QNNBackend — IInferenceBackend implementation for QNN conventional AI
+// QNNBackend — IInferenceBackend implementation for QNN Predictive AI
 //
-// Wraps ConventionalWorkerManager to manage the qnn-inference-worker subprocess.
+// Wraps PredictiveWorkerManager to manage the qnn-inference-worker subprocess.
 // Supports QNN context binary (.bin) models compiled for HTP/GPU/CPU backends.
 //
 // metadata.json fields used:
@@ -21,7 +21,7 @@
 //   "sys_lib":     "/usr/lib/libQnnSystem.so"
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ConventionalWorkerManager;
+class PredictiveWorkerManager;
 
 class QNNBackend : public IInferenceBackend {
 public:
@@ -42,6 +42,6 @@ private:
     QNNBackend(const QNNBackend&) = delete;
     QNNBackend& operator=(const QNNBackend&) = delete;
 
-    std::unique_ptr<ConventionalWorkerManager> worker_;
+    std::unique_ptr<PredictiveWorkerManager> worker_;
     std::string current_model_id_;
 };

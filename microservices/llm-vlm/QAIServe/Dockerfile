@@ -8,7 +8,7 @@
 #
 # Build context: llm-vlm/  (parent directory containing all siblings)
 # Usage (from llm-vlm/):
-#   docker build -f QAIServe/Dockerfile -t QAIServe-server .
+#   docker build -f QAIServe/Dockerfile -t qaiserve-server .
 #
 # The build context must include both:
 #   - qai-forge/  (shared SDK: Layers 2-4 + worker binaries + daemon)
@@ -491,6 +491,18 @@ RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
     cmake --build /build/qai-forge/build -j$(nproc) && \
     cmake --install /build/qai-forge/build --prefix ${DEPLOY_DIR}/usr
 
+# ── Install QAIServe-specific build deps (CURL + libzip) ─────────────────────
+# Placed here (just before COPY QAIServe) so that changes to this step do not
+# invalidate the expensive LiteRT / LiteRT-LM / qai-forge build cache above.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev \
+        libzip-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && touch /usr/bin/zipcmp /usr/bin/zipmerge /usr/bin/ziptool \
+    && chmod +x /usr/bin/zipcmp /usr/bin/zipmerge /usr/bin/ziptool
+
 # ── Build QAIServe server (Layer 1: Drogon HTTP server) ──────────────────────
 COPY QAIServe /build/QAIServe
 
@@ -533,6 +545,8 @@ RUN apt-get update && \
         zlib1g \
         libuuid1 \
         libatomic1 \
+        libcurl4 \
+        libzip4 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -543,15 +557,15 @@ RUN mkdir -p /export/usr/bin \
 
 # Copy stripped binaries from the builder deploy tree.
 # Deliberately excludes qai-forge-daemon — the HTTP server spawns workers directly.
-COPY --from=builder /build/deploy/usr/bin/QAIServe /export/usr/bin/
+COPY --from=builder /build/deploy/usr/bin/qaiserve /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/genai-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/genai-vlm-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/qnn-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/snpe-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/litert-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/litert-lm-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert_lm_main /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert_lm_advanced_main /export/usr/bin/
+COPY --from=builder /build/deploy/usr/bin/litert-lm /export/usr/bin/
+COPY --from=builder /build/deploy/usr/bin/litert-lm-advanced /export/usr/bin/
 COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 
 # Cherry-pick only the required system .so files (with symlinks preserved).
@@ -563,7 +577,7 @@ COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 #
 # Uses find to locate .so files regardless of whether Debian placed them under
 # /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic; do \
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip; do \
       find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
     done
 
@@ -588,10 +602,10 @@ RUN { \
 # No shell, no package manager, no apt cache, no /usr/share docs.
 # All additional .so files were cherry-picked into /export by the stager.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12 AS QAIServe-runtime
+FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12 AS qaiserve-runtime
 
 # Single COPY brings in:
-#   /usr/bin/   - QAIServe, genai-inference-worker, genai-vlm-inference-worker,
+#   /usr/bin/   - qaiserve, genai-inference-worker, genai-vlm-inference-worker,
 #                 qnn-inference-worker, snpe-inference-worker, litert-inference-worker,
 #                 litert-lm-inference-worker, litert-lm, litert-lm-advanced
 #   /usr/lib/   - libqai_forge.so, libdrogon.so, libtrantor.so,
@@ -605,7 +619,7 @@ FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12 AS QAIServe-runtime
 COPY --from=stager /export /
 
 # Set environment defaults
-ENV QAIServe_PORT=9002
+ENV QAISERVE_PORT=9002
 ENV GENAI_MODELS_DIR=/mnt/work/models
 ENV GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
 ENV GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
@@ -629,4 +643,4 @@ WORKDIR /mnt/work/models
 # The C++ server binary is the entrypoint.
 # It calls drop_privileges_and_bind_devices() before starting Drogon.
 # Child processes (inference workers) inherit the dropped privileges.
-ENTRYPOINT ["/usr/bin/QAIServe"]
+ENTRYPOINT ["/usr/bin/qaiserve"]

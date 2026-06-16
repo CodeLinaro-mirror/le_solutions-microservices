@@ -75,6 +75,19 @@ public:
     virtual bool cancelSession(const std::string& completion_id) = 0;
 
     /**
+     * Reset the KV cache for the currently loaded model.
+     *
+     * Called by the OIP /generate endpoint before and after each stateless
+     * inference request to ensure clean state. This maps to IGenerativeBackend::resetKv()
+     * on the active backend (e.g. Genie cache reset API).
+     *
+     * Safe to call even if no model is loaded (no-op in that case).
+     *
+     * @param model_id  Model to reset cache for (used to ensure correct backend)
+     */
+    virtual void resetKvCache(const std::string& model_id) = 0;
+
+    /**
      * Factory method — returns the singleton orchestrator instance.
      * In production, this returns ChatOrchestratorImpl.
      */

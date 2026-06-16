@@ -12,9 +12,9 @@
 using json = nlohmann::ordered_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConventionalWorkerManager — Layer 3 subprocess manager for conventional AI
+// PredictiveWorkerManager — Layer 3 subprocess manager for Predictive AI
 //
-// Manages the lifecycle of a conventional AI inference worker subprocess
+// Manages the lifecycle of a Predictive AI inference worker subprocess
 // (qnn-inference-worker or snpe-inference-worker) and communicates with it
 // via JSON Lines over a Unix domain socket.
 //
@@ -32,23 +32,23 @@ using json = nlohmann::ordered_json;
 // See docs/unified-inference-service.md §10 for the IPC protocol details.
 // ─────────────────────────────────────────────────────────────────────────────
 
-using ConventionalResultCallback = std::function<void(const TensorInferenceResponse&)>;
-using ConventionalErrorCallback  = std::function<void(const std::string& message)>;
+using PredictiveResultCallback = std::function<void(const TensorInferenceResponse&)>;
+using PredictiveErrorCallback  = std::function<void(const std::string& message)>;
 
-class ConventionalWorkerManager {
+class PredictiveWorkerManager {
 public:
     /**
      * @param worker_binary  Path to the worker binary
      *                       (e.g. /usr/local/bin/qnn-inference-worker)
      * @param process_type   Human-readable type for logging ("qnn", "snpe")
      */
-    ConventionalWorkerManager(const std::string& worker_binary,
+    PredictiveWorkerManager(const std::string& worker_binary,
                                const std::string& process_type);
-    ~ConventionalWorkerManager();
+    ~PredictiveWorkerManager();
 
     // Non-copyable
-    ConventionalWorkerManager(const ConventionalWorkerManager&) = delete;
-    ConventionalWorkerManager& operator=(const ConventionalWorkerManager&) = delete;
+    PredictiveWorkerManager(const PredictiveWorkerManager&) = delete;
+    PredictiveWorkerManager& operator=(const PredictiveWorkerManager&) = delete;
 
     /**
      * Ensure the worker subprocess is running with the correct model loaded.
@@ -63,7 +63,7 @@ public:
                              const json&        init_params);
 
     /**
-     * Execute a conventional AI inference request.
+     * Execute a Predictive AI inference request.
      * Blocks until the RESULT or ERROR response is received.
      *
      * @param event_id   Unique ID for this inference event
@@ -73,8 +73,8 @@ public:
      */
     void executeInfer(const std::string&              event_id,
                       const TensorInferenceRequest&   request,
-                      ConventionalResultCallback      on_result,
-                      ConventionalErrorCallback       on_error);
+                      PredictiveResultCallback      on_result,
+                      PredictiveErrorCallback       on_error);
 
     /**
      * Terminate the worker subprocess immediately (SIGKILL).

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// qnn-inference-worker — Layer 3 subprocess for QNN conventional AI inference
+// qnn-inference-worker — Layer 3 subprocess for QNN Predictive AI inference
 //
-// Spawned by QNNBackend (via ConventionalWorkerManager) to provide fault
+// Spawned by QNNBackend (via PredictiveWorkerManager) to provide fault
 // isolation. If the QNN backend crashes (DSP fault, OOM), only this process
 // dies — the server process is unaffected.
 //
@@ -47,7 +47,7 @@
 using json = nlohmann::ordered_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Base64 (same implementation as ConventionalWorkerManager.cpp)
+// Base64 (same implementation as PredictiveWorkerManager.cpp)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static const char B64_CHARS[] =

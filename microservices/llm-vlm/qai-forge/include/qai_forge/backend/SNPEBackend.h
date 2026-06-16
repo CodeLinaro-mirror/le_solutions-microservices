@@ -9,9 +9,9 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SNPEBackend — IInferenceBackend implementation for SNPE conventional AI
+// SNPEBackend — IInferenceBackend implementation for SNPE Predictive AI
 //
-// Wraps ConventionalWorkerManager to manage the snpe-inference-worker subprocess.
+// Wraps PredictiveWorkerManager to manage the snpe-inference-worker subprocess.
 // Supports SNPE DLC container models with DSP/GPU/AIP/CPU delegates.
 //
 // metadata.json fields used:
@@ -21,7 +21,7 @@
 //   "output_tensors": ["output_0"]  (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ConventionalWorkerManager;
+class PredictiveWorkerManager;
 
 class SNPEBackend : public IInferenceBackend {
 public:
@@ -42,6 +42,6 @@ private:
     SNPEBackend(const SNPEBackend&) = delete;
     SNPEBackend& operator=(const SNPEBackend&) = delete;
 
-    std::unique_ptr<ConventionalWorkerManager> worker_;
+    std::unique_ptr<PredictiveWorkerManager> worker_;
     std::string current_model_id_;
 };
