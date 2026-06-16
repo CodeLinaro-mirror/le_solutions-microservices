@@ -1,6 +1,6 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
-FROM docker-registry.qualcomm.com/library/ubuntu:22.04
+FROM ubuntu:22.04
 
 # Install Python 3.10, create python group and user.
 RUN apt-get update && \
