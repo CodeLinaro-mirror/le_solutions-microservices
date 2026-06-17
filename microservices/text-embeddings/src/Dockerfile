@@ -5,7 +5,7 @@ ARG T2E_QNP_VER=2.44.0.260225
 # Downloads and extracts the Qualcomm Neural Network (QNN) SDK.
 # This stage is highly optimized for caching to prevent redundant downloads.
 ###############################################
-FROM python:3.10-slim AS qnn_sdk_downloader
+FROM --platform=linux/arm64 python:3.10-slim AS qnn_sdk_downloader
 
 ARG T2E_QNP_VER
 ENV T2E_QNP_VER=${T2E_QNP_VER}
@@ -52,7 +52,7 @@ RUN wget -t 20 -T 120 -P ${T2E_DOWNLOAD_DIR}                                    
 # Stage 1: Build Stage
 #######################
 
-FROM debian:trixie-slim AS builder
+FROM --platform=linux/arm64 debian:trixie-slim AS builder
 WORKDIR /usr/src/app
 
 # Install system dependencies, python3, and python3-venv for builder stage
@@ -69,10 +69,8 @@ ENV PATH="/venv/bin:$PATH"
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Install dependencies of tokenizer
-RUN python3 -m pip install "sentencepiece==0.2.1"
-RUN python3 -m pip install "transformers==4.57.6"
-RUN python3 -m pip install "huggingface-hub==0.36.1"
+# Install tokenizers ahead of the package install so pip can resolve it from cache
+RUN python3 -m pip install "tokenizers==0.21.1"
 
 # Copy source code
 COPY web-api web-api
@@ -87,30 +85,27 @@ RUN pip install --no-cache-dir .
 # Builds LiteRT from the official LiteRT source tree with Bazel and Qualcomm
 # NPU/FastRPC support enabled.  Build artifacts are staged under
 # /mnt/work/deploy/usr for clean extraction by the service stage.
+#
+# Runs natively on arm64 — no cross-compilation toolchain required.
+# The QAIRT SDK version is pinned to T2E_QNP_VER (default 2.44.0.260225)
+# and kept in sync with the qnn_sdk_downloader stage via the sed patch on
+# third_party/qairt/workspace.bzl.
 ###############################################
 
-FROM --platform=linux/amd64 ubuntu:22.04 AS litert_builder
+FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
 
 ARG T2E_QNP_VER
 ENV T2E_QNP_VER=${T2E_QNP_VER}
 
-RUN dpkg --add-architecture arm64                                                               && \
-    sed -i 's/deb http/deb [arch=amd64] http/g' /etc/apt/sources.list                           && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse" >> /etc/apt/sources.list && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
-    echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe multiverse" >> /etc/apt/sources.list && \
-    apt-get update                                                                              && \
+RUN apt-get update                                                                              && \
     apt-get install -y --no-install-recommends                                                     \
         build-essential                                                                            \
-        binutils-aarch64-linux-gnu                                                                 \
-        gcc-aarch64-linux-gnu                                                                      \
-        g++-aarch64-linux-gnu                                                                      \
         clang                                                                                      \
         lld                                                                                        \
         llvm                                                                                       \
-        libc++-dev:arm64                                                                           \
-        libc++abi-dev:arm64                                                                        \
-        libunwind-14-dev:arm64                                                                     \
+        libc++-dev                                                                                 \
+        libc++abi-dev                                                                              \
+        libunwind-14-dev                                                                           \
         g++                                                                                        \
         wget                                                                                       \
         git                                                                                        \
@@ -134,10 +129,10 @@ COPY --from=qnn_sdk_downloader /mnt/work/downloads/qairt /mnt/work/downloads/qai
 # Configure the local QAIRT SDK path for Bazel (trailing slash is mandatory!)
 ENV LITERT_QAIRT_SDK=/mnt/work/downloads/
 
-# ✅ Use AMD64 Bazelisk (IMPORTANT)
+# ✅ Use ARM64 Bazelisk
 ENV BAZELISK_VERSION=v1.28.1
 RUN wget -t 3 -T 120 --no-verbose -O /usr/local/bin/bazel                                          \
-        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-amd64" && \
+        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" && \
     chmod +x /usr/local/bin/bazel
 
 ENV LITERT_SRC_DIR=/mnt/work/src/litert
@@ -193,7 +188,9 @@ RUN git config --global http.postBuffer 1048576000                              
 # Make LiteRT follow the QAIRT/QNN SDK version selected by this Dockerfile.
 # LiteRT documentation(litert/vendors/qualcomm/doc/BUILD_INSTRUCTIONS.md)
 # requires updating third_party/qairt/workspace.bzl when
-# using a different QAIRT SDK version. Patch strip_prefix and url from T2E_QNP_VER.
+# using a different QAIRT SDK version. Patch strip_prefix and url from T2E_QNP_VER
+# so that LiteRT's Bazel workspace fetches exactly the same QAIRT SDK version
+# that was downloaded in the qnn_sdk_downloader stage.
 RUN sed -i -E                                                                                      \
         -e "s|strip_prefix = \"qairt/[^\"]+\"|strip_prefix = \"qairt/${T2E_QNP_VER}\"|g"           \
         -e "s|url = \"https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/[^\"]+/v[^\"]+\\.zip\"|url = \"https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${T2E_QNP_VER}/v${T2E_QNP_VER}.zip\"|g" \
@@ -204,27 +201,15 @@ WORKDIR ${LITERT_SRC_DIR}
 
 # Prepare Bazel cache outside /dev/shm. Docker's shared-memory mount is often
 # too small for a LiteRT/TensorFlow/XLA build and can fail with ENOSPC.
-# Also provide the cross GCC wrapper with an unprefixed "ld" for target links.
-# Do not prepend /usr/aarch64-linux-gnu/bin to PATH globally: Bazel host tools
-# are compiled with /usr/bin/gcc and must use the host assembler. Putting the
-# AArch64 binutils first causes host compilation to fail with:
-#   as: unrecognized option '--64'
-RUN mkdir -p /bazel-cache                                                                       && \
-    mkdir -p /opt/aarch64-binutils                                                              && \
-    ln -sf /usr/aarch64-linux-gnu/bin/ld /opt/aarch64-binutils/ld
+RUN mkdir -p /bazel-cache
 
-# ✅ Cross-compile build matching the successful internal build steps.
-RUN bazel build --config=elinux_aarch64 -c opt                                                     \
+# ✅ Native arm64 build — no cross-compilation config needed.
+RUN bazel build -c opt                                                                             \
     --repo_env=LITERT_QAIRT_SDK=/mnt/work/downloads/                                               \
     --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1                                                  \
     --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1                                                \
     --copt=-DLITERT_ENABLE_NPU                                                                     \
-    --copt=-std=c++17                                                                              \
     --cxxopt=-std=c++17                                                                            \
-    --linkopt=-L/usr/lib/aarch64-linux-gnu                                                         \
-    --linkopt=-L/usr/lib/llvm-14/lib                                                               \
-    --linkopt=-Wl,-rpath-link,/usr/lib/aarch64-linux-gnu                                           \
-    --linkopt=-Wl,-rpath-link,/usr/lib/llvm-14/lib                                                 \
     --linkopt=-Wl,--whole-archive                                                                  \
     --linkopt=-Wl,--no-whole-archive                                                               \
     //litert/c:litert_runtime_c_api_so                                                             \
@@ -240,7 +225,7 @@ RUN bazel build --config=elinux_aarch64 -c opt                                  
 # scanning bazel-bin/bazel-out for shared/static libraries.
 RUN mkdir -p "${LITERT_DEPLOY_DIR}/lib" "${LITERT_DEPLOY_DIR}/include"                          && \
     bazel cquery                                                                                   \
-        --config=elinux_aarch64 -c opt                                                             \
+        -c opt                                                                                     \
         --repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION}                              \
         --repo_env=LITERT_QAIRT_SDK=/mnt/work/downloads/                                           \
         --output=files                                                                             \
@@ -263,11 +248,15 @@ RUN mkdir -p "${LITERT_DEPLOY_DIR}/lib" "${LITERT_DEPLOY_DIR}/include"          
     test -n "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f \( -iname '*litert*.so' -o -iname '*litert*.so.*' -o -iname '*LiteRt*.so' -o -iname '*LiteRt*.so.*' -o -iname '*litert*.a' -o -iname '*LiteRt*.a' \) | head -1)" && \
     test -n "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f \( -iname '*dispatch*.so' -o -iname '*dispatch*.so.*' -o -iname '*qnn*plugin*.so' -o -iname '*qnn*plugin*.so.*' -o -iname '*dispatch*.a' -o -iname '*qnn*plugin*.a' \) | head -1)"
 
+# Strip debug symbols from LiteRT shared libraries to reduce image size.
+# || true: some .so files may already be stripped or have non-strippable sections.
+RUN find "${LITERT_DEPLOY_DIR}/lib" -name "*.so*" -exec strip --strip-unneeded {} \; || true
+
 ###############################################
 # Stage 3: FastRPC Base Layer Builder
 ###############################################
 
-FROM debian:trixie-slim AS fastrpc-builder
+FROM --platform=linux/arm64 debian:trixie-slim AS fastrpc-builder
 
 # Install build dependencies for fastrpc
 RUN apt-get update                                                                              && \
@@ -290,7 +279,7 @@ RUN git clone --depth 1 https://github.com/quic/fastrpc.git                     
 # Stage 4: Runtime Stage
 #########################
 
-FROM debian:trixie-slim AS service
+FROM --platform=linux/arm64 debian:trixie-slim AS service
 WORKDIR /root/app/site-packages
 
 # Installing Runtime dependencies
@@ -332,10 +321,10 @@ COPY --from=qnn_sdk_downloader /mnt/work/deploy/usr /usr
 COPY --from=fastrpc-builder /usr/lib/libcdsprpc.so* /usr/lib/
 COPY --from=fastrpc-builder /usr/lib/aarch64-linux-gnu/libyaml* /usr/lib/
 
-# Install python3 as a dependency of hypercorn and SWaggerUI web api
+# Install python3 as a runtime dependency (pip not needed — venv is pre-built)
 RUN apt-get update                                                                              && \
     apt-get install -y                                                                             \
-        python3 python3-pip                                                                     && \
+        python3                                                                                 && \
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/*
 
