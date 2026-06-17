@@ -228,8 +228,11 @@ class QnnSampleApp:
                 self.system_provider.systemContextFree(self._sys_ctx)
             except Exception:
                 pass
-            raise RuntimeError(f"Neither metadata (rc={rc_md}) "
-                               f"nor binary info (rc={rc_bi}) available")
+            raise RuntimeError(
+                f"systemContextGetBinaryInfo failed (rc={rc_bi}). "
+                "Check that the context binary is valid and was produced by a "
+                "compatible QNN SDK version."
+            )
 
         BI = bi_pp.contents  # typed; safe
         v = int(BI.version)
@@ -638,5 +641,5 @@ class QnnSampleApp:
 
                 io.teardown(inputs, outputs, gi)
         except Exception as e:
-            raise RuntimeError("[ERR] graphExecute loop failed:", e)
+            raise RuntimeError(f"[ERR] graphExecute loop failed: {e}") from e
         return 0

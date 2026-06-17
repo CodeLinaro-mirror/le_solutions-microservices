@@ -560,10 +560,23 @@ def _decode_log_format(fmt: c_char_p) -> str:
 
 
 def _format_log_message(fmt: c_char_p, va_list_ptr: c_void_p) -> str:
+    """
+    Attempt to format a QNN log message using vsnprintf with the provided va_list.
+
+    Safety notes:
+    - On x86_64 Linux, va_list is __va_list_tag[1] (a struct passed by reference).
+      The CFUNCTYPE callback receives it as c_void_p (pointer to the struct), which
+      is the correct representation for passing to vsnprintf.
+    - On other architectures the layout may differ; the try/except ensures we fall
+      back to the raw format string rather than crashing.
+    - vsnprintf consumes the va_list; QNN must not reuse it after the callback returns
+      (standard practice: QNN passes a fresh va_list per log call).
+    """
     raw_format = _decode_log_format(fmt)
     if not raw_format:
         return raw_format
 
+    # If no va_list pointer was provided, return the raw format string as-is.
     va_addr = ctypes.cast(va_list_ptr, c_void_p).value if va_list_ptr else None
     if not va_addr:
         return raw_format
@@ -574,11 +587,12 @@ def _format_log_message(fmt: c_char_p, va_list_ptr: c_void_p) -> str:
         return raw_format
 
     try:
-        # A va_list should not be reused after formatting, so use one sufficiently
-        # large buffer and make a single vsnprintf call.
+        # Use a single vsnprintf call with a sufficiently large buffer.
+        # If the result is truncated, append a marker rather than crashing.
         buffer = ctypes.create_string_buffer(8192)
         written = _LIBC_VSNPRINTF(buffer, len(buffer), fmt_bytes, va_list_ptr)
         if written < 0:
+            # vsnprintf encoding error — return raw format string
             return raw_format
 
         message = buffer.value.decode("utf-8", errors="replace")
@@ -586,6 +600,8 @@ def _format_log_message(fmt: c_char_p, va_list_ptr: c_void_p) -> str:
             return f"{message}... [truncated]"
         return message
     except Exception:
+        # Any platform-specific failure (e.g., wrong va_list ABI) falls back
+        # to the raw format string so the process does not crash.
         return raw_format
 
 
@@ -621,6 +637,17 @@ class Binder:
         if not addr or addr < 0x1000:
             raise RuntimeError(f"{name} invalid pointer: 0x{addr:016x}")
         return ctypes.cast(addr, proto)
+
+    @staticmethod
+    def optional_callable(addr: int, proto, name: str):
+        """Like callable() but returns None for null/invalid pointers instead of raising.
+        Use for optional API functions that may not be present in all SDK versions."""
+        if not addr or addr < 0x1000:
+            return None
+        try:
+            return ctypes.cast(addr, proto)
+        except Exception:
+            return None
 
 
 class ErrorHelper:
@@ -817,7 +844,7 @@ class QnnProvider:
             self.__iface.propertyHasCapability,
             QnnProperty_HasCapabilityFn_t,
             "propertyHasCapability")
-        self.globalConfigSet = Binder.callable(
+        self.globalConfigSet = Binder.optional_callable(
             self.__iface.globalConfigSet,
             QnnGlobalConfig_SetFn_t,
             "globalConfigSet")
@@ -855,7 +882,7 @@ class QnnProvider:
             self.__iface.backendFree,
             QnnBackend_FreeFn_t,
             "backendFree")
-        self.backendGetProperty = Binder.callable(
+        self.backendGetProperty = Binder.optional_callable(
             self.__iface.backendGetProperty,
             QnnBackend_GetPropertyFn_t,
             "backendGetProperty")
@@ -885,47 +912,47 @@ class QnnProvider:
             self.__iface.contextFree,
             QnnContext_FreeFn_t,
             "contextFree")
-        self.contextValidateBinary = Binder.callable(
+        self.contextValidateBinary = Binder.optional_callable(
             self.__iface.contextValidateBinary,
             QnnContext_ValidateBinaryFn_t,
             "contextValidateBinary")
-        self.contextCreateFromBinaryWithSignal = Binder.callable(
+        self.contextCreateFromBinaryWithSignal = Binder.optional_callable(
             self.__iface.contextCreateFromBinaryWithSignal,
             QnnContext_CreateFromBinaryWithSignalFn_t,
             "contextCreateFromBinaryWithSignal")
-        self.contextCreateFromBinaryListAsync = Binder.callable(
+        self.contextCreateFromBinaryListAsync = Binder.optional_callable(
             self.__iface.contextCreateFromBinaryListAsync,
             QnnContext_CreateFromBinaryListAsyncFn_t,
             "contextCreateFromBinaryListAsync")
-        self.contextFinalize = Binder.callable(
+        self.contextFinalize = Binder.optional_callable(
             self.__iface.contextFinalize,
             QnnContext_FinalizeFn_t,
             "contextFinalize")
-        self.contextCreateFromBinaryWithCallback = Binder.callable(
+        self.contextCreateFromBinaryWithCallback = Binder.optional_callable(
             self.__iface.contextCreateFromBinaryWithCallback,
             QnnContext_CreateFromBinaryWithCallbackFn_t,
             "contextCreateFromBinaryWithCallback")
-        self.contextGetBinarySectionSize = Binder.callable(
+        self.contextGetBinarySectionSize = Binder.optional_callable(
             self.__iface.contextGetBinarySectionSize,
             QnnContext_GetBinarySectionSizeFn_t,
             "contextGetBinarySectionSize")
-        self.contextGetBinarySection = Binder.callable(
+        self.contextGetBinarySection = Binder.optional_callable(
             self.__iface.contextGetBinarySection,
             QnnContext_GetBinarySectionFn_t,
             "contextGetBinarySection")
-        self.contextApplyBinarySection = Binder.callable(
+        self.contextApplyBinarySection = Binder.optional_callable(
             self.__iface.contextApplyBinarySection,
             QnnContext_ApplyBinarySectionFn_t,
             "contextApplyBinarySection")
-        self.contextGetProperty = Binder.callable(
+        self.contextGetProperty = Binder.optional_callable(
             self.__iface.contextGetProperty,
             QnnContext_GetPropertyFn_t,
             "contextGetProperty")
-        self.contextGetIncrementalBinary = Binder.callable(
+        self.contextGetIncrementalBinary = Binder.optional_callable(
             self.__iface.contextGetIncrementalBinary,
             QnnContext_GetIncrementalBinaryFn_t,
             "contextGetIncrementalBinary")
-        self.contextReleaseIncrementalBinary = Binder.callable(
+        self.contextReleaseIncrementalBinary = Binder.optional_callable(
             self.__iface.contextReleaseIncrementalBinary,
             QnnContext_ReleaseIncrementalBinaryFn_t,
             "contextReleaseIncrementalBinary")
@@ -943,7 +970,7 @@ class QnnProvider:
             self.__iface.graphSetConfig,
             QnnGraph_SetConfigFn_t,
             "graphSetConfig")
-        self.graphGetProperty = Binder.callable(
+        self.graphGetProperty = Binder.optional_callable(
             self.__iface.graphGetProperty,
             QnnGraph_GetPropertyFn_t,
             "graphGetProperty")
@@ -959,7 +986,7 @@ class QnnProvider:
             self.__iface.graphRetrieve,
             QnnGraph_RetrieveFn_t,
             "graphRetrieve")
-        self.graphPrepareExecutionEnvironment = Binder.callable(
+        self.graphPrepareExecutionEnvironment = Binder.optional_callable(
             self.__iface.graphPrepareExecutionEnvironment,
             QnnGraph_PrepareExecutionEnvironmentFn_t,
             "graphPrepareExecutionEnvironment")
@@ -967,11 +994,11 @@ class QnnProvider:
             self.__iface.graphExecute,
             QnnGraph_ExecuteFn_t,
             "graphExecute")
-        self.graphExecuteAsync = Binder.callable(
+        self.graphExecuteAsync = Binder.optional_callable(
             self.__iface.graphExecuteAsync,
             QnnGraph_ExecuteAsyncFn_t,
             "graphExecuteAsync")
-        self.graphReleaseExecutionEnvironment = Binder.callable(
+        self.graphReleaseExecutionEnvironment = Binder.optional_callable(
             self.__iface.graphReleaseExecutionEnvironment,
             QnnGraph_ReleaseExecutionEnvironmentFn_t,
             "graphReleaseExecutionEnvironment")
@@ -985,11 +1012,11 @@ class QnnProvider:
             self.__iface.tensorCreateGraphTensor,
             QnnTensor_CreateGraphTensorFn_t,
             "tensorCreateGraphTensor")
-        self.tensorUpdateContextTensors = Binder.callable(
+        self.tensorUpdateContextTensors = Binder.optional_callable(
             self.__iface.tensorUpdateContextTensors,
             QnnTensor_UpdateContextTensorsFn_t,
             "tensorUpdateContextTensors")
-        self.tensorUpdateGraphTensors = Binder.callable(
+        self.tensorUpdateGraphTensors = Binder.optional_callable(
             self.__iface.tensorUpdateGraphTensors,
             QnnTensor_UpdateGraphTensorsFn_t,
             "tensorUpdateGraphTensors")
