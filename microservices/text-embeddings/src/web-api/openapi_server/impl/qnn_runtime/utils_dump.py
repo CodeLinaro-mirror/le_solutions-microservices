@@ -3,7 +3,12 @@
 
 import builtins
 import ctypes
+import os
 from typing import Optional
+from openapi_server.logger.logger_config import LoggerConfig
+
+LoggerConfig.initialize()
+logger = LoggerConfig.get_logger(__name__)
 
 try:
     from .qnn_types import Qnn_Tensor_t  # adjust import if needed
@@ -15,9 +20,15 @@ except Exception:
 
 def print_to_log(fn):
     def wrapper(*args, **kwargs):
-        # print only to file
-        with open("/tmp/log_qnn-cli-python.txt", "a", buffering=1) as f:
-            fn(*args, **kwargs, file=f)
+        log_dir = "/tmp"
+        log_file = os.path.join(log_dir, "log_qnn-python.txt")
+
+        if os.path.isdir(log_dir):
+            try:
+                with open(log_file, "a", buffering=1) as f:
+                    fn(*args, **kwargs, file=f)
+            except OSError:
+                pass  # silently ignore logging failures
 
     return wrapper
 

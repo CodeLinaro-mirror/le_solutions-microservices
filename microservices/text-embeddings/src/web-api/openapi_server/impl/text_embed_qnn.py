@@ -17,7 +17,7 @@ from ctypes import (
     POINTER,
 )
 
-from openapi_server.impl.qnn_runtime.lib_provider import QnnLibrary, QnnProvider, SystemProvider
+from openapi_server.impl.qnn_runtime.lib_provider import QnnLibrary, QnnProvider, SystemProvider, CORE_LOG_CB
 from openapi_server.impl.qnn_runtime.qnn_types import (
     Qnn_Tensor_t,
     QNN_DATATYPE_FLOAT_16,
@@ -28,6 +28,7 @@ from openapi_server.impl.qnn_runtime.qnn_types import (
     qnn_dtype_size_bytes,
 )
 from openapi_server.impl.qnn_runtime.system_structs import QnnSystemContext_BinaryInfo_t
+from openapi_server.impl.qnn_runtime.utils_dump import dump_tensors
 
 try:
     import numpy as np
@@ -255,7 +256,6 @@ class SimpleQnnEmbeddingApp:
         output_name: Optional[str],
         pad_token: int,
         assume_attention_mask: bool,
-        verbose: bool,
         tokenizer: TokenizerAdapter,
     ):
 
@@ -267,7 +267,7 @@ class SimpleQnnEmbeddingApp:
         self.output_name = output_name
         self.pad_token = pad_token
         self.assume_attention_mask = assume_attention_mask
-        self.verbose = verbose
+        self.verbose = True
         self.tokenizer = tokenizer
 
         # Load QNN libraries
@@ -283,6 +283,7 @@ class SimpleQnnEmbeddingApp:
             self.system_provider = SystemProvider(spp[0])
 
         self.backend_handle = c_void_p()
+        self.logger_handle = c_void_p()
         self.device_handle = c_void_p(None)
         self.context_handle = c_void_p()
         self.graph_handle = c_void_p()
@@ -290,12 +291,27 @@ class SimpleQnnEmbeddingApp:
         self._binary_info_ptr = None
 
         # Initialize and prepare once
+        self._init_logging()
         self._init_backend()
         self._bi, self._binary_buf, self._binary_size = self._load_binary()
         self._graph_name, self._in_meta, self._out_meta, self._resolved_input, self._resolved_output = \
             self._find_graph_and_io(self._bi)
         self._create_context(self._binary_buf, self._binary_size)
         self._retrieve_graph(self._graph_name)
+
+    # ------------------------------------------------------------------
+    def _init_logging(self):
+        """Create a QNN logger and attach CORE_LOG_CB so backend messages are visible."""
+        # Use VERBOSE (4) when verbose mode is requested, INFO (2) otherwise.
+        log_level = 4 if self.verbose else 2
+        rc = self.provider.logCreate(
+            CORE_LOG_CB,
+            ctypes.c_int(log_level),
+            ctypes.byref(self.logger_handle)
+        )
+        if rc != 0:
+            # Non-fatal: continue without a logger rather than aborting startup.
+            self.logger_handle = c_void_p()
 
     # ------------------------------------------------------------------
     @classmethod
@@ -309,7 +325,6 @@ class SimpleQnnEmbeddingApp:
         out_name = os.getenv("QNN_OUTPUT_NAME")
 
         pad_token = int(os.getenv("QNN_PAD_TOKEN", "0"))
-        verbose   = os.getenv("QNN_VERBOSE", "0") == "1"
 
         tokenizer = load_tokenizer_auto()
 
@@ -322,23 +337,56 @@ class SimpleQnnEmbeddingApp:
             output_name=out_name,
             pad_token=pad_token,
             assume_attention_mask=True,
-            verbose=verbose,
             tokenizer=tokenizer
         )
 
     # ------------------------------------------------------------------
     def close(self):
+        # 1. Free system context (holds binary-info pointer; must go first)
         try:
             if self.system_provider and self._sys_ctx_handle:
                 self.system_provider.systemContextFree(self._sys_ctx_handle)
-        finally:
-            self._sys_ctx_handle = None
-            self._binary_info_ptr = None
+        except Exception:
+            pass
+        self._sys_ctx_handle = None
+        self._binary_info_ptr = None
+
+        # 2. Free QNN context (owns graph handles; must be freed before backend)
+        try:
+            if self.context_handle and self.context_handle.value:
+                self.provider.contextFree(self.context_handle, c_void_p(None))
+        except Exception:
+            pass
+        self.context_handle = c_void_p()
+
+        # 3. Free device
+        try:
+            if self.device_handle and self.device_handle.value:
+                self.provider.deviceFree(self.device_handle)
+        except Exception:
+            pass
+        self.device_handle = c_void_p(None)
+
+        # 4. Free backend
+        try:
+            if self.backend_handle and self.backend_handle.value:
+                self.provider.backendFree(self.backend_handle)
+        except Exception:
+            pass
+        self.backend_handle = c_void_p()
+
+        # 5. Free logger (must be last – backend may still log during its own teardown)
+        try:
+            if self.logger_handle and self.logger_handle.value:
+                self.provider.logFree(self.logger_handle)
+        except Exception:
+            pass
+        self.logger_handle = c_void_p()
 
     def _init_backend(self):
         null_cfg = POINTER(c_void_p)()
         rc = self.provider.backendCreate(
-            c_void_p(None),
+            self.logger_handle,
             ctypes.byref(null_cfg),
             ctypes.byref(self.backend_handle)
         )
@@ -349,7 +397,7 @@ class SimpleQnnEmbeddingApp:
         try:
             null_dev_cfg = POINTER(c_void_p)()
             rc2 = self.provider.deviceCreate(
-                c_void_p(None),
+                self.logger_handle,
                 ctypes.byref(null_dev_cfg),
                 ctypes.byref(self.device_handle)
             )
@@ -585,6 +633,9 @@ class SimpleQnnEmbeddingApp:
 
             outputs[i] = t
 
+        dump_tensors(inputs, n_in, kind="INPUTS")
+        dump_tensors(outputs, n_out, kind="OUTPUTS")
+
         # Execute
         rc = self.provider.graphExecute(
             self.graph_handle,
@@ -598,6 +649,8 @@ class SimpleQnnEmbeddingApp:
 
         if rc != 0:
             raise RuntimeError(f"graphExecute failed rc={rc}")
+
+        dump_tensors(outputs, n_out, kind="OUTPUTS_POST_EXEC")
 
         # Decode output
         out_t = outputs[selected_idx]
