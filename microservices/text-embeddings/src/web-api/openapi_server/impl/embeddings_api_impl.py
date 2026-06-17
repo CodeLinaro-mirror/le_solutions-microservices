@@ -206,7 +206,7 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             # ── Resolve model binary path ─────────────────────────────────
             model_info = model_config_manager.get_model_info(requested_model)
             model_file = model_info["model_file"]
-            models_path = os.environ.get("MODELS_PATH", "/opt/embed_gen/")
+            models_path = os.getenv("T2E_MODEL_DIR", "/mnt/work/models")
             model_binary_path = os.path.join(models_path, model_file)
 
             # ── Run inference ─────────────────────────────────────────────
