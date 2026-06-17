@@ -20,7 +20,5 @@ services:
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
     volumes:
-      - /usr/lib/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0
-      - /usr/lib/libcdsprpc.so:/usr/lib/libcdsprpc.so
       - ${MODELS_PATH:-/opt/embed_gen}:/opt/embed_gen/
     command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2E_PORT} --reload"
