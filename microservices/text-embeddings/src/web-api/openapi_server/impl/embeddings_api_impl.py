@@ -19,7 +19,6 @@ from openapi_server.apis.embeddings_api_base import BaseEmbeddingsApi
 from openapi_server.models.create_embeddings_request import CreateEmbeddingsRequest
 from openapi_server.models.create_embeddings_response import CreateEmbeddingsResponse
 from openapi_server.models.embedding import Embedding
-from openapi_server.models.embedding_embedding import EmbeddingEmbedding
 from openapi_server.models.embedding_usage import EmbeddingUsage
 from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.constant import HttpStatusCodes, ErrorMessages
@@ -221,7 +220,7 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             embedding_objects = [
                 Embedding(
                     object="embedding",
-                    embedding=EmbeddingEmbedding(emb_vector),
+                    embedding=emb_vector,
                     index=idx,
                 )
                 for idx, emb_vector in enumerate(embeddings_data)

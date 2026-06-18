@@ -24,8 +24,7 @@ import json
 
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
-from typing import Any, ClassVar, Dict, List, Optional
-from openapi_server.models.embedding_embedding import EmbeddingEmbedding
+from typing import Any, ClassVar, Dict, List, Optional, Union
 try:
     from typing import Self
 except ImportError:
@@ -36,7 +35,7 @@ class Embedding(BaseModel):
     Represents a single embedding.
     """ # noqa: E501
     object: Optional[StrictStr] = Field(default=None, description="The object type, always 'embedding'.")
-    embedding: Optional[EmbeddingEmbedding] = None
+    embedding: Optional[Union[List[float], str]] = Field(default=None, description="The embedding vector as a list of floats, or a base64-encoded string when encoding_format=base64.")
     index: Optional[StrictInt] = Field(default=None, description="Index of the embedding in the list.")
     __properties: ClassVar[List[str]] = ["object", "embedding", "index"]
 
@@ -77,9 +76,6 @@ class Embedding(BaseModel):
             },
             exclude_none=True,
         )
-        # override the default output from pydantic by calling `to_dict()` of embedding
-        if self.embedding:
-            _dict['embedding'] = self.embedding.to_dict()
         return _dict
 
     @classmethod
@@ -93,9 +89,7 @@ class Embedding(BaseModel):
 
         _obj = cls.model_validate({
             "object": obj.get("object"),
-            "embedding": EmbeddingEmbedding.from_dict(obj.get("embedding")) if obj.get("embedding") is not None else None,
+            "embedding": obj.get("embedding"),
             "index": obj.get("index")
         })
         return _obj
-
-
