@@ -9,9 +9,8 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ../../configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
-      - ../../configs/nginx/solutions/camera-api.conf:/etc/nginx/solutions/camera-api.conf
-      - ../../configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
+      - ~/configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ~/configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
   mariadb:
     image: mariadb:11.6.2
     platform: arm64
@@ -29,27 +28,10 @@ services:
     container_name: redis
     hostname: redis
     restart: always
-    command: redis-server --loglevel notice
-    network_mode: host
-  camera-api:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/camera-api:1.0.1
-    platform: arm64
-    container_name: camera-api
-    depends_on:
-      - redis
-      - mariadb
-      - nginx
-    restart: always
-    environment:
-      - redisHost=172.17.0.1
-      - mariadbHost=172.17.0.1
-      - mariadbPass=secretpw
-      - redisCameraUpdates=${REDIS_CAMERA_UPDATES_CHANNEL:-camera-api.updates}
-    expose:
-      - '3000'
+    command: redis-server --loglevel notice --notify-keyspace-events Kh
     network_mode: host
   region-analytics-api:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/region-analytics-api:1.0.2
+    image: artifacts.codelinaro.org/iot-solutions-microservices/region-analytics-api:latest
     platform: arm64
     container_name: region-analytics-api
     depends_on:
@@ -68,7 +50,7 @@ services:
       - '8081'
     network_mode: host
   region-analytics-server:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/region-analytics-server:1.0.2
+    image: artifacts.codelinaro.org/iot-solutions-microservices/region-analytics-server:latest
     platform: arm64
     container_name: region-analytics-server
     depends_on:
