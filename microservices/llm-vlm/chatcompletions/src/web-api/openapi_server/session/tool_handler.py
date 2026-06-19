@@ -72,8 +72,12 @@ class ToolHandler:
         - If a system message exists: append tool instructions to it
         - If no system message: create one with tool instructions
 
+        Handles both Pydantic model objects (from request parsing) and plain
+        dicts (from session history). Always creates new system messages as
+        plain dicts to avoid AttributeError when downstream code calls .get().
+
         Args:
-            messages: List of message objects
+            messages: List of message objects (Pydantic models or dicts)
             tools: List of ChatCompletionTool objects
 
         Returns:
@@ -84,22 +88,40 @@ class ToolHandler:
 
         tool_instructions = ToolHandler.format_tools_for_prompt(tools)
 
-        # Check if first message is a system message
-        has_system_msg = messages and hasattr(messages[0], 'role') and messages[0].role == "system"
+        # Check if first message is a system message.
+        # Support both Pydantic objects (.role attribute) and dicts (['role'] key).
+        def _get_role(msg) -> str:
+            if isinstance(msg, dict):
+                return msg.get('role', '')
+            return getattr(msg, 'role', '')
+
+        def _get_content(msg) -> str:
+            if isinstance(msg, dict):
+                return msg.get('content') or ''
+            return getattr(msg, 'content', '') or ''
+
+        def _set_content(msg, content: str):
+            if isinstance(msg, dict):
+                msg['content'] = content
+            else:
+                msg.content = content
+
+        has_system_msg = bool(messages) and _get_role(messages[0]) == "system"
 
         if has_system_msg:
-            # Append to existing system message
-            existing_content = messages[0].content or ""
-            messages[0].content = f"{existing_content}{tool_instructions}"
+            # Append to existing system message (works for both Pydantic and dict)
+            existing_content = _get_content(messages[0])
+            _set_content(messages[0], f"{existing_content}{tool_instructions}")
             logger.info("Appended tool instructions to existing system message")
         else:
-            # Create new system message with tool instructions
-            from openapi_server.models.chat_completion_request_system_message import ChatCompletionRequestSystemMessage
-
-            system_msg = ChatCompletionRequestSystemMessage(
-                role="system",
-                content=f"You are a helpful assistant.{tool_instructions}"
-            )
+            # Create new system message as a plain dict.
+            # Using a Pydantic ChatCompletionRequestSystemMessage here causes
+            # AttributeError in text_conversation_event.py which calls .get()
+            # on messages (dict method, not available on Pydantic objects).
+            system_msg = {
+                "role": "system",
+                "content": f"You are a helpful assistant.{tool_instructions}"
+            }
             messages.insert(0, system_msg)
             logger.info("Created new system message with tool instructions")
 
@@ -169,6 +191,26 @@ class ToolHandler:
                         return ToolHandler._convert_to_tool_calls(tool_calls_data)
                 except json.JSONDecodeError:
                     pass
+
+            # Strategy 4: Handle {"type": "function", "function": {"name": ..., "arguments": ...}}
+            # This is the format the model sometimes outputs directly.
+            try:
+                stripped = response_text.strip()
+                parsed = json.loads(stripped)
+                if (isinstance(parsed, dict)
+                        and parsed.get("type") == "function"
+                        and "function" in parsed):
+                    func_data = parsed["function"]
+                    tool_calls_data = [{
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": func_data,
+                    }]
+                    func_name = func_data.get("name", "unknown")
+                    logger.info(f"Detected function call (Strategy 4 - type/function): {func_name}")
+                    return ToolHandler._convert_to_tool_calls(tool_calls_data)
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
         except Exception as e:
             logger.warning(f"Error parsing tool response: {e}")

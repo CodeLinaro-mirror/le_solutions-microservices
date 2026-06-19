@@ -141,6 +141,9 @@ COPY --from=builder /usr/local /usr/local
 
 ENV PATH=/mnt/work/venv/bin:$PATH
 
+# FastRPC searches ADSP_LIBRARY_PATH for Hexagon skel .so files on the ARM side
+ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+
 # Copy the Python entrypoint and make it executable
 COPY entrypoint.py /entrypoint.py
 RUN chmod +x /entrypoint.py
