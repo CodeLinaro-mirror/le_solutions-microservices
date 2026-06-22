@@ -547,6 +547,19 @@ RUN apt-get update && \
         libatomic1 \
         libcurl4 \
         libzip4 \
+        libnghttp2-14 \
+        librtmp1 \
+        libidn2-0 \
+        libssh2-1 \
+        libpsl5 \
+        libgssapi-krb5-2 \
+        libldap-2.5-0 \
+        libbrotli1 \
+        libzstd1 \
+        libbz2-1.0 \
+        libsasl2-2 \
+        libunistring2 \
+        libgnutls30 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -577,7 +590,7 @@ COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 #
 # Uses find to locate .so files regardless of whether Debian placed them under
 # /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip; do \
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap-2.5" "liblber-2.5" libbrotlidec libbrotlicommon libzstd libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1; do \
       find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
     done
 
