@@ -74,18 +74,12 @@ services:
       - DEFAULT_HEATMAP_COLS=64
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.5
+    image: qimsdk:latest
     platform: arm64
     container_name: qimsdk-vehicle-detection
     hostname: qimsdk-vehicle-detection
-    user: qimsdk
     restart: always
     environment:
-      - XDG_RUNTIME_DIR=/dev/socket/weston
-      - WAYLAND_DISPLAY=wayland-1
-      - GST_PLUGIN_SCANNER=/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
-      - GST_DEBUG_NO_COLOR=1
-      - GST_DEBUG=2
       - INPUT_TYPE=${INPUT_TYPE:-video}
       - INPUT_URL=${INPUT_URL:-/etc/media/sample-videos/Street_Bridge.ts}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.vehicle}:0
@@ -95,18 +89,18 @@ services:
       - LABELS_PATH_VEHICLE=${LABELS_PATH_VEHICLE:-/etc/labels/yolov8n.labels}
       - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
+    env_file:
+      - /etc/docker/env/qimsdk.env
     command: bash /etc/media/qimsdk_vehicle_detect.sh
-    volumes:
-      - /etc/labels:/etc/labels
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
     deploy:
       resources:
         reservations:
           devices:
             - driver: cdi
               device_ids:
-                - qualcomm.com/device=cdi-hw-acc
+                - qualcomm.com/device=qimsdk
+              capabilities:
+                - hw-acc
     network_mode: host
 volumes:
   mariadbVolume: null

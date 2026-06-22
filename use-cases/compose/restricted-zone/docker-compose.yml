@@ -71,37 +71,39 @@ services:
       - DEFAULT_COUNT_TABLE=count_statistics
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.5
+    image: qimsdk:latest
     platform: arm64
     container_name: qimsdk-restricted-zone
     hostname: qimsdk-restricted-zone
-    user: qimsdk
     restart: always
-    environment:
-      - XDG_RUNTIME_DIR=/dev/socket/weston
-      - WAYLAND_DISPLAY=wayland-1
-      - GST_DEBUG_NO_COLOR=1
-      - GST_DEBUG=2
-      - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/opt/sample-videos/rtsp2_6_region_top_right_qtr.ts}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.json}
-      - SETTINGS_PATH_PERSON=${SETTINGS_PATH_PERSON:-/opt/labels/foot_track_net_settings.json}
-      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
-      - OUT_PORT=${OUT_PORT:-8900}
-    command: bash qimsdk_person_detect.sh
-    volumes:
-      - /etc/labels:/etc/labels
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
+    env_file:
+      - /etc/docker/env/qimsdk.env
+    command: >
+      microservices-restricted-zone
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/rz_video.mp4}
+      --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8554}
+      --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
+      --model-path=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
+      --labels-path=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.json}
+      --settings-path=${SETTINGS_PATH_PERSON:-/etc/labels/foot_track_net_settings.json}
+      --restricted-zone-boundaries=${ZONE_BOUNDARIES:-"Zones,Zone1=<<960,540>,<1920,540>,<1920,1080>,<960,1080>>;"}
+      --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
+      --redis-host=${REDIS_HOST:-127.0.0.1}
+      --redis-port=${REDIS_OUT_PORT:-6379}
+      --redis-channel=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
+      --webrtc-id=${WEBRTC_ID:-1010}
+      --no-display=${NO_DISPLAY_ARG:-0}
+      --no-output-overlay=${NO_OUT_OVERLAY_ARG:-0}
+      --no-debug=${NO_DEBUG_ARG:-0}
     deploy:
       resources:
         reservations:
           devices:
             - driver: cdi
               device_ids:
-                - qualcomm.com/device=cdi-hw-acc
+                - qualcomm.com/device=qimsdk
+              capabilities:
+                - hw-acc
     network_mode: host
 volumes:
   mariadbVolume: null
