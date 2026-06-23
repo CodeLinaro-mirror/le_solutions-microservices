@@ -75,6 +75,17 @@ class ConversationSession:
         self.system_prompt_tokens = 0
         self.system_prompt_content = ""
 
+        # ── Memory slots (MemGPT-inspired) ────────────────────────────────────
+        # Slot 3: Core memory — LLM-extracted facts, persisted across eviction cycles
+        self.facts: dict = {}
+        # Tracks which turn each fact was last updated (for LRU eviction)
+        self.facts_last_updated: dict = {}
+
+        # Eviction tracking — messages removed from history queue, pending summarization
+        # These are excluded from the history queue when building the next turn's prompt.
+        # Cleared after post-turn summarization completes.
+        self.eviction_batch: list = []
+
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
 
     @staticmethod
@@ -670,5 +681,88 @@ class ConversationSession:
 
         logger.info(f"Session {self.session_id}: Successfully cancelled event {event.event_id}")
         return True
+
+    # ── Memory helper methods ─────────────────────────────────────────────────
+
+    def get_post_summary_messages(self) -> list:
+        """
+        Return all session messages that are eligible for the history queue:
+        - Occurred after the last summarization point
+        - Not in the current eviction batch
+        - Not system messages
+        - Not tool-only assistant messages (no content, only tool_calls)
+
+        These are the messages that will be filled into Slot 5 (history queue)
+        when building the next turn's prompt.
+        """
+        eviction_ids = {id(m) for m in self.eviction_batch}
+        result = []
+        for msg in self.messages:
+            if id(msg) in eviction_ids:
+                continue
+            role = msg.get('role', '')
+            if role == 'system':
+                continue
+            if role == 'assistant':
+                has_content = msg.get('content') not in (None, '')
+                if msg.get('tool_calls') and not has_content:
+                    continue
+            result.append(msg)
+        return result
+
+    def format_facts(self) -> str:
+        """
+        Format the facts dict as a compact single-line string for Slot 3 injection.
+        Returns empty string if no facts are stored.
+
+        Example output:
+            [Memory] user_name=Alice; project=REST API; language=Python
+        """
+        if not self.facts:
+            return ""
+        pairs = "; ".join(f"{k}={v}" for k, v in self.facts.items())
+        return f"[Memory] {pairs}"
+
+    def update_facts(self, new_facts: dict, turn_number: int) -> None:
+        """
+        Merge new facts into the fact store.
+        New values override existing ones for the same key.
+        New keys are added. Keys are never deleted (facts don't un-happen).
+
+        Args:
+            new_facts: Dict of key-value fact pairs extracted from the conversation.
+            turn_number: Current turn number, used for LRU eviction tracking.
+        """
+        for k, v in new_facts.items():
+            if isinstance(k, str) and isinstance(v, str):
+                self.facts[k] = v
+                self.facts_last_updated[k] = turn_number
+        logger.debug(
+            f"Session {self.session_id}: Updated facts store "
+            f"({len(new_facts)} new/updated, {len(self.facts)} total)"
+        )
+
+    def enforce_facts_ceiling(self, ceiling_tokens: int) -> None:
+        """
+        Evict least-recently-updated facts when the formatted facts string
+        exceeds ceiling_tokens. Uses LRU eviction: oldest-updated facts are
+        removed first.
+
+        Args:
+            ceiling_tokens: Maximum token budget for the facts slot.
+        """
+        from openapi_server.session.token_counter import TokenCounter
+        while self.facts and TokenCounter.estimate_tokens(self.format_facts()) > ceiling_tokens:
+            # Find the key with the smallest (oldest) last_updated turn number
+            oldest_key = min(
+                self.facts_last_updated,
+                key=lambda k: self.facts_last_updated.get(k, 0)
+            )
+            del self.facts[oldest_key]
+            del self.facts_last_updated[oldest_key]
+            logger.debug(
+                f"Session {self.session_id}: Evicted fact '{oldest_key}' (LRU, "
+                f"{len(self.facts)} facts remaining)"
+            )
 
     # Removed unused summarization methods as they are now handled directly in TextConversationEvent

@@ -78,41 +78,15 @@ class TextConversationEvent(ConversationEvent):
         Return True when the next execute_request() will run on a clean KV cache
         and therefore must treat the prompt as self-contained.
 
-        Non-ADHOC Trip 2 tool continuations intentionally return False: they
-        continue on top of the active event's live KV state.
+        With universal reset (KV cache reset after every inference), every new
+        turn starts from a clean KV cache. The only exception is Trip 2 of a
+        tool continuation, which uses the live KV cache from Trip 1.
         """
-        from openapi_server.impl.constant import ADHOC_MODE
-
-        if ADHOC_MODE:
-            return True
-
-        llm_manager = LLMProcessManager.get_instance()
-        process = getattr(llm_manager, "process", None)
-        if not process or process.poll() is not None:
-            return True
-
-        current_model = getattr(llm_manager, "current_model", None)
-        if current_model and current_model != self.model_id:
-            return True
-
-        current_session_id = getattr(llm_manager, "current_session_id", None)
-        if current_session_id and current_session_id != self.session.session_id:
-            return True
-
-        if self._is_tool_calling:
+        # Trip 2 tool continuation: KV cache from Trip 1 is still live
+        if self._is_tool_calling and not self._tool_response_received:
             return False
-
-        if self.inject_summary:
-            return True
-
-        if self.force_rebuild:
-            return True
-
-        previous_event = self.session.get_last_completed_event()
-        if not previous_event:
-            return True
-
-        return previous_event.model_id != self.model_id
+        # All other cases: always rebuild from clean KV cache
+        return True
 
     def _cap_cache_usage_tokens(self, started_from_clean_kv: Optional[bool] = None) -> float:
         """
@@ -529,6 +503,18 @@ class TextConversationEvent(ConversationEvent):
                 self.assistant_message = response_content
                 logger.info(f"Event {self.event_id}: Turn completed successfully")
 
+                # Post-turn processing for non-streaming complete turns.
+                # Reset KV cache after inference, then run eviction/summarization/facts.
+                # This runs synchronously here (before returning) so the session is
+                # fully prepared for the next turn before the DSP lock is released.
+                self._reset_handle()
+                try:
+                    await self._post_turn_processing()
+                except Exception as _ptp_err:
+                    logger.error(
+                        f"Event {self.event_id}: post-turn processing error (non-streaming): {_ptp_err}"
+                    )
+
                 return {
                     "response": response_content,
                     "finish_reason": "stop",
@@ -857,9 +843,43 @@ class TextConversationEvent(ConversationEvent):
                                 logger.error(f"Event {self.event_id}: Error terminating handle on unexpected exit: {_term_err}")
                         self.fail_turn(stream_failure or Exception("Stream aborted or failed"))
 
-                # *** KEY CHANGE: Release DSP lock HERE (in inference producer), not in network generator ***
-                # This ensures the lock is released as soon as inference is done,
-                # regardless of how fast the client reads the HTTP stream.
+                # ── Post-turn processing (while DSP lock is still held) ────────
+                # Run eviction, summarization, and fact extraction BEFORE releasing
+                # the DSP lock. This ensures the next turn's prompt is fully
+                # prepared (summary + facts updated) before the lock is released.
+                # Only runs for complete turns (not tool call Trip 1, not cancelled).
+                if (stream_outcome == "success"
+                        and not self._is_tool_calling
+                        and not self.is_cancelled):
+                    # Reset KV cache after user turn inference (universal reset)
+                    self._reset_handle()
+                    # Run post-turn memory management.
+                    # asyncio.shield() prevents client disconnection from
+                    # interrupting _post_turn_processing() mid-execution.
+                    # Without shielding, a client disconnect cancels the
+                    # producer_task while the summary/facts inference is running,
+                    # leaving the subprocess in an inconsistent state and causing
+                    # the next request to hang on "Waiting for eager background
+                    # RESET to complete...".
+                    try:
+                        await asyncio.shield(self._post_turn_processing())
+                    except asyncio.CancelledError:
+                        # Client disconnected during post-turn processing.
+                        # _post_turn_processing() is shielded and will complete
+                        # independently. Suppress the CancelledError so the
+                        # finally block can fire the completion callback cleanly.
+                        logger.info(
+                            f"Event {self.event_id}: client disconnected during "
+                            "post-turn processing — shielded task will complete independently"
+                        )
+                    except Exception as _ptp_err:
+                        logger.error(
+                            f"Event {self.event_id}: post-turn processing error: {_ptp_err}"
+                        )
+
+                # ── Release DSP lock ──────────────────────────────────────────
+                # Fires AFTER post-turn processing so the next request sees
+                # updated summary and facts immediately.
                 if self._completion_callback:
                     logger.info(f"Event {self.event_id}: Triggering completion callback from inference producer")
                     try:
@@ -1005,8 +1025,18 @@ class TextConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Turn completed after tool calling")
 
-            # Explicitly trigger completion callback to release DSP lock
-            # because tool continuation bypasses the streaming generator
+            # Post-turn processing for tool continuation complete turns.
+            # Reset KV cache after Trip 2 inference, then run eviction/summarization/facts.
+            # This runs before releasing the DSP lock so the next turn is fully prepared.
+            self._reset_handle()
+            try:
+                await self._post_turn_processing()
+            except Exception as _ptp_err:
+                logger.error(
+                    f"Event {self.event_id}: post-turn processing error (tool continuation): {_ptp_err}"
+                )
+
+            # Release DSP lock after post-turn processing completes
             if self._completion_callback:
                 try:
                     await self._completion_callback(self.event_id, EventState.COMPLETED)
@@ -1033,39 +1063,89 @@ class TextConversationEvent(ConversationEvent):
         except Exception as e:
             return await self._handle_error(e, request_data)
 
-    async def generate_summary(self, max_summary_tokens: int, messages_to_summarize: Optional[list] = None, include_history_in_prompt: bool = True) -> tuple:
-        """Generate a summary of the conversation using LLMProcessManager."""
+    async def generate_summary(
+        self,
+        max_summary_tokens: int,
+        messages_to_summarize: Optional[list] = None,
+        include_history_in_prompt: bool = True,
+    ) -> tuple:
+        """
+        Generate a structured summary of the conversation using LLMProcessManager.
 
-        source_messages = messages_to_summarize if messages_to_summarize is not None else self.session.messages
-        relevant_messages = [msg for msg in source_messages if msg.get('role', '') != 'tool']
+        Improvements over the previous implementation:
+        - Removed the 4-message cap: summarizes the full eviction batch
+        - Uses a structured prompt that preserves facts, tasks, key exchanges,
+          and open items — not just a generic narrative recap
+        - Prepends prior summary for continuity (accumulated rolling summary)
+        - Token-budget-aware: limits input to 50% of context window
 
-        if len(relevant_messages) > 4:
-            relevant_messages = relevant_messages[-4:]
+        Args:
+            max_summary_tokens:      Maximum tokens for the generated summary.
+            messages_to_summarize:   Messages to summarize. Defaults to session.messages.
+            include_history_in_prompt: Legacy parameter, kept for call-site compat.
 
-        context_parts = []
+        Returns:
+            Tuple of (summary_text, summary_token_count).
+        """
+        from openapi_server.impl.constant import STRUCTURED_SUMMARY_PROMPT
+
+        source_messages = (
+            messages_to_summarize
+            if messages_to_summarize is not None
+            else self.session.messages
+        )
+        # Exclude tool messages — they are verbose and rarely useful in summaries
+        relevant_messages = [
+            msg for msg in source_messages if msg.get('role', '') != 'tool'
+        ]
+
+        if not relevant_messages:
+            return "", 0
+
+        # If a prior summary exists, prepend it so the new summary is a
+        # continuation rather than an independent snapshot of the batch.
+        if getattr(self.session, 'summary_content', None):
+            prior_summary_msg = {
+                "role": "system",
+                "content": f"[Prior summary: {self.session.summary_content}]",
+            }
+            relevant_messages = [prior_summary_msg] + relevant_messages
+
+        # Build conversation text, token-budget-aware.
+        # Limit input to 50% of context to leave room for the summary prompt itself.
+        input_budget = int(self.context_size * 0.5)
+        conversation_parts = []
+        accumulated = 0
         for msg in relevant_messages:
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-
-            content_text = content if isinstance(content, str) else ' '.join(i.get('text', '') for i in content if isinstance(i, dict) and i.get('type') == 'text')
+            role = msg.get('role', '').capitalize()
+            content = msg.get('content', '') or ''
+            if isinstance(content, list):
+                content = ' '.join(
+                    i.get('text', '') for i in content
+                    if isinstance(i, dict) and i.get('type') == 'text'
+                )
             tool_call_text = " [Tool Calls]" if msg.get('tool_calls') else ""
+            line = f"{role}: {content}{tool_call_text}"
+            line_tokens = TokenCounter.estimate_tokens(line)
+            if accumulated + line_tokens > input_budget:
+                break
+            conversation_parts.append(line)
+            accumulated += line_tokens
 
-            if content_text or tool_call_text:
-                context_parts.append(f"{role.capitalize()}: {content_text}{tool_call_text}")
+        if not conversation_parts:
+            return "", 0
 
-        summary_prompt = (
-            f"Below is a conversation that needs to be summarized:\n\n{chr(10).join(context_parts)}\n\n"
-            f"Please provide a concise summary of the conversation above. The summary should be no more than {max_summary_tokens} tokens. "
-            "Focus on the key points and maintain chronological order."
-        ) if include_history_in_prompt else (
-            f"Please provide a concise summary of the conversation above. The summary should be no more than {max_summary_tokens} tokens. Focus on the key points."
+        conversation_text = "\n".join(conversation_parts)
+        summary_prompt = STRUCTURED_SUMMARY_PROMPT.format(
+            max_tokens=max_summary_tokens,
+            conversation=conversation_text,
         )
 
         formatted_prompt = CommonUtils.build_chat_prompt(
             model_id=self.model_id,
             messages=[{"role": "user", "content": summary_prompt}],
             include_assistant_prefix=True,
-            has_vision=False
+            has_vision=False,
         )
 
         llm_manager = LLMProcessManager.get_instance()
@@ -1078,15 +1158,232 @@ class TextConversationEvent(ConversationEvent):
             prompt=formatted_prompt,
             streaming=False,
             max_tokens=max_summary_tokens,
-            temperature=0.3
+            temperature=0.3,
         ):
             accumulated_tokens.append(token)
 
-        summary_text = "".join(accumulated_tokens)
+        summary_text = "".join(accumulated_tokens).strip()
         summary_tokens = TokenCounter.estimate_tokens(summary_text)
 
-        logger.info(f"Generated summary: {len(summary_text)} chars, {summary_tokens} tokens")
+        logger.info(
+            f"Event {self.event_id}: summary generated — "
+            f"{len(relevant_messages)} messages → {summary_tokens} tokens"
+        )
         return summary_text, summary_tokens
+
+    async def _extract_facts(self, messages_to_extract: list) -> None:
+        """
+        Extract persistent facts from a batch of messages using the LLM.
+
+        Called as part of post-turn processing after an eviction batch has been
+        summarized. Updates session.facts with newly extracted key-value pairs.
+
+        The LLM is asked to return a JSON object of short string key-value pairs
+        representing persistent facts (names, goals, decisions, constraints, etc.).
+        New facts override existing ones for the same key; keys are never deleted.
+
+        Args:
+            messages_to_extract: Messages to extract facts from (eviction batch).
+        """
+        import re as _re
+        from openapi_server.impl.constant import FACT_EXTRACTION_PROMPT, SLOT_FACTS_CEILING
+
+        relevant = [
+            msg for msg in messages_to_extract
+            if msg.get('role') in ('user', 'assistant')
+        ]
+        if not relevant:
+            return
+
+        # Build conversation text for the extraction prompt
+        conversation_parts = []
+        for msg in relevant:
+            role = msg.get('role', '').capitalize()
+            content = msg.get('content', '') or ''
+            if isinstance(content, list):
+                content = ' '.join(
+                    i.get('text', '') for i in content
+                    if isinstance(i, dict) and i.get('type') == 'text'
+                )
+            if content:
+                conversation_parts.append(f"{role}: {content}")
+
+        if not conversation_parts:
+            return
+
+        prompt_text = FACT_EXTRACTION_PROMPT.format(
+            conversation="\n".join(conversation_parts)
+        )
+
+        formatted_prompt = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=[{"role": "user", "content": prompt_text}],
+            include_assistant_prefix=True,
+            has_vision=False,
+        )
+
+        llm_manager = LLMProcessManager.get_instance()
+        tokens = []
+
+        async for token in llm_manager.execute_request(
+            event_id=f"{self.event_id}-facts",
+            session_id=self.session.session_id,
+            model=self.model_id,
+            prompt=formatted_prompt,
+            streaming=False,
+            max_tokens=150,
+            temperature=0.0,
+        ):
+            tokens.append(token)
+
+        raw = "".join(tokens).strip()
+
+        # Parse JSON from the response (model may add surrounding text)
+        new_facts = {}
+        try:
+            new_facts = json.loads(raw)
+        except json.JSONDecodeError:
+            match = _re.search(r'\{[^{}]*\}', raw, _re.DOTALL)
+            if match:
+                try:
+                    new_facts = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if new_facts and isinstance(new_facts, dict):
+            turn_number = len(self.session.events)
+            self.session.update_facts(new_facts, turn_number)
+            self.session.enforce_facts_ceiling(SLOT_FACTS_CEILING)
+            logger.info(
+                f"Event {self.event_id}: extracted {len(new_facts)} facts "
+                f"({len(self.session.facts)} total in store)"
+            )
+        else:
+            logger.debug(f"Event {self.event_id}: no facts extracted from batch")
+
+    async def _post_turn_processing(self) -> None:
+        """
+        Post-turn memory management: eviction, summarization, and fact extraction.
+
+        Called after every complete turn (not tool continuations) while the DSP
+        lock is still held. This ensures the next turn's prompt is fully prepared
+        before the lock is released.
+
+        Sequence:
+          1. Compute history token usage (includes the just-completed turn)
+          2. If over eviction threshold: identify oldest messages to evict
+          3. Mark eviction batch in session (excluded from next turn's history queue)
+          4. Summarize eviction batch → update session.summary_content
+          5. Reset KV cache after summarization inference
+          6. Extract facts from eviction batch → update session.facts
+          7. Reset KV cache after fact extraction inference
+          8. Clear eviction batch (messages now represented by summary)
+        """
+        from openapi_server.impl.constant import (
+            HISTORY_EVICTION_THRESHOLD,
+            HISTORY_EVICTION_TARGET,
+            MAX_COMPLETION_SAFETY_MARGIN,
+        )
+
+        try:
+            # Compute slot ceilings proportional to context size so that small-context
+            # models (e.g. 2048 tokens) still have a non-zero history budget.
+            # Each slot is capped at its absolute ceiling but also at a fraction of
+            # the available input budget to prevent fixed overheads from consuming
+            # the entire context on small models.
+            output_reserve = int(self.context_size * 0.5)
+            input_budget = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
+
+            # Slot fractions: system=12%, tools=14%, facts=14%, summary=20% of input budget
+            # These fractions sum to 60%, leaving 40% for history.
+            slot_system  = min(int(input_budget * 0.12), 256)
+            slot_tools   = min(int(input_budget * 0.14), 300)
+            slot_facts   = min(int(input_budget * 0.14), 300)
+            slot_summary = min(int(input_budget * 0.20), 400)
+
+            fixed_overhead = slot_system + slot_tools + slot_facts + slot_summary
+            history_budget = max(input_budget - fixed_overhead, 0)
+
+            logger.debug(
+                f"Event {self.event_id}: post-turn budget — "
+                f"context={self.context_size}, input={input_budget}, "
+                f"fixed={fixed_overhead} (sys={slot_system} tools={slot_tools} "
+                f"facts={slot_facts} summary={slot_summary}), "
+                f"history={history_budget}"
+            )
+
+            # Get all post-summary messages (excludes eviction batch and system msgs)
+            history_messages = self.session.get_post_summary_messages()
+            if not history_messages:
+                return
+
+            current_tokens = sum(
+                TokenCounter.estimate_tokens_for_multimodal_content(m.get('content', '')) + 4
+                for m in history_messages
+            )
+
+            if current_tokens <= history_budget * HISTORY_EVICTION_THRESHOLD:
+                logger.debug(
+                    f"Event {self.event_id}: post-turn — no eviction needed "
+                    f"({current_tokens}/{history_budget} tokens, "
+                    f"threshold={HISTORY_EVICTION_THRESHOLD:.0%})"
+                )
+                return
+
+            # Identify eviction batch: remove oldest messages until under target
+            target_tokens = int(history_budget * HISTORY_EVICTION_TARGET)
+            eviction_batch = []
+            remaining = list(history_messages)
+
+            while remaining and current_tokens > target_tokens:
+                msg = remaining.pop(0)
+                msg_tokens = (
+                    TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+                    + 4
+                )
+                eviction_batch.append(msg)
+                current_tokens -= msg_tokens
+
+            if not eviction_batch:
+                return
+
+            logger.info(
+                f"Event {self.event_id}: post-turn eviction — "
+                f"{len(eviction_batch)} messages evicted, "
+                f"target={target_tokens} tokens"
+            )
+
+            # Mark eviction batch in session so next turn's history queue excludes them
+            self.session.eviction_batch = eviction_batch
+
+            # Summarize eviction batch.
+            # execute_request() inside generate_summary() handles the KV cache reset
+            # via the eager background reset mechanism — no explicit _reset_handle()
+            # call is needed here (it would cause a double reset).
+            summary_text, summary_tokens = await self.generate_summary(
+                max_summary_tokens=slot_summary,
+                messages_to_summarize=eviction_batch,
+            )
+            if summary_text:
+                self.session.summary_content = summary_text
+                self.session.summary_token_count = summary_tokens
+                self.summarization_performed = True
+                logger.info(
+                    f"Event {self.event_id}: post-turn summary updated "
+                    f"({summary_tokens} tokens)"
+                )
+
+            # Extract facts from eviction batch.
+            # Same: execute_request() inside _extract_facts() handles the reset.
+            await self._extract_facts(eviction_batch)
+
+            # Clear eviction batch — messages are now represented by the summary
+            self.session.eviction_batch = []
+
+        except Exception as e:
+            logger.error(f"Event {self.event_id}: post-turn processing failed: {e}")
+            # Always clear eviction batch on failure to avoid stale exclusions
+            self.session.eviction_batch = []
 
     async def _handle_error(self, error: Exception, request_data) -> dict:
         """

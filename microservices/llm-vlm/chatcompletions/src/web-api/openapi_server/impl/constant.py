@@ -28,6 +28,43 @@ SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD = 1.3  # 1.3x multiplier for system prompt 
 # Max completion tokens multiplier: Reduces weight of max_completion_tokens
 SUMMARIZATION_MAX_COMPLETION_MULTIPLIER = 0.5  # 50% weight for max_completion tokens
 
+# ── Prompt slot ceilings (tokens) ─────────────────────────────────────────────
+# Hard token ceilings for each named slot in the assembled prompt.
+# These ensure no single slot can crowd out the history queue.
+SLOT_SYSTEM_CEILING        = int(os.getenv("SLOT_SYSTEM_CEILING", "256"))
+SLOT_TOOLS_CEILING         = int(os.getenv("SLOT_TOOLS_CEILING", "300"))
+SLOT_FACTS_CEILING         = int(os.getenv("SLOT_FACTS_CEILING", "300"))
+SLOT_SUMMARY_CEILING       = int(os.getenv("SLOT_SUMMARY_CEILING", "400"))
+
+# ── Post-turn processing (eviction) ───────────────────────────────────────────
+# Trigger eviction when history token usage exceeds this fraction of history budget
+HISTORY_EVICTION_THRESHOLD = float(os.getenv("HISTORY_EVICTION_THRESHOLD", "0.85"))
+# Target usage after eviction (fraction of history budget)
+HISTORY_EVICTION_TARGET    = float(os.getenv("HISTORY_EVICTION_TARGET", "0.75"))
+
+# ── Structured summarization prompt ───────────────────────────────────────────
+STRUCTURED_SUMMARY_PROMPT = (
+    "Summarize this conversation. Your summary will be used as context for future turns.\n"
+    "Preserve:\n"
+    "1. FACTS: Names, preferences, constraints, decisions\n"
+    "2. TASK: What the user is trying to accomplish\n"
+    "3. KEY EXCHANGES: Important questions asked and answers given\n"
+    "4. OPEN ITEMS: Unresolved topics\n\n"
+    "Write a compact paragraph. Maximum {max_tokens} tokens.\n\n"
+    "Conversation:\n{conversation}\n\nSummary:"
+)
+
+# ── Fact extraction prompt ─────────────────────────────────────────────────────
+# NOTE: {{}} is escaped braces — produces literal {} in the formatted string.
+FACT_EXTRACTION_PROMPT = (
+    "Extract persistent facts from this conversation. "
+    "Return ONLY a JSON object with short string keys and values.\n"
+    "Include: names, goals, decisions, constraints, preferences, current state.\n"
+    "If a fact was established then contradicted, keep only the latest value.\n"
+    "If no facts found, return {{}}.\n\n"
+    "Conversation:\n{conversation}\n\nJSON:"
+)
+
 # --- Max completion tokens cap (context overflow prevention) ---
 # Safety margin subtracted from the hard cap to absorb estimator error,
 # BOS/EOS markers, and chat template overhead not explicitly tracked.

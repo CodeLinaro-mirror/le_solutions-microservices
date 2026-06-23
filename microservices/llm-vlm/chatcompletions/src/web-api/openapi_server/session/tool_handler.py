@@ -16,55 +16,97 @@ logger = LoggerConfig.get_logger(__name__)
 
 class ToolHandler:
     @staticmethod
-    def format_tools_for_prompt(tools: List[ChatCompletionTool]) -> str:
+    def format_tools_for_prompt(
+        tools: List[ChatCompletionTool],
+        ceiling_tokens: int = None,
+    ) -> str:
         """
-        Convert tools to a text format that the model can understand.
-        Creates instructions for the LLM on how to use tools.
+        Convert tools to a compact text format the model can understand.
+
+        Uses a three-level truncation strategy to stay within ceiling_tokens:
+          Level 1: Compact signature format with parameter descriptions (~35-60 tokens/tool)
+          Level 2: Compact format without parameter descriptions, truncated function descriptions
+          Level 3: Drop tools from end of list until under ceiling
 
         Args:
             tools: List of ChatCompletionTool objects
+            ceiling_tokens: Hard token ceiling for the entire tools block.
+                           Defaults to SLOT_TOOLS_CEILING from constants.
 
         Returns:
-            Formatted string describing the tools and usage instructions
+            Formatted string describing the tools and usage instructions,
+            guaranteed to be within ceiling_tokens.
         """
         if not tools:
             return ""
 
-        tools_text = "\n\n--- TOOL USAGE GUIDELINES ---\n\n"
-        tools_text += "IMPORTANT: You can ONLY use the tools explicitly listed below. "
-        tools_text += "If no relevant tool is available for the user's request, respond with text instead of calling any function. "
-        tools_text += "Do NOT output a JSON object with empty tool_calls. If no tool is needed, simply output the plain text response. "
-        tools_text += "Never invent or hallucinate function names that are not in the tools list. "
-        tools_text += "If the available tools cannot directly help with the user request, do not call any tool and reply with plain text instead.\n"
+        from openapi_server.impl.constant import SLOT_TOOLS_CEILING
+        from openapi_server.session.token_counter import TokenCounter
+        ceiling = ceiling_tokens if ceiling_tokens is not None else SLOT_TOOLS_CEILING
 
-        tools_text += "\n--- AVAILABLE TOOLS ---\n\n"
-        tools_text += (
-            "You have access to the following tools. To use a tool, respond with a JSON object in this exact format:\n\n"
+        # Fixed header: usage instructions (always included)
+        header = (
+            "\n\n--- TOOLS ---\n"
+            "To call a tool, respond with JSON:\n"
+            '{"tool_calls": [{"type": "function", "function": {"name": "...", "arguments": {...}}}]}\n'
+            "Only call tools from the list below. If no tool is needed, respond with plain text.\n\n"
         )
-        tools_text += (
-            '{\n  "tool_calls": [{\n    "type": "function",\n    "function": {\n      "name": "tool_name",\n'
-            '      "arguments": {\n        "param": "value"\n      }\n    }\n  }]\n}\n\n'
-        )
-        tools_text += "Available tools:\n\n"
 
-        for i, tool in enumerate(tools, 1):
-            func = tool.function
-            tools_text += f"{i}. {func.name}\n"
+        def _build_signature(func, include_param_desc: bool) -> str:
+            """Build compact function signature: name(param*: type, ...) → description"""
+            params = func.parameters or {}
+            props = params.get("properties", {}) if isinstance(params, dict) else {}
+            required = params.get("required", []) if isinstance(params, dict) else []
+            sig_parts = []
+            for pname, pdef in props.items():
+                ptype = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
+                marker = "*" if pname in required else ""
+                if include_param_desc and isinstance(pdef, dict):
+                    pdesc = pdef.get("description", "")
+                    if pdesc:
+                        sig_parts.append(f"{pname}{marker}: {ptype} ({pdesc[:40]})")
+                        continue
+                sig_parts.append(f"{pname}{marker}: {ptype}")
+            return f"{func.name}({', '.join(sig_parts)})"
 
-            if func.description:
-                tools_text += f"   Description: {func.description}\n"
+        def _render(tool_list: list, include_param_desc: bool, truncate_desc: bool) -> str:
+            lines = []
+            for tool in tool_list:
+                func = tool.function
+                sig = _build_signature(func, include_param_desc)
+                desc = func.description or ""
+                if truncate_desc and len(desc) > 60:
+                    desc = desc[:57] + "..."
+                lines.append(f"- {sig} → {desc}")
+            return header + "\n".join(lines)
 
-            if func.parameters:
-                try:
-                    params_str = json.dumps(func.parameters, indent=2)
-                    tools_text += f"   Parameters: {params_str}\n"
-                except Exception as e:
-                    logger.warning(f"Failed to format parameters for {func.name}: {e}")
-                    tools_text += f"   Parameters: {func.parameters}\n"
+        # Level 1: compact with parameter descriptions
+        text = _render(list(tools), include_param_desc=True, truncate_desc=False)
+        if TokenCounter.estimate_tokens(text) <= ceiling:
+            return text
 
-            tools_text += "\n"
+        # Level 2: compact without parameter descriptions, truncated function descriptions
+        text = _render(list(tools), include_param_desc=False, truncate_desc=True)
+        if TokenCounter.estimate_tokens(text) <= ceiling:
+            return text
 
-        return tools_text
+        # Level 3: drop tools from end until under ceiling
+        tool_list = list(tools)
+        while tool_list:
+            text = _render(tool_list, include_param_desc=False, truncate_desc=True)
+            if TokenCounter.estimate_tokens(text) <= ceiling:
+                if len(tool_list) < len(tools):
+                    dropped_names = [t.function.name for t in tools[len(tool_list):]]
+                    logger.warning(
+                        f"Tool instructions exceed budget ({ceiling} tokens): "
+                        f"dropped tools {dropped_names}"
+                    )
+                return text
+            tool_list.pop()
+
+        # Fallback: header only (no tools fit)
+        logger.warning(f"No tools fit within budget ({ceiling} tokens): returning header only")
+        return header
 
     def inject_tool_instructions(messages: List[Any], tools: List[ChatCompletionTool]) -> List[Any]:
         """

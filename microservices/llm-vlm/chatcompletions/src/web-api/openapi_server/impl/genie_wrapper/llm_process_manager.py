@@ -156,19 +156,23 @@ class LLMProcessManager(InferenceProcessManager):
                 async for token in self._execute_request_internal(event_id, execute_cmd):
                     yield token
             finally:
-                from openapi_server.impl.constant import ADHOC_MODE
-                if ADHOC_MODE:
-                    logger.info("ADHOC_MODE: Launching eager background RESET task to hide latency for next request")
+                # Universal reset: schedule an eager background KV cache reset after
+                # every inference (not just ADHOC_MODE). The reset runs concurrently
+                # with post-turn processing in TextConversationEvent, which calls
+                # _reset_handle() explicitly at the right points. This background task
+                # acts as a safety net for paths that don't go through post-turn
+                # processing (e.g. error paths, tool call Trip 1).
+                logger.debug("Launching eager background RESET after inference")
 
-                    async def _eager_reset_safe():
-                        try:
-                            await asyncio.to_thread(self._send_reset_and_wait)
-                            self._just_eager_reset = True
-                        except Exception as e:
-                            # Socket may already be closed (e.g. process was force-killed due to
-                            # client cancellation).  This is expected and not an error — the next
-                            # call to _ensure_process_running will start a fresh process and reset.
-                            logger.debug(f"ADHOC_MODE: Eager background RESET skipped (process gone): {e}")
-                            self._just_eager_reset = False
+                async def _eager_reset_safe():
+                    try:
+                        await asyncio.to_thread(self._send_reset_and_wait)
+                        self._just_eager_reset = True
+                    except Exception as e:
+                        # Socket may already be closed (e.g. process was force-killed due to
+                        # client cancellation). This is expected and not an error — the next
+                        # call to _ensure_process_running will start a fresh process and reset.
+                        logger.debug(f"Eager background RESET skipped (process gone): {e}")
+                        self._just_eager_reset = False
 
-                    self._eager_reset_task = asyncio.create_task(_eager_reset_safe())
+                self._eager_reset_task = asyncio.create_task(_eager_reset_safe())
