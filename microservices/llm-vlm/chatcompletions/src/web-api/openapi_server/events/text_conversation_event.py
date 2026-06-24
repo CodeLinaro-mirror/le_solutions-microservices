@@ -58,6 +58,7 @@ class TextConversationEvent(ConversationEvent):
 
         # Flag to track if we need to inject summary
         self.inject_summary = False
+        self.force_rebuild = False
 
         # Retry configuration
         self.retry_count = 0
@@ -102,6 +103,9 @@ class TextConversationEvent(ConversationEvent):
             return False
 
         if self.inject_summary:
+            return True
+
+        if self.force_rebuild:
             return True
 
         previous_event = self.session.get_last_completed_event()
@@ -429,6 +433,7 @@ class TextConversationEvent(ConversationEvent):
                 request_data=request_data,
                 handle_borrowed=getattr(self, 'handle_borrowed', False),
                 inject_summary=self.inject_summary,
+                rebuild_with_history=self.force_rebuild,
                 is_tool_calling=self._is_tool_calling,
                 tool_response_received=self._tool_response_received,
                 include_tools=True
@@ -939,10 +944,15 @@ class TextConversationEvent(ConversationEvent):
             # Build Prompt
             import copy
             context_messages = copy.deepcopy(self.session.get_event_messages(self))
+            system_message = TextEventHelpers._build_effective_system_message(
+                self.session,
+                include_summary=False
+            )
+            if system_message:
+                context_messages.insert(0, system_message)
 
             if hasattr(request_data, 'tools') and request_data.tools:
-                if any(m.get('role') == 'system' for m in context_messages):
-                    context_messages = ToolHandler.inject_tool_instructions(context_messages, request_data.tools)
+                context_messages = ToolHandler.inject_tool_instructions(context_messages, request_data.tools)
 
             # Filter existing tools and append new result
             prompt_messages = [msg for msg in context_messages if msg.get('role', '') != 'tool']

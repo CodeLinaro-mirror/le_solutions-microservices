@@ -7,9 +7,7 @@ Each session has a stable chat completion ID and stores messages in OpenAI forma
 Events reference indices into the shared message history.
 """
 
-import json
-import hashlib
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from openapi_server.events.conversation_event import ConversationEvent, EventType
@@ -79,6 +77,79 @@ class ConversationSession:
 
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
 
+    @staticmethod
+    def _message_value(message: Any, key: str, default=None):
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return getattr(message, key, default)
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text' or 'text' in item:
+                        text = item.get('text', '')
+                        if text is not None:
+                            parts.append(text if isinstance(text, str) else str(text))
+                    elif item:
+                        parts.append(str(item))
+                    continue
+
+                text = getattr(item, 'text', None)
+                parts.append(str(text) if text is not None else str(item))
+
+            return "\n".join(part for part in parts if part)
+
+        return str(content)
+
+    @classmethod
+    def get_leading_system_prompt(cls, messages: List[Dict]) -> str:
+        """Return the leading request system prompt, if present."""
+        if not messages:
+            return ""
+
+        first_message = messages[0]
+        if cls._message_value(first_message, 'role') != 'system':
+            return ""
+
+        return cls._content_to_text(cls._message_value(first_message, 'content', ''))
+
+    def _set_system_prompt_content(self, content: Any) -> None:
+        from openapi_server.session.token_counter import TokenCounter
+
+        self.system_prompt_content = self._content_to_text(content)
+        self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
+        logger.info(
+            f"Session {self.session_id}: System prompt updated "
+            f"({self.system_prompt_tokens} tokens)"
+        )
+
+    def sync_system_prompt_from_request(self, messages: List[Dict]) -> bool:
+        """
+        Update the active session system prompt from the latest request.
+
+        Only the leading request system prompt is considered active.
+        Requests without a leading system prompt leave the current session
+        prompt intact.
+        """
+        request_system_prompt = self.get_leading_system_prompt(messages)
+        if not request_system_prompt:
+            return False
+
+        if request_system_prompt == self.system_prompt_content:
+            return False
+
+        self._set_system_prompt_content(request_system_prompt)
+        return True
+
     def add_message(self, message: Dict, compact_images: bool = True) -> int:
         """
         Add a message to the shared history.
@@ -90,14 +161,6 @@ class ConversationSession:
         Returns:
             Index of the added message
         """
-        # Track system prompt tokens for new summarization formula
-        if message.get('role') == 'system':
-            from openapi_server.session.token_counter import TokenCounter
-            content = message.get('content', '')
-            self.system_prompt_content = content if isinstance(content, str) else str(content)
-            self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
-            logger.info(f"Session {self.session_id}: System prompt updated ({self.system_prompt_tokens} tokens)")
-
         self.messages.append(message)
         if compact_images and self._message_contains_base64_image(message):
             self._compact_historical_base64_images()

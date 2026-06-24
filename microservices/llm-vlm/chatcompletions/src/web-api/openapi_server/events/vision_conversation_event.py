@@ -63,8 +63,18 @@ class VisionConversationEvent(ConversationEvent):
             # Build raw_json from session messages for VLM handler
             # The VLM handler needs this to extract images and text
             # IMPORTANT: Pass session_id so VLM responses use the correct chat completion ID
+            raw_messages = [
+                msg for msg in self.session.messages
+                if msg.get('role') != 'system'
+            ]
+            if self.session.system_prompt_content:
+                raw_messages.insert(0, {
+                    'role': 'system',
+                    'content': self.session.system_prompt_content,
+                })
+
             raw_json = {
-                'messages': self.session.messages,
+                'messages': raw_messages,
                 'model': self.model_id,
                 'stream': getattr(request_data, 'stream', False),
                 'max_completion_tokens': getattr(request_data, 'max_completion_tokens', None),

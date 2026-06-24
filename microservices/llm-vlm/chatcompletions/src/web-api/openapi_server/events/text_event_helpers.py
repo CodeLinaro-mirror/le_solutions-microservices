@@ -26,6 +26,7 @@ class TextEventHelpers:
         request_data,
         handle_borrowed: bool = False,
         inject_summary: bool = False,
+        rebuild_with_history: bool = False,
         is_tool_calling: bool = False,
         tool_response_received: bool = False,
         include_tools: bool = True,
@@ -41,6 +42,7 @@ class TextEventHelpers:
             request_data: Request data with messages and parameters
             handle_borrowed: Whether handle was borrowed from previous event
             inject_summary: Whether to inject summary after reset
+            rebuild_with_history: Whether to rebuild prompt with prior history
             is_tool_calling: Whether currently in tool calling state
             tool_response_received: Whether tool response was received
             include_tools: Whether to include tool instructions
@@ -106,27 +108,36 @@ class TextEventHelpers:
             # NON-ADHOC MODE: Rely on persistent KV cache
             # Only send new messages since KV cache has previous context
 
-            if inject_summary or not handle_borrowed:
+            if rebuild_with_history:
+                logger.info(f"Event {event_id}: Non-ADHOC mode - rebuilding full history after prompt reset")
+                messages_to_format = TextEventHelpers._build_context_for_adhoc_mode(
+                    event_id,
+                    model_id,
+                    session,
+                    messages_to_format,
+                    is_tool_calling,
+                    tool_response_received
+                )
+            elif inject_summary or not handle_borrowed:
                 # First turn or after reset (summarization): Include system prompt + summary + new messages
                 logger.info(f"Event {event_id}: Non-ADHOC mode - rebuilding context after reset/first turn")
 
                 rebuilt_messages = []
 
-                # 1. System Prompt (always include on first turn or after reset)
-                system_msg = TextEventHelpers._find_system_prompt(session)
+                # 1. Effective system message (prompt plus summary, if needed)
+                system_msg = TextEventHelpers._build_effective_system_message(
+                    session,
+                    include_summary=inject_summary
+                )
                 if system_msg:
                     rebuilt_messages.append(system_msg)
 
-                # 2. Summary (if available after reset)
-                if inject_summary and hasattr(session, 'summary_content') and session.summary_content:
-                    summary_msg = {
-                        "role": "system",
-                        "content": f"Previous conversation summary:\n{session.summary_content}"
-                    }
-                    rebuilt_messages.append(summary_msg)
-
-                # 3. Current Turn Messages
-                rebuilt_messages.extend(messages_to_format)
+                # 2. Current Turn Messages. System messages are already
+                # represented by the effective system message above.
+                rebuilt_messages.extend(
+                    message for message in messages_to_format
+                    if message.get('role') != 'system'
+                )
 
                 messages_to_format = rebuilt_messages
                 logger.info(f"Event {event_id}: Non-ADHOC mode - using {len(messages_to_format)} messages (system + summary + new)")
@@ -156,7 +167,7 @@ class TextEventHelpers:
         # 2. We are in ADHOC_MODE (full reset every time)
         # 3. We are injecting summary (effectively a reset)
         is_first_turn = (not session.events)
-        should_add_system = is_first_turn or ADHOC_MODE or inject_summary
+        should_add_system = is_first_turn or ADHOC_MODE or inject_summary or rebuild_with_history
 
         if not should_add_system:
             logger.info(f"Event {event_id}: Suppressing system prompt (not first turn/reset)")
@@ -174,23 +185,41 @@ class TextEventHelpers:
 
     @staticmethod
     def _find_system_prompt(session) -> Optional[Dict[str, Any]]:
-        """Find the most recent system prompt from conversation history."""
+        """Return the active session system prompt, if any."""
         if getattr(session, 'system_prompt_content', None):
             return {
                 "role": "system",
                 "content": session.system_prompt_content,
             }
+        return None
 
-        if not session.events:
+    @staticmethod
+    def _build_effective_system_message(
+        session,
+        include_summary: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build one effective system message from the active system prompt and
+        optional conversation summary.
+        """
+        parts = []
+
+        system_msg = TextEventHelpers._find_system_prompt(session)
+        if system_msg:
+            content = system_msg.get('content', '')
+            if content:
+                parts.append(content if isinstance(content, str) else str(content))
+
+        if include_summary and getattr(session, 'summary_content', None):
+            parts.append(f"Previous conversation summary:\n{session.summary_content}")
+
+        if not parts:
             return None
 
-        # Iterate backwards through events
-        for event in reversed(session.events):
-            event_msgs = session.get_event_messages(event)
-            for msg in event_msgs:
-                if msg.get('role') == 'system':
-                    return msg
-        return None
+        return {
+            "role": "system",
+            "content": "\n\n".join(parts)
+        }
 
     @staticmethod
     def _build_context_for_adhoc_mode(
@@ -230,18 +259,13 @@ class TextEventHelpers:
                 "using session-level system prompt"
             )
 
-        # System Prompt
-        system_message = TextEventHelpers._find_system_prompt(session)
+        # Effective system message: active system prompt plus summary.
+        system_message = TextEventHelpers._build_effective_system_message(
+            session,
+            include_summary=True
+        )
         if system_message:
             priority_messages.append(system_message)
-
-        # Summary
-        if session.summary_content:
-            summary_msg = {
-                "role": "system",
-                "content": f"Here is a summary of the conversation so far:\n{session.summary_content}"
-            }
-            priority_messages.append(summary_msg)
 
         # Current Turn
         priority_messages.extend(current_turn_body_messages)
@@ -274,10 +298,9 @@ class TextEventHelpers:
         events_included = 0
 
         for event in reversed(session.events):
-            # Stop if we've reached the summarization point
-            if last_summary_event and event.event_id == last_summary_event.event_id:
-                logger.info(f"Event {event_id}: Reached last summarization point at event {event.event_id}, stopping history collection")
-                break
+            reached_summary_event = (
+                last_summary_event and event.event_id == last_summary_event.event_id
+            )
 
             event_messages = session.get_event_messages(event)
 
@@ -316,15 +339,19 @@ class TextEventHelpers:
             accumulated_tokens += event_tokens
             events_included += 1
 
+            # Include the event that triggered summarization if it fits. The
+            # summary was generated before that event's assistant response.
+            if reached_summary_event:
+                logger.info(
+                    f"Event {event_id}: Included last summarization event "
+                    f"{event.event_id}, stopping older history collection"
+                )
+                break
+
         # Combine: [System] + [Summary] + [History] + [Current Turn]
         final_context = []
         if system_message:
             final_context.append(system_message)
-        if session.summary_content:
-            final_context.append({
-                "role": "system",
-                "content": f"Here is a summary of the conversation so far:\n{session.summary_content}"
-            })
 
         final_context.extend(history_messages)
         final_context.extend(current_turn_body_messages)
