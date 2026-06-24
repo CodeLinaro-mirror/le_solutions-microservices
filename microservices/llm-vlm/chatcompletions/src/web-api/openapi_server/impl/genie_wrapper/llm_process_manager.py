@@ -159,5 +159,16 @@ class LLMProcessManager(InferenceProcessManager):
                 from openapi_server.impl.constant import ADHOC_MODE
                 if ADHOC_MODE:
                     logger.info("ADHOC_MODE: Launching eager background RESET task to hide latency for next request")
-                    self._eager_reset_task = asyncio.create_task(asyncio.to_thread(self._send_reset_and_wait))
-                    self._just_eager_reset = True
+
+                    async def _eager_reset_safe():
+                        try:
+                            await asyncio.to_thread(self._send_reset_and_wait)
+                            self._just_eager_reset = True
+                        except Exception as e:
+                            # Socket may already be closed (e.g. process was force-killed due to
+                            # client cancellation).  This is expected and not an error — the next
+                            # call to _ensure_process_running will start a fresh process and reset.
+                            logger.debug(f"ADHOC_MODE: Eager background RESET skipped (process gone): {e}")
+                            self._just_eager_reset = False
+
+                    self._eager_reset_task = asyncio.create_task(_eager_reset_safe())
