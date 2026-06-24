@@ -48,6 +48,22 @@ class ChatApiImpl(BaseChatApi):
                     raise HTTPException(status_code=HttpStatusCodes.BAD_REQUEST, detail=error_message)
                 logger.debug(f"Model validation passed for: {create_chat_completion_request.model}")
 
+            # Map legacy max_tokens → max_completion_tokens for backward compatibility.
+            # The OpenAI API deprecated max_tokens in favor of max_completion_tokens.
+            # If max_completion_tokens is not set but max_tokens is, use max_tokens value
+            # so that clients using the legacy field get correct budget calculations.
+            if (
+                getattr(create_chat_completion_request, 'max_completion_tokens', None) is None
+                and getattr(create_chat_completion_request, 'max_tokens', None) is not None
+            ):
+                create_chat_completion_request.max_completion_tokens = (
+                    create_chat_completion_request.max_tokens
+                )
+                logger.debug(
+                    f"Mapped legacy max_tokens={create_chat_completion_request.max_tokens} "
+                    "→ max_completion_tokens"
+                )
+
             # FIX: Pass raw JSON to bypass Pydantic OneOf deserialization issues
             if raw_json:
                 logger.debug("Received raw JSON dict to bypass Pydantic OneOf issues")

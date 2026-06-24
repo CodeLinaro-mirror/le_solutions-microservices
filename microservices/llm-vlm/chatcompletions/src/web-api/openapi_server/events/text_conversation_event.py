@@ -53,8 +53,10 @@ class TextConversationEvent(ConversationEvent):
         config_manager = ModelConfigManager()
         self.context_size = config_manager.get_context_size(model_id)
 
-        # Determine max completion tokens fallback from context size
-        self.default_max_completion_tokens = int(self.context_size * 0.5)
+        # Default max completion tokens when the client does not specify.
+        # Capped at 50% of context_size when the client requests a larger value.
+        from openapi_server.impl.constant import DEFAULT_MAX_COMPLETION_TOKENS
+        self.default_max_completion_tokens = DEFAULT_MAX_COMPLETION_TOKENS
 
         # Flag to track if we need to inject summary
         self.inject_summary = False
@@ -112,6 +114,95 @@ class TextConversationEvent(ConversationEvent):
 
         return cached
 
+    def _check_user_query_length(
+        self,
+        current_turn_messages: list,
+        requested_max_completion: Optional[int],
+    ) -> None:
+        """
+        Pre-assembly guard: reject immediately if the user's current turn messages
+        are too large to fit in the available input budget, given the current
+        session memory state (facts, summary, system prompt).
+
+        This check fires BEFORE prompt assembly so the client gets an immediate
+        HTTP 400 with a precise, actionable message — including exactly how many
+        tokens their message is and how many tokens are available — without
+        touching the inference subprocess.
+
+        The error message includes a breakdown of what is consuming the input
+        budget (system prompt, conversation memory, summary, output reservation)
+        so the user understands why the limit is what it is.
+
+        This is particularly important for RAG use cases where large document
+        chunks are included in the user message.
+
+        Args:
+            current_turn_messages:    Messages belonging to the current turn.
+            requested_max_completion: Caller's requested max_completion_tokens.
+        """
+        from openapi_server.impl.constant import (
+            HttpStatusCodes,
+            ErrorMessages,
+            MAX_COMPLETION_SAFETY_MARGIN,
+            MIN_USEFUL_COMPLETION_TOKENS,
+            ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+        )
+
+        # Estimate current turn token cost (exclude system messages — handled separately)
+        current_turn_tokens = sum(
+            TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+            + 4  # role/separator overhead per message
+            for msg in current_turn_messages
+            if msg.get('role') != 'system'
+        )
+        if current_turn_tokens == 0:
+            return
+
+        # Compute output reservation
+        output_reserve = int(min(
+            requested_max_completion or self.default_max_completion_tokens,
+            self.context_size * 0.5,
+        ))
+        input_budget = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
+
+        # Estimate tokens consumed by fixed slots (system prompt, facts, summary)
+        system_tokens = TokenCounter.estimate_tokens(
+            getattr(self.session, 'system_prompt_content', None) or ""
+        )
+        facts_text = self.session.format_facts() if hasattr(self.session, 'format_facts') else ""
+        facts_tokens = TokenCounter.estimate_tokens(facts_text) if facts_text else 0
+        summary_tokens = TokenCounter.estimate_tokens(
+            getattr(self.session, 'summary_content', None) or ""
+        )
+
+        # Add per-message overhead for each fixed slot that is present
+        fixed_overhead = 0
+        if system_tokens > 0:
+            fixed_overhead += system_tokens + 4
+        if facts_tokens > 0:
+            fixed_overhead += facts_tokens + 4
+        if summary_tokens > 0:
+            fixed_overhead += summary_tokens + 4
+
+        # Maximum tokens available for the user's current turn message
+        max_query_tokens = max(0, input_budget - fixed_overhead - MIN_USEFUL_COMPLETION_TOKENS)
+
+        if current_turn_tokens > max_query_tokens:
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail={
+                    "message": ErrorMessages.USER_QUERY_TOO_LONG.format(
+                        query_tokens=current_turn_tokens,
+                        max_query_tokens=max_query_tokens,
+                        context_size=self.context_size,
+                        output_tokens=output_reserve,
+                    ),
+                    "type": "invalid_request_error",
+                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                    "param": "messages",
+                },
+            )
+
     def _resolve_max_completion_tokens(self, request_data, prompt_content: str):
         """
         Validate max_completion_tokens against the computed cap. Raises 400 on
@@ -124,14 +215,24 @@ class TextConversationEvent(ConversationEvent):
             ErrorMessages,
             MIN_USEFUL_COMPLETION_TOKENS,
             MAX_COMPLETION_SAFETY_MARGIN,
+            TOKEN_ESTIMATION_BUFFER_RATIO,
             ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
         )
 
         started_from_clean_kv = self._is_rebuild_path()
         prompt_tokens = TokenCounter.estimate_tokens(prompt_content or "")
         cached_context_tokens = self._cap_cache_usage_tokens(started_from_clean_kv)
+
+        # Add a configurable estimation buffer (default 10%) to account for the
+        # discrepancy between the character-based heuristic and the actual tokenizer.
+        # Without this buffer, prompts that are slightly over the context window may
+        # pass the check (because the heuristic underestimates for dense content such
+        # as code, JSON, or non-English text) and cause silent truncation.
+        estimation_buffer = int(prompt_tokens * TOKEN_ESTIMATION_BUFFER_RATIO)
+
         cap = max(int(
-            self.context_size - cached_context_tokens - prompt_tokens - MAX_COMPLETION_SAFETY_MARGIN
+            self.context_size - cached_context_tokens - prompt_tokens
+            - MAX_COMPLETION_SAFETY_MARGIN - estimation_buffer
         ), 0)
 
         logger.info(
@@ -352,6 +453,19 @@ class TextConversationEvent(ConversationEvent):
                         prior_session_messages.append(copy.deepcopy(msg))
                     if prior_session_messages:
                         adhoc_summary_messages = prior_session_messages
+
+                # Pre-assembly user query length guard.
+                # Reject immediately if the current turn messages are too large
+                # to fit in the available input budget given the current session
+                # memory state (facts, summary, system prompt). This fires before
+                # prompt assembly and subprocess interaction, giving the client a
+                # precise HTTP 400 with the exact token limit and a breakdown of
+                # what is consuming the budget.
+                self._check_user_query_length(
+                    current_conversation_messages,
+                    requested_max_completion,
+                )
+
             # 1. Summarization Check
             if not self._is_tool_calling and not self._tool_response_received:
                 max_completion_target = requested_max_completion or self.default_max_completion_tokens
