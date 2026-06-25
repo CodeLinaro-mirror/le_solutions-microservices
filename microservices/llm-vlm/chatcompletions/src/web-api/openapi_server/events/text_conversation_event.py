@@ -743,12 +743,14 @@ class TextConversationEvent(ConversationEvent):
                     completion_tokens += 1
                     full_response_content.append(token)
 
-                    # Tool call detection buffering
+                    # Tool call detection buffering.
+                    # Detect both generic JSON format (starts with '{') and
+                    # Qwen native format (starts with '<tool_call>').
                     if not tool_check_completed:
                         tool_check_buffer.append(token)
                         current_text = "".join(tool_check_buffer).lstrip()
                         if current_text:
-                            if current_text.startswith('{'):
+                            if current_text.startswith('{') or current_text.startswith('<tool_call'):
                                 is_potential_tool_call = True
                                 tool_check_completed = True
                                 logger.info(f"Event {self.event_id}: Potential tool call detected in stream")
@@ -1086,7 +1088,9 @@ class TextConversationEvent(ConversationEvent):
                 context_messages.insert(0, system_message)
 
             if hasattr(request_data, 'tools') and request_data.tools:
-                context_messages = ToolHandler.inject_tool_instructions(context_messages, request_data.tools)
+                context_messages = ToolHandler.inject_tool_instructions(
+                    context_messages, request_data.tools, model_id=self.model_id
+                )
 
             # Filter existing tools and append new result
             prompt_messages = [msg for msg in context_messages if msg.get('role', '') != 'tool']

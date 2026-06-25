@@ -92,9 +92,11 @@ class TextEventHelpers:
                 event_id, model_id, session, current_turn_body, request_data
             )
 
-        # Inject tool instructions into the assembled messages
+        # Inject tool instructions into the assembled messages.
+        # Pass model_id so Qwen-family models receive their native <tools> XML format
+        # instead of the generic JSON format, improving tool calling reliability.
         if include_tools and hasattr(request_data, 'tools') and request_data.tools:
-            messages = ToolHandler.inject_tool_instructions(messages, request_data.tools)
+            messages = ToolHandler.inject_tool_instructions(messages, request_data.tools, model_id=model_id)
 
         # Determine whether to include the system prompt prefix in the formatted output.
         # For tool continuations, the system prompt was already sent in Trip 1.
