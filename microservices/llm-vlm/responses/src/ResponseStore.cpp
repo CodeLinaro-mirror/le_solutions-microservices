@@ -55,6 +55,22 @@ ApplyCompactionResult makeApplyError(int http_status,
     return result;
 }
 
+std::string publicStatusFor(StoredResponseStatus status) {
+    switch (status) {
+    case StoredResponseStatus::InProgress:
+        return "in_progress";
+    case StoredResponseStatus::Completed:
+        return "completed";
+    case StoredResponseStatus::Failed:
+        return "failed";
+    case StoredResponseStatus::Cancelled:
+        return "cancelled";
+    case StoredResponseStatus::Expired:
+        return "expired";
+    }
+    return "unknown";
+}
+
 } // namespace
 
 ResponseStore& ResponseStore::getInstance() {
@@ -232,22 +248,44 @@ bool ResponseStore::failResponse(const std::string& response_id,
     return true;
 }
 
-CancelOutcome ResponseStore::cancelResponse(const std::string& response_id) {
+CancelResponseResult ResponseStore::cancelResponseDetailed(
+    const std::string& response_id) {
     std::lock_guard<std::mutex> lock(mu_);
+    CancelResponseResult result;
     auto it = responses_by_id_.find(response_id);
     if (it == responses_by_id_.end()) {
-        return CancelOutcome::NotFound;
+        result.ok = false;
+        result.http_status = 404;
+        result.error_message = "Response " + response_id + " not found";
+        result.outcome = CancelOutcome::NotFound;
+        return result;
     }
-    if (it->second.status != StoredResponseStatus::InProgress) {
-        return CancelOutcome::InvalidState;
+
+    StoredResponse& response = it->second;
+    if (response.status == StoredResponseStatus::Cancelled) {
+        result.ok = true;
+        result.outcome = CancelOutcome::AlreadyCancelled;
+        result.response_object = response.response_object;
+        return result;
+    }
+
+    if (response.status != StoredResponseStatus::InProgress) {
+        result.ok = false;
+        result.http_status = 409;
+        result.error_message =
+            "Response " + response_id + " is already "
+            + publicStatusFor(response.status) + " and cannot be cancelled";
+        result.outcome = CancelOutcome::InvalidState;
+        return result;
     }
 
     int now = currentUnixTime();
-    StoredResponse& response = it->second;
+    result.active_job_id = response.active_job_id;
     response.status = StoredResponseStatus::Cancelled;
     response.error = nullptr;
     response.incomplete_details = nullptr;
     response.output_items = ResponseStoreJson::array();
+    // Current cancel does not record partial usage before the terminal state.
     response.usage = nullptr;
     response.active_job_id.clear();
     response.updated_at = now;
@@ -259,7 +297,10 @@ CancelOutcome ResponseStore::cancelResponse(const std::string& response_id) {
         response.usage,
         ResponseStoreJson(nullptr),
         ResponseStoreJson(nullptr));
-    return CancelOutcome::Cancelled;
+    result.ok = true;
+    result.outcome = CancelOutcome::Cancelled;
+    result.response_object = response.response_object;
+    return result;
 }
 
 DeleteCascadeResult ResponseStore::deleteCascade(
