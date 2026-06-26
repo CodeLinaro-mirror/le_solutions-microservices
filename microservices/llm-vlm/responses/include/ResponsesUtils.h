@@ -21,6 +21,7 @@
 //   paginate_input_items()       — slice input_items into a list envelope
 //   generate_compaction_id()     — generate a unique "cmp_XXXX" ID
 //   inject_summary_into_instructions() — append branch summary to instructions
+//   build_vlm_runtime_messages() — build model-facing VLM messages
 //   current_unix_time()          — current time as Unix timestamp (seconds)
 //   generate_response_id()       — generate a unique "resp_XXXX" ID
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +86,21 @@ std::string inject_summary_into_instructions(
 // @return               OpenAI-format messages array
 // ─────────────────────────────────────────────────────────────────────────────
 json input_to_messages(const json& input, const std::string& system_prompt = "");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_vlm_runtime_messages — build model-facing messages for VLM inference
+//
+// Stored Responses input stays OpenAI-shaped (`input_text`, `input_image`).
+// VLM runtime receives chat-style parts (`text`, `image_url`) and only the
+// current request text plus the current/latest image from the lineage.
+//
+// @param current_messages  Messages for the current request
+// @param ancestor_messages Stored parent-lineage messages used for image fallback
+// @return                  Current-turn VLM runtime messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_vlm_runtime_messages(
+    const json& current_messages,
+    const json& ancestor_messages = json::array());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // extract_mcp_tool_requests — parse MCP tool entries from tools[] array

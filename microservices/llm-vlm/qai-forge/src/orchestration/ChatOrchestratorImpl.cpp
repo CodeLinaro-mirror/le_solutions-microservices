@@ -137,21 +137,25 @@ ImageUtils::TempFileGuard preprocessImagesToTempFiles(
             if (!part.is_object()) {
                 continue;
             }
-            if (part.value("type", "") != "image_url") {
+            std::string type = part.value("type", "");
+            if (type != "image_url" && type != "input_image") {
                 continue;
             }
 
             auto img = part.value("image_url", json::object());
+            if (img.is_string()) {
+                std::string url = img.get<std::string>();
+                if (!url.empty()) {
+                    image_urls.push_back(url);
+                }
+                continue;
+            }
             if (img.is_object()) {
                 std::string url = img.value("url", "");
                 if (!url.empty()) {
                     image_urls.push_back(url);
                 }
                 continue;
-            }
-            std::string url = img.get<std::string>();
-            if (!url.empty()) {
-                image_urls.push_back(url);
             }
         }
     }

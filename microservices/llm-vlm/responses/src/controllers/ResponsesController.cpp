@@ -1256,12 +1256,18 @@ void ResponsesController::createResponse(
         return;
     }
 
+    json runtime_request_messages = is_vlm
+        ? ResponsesUtils::build_vlm_runtime_messages(
+            begin.current_request_messages,
+            begin.ancestor_messages)
+        : begin.current_request_messages;
+
     CreateChatCompletionRequest standard_request;
     try {
         standard_request = make_standard_sdk_request(
             body,
             model,
-            begin.current_request_messages,
+            runtime_request_messages,
             effective_system_prompt,
             reasoning_effort,
             reasoning_summary,
@@ -1288,7 +1294,9 @@ void ResponsesController::createResponse(
         : scheduler::JobKind::HTTP_NON_STREAMING;
     invoke_options.skip_summarization_middleware = true;
     invoke_options.use_response_history = true;
-    invoke_options.response_history = begin.ancestor_messages;
+    invoke_options.response_history = is_vlm
+        ? json::array()
+        : begin.ancestor_messages;
     if (current_turn_has_tool_response(begin.current_request_messages)
         && !previous_response_id.empty()) {
         invoke_options.previous_response_id = previous_response_id;
@@ -1786,8 +1794,22 @@ void ResponsesController::countInputTokens(
             walk.applied_summary);
     }
 
+    bool is_vlm = ModelConfigManager::getInstance().supportsVision(model);
+    json token_ancestor_messages = ancestor_messages;
+    json token_current_messages = current_messages;
+    if (is_vlm) {
+        token_current_messages = ResponsesUtils::build_vlm_runtime_messages(
+            current_messages,
+            ancestor_messages);
+        token_ancestor_messages = json::array();
+    }
+
     int input_tokens = TokenBudgetUtils::count_input_tokens(
-        model, ancestor_messages, current_messages, instructions, tools);
+        model,
+        token_ancestor_messages,
+        token_current_messages,
+        instructions,
+        tools);
 
     json response = {
         {"object", "response.input_tokens"},
