@@ -207,11 +207,13 @@ json build_response_object(const std::string& response_id,
                             const std::string& status,
                             int prompt_tokens,
                             int completion_tokens,
-                            bool truncated) {
+                            int created_at,
+                            const json& error,
+                            const json& incomplete_details) {
     return {
         {"id",               response_id},
         {"object",           "response"},
-        {"created_at",       current_unix_time()},
+        {"created_at",       created_at},
         {"model",            model},
         {"status",           status},
         {"output",           output},
@@ -220,10 +222,10 @@ json build_response_object(const std::string& response_id,
             {"output_tokens", completion_tokens},
             {"total_tokens",  prompt_tokens + completion_tokens}
         }},
-        {"error",            nullptr},
-        {"incomplete_details", truncated
-            ? json({{"reason", "max_tool_calls"}})
-            : json(nullptr)}
+        {"error",            error.is_null() ? json(nullptr) : error},
+        {"incomplete_details", incomplete_details.is_null()
+            ? json(nullptr)
+            : incomplete_details}
     };
 }
 

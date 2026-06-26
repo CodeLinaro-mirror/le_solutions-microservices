@@ -41,12 +41,13 @@ using json = nlohmann::ordered_json;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 static HttpResponsePtr make_error_response(int status_code, const std::string& message,
-                                            const std::string& error_type = "server_error") {
+                                            const std::string& error_type = "server_error",
+                                            const std::string& param = "") {
     json error_body = {
         {"error", {
             {"message", message},
             {"type", error_type},
-            {"param", nullptr},
+            {"param", param.empty() ? json(nullptr) : json(param)},
             {"code", status_code}
         }}
     };
@@ -342,7 +343,11 @@ void ResponsesController::createResponse(
                                     response_id, model, output, "completed",
                                     loop_result.final_response.prompt_tokens,
                                     loop_result.final_response.completion_tokens,
-                                    loop_result.truncated)}
+                                    created_time,
+                                    json(nullptr),
+                                    loop_result.truncated
+                                        ? json({{"reason", "max_tool_calls"}})
+                                        : json(nullptr))}
                             });
                         } else {
                             emit_event("error", {
@@ -369,12 +374,17 @@ void ResponsesController::createResponse(
 
                 json output = ResponsesUtils::build_output_array(
                     loop_result.final_response, loop_result.call_records);
+                int created_time = ResponsesUtils::current_unix_time();
                 json response_obj = ResponsesUtils::build_response_object(
                     response_id, model, output,
                     loop_result.truncated ? "incomplete" : "completed",
                     loop_result.final_response.prompt_tokens,
                     loop_result.final_response.completion_tokens,
-                    loop_result.truncated);
+                    created_time,
+                    json(nullptr),
+                    loop_result.truncated
+                        ? json({{"reason", "max_tool_calls"}})
+                        : json(nullptr));
 
                 auto resp = HttpResponse::newHttpJsonResponse(response_obj.dump());
                 resp->setStatusCode(k200OK);
@@ -573,9 +583,11 @@ void ResponsesController::createResponse(
             json output = ResponsesUtils::build_output_array(result);
 
             // Build response object
+            int created_time = ResponsesUtils::current_unix_time();
             json response_obj = ResponsesUtils::build_response_object(
                 response_id, model, output, "completed",
-                result.prompt_tokens, result.completion_tokens);
+                result.prompt_tokens, result.completion_tokens,
+                created_time, json(nullptr), json(nullptr));
 
             // Add output_tokens_details.reasoning_tokens when thinking occurred
             if (result.reasoning_tokens > 0) {
