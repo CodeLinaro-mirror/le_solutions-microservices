@@ -32,6 +32,7 @@ struct SchedulerInvokeOptions {
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool tool_output_submission = false;
+    bool skip_summarization_middleware = false;
 };
 
 // Public scheduler facade.

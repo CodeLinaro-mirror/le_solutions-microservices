@@ -21,7 +21,10 @@ set(SERVER_SOURCES
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
     src/ResponseStore.cpp
+    src/ResponsesCompactionService.cpp
+    src/TokenBudgetUtils.cpp
 
+    # Scheduler / model residency layer
     src/scheduler/EvictionPolicy.cpp
     src/scheduler/ModelScheduler.cpp
     src/scheduler/ModelRuntime.cpp

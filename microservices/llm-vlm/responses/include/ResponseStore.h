@@ -95,6 +95,9 @@ struct BuildCandidateResult {
     std::string session_id;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
+    std::string applied_compaction_id;
+    std::string applied_summary;
+    int summary_tokens = 0;
 };
 
 /**
@@ -135,6 +138,17 @@ struct DeleteCascadeResult {
     bool ok = false;
     int http_status = 200;
     std::string error_message;
+};
+
+/**
+ * @brief Result of storing a branch compaction summary.
+ */
+struct ApplyCompactionResult {
+    bool ok = false;
+    bool applied = false;
+    int http_status = 200;
+    std::string error_message;
+    std::string compaction_id;
 };
 
 class ResponseStoreTestAccess;
@@ -192,6 +206,13 @@ public:
      * @brief Expire stale InProgress responses and return job ids to cancel.
      */
     std::vector<ExpiredResponse> expireStaleInProgress(int now_unix);
+
+    /**
+     * @brief Store or replace a fork-safe branch compaction summary.
+     */
+    ApplyCompactionResult applyCompaction(
+        const std::string& session_id,
+        const CompactionSummary& summary);
 
     /**
      * @brief Return a copy of a stored response, or nullopt if missing.

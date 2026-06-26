@@ -62,6 +62,8 @@ const char* kindToString(JobKind kind) {
             return "websocket";
         case JobKind::MCP_ROUND:
             return "mcp_round";
+        case JobKind::INTERNAL_SUMMARIZATION:
+            return "internal_summarization";
     }
     return "unknown";
 }
@@ -299,6 +301,8 @@ InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
     job->model_id = request.model;
     job->kind = options.kind;
     job->priority = options.priority;
+    job->skip_summarization_middleware =
+        options.skip_summarization_middleware;
     job->request = request;
     if (!job->session_id.empty()) {
         job->request.user = job->session_id;

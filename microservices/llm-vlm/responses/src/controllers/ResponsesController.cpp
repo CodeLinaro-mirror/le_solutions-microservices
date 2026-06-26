@@ -24,11 +24,14 @@
 
 #include "controllers/ResponsesController.h"
 #include "ResponseStore.h"
+#include "ResponsesConstants.h"
 #include "ResponsesUtils.h"
+#include "TokenBudgetUtils.h"
 #include "mcp/McpAgenticLoop.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
 #include "qai_forge/InternalDTOs.h"
+#include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include "scheduler/ModelScheduler.h"
 #include <nlohmann/json.hpp>
@@ -93,6 +96,20 @@ static bool parse_input_items_order(const std::string& raw,
                        return static_cast<char>(std::tolower(c));
                    });
     return order == "asc" || order == "desc";
+}
+
+static bool get_optional_string_field(const json& body,
+                                      const std::string& field,
+                                      std::string& value) {
+    value.clear();
+    if (!body.contains(field) || body[field].is_null()) {
+        return true;
+    }
+    if (!body[field].is_string()) {
+        return false;
+    }
+    value = body[field].get<std::string>();
+    return true;
 }
 
 static HttpResponsePtr make_error_response(int status_code, const std::string& message,
@@ -527,6 +544,7 @@ void ResponsesController::createResponse(
                         invoke_options.response_id = response_id;
                         invoke_options.previous_response_id = previous_response_id;
                         invoke_options.kind = scheduler::JobKind::HTTP_STREAMING;
+                        invoke_options.skip_summarization_middleware = true;
 
                         scheduler::ModelScheduler::getInstance().runStreaming(
                             streaming_req,
@@ -626,6 +644,7 @@ void ResponsesController::createResponse(
             invoke_options.response_id = response_id;
             invoke_options.previous_response_id = previous_response_id;
             invoke_options.kind = scheduler::JobKind::HTTP_NON_STREAMING;
+            invoke_options.skip_summarization_middleware = true;
 
             StandardResponse result =
                 scheduler::ModelScheduler::getInstance().runBlocking(
@@ -664,6 +683,159 @@ void ResponsesController::createResponse(
         callback(make_error_response(500,
             std::string("Internal server error: ") + e.what()));
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /v1/responses/input_tokens — Count input tokens
+// ─────────────────────────────────────────────────────────────────────────────
+void ResponsesController::countInputTokens(
+    const HttpRequestPtr& req,
+    std::function<void(const HttpResponsePtr&)>&& callback) {
+
+    json body;
+    try {
+        body = json::parse(req->getBody());
+    } catch (...) {
+        callback(make_error_response(
+            400,
+            "Invalid JSON body",
+            "invalid_request_error"));
+        return;
+    }
+
+    if (!body.is_object()) {
+        callback(make_error_response(
+            400,
+            "Invalid JSON body",
+            "invalid_request_error"));
+        return;
+    }
+
+    if (body.contains("conversation")) {
+        callback(make_error_response(
+            400,
+            "conversation is not supported",
+            "invalid_request_error",
+            "conversation"));
+        return;
+    }
+
+    if (body.contains("truncation") && !body["truncation"].is_null()) {
+        if (!body["truncation"].is_string()) {
+            callback(make_error_response(
+                400,
+                "invalid value for 'truncation' - expected 'disabled'",
+                "invalid_request_error",
+                "truncation"));
+            return;
+        }
+        std::string truncation = body["truncation"].get<std::string>();
+        if (truncation != "disabled") {
+            callback(make_error_response(
+                400,
+                truncation == "auto"
+                    ? "truncation:auto is not supported"
+                    : "invalid value for 'truncation' - expected 'disabled'",
+                "invalid_request_error",
+                "truncation"));
+            return;
+        }
+    }
+
+    std::string model;
+    if (!get_optional_string_field(body, "model", model)) {
+        callback(make_error_response(
+            400,
+            "unknown or unresolvable model",
+            "invalid_request_error",
+            "model"));
+        return;
+    }
+
+    auto& config_mgr = ModelConfigManager::getInstance();
+    if (model.empty()) {
+        model = config_mgr.getDefaultModelId();
+    }
+    if (model.empty() || !config_mgr.validateModel(model)) {
+        callback(make_error_response(
+            400,
+            "unknown or unresolvable model",
+            "invalid_request_error",
+            "model"));
+        return;
+    }
+
+    std::string previous_response_id;
+    if (!get_optional_string_field(
+            body, "previous_response_id", previous_response_id)) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'previous_response_id'",
+            "invalid_request_error",
+            "previous_response_id"));
+        return;
+    }
+
+    std::string instructions;
+    if (!get_optional_string_field(body, "instructions", instructions)) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'instructions'",
+            "invalid_request_error",
+            "instructions"));
+        return;
+    }
+    if (instructions.empty()) {
+        instructions = ResponsesConstants::DEFAULT_SYSTEM_PROMPT;
+    }
+
+    json tools = json::array();
+    if (body.contains("tools") && !body["tools"].is_null()) {
+        if (!body["tools"].is_array()) {
+            callback(make_error_response(
+                400,
+                "invalid value for 'tools' - expected array",
+                "invalid_request_error",
+                "tools"));
+            return;
+        }
+        tools = body["tools"];
+    }
+
+    json current_messages = body.contains("input")
+        ? ResponsesUtils::input_to_messages(body["input"], "")
+        : json::array();
+
+    json ancestor_messages = json::array();
+    if (!previous_response_id.empty()) {
+        BuildCandidateResult walk =
+            ResponseStore::getInstance().buildCandidateMessages(
+                previous_response_id, current_messages);
+        if (!walk.ok) {
+            callback(make_error_response(
+                walk.http_status,
+                walk.error_message,
+                "invalid_request_error",
+                "previous_response_id"));
+            return;
+        }
+        ancestor_messages = walk.ancestor_messages;
+        current_messages = walk.current_request_messages;
+        instructions = ResponsesUtils::inject_summary_into_instructions(
+            instructions,
+            walk.applied_summary);
+    }
+
+    int input_tokens = TokenBudgetUtils::count_input_tokens(
+        model, ancestor_messages, current_messages, instructions, tools);
+
+    json response = {
+        {"object", "response.input_tokens"},
+        {"input_tokens", input_tokens}
+    };
+    auto resp = HttpResponse::newHttpJsonResponse(response.dump());
+    resp->setStatusCode(k200OK);
+    callback(resp);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

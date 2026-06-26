@@ -672,7 +672,8 @@ void ModelRuntime::runJob(InferenceJob& job) {
                         job.callbacks.on_token(chunk);
                     }
                 },
-                cancel_requested);
+                cancel_requested,
+                job.skip_summarization_middleware);
 
             if (job.isCancelled()) {
                 notify_cancelled();
@@ -699,7 +700,8 @@ void ModelRuntime::runJob(InferenceJob& job) {
             orchestrator.executeBlocking(
                 job.request,
                 *backend_,
-                cancel_requested);
+                cancel_requested,
+                job.skip_summarization_middleware);
         if (job.isCancelled()) {
             notify_cancelled();
             return;

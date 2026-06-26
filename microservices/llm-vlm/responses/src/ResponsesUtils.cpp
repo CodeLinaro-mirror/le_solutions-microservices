@@ -36,6 +36,35 @@ std::string generate_response_id() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// generate_compaction_id
+// ─────────────────────────────────────────────────────────────────────────────
+std::string generate_compaction_id() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "cmp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
+    return oss.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// inject_summary_into_instructions
+// ─────────────────────────────────────────────────────────────────────────────
+std::string inject_summary_into_instructions(
+    const std::string& instructions,
+    const std::string& applied_summary) {
+    if (applied_summary.empty()) {
+        return instructions;
+    }
+
+    std::string result = instructions;
+    if (!result.empty()) {
+        result += "\n\n";
+    }
+    result += "Previous conversation summary:\n";
+    result += applied_summary;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // input_to_messages
 //
 // Converts Responses API `input` to OpenAI-format messages array.
