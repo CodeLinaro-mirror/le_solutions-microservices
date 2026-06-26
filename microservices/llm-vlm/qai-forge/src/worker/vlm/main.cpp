@@ -194,13 +194,17 @@ int main() {
         }
 
         // ── RESET ─────────────────────────────────────────────────────────────
-        // VLM does not support mid-session reset via the pipeline API.
-        // Full context reset requires destroy + re-create (handled at manager level).
-        // Intra-session context management uses SAVE_KV / RESTORE_KV.
         else if (type == "RESET") {
             std::string cid = cmd.value("command_id", gen_id());
-            LOG_DEBUG("[vlm-worker] RESET acknowledged (no-op for VLM)");
-            send_message({{"type", "READY"}, {"command_id", cid}});
+            try {
+                if (engine) engine->reset();
+                LOG_INFO("[vlm-worker] Pipeline reset");
+                send_message({{"type", "READY"}, {"command_id", cid}});
+            } catch (const std::exception& e) {
+                send_message({{"type", "ERROR"},
+                              {"command_id", cid},
+                              {"message", std::string(e.what())}});
+            }
         }
 
         // ── SAVE_KV ───────────────────────────────────────────────────────────

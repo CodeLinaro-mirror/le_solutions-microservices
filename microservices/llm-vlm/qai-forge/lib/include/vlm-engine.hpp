@@ -8,6 +8,7 @@
 //
 // VlmEngine wraps GeniePipeline and exposes a minimal C++ API:
 //   - generate()    : run inference with optional images, stream tokens
+//   - reset()       : reset pipeline state
 //   - save_kv()     : save KV cache checkpoint
 //   - restore_kv()  : restore KV cache checkpoint
 //
@@ -44,6 +45,7 @@ public:
                   const GenerationConfig& config,
                   TokenCallback callback);
 
+    void reset();
     void save_kv(const std::string& name);
     void restore_kv(const std::string& name);
 

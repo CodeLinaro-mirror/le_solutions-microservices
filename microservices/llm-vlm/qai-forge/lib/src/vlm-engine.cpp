@@ -452,6 +452,13 @@ void VlmEngine::generate(const std::string& prompt,
 // ─────────────────────────────────────────────────────────────────────────────
 // VlmEngine — KV cache
 // ─────────────────────────────────────────────────────────────────────────────
+void VlmEngine::reset() {
+    Genie_Status_t status = GeniePipeline_reset(m_impl->pipeline_handle);
+    if (status != GENIE_STATUS_SUCCESS) {
+        throw std::runtime_error("[VlmEngine] Failed to reset pipeline");
+    }
+}
+
 void VlmEngine::save_kv(const std::string& name) {
     Genie_Status_t status = GeniePipeline_save(m_impl->pipeline_handle, name.c_str());
     if (status != GENIE_STATUS_SUCCESS)
