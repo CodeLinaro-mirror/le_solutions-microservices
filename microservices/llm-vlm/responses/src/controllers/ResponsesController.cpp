@@ -25,6 +25,7 @@
 #include "controllers/ResponsesController.h"
 #include "ResponseStore.h"
 #include "ResponsesConstants.h"
+#include "ResponsesCompactionService.h"
 #include "ResponsesUtils.h"
 #include "TokenBudgetUtils.h"
 #include "mcp/McpAgenticLoop.h"
@@ -40,6 +41,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <utility>
 
 using json = nlohmann::ordered_json;
 
@@ -112,20 +114,177 @@ static bool get_optional_string_field(const json& body,
     return true;
 }
 
+static json make_assistant_messages(const StandardResponse& result) {
+    json message = {
+        {"role", "assistant"},
+        {"content", result.content.value_or("")}
+    };
+    if (result.reasoning_content.has_value()
+        && !result.reasoning_content.value().empty()) {
+        message["_thinking_content"] = result.reasoning_content.value();
+    }
+    if (result.tool_calls.has_value()
+        && !result.tool_calls.value().empty()) {
+        message["tool_calls"] = result.tool_calls.value();
+    }
+    return json::array({message});
+}
+
+static json make_store_error_object(const std::string& code,
+                                    const std::string& message,
+                                    const std::string& param = "") {
+    json error = {
+        {"code", code},
+        {"message", message}
+    };
+    if (!param.empty()) {
+        error["param"] = param;
+    }
+    return error;
+}
+
+static void add_reasoning_usage_details(json& response_obj,
+                                        const StandardResponse& result) {
+    if (result.reasoning_tokens <= 0) {
+        return;
+    }
+    response_obj["usage"]["output_tokens_details"] = {
+        {"reasoning_tokens", result.reasoning_tokens}
+    };
+}
+
+static bool current_turn_has_tool_response(const json& messages) {
+    if (!messages.is_array()) {
+        return false;
+    }
+    for (const auto& message : messages) {
+        if (message.is_object() && message.value("role", "") == "tool") {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool branch_ends_with_tool_call(const json& ancestor_messages) {
+    if (!ancestor_messages.is_array() || ancestor_messages.empty()) {
+        return false;
+    }
+    const auto& last = ancestor_messages.back();
+    if (!last.is_object() || last.value("role", "") != "assistant") {
+        return false;
+    }
+    return last.contains("tool_calls")
+        && last["tool_calls"].is_array()
+        && !last["tool_calls"].empty();
+}
+
+static void prepend_system_message(json& messages,
+                                   const std::string& instructions) {
+    if (instructions.empty()) {
+        return;
+    }
+    json with_system = json::array();
+    with_system.push_back({{"role", "system"}, {"content", instructions}});
+    if (messages.is_array()) {
+        for (const auto& message : messages) {
+            with_system.push_back(message);
+        }
+    }
+    messages = std::move(with_system);
+}
+
+static CreateChatCompletionRequest make_standard_sdk_request(
+    const json& body,
+    const std::string& model,
+    const json& request_messages,
+    const std::string& instructions,
+    const std::string& reasoning_effort,
+    const std::string& reasoning_summary,
+    const json& function_tools,
+    bool has_function_tools,
+    std::optional<int> max_completion_tokens) {
+    json sdk_messages = request_messages;
+    prepend_system_message(sdk_messages, instructions);
+
+    json sdk_body = {
+        {"model", model},
+        {"messages", sdk_messages},
+        {"stream", false},
+        {"reasoning_effort", reasoning_effort}
+    };
+    if (max_completion_tokens.has_value()) {
+        sdk_body["max_completion_tokens"] = max_completion_tokens.value();
+    }
+    if (body.contains("temperature") && !body["temperature"].is_null()) {
+        sdk_body["temperature"] = body["temperature"];
+    }
+    if (body.contains("top_p") && !body["top_p"].is_null()) {
+        sdk_body["top_p"] = body["top_p"];
+    }
+    if (!reasoning_summary.empty()) {
+        sdk_body["reasoning_summary"] = reasoning_summary;
+    }
+    if (has_function_tools) {
+        sdk_body["tools"] = function_tools;
+    }
+    return CreateChatCompletionRequest::from_json(sdk_body);
+}
+
+static std::string generate_summary_with_scheduler(
+    const std::string& model,
+    const std::string& prompt,
+    int max_output_tokens) {
+    json sdk_body = {
+        {"model", model},
+        {"messages", json::array({{
+            {"role", "user"},
+            {"content", prompt}
+        }})},
+        {"stream", false},
+        {"max_completion_tokens", max_output_tokens},
+        {"temperature", 0.3f},
+        {"reasoning_effort", "none"}
+    };
+    CreateChatCompletionRequest request =
+        CreateChatCompletionRequest::from_json(sdk_body);
+
+    scheduler::SchedulerInvokeOptions options;
+    options.response_id = ResponsesUtils::generate_compaction_id();
+    options.session_id = options.response_id;
+    options.kind = scheduler::JobKind::INTERNAL_SUMMARIZATION;
+    options.skip_summarization_middleware = true;
+    options.use_response_history = true;
+    options.response_history = json::array();
+
+    StandardResponse result =
+        scheduler::ModelScheduler::getInstance().runBlocking(request, options);
+    return result.content.value_or("");
+}
+
+static HttpResponsePtr make_json_response(const json& body,
+                                           HttpStatusCode status_code) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(status_code);
+    resp->addHeader("Content-Type", "application/json; charset=utf-8");
+    resp->setBody(body.dump());
+    return resp;
+}
+
 static HttpResponsePtr make_error_response(int status_code, const std::string& message,
                                             const std::string& error_type = "server_error",
-                                            const std::string& param = "") {
+                                            const std::string& param = "",
+                                            const std::string& code = "") {
     json error_body = {
         {"error", {
             {"message", message},
             {"type", error_type},
             {"param", param.empty() ? json(nullptr) : json(param)},
-            {"code", status_code}
+            {"code", code.empty() ? json(nullptr) : json(code)}
         }}
     };
-    auto resp = HttpResponse::newHttpJsonResponse(error_body.dump());
-    resp->setStatusCode(static_cast<HttpStatusCode>(status_code));
-    return resp;
+    return make_json_response(
+        error_body,
+        static_cast<HttpStatusCode>(status_code));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,12 +397,14 @@ void ResponsesController::createResponse(
         }
     }
 
-    // Convert input to messages format
-    json messages = ResponsesUtils::input_to_messages(body["input"], system_prompt);
-    if (messages.empty()) {
+    json request_messages = ResponsesUtils::input_to_messages(body["input"], "");
+    if (request_messages.empty()) {
         callback(make_error_response(400, "Input produced no messages", "invalid_request_error"));
         return;
     }
+
+    // Convert input to messages format for the existing MCP path.
+    json messages = ResponsesUtils::input_to_messages(body["input"], system_prompt);
 
     // Build CreateChatCompletionRequest for the SDK
     CreateChatCompletionRequest sdk_request;
@@ -271,6 +432,19 @@ void ResponsesController::createResponse(
         callback(make_error_response(400,
             std::string("Request parsing error: ") + e.what(), "invalid_request_error"));
         return;
+    }
+
+    json metadata = json::object();
+    if (body.contains("metadata") && !body["metadata"].is_null()) {
+        if (!body["metadata"].is_object()) {
+            callback(make_error_response(
+                400,
+                "invalid value for 'metadata' - expected object",
+                "invalid_request_error",
+                "metadata"));
+            return;
+        }
+        metadata = body["metadata"];
     }
 
     std::string response_id = ResponsesUtils::generate_response_id();
@@ -419,7 +593,9 @@ void ResponsesController::createResponse(
                                     json(nullptr),
                                     loop_result.truncated
                                         ? json({{"reason", "max_tool_calls"}})
-                                        : json(nullptr))}
+                                        : json(nullptr),
+                                    previous_response_id,
+                                    metadata)}
                             });
                         } else {
                             emit_event("error", {
@@ -456,10 +632,11 @@ void ResponsesController::createResponse(
                     json(nullptr),
                     loop_result.truncated
                         ? json({{"reason", "max_tool_calls"}})
-                        : json(nullptr));
+                        : json(nullptr),
+                    previous_response_id,
+                    metadata);
 
-                auto resp = HttpResponse::newHttpJsonResponse(response_obj.dump());
-                resp->setStatusCode(k200OK);
+                auto resp = make_json_response(response_obj, k200OK);
                 callback(resp);
             }
 
@@ -475,10 +652,199 @@ void ResponsesController::createResponse(
     }
 
     // ── Standard (non-MCP) path ───────────────────────────────────────────────
-    // Pass function tools to the SDK if present
-    if (has_function_tools) {
-        sdk_request.tools = function_tools;
+    auto& config_mgr = ModelConfigManager::getInstance();
+    if (model.empty() || !config_mgr.validateModel(model)) {
+        callback(make_error_response(
+            404,
+            "Model '" + model + "' not found. Check /v1/models for available models.",
+            "invalid_request_error",
+            "model"));
+        return;
     }
+
+    std::string base_system_prompt = system_prompt.empty()
+        ? std::string(ResponsesConstants::DEFAULT_SYSTEM_PROMPT)
+        : system_prompt;
+    std::string effective_system_prompt = base_system_prompt;
+    json input_items =
+        ResponsesUtils::normalize_input_items(response_id, body["input"]);
+    json tools_for_budget = has_function_tools ? function_tools : json::array();
+
+    ResponseStore& store = ResponseStore::getInstance();
+    BuildCandidateResult walk =
+        store.buildCandidateMessages(previous_response_id, request_messages);
+    if (!walk.ok) {
+        callback(make_error_response(
+            walk.http_status,
+            walk.error_message,
+            "invalid_request_error",
+            "previous_response_id"));
+        return;
+    }
+    effective_system_prompt = ResponsesUtils::inject_summary_into_instructions(
+        base_system_prompt,
+        walk.applied_summary);
+
+    const bool is_vlm = config_mgr.supportsVision(model);
+    std::optional<int> requested_max_output_tokens =
+        sdk_request.max_completion_tokens;
+    std::optional<int> resolved_max_output_tokens =
+        requested_max_output_tokens;
+
+    if (!is_vlm) {
+        bool skip_summarization =
+            previous_response_id.empty()
+            || current_turn_has_tool_response(walk.current_request_messages)
+            || branch_ends_with_tool_call(walk.ancestor_messages);
+        int context_size = config_mgr.getContextSize(model);
+        int projected_max_output_tokens = requested_max_output_tokens.value_or(
+            TokenBudgetUtils::default_max_output_tokens(context_size));
+        TokenBudgetUtils::SummarizationTriggerResult trigger =
+            TokenBudgetUtils::evaluate_summarization_trigger(
+                model,
+                walk.ancestor_messages,
+                walk.current_request_messages,
+                effective_system_prompt,
+                tools_for_budget,
+                projected_max_output_tokens);
+
+        if (!skip_summarization && trigger.should_summarize) {
+            ResponsesCompactionService::CompactBranchResult compact_result =
+                ResponsesCompactionService::getInstance().compactBranch(
+                    previous_response_id,
+                    model,
+                    [model](const std::string& prompt, int max_tokens) {
+                        return generate_summary_with_scheduler(
+                            model, prompt, max_tokens);
+                    });
+            if (!compact_result.ok) {
+                TokenBudgetUtils::ContextBudgetResult fallback_budget =
+                    TokenBudgetUtils::resolve_context_budget(
+                        model,
+                        walk.ancestor_messages,
+                        walk.current_request_messages,
+                        effective_system_prompt,
+                        tools_for_budget,
+                        requested_max_output_tokens);
+                if (!fallback_budget.ok) {
+                    callback(make_error_response(
+                        500,
+                        "summary generation failed and the request cannot proceed without it",
+                        "server_error"));
+                    return;
+                }
+                resolved_max_output_tokens =
+                    fallback_budget.resolved_max_output_tokens;
+                LOG_WARN("[ResponsesController] Summary generation failed but "
+                         "request fits without compaction: response="
+                         << response_id
+                         << " error=\"" << compact_result.error_message << "\"");
+            } else {
+                walk = store.buildCandidateMessages(
+                    previous_response_id,
+                    request_messages);
+                if (!walk.ok) {
+                    callback(make_error_response(
+                        walk.http_status,
+                        walk.error_message,
+                        "invalid_request_error",
+                        "previous_response_id"));
+                    return;
+                }
+                effective_system_prompt =
+                    ResponsesUtils::inject_summary_into_instructions(
+                        base_system_prompt,
+                        walk.applied_summary);
+            }
+        }
+
+        if (!resolved_max_output_tokens.has_value()
+            || resolved_max_output_tokens == requested_max_output_tokens) {
+            TokenBudgetUtils::ContextBudgetResult budget =
+                TokenBudgetUtils::resolve_context_budget(
+                    model,
+                    walk.ancestor_messages,
+                    walk.current_request_messages,
+                    effective_system_prompt,
+                    tools_for_budget,
+                    requested_max_output_tokens);
+            if (!budget.ok) {
+                callback(make_error_response(
+                    budget.http_status,
+                    budget.error_message,
+                    "invalid_request_error",
+                    budget.error_param,
+                    budget.error_code));
+                return;
+            }
+            resolved_max_output_tokens =
+                budget.resolved_max_output_tokens;
+        }
+    }
+
+    BeginResponseResult begin = store.beginResponse(
+        response_id,
+        model,
+        previous_response_id,
+        input_items,
+        walk.current_request_messages,
+        metadata);
+    if (!begin.ok) {
+        callback(make_error_response(
+            begin.http_status,
+            begin.error_message,
+            "invalid_request_error",
+            "previous_response_id"));
+        return;
+    }
+
+    CreateChatCompletionRequest standard_request;
+    try {
+        standard_request = make_standard_sdk_request(
+            body,
+            model,
+            begin.current_request_messages,
+            effective_system_prompt,
+            reasoning_effort,
+            reasoning_summary,
+            function_tools,
+            has_function_tools,
+            is_vlm ? requested_max_output_tokens : resolved_max_output_tokens);
+    } catch (const std::exception& e) {
+        json error_obj = make_store_error_object(
+            "invalid_request_error",
+            std::string("Request parsing error: ") + e.what());
+        store.failResponse(response_id, error_obj);
+        callback(make_error_response(
+            400,
+            std::string("Request parsing error: ") + e.what(),
+            "invalid_request_error"));
+        return;
+    }
+
+    scheduler::SchedulerInvokeOptions invoke_options;
+    invoke_options.response_id = response_id;
+    invoke_options.session_id = response_id;
+    invoke_options.kind = streaming
+        ? scheduler::JobKind::HTTP_STREAMING
+        : scheduler::JobKind::HTTP_NON_STREAMING;
+    invoke_options.skip_summarization_middleware = true;
+    invoke_options.use_response_history = true;
+    invoke_options.response_history = begin.ancestor_messages;
+
+    std::optional<StoredResponse> pre_submit = store.getResponse(response_id);
+    if (!pre_submit.has_value()
+        || pre_submit->status != StoredResponseStatus::InProgress) {
+        json response_obj = pre_submit.has_value()
+            ? pre_submit->response_object
+            : json::object();
+        auto resp = make_json_response(
+            response_obj,
+            pre_submit.has_value() ? k200OK : k404NotFound);
+        callback(resp);
+        return;
+    }
+
     LOG_INFO("[ResponsesController] Routing through standard path: response="
              << response_id << " model=" << model
              << " stream=" << (streaming ? "true" : "false"));
@@ -487,14 +853,13 @@ void ResponsesController::createResponse(
         if (streaming) {
             // ── Streaming: emit Responses API SSE events ──────────────────────
             auto resp = HttpResponse::newAsyncStreamResponse(
-                [sdk_request, response_id, previous_response_id, model](ResponseStreamPtr stream) {
+                [standard_request, invoke_options, response_id, model,
+                 begin_created_at = begin.created_at](ResponseStreamPtr stream) {
                     auto emit_event = [&stream](const std::string& event_type,
                                                  const json& data) {
                         stream->send("event: " + event_type + "\n");
                         stream->send("data: " + data.dump() + "\n\n");
                     };
-
-                    int created_time = ResponsesUtils::current_unix_time();
 
                     // response.created event
                     emit_event("response.created", {
@@ -502,7 +867,7 @@ void ResponsesController::createResponse(
                         {"response", {
                             {"id",         response_id},
                             {"object",     "response"},
-                            {"created_at", created_time},
+                            {"created_at", begin_created_at},
                             {"model",      model},
                             {"status",     "in_progress"},
                             {"output",     json::array()}
@@ -533,26 +898,20 @@ void ResponsesController::createResponse(
                     std::string full_text;
                     bool had_error = false;
                     std::string error_msg;
-                    int token_count = 0;
+                    int http_status = 500;
+                    StandardResponse result;
 
                     // Re-enable streaming for the SDK call
-                    CreateChatCompletionRequest streaming_req = sdk_request;
+                    CreateChatCompletionRequest streaming_req = standard_request;
                     streaming_req.stream = true;
 
                     try {
-                        scheduler::SchedulerInvokeOptions invoke_options;
-                        invoke_options.response_id = response_id;
-                        invoke_options.previous_response_id = previous_response_id;
-                        invoke_options.kind = scheduler::JobKind::HTTP_STREAMING;
-                        invoke_options.skip_summarization_middleware = true;
-
-                        scheduler::ModelScheduler::getInstance().runStreaming(
+                        result = scheduler::ModelScheduler::getInstance().runStreaming(
                             streaming_req,
                             [&](const StreamChunk& chunk) {
                                 if (chunk.content_delta.has_value()
                                     && !chunk.content_delta.value().empty()) {
                                     full_text += chunk.content_delta.value();
-                                    token_count++;
                                     emit_event("response.output_text.delta", {
                                         {"type",          "response.output_text.delta"},
                                         {"output_index",  0},
@@ -573,6 +932,7 @@ void ResponsesController::createResponse(
                     } catch (const GenAIException& e) {
                         had_error = true;
                         error_msg = e.message;
+                        http_status = e.http_status;
                     } catch (const std::exception& e) {
                         had_error = true;
                         error_msg = e.what();
@@ -599,29 +959,49 @@ void ResponsesController::createResponse(
                             }}
                         });
 
+                        json output = ResponsesUtils::build_output_array(result);
+                        json response_obj = ResponsesUtils::build_response_object(
+                            response_id,
+                            model,
+                            output,
+                            "completed",
+                            result.prompt_tokens,
+                            result.completion_tokens,
+                            begin_created_at,
+                            json(nullptr),
+                            json(nullptr),
+                            previous_response_id,
+                            metadata);
+                        add_reasoning_usage_details(response_obj, result);
+                        bool completed =
+                            ResponseStore::getInstance().completeResponse(
+                            response_id,
+                            make_assistant_messages(result),
+                            output,
+                            response_obj,
+                            response_obj["usage"]);
+                        if (!completed) {
+                            std::optional<StoredResponse> stored =
+                                ResponseStore::getInstance().getResponse(
+                                    response_id);
+                            if (stored.has_value()
+                                && stored->response_object.is_object()) {
+                                response_obj = stored->response_object;
+                            }
+                        }
+
                         emit_event("response.completed", {
                             {"type", "response.completed"},
-                            {"response", {
-                                {"id",         response_id},
-                                {"object",     "response"},
-                                {"model",      model},
-                                {"status",     "completed"},
-                                {"output", {{
-                                    {"type",    "message"},
-                                    {"id",      "msg_" + response_id},
-                                    {"role",    "assistant"},
-                                    {"content", {{{"type", "output_text"},
-                                                  {"text", full_text}}}},
-                                    {"status",  "completed"}
-                                }}},
-                                {"usage", {
-                                    {"input_tokens",  0},
-                                    {"output_tokens", token_count},
-                                    {"total_tokens",  token_count}
-                                }}
-                            }}
+                            {"response", response_obj}
                         });
                     } else {
+                        ResponseStore::getInstance().failResponse(
+                            response_id,
+                            make_store_error_object(
+                                http_status >= 500
+                                    ? "server_error"
+                                    : "invalid_request_error",
+                                error_msg));
                         emit_event("error", {
                             {"type",    "error"},
                             {"code",    "server_error"},
@@ -640,15 +1020,9 @@ void ResponsesController::createResponse(
 
         } else {
             // ── Non-streaming ─────────────────────────────────────────────────
-            scheduler::SchedulerInvokeOptions invoke_options;
-            invoke_options.response_id = response_id;
-            invoke_options.previous_response_id = previous_response_id;
-            invoke_options.kind = scheduler::JobKind::HTTP_NON_STREAMING;
-            invoke_options.skip_summarization_middleware = true;
-
             StandardResponse result =
                 scheduler::ModelScheduler::getInstance().runBlocking(
-                    sdk_request, invoke_options);
+                    standard_request, invoke_options);
 
             // Build output array.
             // build_output_array() automatically emits a separate top-level
@@ -657,29 +1031,46 @@ void ResponsesController::createResponse(
             json output = ResponsesUtils::build_output_array(result);
 
             // Build response object
-            int created_time = ResponsesUtils::current_unix_time();
             json response_obj = ResponsesUtils::build_response_object(
                 response_id, model, output, "completed",
                 result.prompt_tokens, result.completion_tokens,
-                created_time, json(nullptr), json(nullptr));
+                begin.created_at, json(nullptr), json(nullptr),
+                previous_response_id, metadata);
 
             // Add output_tokens_details.reasoning_tokens when thinking occurred
-            if (result.reasoning_tokens > 0) {
-                response_obj["usage"]["output_tokens_details"] = {
-                    {"reasoning_tokens", result.reasoning_tokens}
-                };
+            add_reasoning_usage_details(response_obj, result);
+            bool completed = store.completeResponse(
+                response_id,
+                make_assistant_messages(result),
+                output,
+                response_obj,
+                response_obj["usage"]);
+            if (!completed) {
+                std::optional<StoredResponse> stored =
+                    store.getResponse(response_id);
+                if (stored.has_value()
+                    && stored->response_object.is_object()) {
+                    response_obj = stored->response_object;
+                }
             }
 
-            auto resp = HttpResponse::newHttpJsonResponse(response_obj.dump());
-            resp->setStatusCode(k200OK);
+            auto resp = make_json_response(response_obj, k200OK);
             callback(resp);
         }
 
     } catch (const GenAIException& e) {
         std::string error_type = (e.http_status >= 500) ? "server_error"
                                                          : "invalid_request_error";
+        store.failResponse(
+            response_id,
+            make_store_error_object(error_type, e.message));
         callback(make_error_response(e.http_status, e.message, error_type));
     } catch (const std::exception& e) {
+        store.failResponse(
+            response_id,
+            make_store_error_object(
+                "server_error",
+                std::string("Internal server error: ") + e.what()));
         callback(make_error_response(500,
             std::string("Internal server error: ") + e.what()));
     }
@@ -833,8 +1224,7 @@ void ResponsesController::countInputTokens(
         {"object", "response.input_tokens"},
         {"input_tokens", input_tokens}
     };
-    auto resp = HttpResponse::newHttpJsonResponse(response.dump());
-    resp->setStatusCode(k200OK);
+    auto resp = make_json_response(response, k200OK);
     callback(resp);
 }
 
@@ -897,8 +1287,7 @@ void ResponsesController::getResponse(
         response_obj = stored->response_object;
     }
 
-    auto resp = HttpResponse::newHttpJsonResponse(response_obj.dump());
-    resp->setStatusCode(k200OK);
+    auto resp = make_json_response(response_obj, k200OK);
     callback(resp);
 }
 
@@ -953,8 +1342,7 @@ void ResponsesController::listInputItems(
         return;
     }
 
-    auto resp = HttpResponse::newHttpJsonResponse(page.envelope.dump());
-    resp->setStatusCode(k200OK);
+    auto resp = make_json_response(page.envelope, k200OK);
     callback(resp);
 }
 
@@ -985,8 +1373,7 @@ void ResponsesController::deleteResponse(
         {"object",  "response"},
         {"deleted", true}
     };
-    auto resp = HttpResponse::newHttpJsonResponse(response.dump());
-    resp->setStatusCode(k200OK);
+    auto resp = make_json_response(response, k200OK);
     callback(resp);
 }
 
@@ -1014,7 +1401,6 @@ void ResponsesController::cancelResponse(
         {"object", "response"},
         {"status", "cancelled"}
     };
-    auto resp = HttpResponse::newHttpJsonResponse(response.dump());
-    resp->setStatusCode(k200OK);
+    auto resp = make_json_response(response, k200OK);
     callback(resp);
 }

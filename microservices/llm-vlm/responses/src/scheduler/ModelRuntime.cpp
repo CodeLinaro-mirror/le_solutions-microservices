@@ -655,25 +655,35 @@ void ModelRuntime::runJob(InferenceJob& job) {
                      << job.job_id << " model=" << model_id_);
             std::string finish_reason = "stop";
             std::string response_id = job.session_id;
-            orchestrator.executeStreaming(
-                job.request,
-                *backend_,
+            auto on_token =
                 [&job, &finish_reason, &response_id](const StreamChunk& chunk) {
-                    if (chunk.finish_reason.has_value()) {
-                        finish_reason = chunk.finish_reason.value();
-                    }
-                    if (!chunk.id.empty()) {
-                        response_id = chunk.id;
-                    }
-                    if (job.isCancelled()) {
-                        return;
-                    }
-                    if (job.callbacks.on_token) {
-                        job.callbacks.on_token(chunk);
-                    }
-                },
-                cancel_requested,
-                job.skip_summarization_middleware);
+                if (chunk.finish_reason.has_value()) {
+                    finish_reason = chunk.finish_reason.value();
+                }
+                if (!chunk.id.empty()) {
+                    response_id = chunk.id;
+                }
+                if (job.isCancelled()) {
+                    return;
+                }
+                if (job.callbacks.on_token) {
+                    job.callbacks.on_token(chunk);
+                }
+            };
+            StandardResponse response = job.use_response_history
+                ? orchestrator.executeFromMessages(
+                    job.request,
+                    job.response_history,
+                    *backend_,
+                    on_token,
+                    cancel_requested,
+                    job.skip_summarization_middleware)
+                : orchestrator.executeStreaming(
+                    job.request,
+                    *backend_,
+                    on_token,
+                    cancel_requested,
+                    job.skip_summarization_middleware);
 
             if (job.isCancelled()) {
                 notify_cancelled();
@@ -681,11 +691,12 @@ void ModelRuntime::runJob(InferenceJob& job) {
             }
 
             if (job.callbacks.on_complete) {
-                StandardResponse response;
-                response.id = response_id;
-                response.model = job.request.model;
-                response.role = "assistant";
-                response.finish_reason = finish_reason;
+                if (response.id.empty()) {
+                    response.id = response_id;
+                }
+                if (response.finish_reason.empty()) {
+                    response.finish_reason = finish_reason;
+                }
                 job.callbacks.on_complete(response);
             }
             LOG_INFO("[ModelRuntime] Streaming execution completed: job="
@@ -696,8 +707,14 @@ void ModelRuntime::runJob(InferenceJob& job) {
 
         LOG_INFO("[ModelRuntime] Blocking execution started: job="
                  << job.job_id << " model=" << model_id_);
-        StandardResponse response =
-            orchestrator.executeBlocking(
+        StandardResponse response = job.use_response_history
+            ? orchestrator.executeFromMessages(
+                job.request,
+                job.response_history,
+                *backend_,
+                cancel_requested,
+                job.skip_summarization_middleware)
+            : orchestrator.executeBlocking(
                 job.request,
                 *backend_,
                 cancel_requested,

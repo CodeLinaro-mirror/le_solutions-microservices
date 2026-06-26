@@ -76,6 +76,8 @@ struct InferenceJob {
     bool is_tool_output_submission = false;
     bool is_tool_continuation = false;
     bool skip_summarization_middleware = false;
+    bool use_response_history = false;
+    json response_history = json::array();
 
     CreateChatCompletionRequest request;
 

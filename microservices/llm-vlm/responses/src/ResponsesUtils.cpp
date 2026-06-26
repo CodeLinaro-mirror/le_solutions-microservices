@@ -239,7 +239,9 @@ json build_response_object(const std::string& response_id,
                             int completion_tokens,
                             int created_at,
                             const json& error,
-                            const json& incomplete_details) {
+                            const json& incomplete_details,
+                            const std::string& previous_response_id,
+                            const json& metadata) {
     return {
         {"id",               response_id},
         {"object",           "response"},
@@ -255,7 +257,11 @@ json build_response_object(const std::string& response_id,
         {"error",            error.is_null() ? json(nullptr) : error},
         {"incomplete_details", incomplete_details.is_null()
             ? json(nullptr)
-            : incomplete_details}
+            : incomplete_details},
+        {"previous_response_id", previous_response_id.empty()
+            ? json(nullptr)
+            : json(previous_response_id)},
+        {"metadata", metadata.is_null() ? json::object() : metadata}
     };
 }
 
