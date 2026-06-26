@@ -1,0 +1,103 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+version: '3.8'
+
+# All services target linux/arm64 (Apple Silicon, AWS Graviton, Raspberry Pi 4+, etc.)
+# Build the vector-store runtime image locally with: docker compose build
+# Start the full stack with:                         docker compose up
+
+networks:
+  # Dedicated secure internal network for secure inter-service communication
+  vector-store-network:
+    driver: bridge
+
+services:
+
+  # -- PostgreSQL 16 + pgvector ----------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    platform: linux/arm64
+    container_name: vector-store-db
+    restart: unless-stopped
+    networks:
+      - vector-store-network
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vectordb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # SQL Database initialization script runs automatically on first startup
+      - ./server/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vectordb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # -- Vector Store C++ API service (compiled by docker compose) -------------
+  vector-store:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    image: vector-store:latest
+    container_name: vector-store-platform
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      - VECTOR_STORE_PORT=9005
+      - VECTOR_STORE_PG_CONN=postgresql://postgres:postgres@localhost:5432/vectordb
+      - VECTOR_STORE_PG_POOL_SIZE=10
+      # Static embedding file source of truth
+      # Point to your embedding sidecar; override at runtime if needed
+      - EMBEDDING_SERVICE_URL=http://localhost:9090
+      - EMBEDDING_SERVICE_TIMEOUT_MS=10000
+      - EMBEDDING_CIRCUIT_BREAKER_THRESHOLD=5
+      - EMBEDDING_CIRCUIT_BREAKER_COOLDOWN_S=30
+      - VECTOR_STORE_INGEST_BATCH_SIZE=32
+      - VECTOR_STORE_INGEST_WORKERS=2
+      - VECTOR_STORE_MIGRATIONS_DIR=/app/migrations
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9005/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # -- Swagger UI Interactive API documentation ------------------------------
+  swagger-ui:
+    image: swaggerapi/swagger-ui:latest
+    platform: linux/arm64
+    container_name: vector-store-swagger
+    restart: unless-stopped
+    networks:
+      - vector-store-network
+    ports:
+      - "8081:8080"
+    environment:
+      SWAGGER_JSON: /openapi.json
+    volumes:
+      - ./openapi.json:/openapi.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+    driver: local

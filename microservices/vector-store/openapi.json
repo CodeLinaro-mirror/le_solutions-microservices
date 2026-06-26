@@ -1,0 +1,897 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Vector Store Platform Service API",
+    "description": "Enterprise-grade standalone C++ vector database service providing OpenAI-compatible vector store management, asynchronous file ingestion, pgvector HNSW-indexed similarity searches, and Model Context Protocol (MCP) integrations.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "DevOps & Platform Engineering Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:9005",
+      "description": "Local API Service Gateway"
+    }
+  ],
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "summary": "Retrieve System Health Status",
+        "description": "Performs deep health checks against PostgreSQL database connection pooling, pgvector availability, and external embedding client connectivity.",
+        "responses": {
+          "200": {
+            "description": "Service is fully operational and healthy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is degraded or unhealthy (e.g. database or embedding client unreachable).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores": {
+      "post": {
+        "summary": "Create a New Vector Store",
+        "description": "Initializes a new vector store collection schema inside PostgreSQL. If not specified, default pgvector HNSW parameters will be configured.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStoreRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Vector store created successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorStore"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Validation errors or invalid configuration parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Database or Platform Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List All Vector Stores",
+        "description": "Retrieves the status, configuration, and structural parameters of all active vector store collections.",
+        "responses": {
+          "200": {
+            "description": "A list of active vector stores.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/VectorStore"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores/{id}": {
+      "get": {
+        "summary": "Retrieve Vector Store Details",
+        "description": "Gets structural parameters, embedding model specifications, and current status of a specific vector store by ID.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Unique identifier of the vector store.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vector store configuration and parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorStore"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Specified Vector Store does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a Vector Store Collection",
+        "description": "Hard-deletes a vector store collection and cascades hard deletes to all associated document chunks and vector index mappings.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Unique identifier of the vector store to delete.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Vector store and associated assets deleted cleanly."
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores/{id}/files": {
+      "post": {
+        "summary": "Ingest File for Asynchronous Chunking and Vector Indexing",
+        "description": "Accepts an raw chunk array with associated metadata. Calculates embeddings using the store's configured embedding service, executes batch database insertions, and indexes them asynchronously inside Pgvector HNSW indices.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The target vector store ID.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "File ingestion task accepted. Processing asynchronously in the ingestion worker threads.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestionJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Payload validation failed or array limits violated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The specified Vector Store collection does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Ingestion Jobs",
+        "description": "Returns details, processing counters, and current ingestion status of all import jobs associated with this vector store.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The parent vector store ID.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A list of ingestion jobs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/IngestionJob"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores/{id}/search": {
+      "post": {
+        "summary": "Perform Vector Similarity Search",
+        "description": "Generates query vectors via embedding pipelines and performs high-speed ANN inner product similarity lookup with JSONB sub-document metadata containment filters against HNSW structures.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The vector store collection to search within.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sorted list of similarity matches.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Vector store not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores/{id}/insert_with_vectors": {
+      "post": {
+        "summary": "Directly Insert Documents with Pre-computed Embeddings",
+        "description": "Accepts text chunks and their pre-computed float embedding vectors, validating that the dimensions match, and saves them directly into the PostgreSQL Pgvector database.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The target vector store ID.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsertWithVectorsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Documents and pre-computed embeddings saved successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InsertWithVectorsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Validation errors or array mismatch.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/vector_stores/{id}/documents/{doc_id}": {
+      "get": {
+        "summary": "Retrieve Document and its Raw Embedding Vector",
+        "description": "Fetches a single document by ID from a specific vector store collection, returning its text, metadata, and the raw pgvector float array.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The vector store ID.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "description": "The document primary key ID.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The document with its embedding vector.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentWithEmbedding"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Document not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mcp": {
+      "post": {
+        "summary": "Model Context Protocol JSON-RPC Endpoint",
+        "description": "Adapter exposing vector search tool capabilities to LLMs and Agentic Frameworks using the Model Context Protocol (MCP) JSON-RPC 2.0 standards.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpJsonRpcRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Standard JSON-RPC 2.0 Response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpJsonRpcResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateStoreRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The primary unique string ID for the collection."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name of the vector store."
+          },
+          "embedding_model": {
+            "type": "string",
+            "default": "nomic-embed-text-v1",
+            "description": "The exact name of the embedding model to use."
+          },
+          "embedding_dim": {
+            "type": "integer",
+            "default": 768,
+            "description": "The vector output dimensions of the target embedding model."
+          },
+          "hnsw_m": {
+            "type": "integer",
+            "default": 16,
+            "description": "HNSW index hyperparameter 'M' representing maximum bi-directional links."
+          },
+          "hnsw_ef_construction": {
+            "type": "integer",
+            "default": 64,
+            "description": "HNSW index construction search width."
+          },
+          "hnsw_ef_search": {
+            "type": "integer",
+            "default": 40,
+            "description": "HNSW default runtime query search width."
+          },
+          "metadata": {
+            "type": "object",
+            "default": {},
+            "description": "Custom configuration properties."
+          }
+        }
+      },
+      "InsertWithVectorsRequest": {
+        "type": "object",
+        "required": [
+          "chunks",
+          "embeddings"
+        ],
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Optional file identifier grouping."
+          },
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DocumentChunk"
+            }
+          },
+          "embeddings": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "description": "Pre-computed embedding vectors matching chunks size."
+          }
+        }
+      },
+      "InsertWithVectorsResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "inserted_count": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "DocumentWithEmbedding": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "vector_store_id": {
+            "type": "string"
+          },
+          "file_id": {
+            "type": "string"
+          },
+          "text_chunk": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "embedding": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "embedding_dimensions": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "VectorStore": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "embedding_model": {
+            "type": "string"
+          },
+          "embedding_dim": {
+            "type": "integer"
+          },
+          "hnsw_m": {
+            "type": "integer"
+          },
+          "hnsw_ef_construction": {
+            "type": "integer"
+          },
+          "hnsw_ef_search": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation timestamp in epoch milliseconds."
+          }
+        }
+      },
+      "DocumentChunk": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Raw text fragment to ingest."
+          },
+          "metadata": {
+            "type": "object",
+            "default": {},
+            "description": "Custom chunk-level key-values."
+          }
+        }
+      },
+      "IngestRequest": {
+        "type": "object",
+        "required": [
+          "file_id",
+          "chunks"
+        ],
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Logical file identifier."
+          },
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DocumentChunk"
+            },
+            "description": "Array of sequential text chunks."
+          }
+        }
+      },
+      "IngestionJob": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "vector_store_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "processing",
+              "completed",
+              "failed"
+            ]
+          },
+          "total_chunks": {
+            "type": "integer"
+          },
+          "processed_chunks": {
+            "type": "integer"
+          },
+          "failed_chunks": {
+            "type": "integer"
+          },
+          "error_message": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "completed_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "SearchRequest": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Plain text search prompt."
+          },
+          "top_k": {
+            "type": "integer",
+            "default": 5,
+            "description": "Max results to return."
+          },
+          "score_threshold": {
+            "type": "number",
+            "format": "float",
+            "default": 0.0,
+            "description": "Similarity score filter (inner product equivalent)."
+          },
+          "metadata_filter": {
+            "type": "object",
+            "default": {},
+            "description": "JSONB metadata target containment matching pattern."
+          }
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number",
+            "format": "float"
+          },
+          "text": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "file_id": {
+            "type": "string"
+          }
+        }
+      },
+      "SearchResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            }
+          }
+        }
+      },
+      "HealthCheckResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "object",
+            "properties": {
+              "postgresql": {
+                "type": "string"
+              },
+              "embedding_service": {
+                "type": "string"
+              },
+              "embedding_failures": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "McpJsonRpcRequest": {
+        "type": "object",
+        "required": [
+          "jsonrpc",
+          "method",
+          "id"
+        ],
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "enum": [
+              "2.0"
+            ]
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "tools/list",
+              "tools/call"
+            ]
+          },
+          "id": {
+            "type": "integer"
+          },
+          "params": {
+            "type": "object"
+          }
+        }
+      },
+      "McpJsonRpcResponse": {
+        "type": "object",
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "enum": [
+              "2.0"
+            ]
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

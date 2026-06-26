@@ -1,0 +1,20 @@
+{
+  "comment": "Model Context Protocol (MCP) Server Registries. Place this file in your Responses API / Agentic Platform directory or user config path.",
+  "servers": [
+    {
+      "name": "vector-store",
+      "type": "http",
+      "url": "http://localhost:9005/mcp",
+      "description": "Semantic search and automated code indexing over the codebase"
+    },
+    {
+      "name": "filesystem",
+      "type": "stdio",
+      "command": "mcp-server-filesystem",
+      "args": [
+        "/workspace"
+      ],
+      "description": "Standard read, write, and patch filesystem tool operations"
+    }
+  ]
+}
