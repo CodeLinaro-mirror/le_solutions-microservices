@@ -41,7 +41,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 using json = nlohmann::ordered_json;
 
@@ -115,9 +117,12 @@ static bool get_optional_string_field(const json& body,
 }
 
 static json make_assistant_messages(const StandardResponse& result) {
+    std::string content = result.content.has_value()
+        ? ResponsesUtils::strip_tool_call_protocol_text(result.content.value())
+        : "";
     json message = {
         {"role", "assistant"},
-        {"content", result.content.value_or("")}
+        {"content", content}
     };
     if (result.reasoning_content.has_value()
         && !result.reasoning_content.value().empty()) {
@@ -176,6 +181,368 @@ static bool branch_ends_with_tool_call(const json& ancestor_messages) {
     return last.contains("tool_calls")
         && last["tool_calls"].is_array()
         && !last["tool_calls"].empty();
+}
+
+static void collect_tool_call_ids(const json& messages,
+                                  std::unordered_set<std::string>& ids) {
+    if (!messages.is_array()) {
+        return;
+    }
+    for (const auto& message : messages) {
+        if (!message.is_object() || !message.contains("tool_calls")
+            || !message["tool_calls"].is_array()) {
+            continue;
+        }
+        for (const auto& tool_call : message["tool_calls"]) {
+            if (tool_call.is_object()) {
+                std::string id = tool_call.value("id", "");
+                if (!id.empty()) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+}
+
+static bool validate_function_call_outputs(const json& input,
+                                           const json& ancestor_messages,
+                                           std::string& error_message) {
+    std::vector<std::string> call_ids;
+    if (input.is_array()) {
+        for (const auto& item : input) {
+            if (!item.is_object()
+                || item.value("type", "") != "function_call_output") {
+                continue;
+            }
+            if (!item.contains("call_id") || !item["call_id"].is_string()
+                || item["call_id"].get<std::string>().empty()) {
+                error_message =
+                    "function_call_output items require a non-empty call_id";
+                return false;
+            }
+            if (!item.contains("output") || !item["output"].is_string()) {
+                error_message =
+                    "function_call_output items require a string output";
+                return false;
+            }
+            call_ids.push_back(item["call_id"].get<std::string>());
+        }
+    }
+
+    if (call_ids.empty()) {
+        return true;
+    }
+
+    std::unordered_set<std::string> known_call_ids;
+    collect_tool_call_ids(ancestor_messages, known_call_ids);
+    if (known_call_ids.empty()) {
+        error_message =
+            "function_call_output requires previous_response_id with a prior function_call";
+        return false;
+    }
+
+    for (const auto& call_id : call_ids) {
+        if (known_call_ids.find(call_id) == known_call_ids.end()) {
+            error_message =
+                "function_call_output call_id '" + call_id +
+                "' does not match a prior function_call";
+            return false;
+        }
+    }
+    return true;
+}
+
+struct FunctionToolPolicy {
+    bool expose_tools = true;
+    bool parallel_tool_calls = true;
+    std::string tool_choice = "auto";
+    std::string named_tool;
+};
+
+static std::string function_tool_name(const json& tool) {
+    if (!tool.is_object()) {
+        return "";
+    }
+    if (tool.contains("function") && tool["function"].is_object()) {
+        return tool["function"].value("name", "");
+    }
+    return tool.value("name", "");
+}
+
+static bool normalize_function_tool(const json& tool,
+                                    json& normalized,
+                                    std::string& error_message) {
+    if (!tool.is_object() || tool.value("type", "") != "function") {
+        error_message = "Function tool entries must be objects with type 'function'";
+        return false;
+    }
+
+    if (tool.contains("function") && tool["function"].is_object()) {
+        normalized = tool;
+    } else {
+        json function = json::object();
+        if (tool.contains("name")) {
+            function["name"] = tool["name"];
+        }
+        if (tool.contains("description")) {
+            function["description"] = tool["description"];
+        }
+        function["parameters"] = tool.contains("parameters")
+            ? tool["parameters"]
+            : json::object();
+        if (tool.contains("strict")) {
+            function["strict"] = tool["strict"];
+        }
+        normalized = {
+            {"type", "function"},
+            {"function", function}
+        };
+    }
+
+    json function = normalized.value("function", json::object());
+    if (!function.contains("name") || !function["name"].is_string()
+        || function["name"].get<std::string>().empty()) {
+        error_message = "Function tools require a non-empty string 'name'";
+        return false;
+    }
+    if (function.contains("description") && !function["description"].is_string()) {
+        error_message = "Function tool 'description' must be a string";
+        return false;
+    }
+    if (function.contains("parameters") && !function["parameters"].is_object()) {
+        error_message = "Function tool 'parameters' must be an object";
+        return false;
+    }
+    normalized["function"] = function;
+    return true;
+}
+
+static bool function_tool_exists(const json& tools, const std::string& name) {
+    if (!tools.is_array()) {
+        return false;
+    }
+    for (const auto& tool : tools) {
+        if (function_tool_name(tool) == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static json select_function_tools_for_policy(const json& tools,
+                                             const FunctionToolPolicy& policy) {
+    if (!tools.is_array() || !policy.expose_tools) {
+        return json::array();
+    }
+    if (policy.named_tool.empty()) {
+        return tools;
+    }
+
+    json selected = json::array();
+    for (const auto& tool : tools) {
+        if (function_tool_name(tool) == policy.named_tool) {
+            selected.push_back(tool);
+            break;
+        }
+    }
+    return selected;
+}
+
+static json flatten_function_tool_for_response(const json& tool) {
+    json function = tool.value("function", json::object());
+    json response_tool = {
+        {"type", "function"},
+        {"name", function.value("name", "")},
+        {"parameters", function.value("parameters", json::object())}
+    };
+    if (function.contains("description")) {
+        response_tool["description"] = function["description"];
+    }
+    if (function.contains("strict")) {
+        response_tool["strict"] = function["strict"];
+    }
+    return response_tool;
+}
+
+static json flatten_function_tools_for_response(const json& tools) {
+    json response_tools = json::array();
+    if (!tools.is_array()) {
+        return response_tools;
+    }
+    for (const auto& tool : tools) {
+        response_tools.push_back(flatten_function_tool_for_response(tool));
+    }
+    return response_tools;
+}
+
+static json response_tool_choice_for_policy(const FunctionToolPolicy& policy) {
+    if (!policy.named_tool.empty()) {
+        return {
+            {"type", "function"},
+            {"name", policy.named_tool}
+        };
+    }
+    return policy.tool_choice;
+}
+
+static void attach_function_tool_response_fields(
+    json& response_obj,
+    const json& tools,
+    const FunctionToolPolicy& policy,
+    bool has_function_tools) {
+    if (!has_function_tools) {
+        return;
+    }
+    response_obj["tools"] = flatten_function_tools_for_response(tools);
+    response_obj["tool_choice"] = response_tool_choice_for_policy(policy);
+    response_obj["parallel_tool_calls"] = policy.parallel_tool_calls;
+}
+
+static bool parse_function_tool_policy(const json& body,
+                                       const json& function_tools,
+                                       FunctionToolPolicy& policy,
+                                       std::string& error_message,
+                                       std::string& error_param) {
+    if (body.contains("parallel_tool_calls")
+        && !body["parallel_tool_calls"].is_null()) {
+        if (!body["parallel_tool_calls"].is_boolean()) {
+            error_message = "invalid value for 'parallel_tool_calls' - expected boolean";
+            error_param = "parallel_tool_calls";
+            return false;
+        }
+        policy.parallel_tool_calls =
+            body["parallel_tool_calls"].get<bool>();
+    }
+
+    if (!body.contains("tool_choice") || body["tool_choice"].is_null()) {
+        return true;
+    }
+
+    const json& choice = body["tool_choice"];
+    if (choice.is_string()) {
+        std::string value = choice.get<std::string>();
+        if (value == "none") {
+            policy.tool_choice = value;
+            policy.expose_tools = false;
+            return true;
+        }
+        if (value == "required" && function_tools.empty()) {
+            error_message =
+                "tool_choice 'required' requires at least one function tool";
+            error_param = "tool_choice";
+            return false;
+        }
+        if (value == "auto" || value == "required") {
+            policy.tool_choice = value;
+            return true;
+        }
+        error_message = "invalid value for 'tool_choice'";
+        error_param = "tool_choice";
+        return false;
+    }
+
+    if (choice.is_object() && choice.value("type", "") == "function") {
+        std::string name = choice.value("name", "");
+        if (name.empty() && choice.contains("function")
+            && choice["function"].is_object()) {
+            name = choice["function"].value("name", "");
+        }
+        if (name.empty() || !function_tool_exists(function_tools, name)) {
+            error_message =
+                "tool_choice references a function that is not present in tools";
+            error_param = "tool_choice";
+            return false;
+        }
+        policy.tool_choice = "function";
+        policy.named_tool = name;
+        return true;
+    }
+
+    error_message = "invalid value for 'tool_choice'";
+    error_param = "tool_choice";
+    return false;
+}
+
+static std::string append_function_tool_policy_instructions(
+    const std::string& instructions,
+    const FunctionToolPolicy& policy,
+    bool has_function_tools) {
+    if (!has_function_tools || !policy.expose_tools) {
+        return instructions;
+    }
+
+    std::string result = instructions;
+    auto append_line = [&result](const std::string& line) {
+        if (!result.empty()) {
+            result += "\n";
+        }
+        result += line;
+    };
+
+    if (policy.tool_choice == "required") {
+        append_line(
+            "For this response, you MUST call at least one provided function. "
+            "Your entire assistant response must be only valid "
+            "<tool_call>...</tool_call> block(s); do not answer in natural "
+            "language.");
+    } else if (!policy.named_tool.empty()) {
+        append_line(
+            "For this response, you MUST call exactly the function named '" +
+            policy.named_tool + "'. Your entire assistant response must be "
+            "only a valid <tool_call>...</tool_call> block; do not answer in "
+            "natural language.");
+    }
+    if (!policy.parallel_tool_calls) {
+        append_line("Call at most one function in this response.");
+    }
+    return result;
+}
+
+static void apply_function_tool_policy(StandardResponse& result,
+                                       const FunctionToolPolicy& policy) {
+    if (!result.content.value_or("").empty()) {
+        result.content = ResponsesUtils::strip_tool_call_protocol_text(
+            result.content.value());
+    }
+    if (!result.tool_calls.has_value()
+        || !result.tool_calls.value().is_array()
+        || result.tool_calls.value().empty()) {
+        return;
+    }
+    if (!policy.expose_tools) {
+        result.tool_calls.reset();
+        if (result.finish_reason == "tool_calls") {
+            result.finish_reason = "stop";
+        }
+        return;
+    }
+
+    json filtered = json::array();
+    for (const auto& tool_call : result.tool_calls.value()) {
+        const std::string name =
+            tool_call.value("function", json::object()).value("name", "");
+        if (!policy.named_tool.empty() && name != policy.named_tool) {
+            LOG_WARN("[ResponsesController] Dropping tool call that violates "
+                     "tool_choice: expected=" << policy.named_tool
+                     << " actual=" << name);
+            continue;
+        }
+        filtered.push_back(tool_call);
+        if (!policy.parallel_tool_calls) {
+            break;
+        }
+    }
+
+    if (filtered.empty()) {
+        result.tool_calls.reset();
+        if (result.finish_reason == "tool_calls") {
+            result.finish_reason = "stop";
+        }
+        return;
+    }
+
+    result.tool_calls = filtered;
+    result.finish_reason = "tool_calls";
 }
 
 static void prepend_system_message(json& messages,
@@ -342,6 +709,16 @@ void ResponsesController::createResponse(
     std::vector<McpToolRequest> mcp_requests;
     json function_tools = json::array();
 
+    if (body.contains("tools") && !body["tools"].is_null()
+        && !body["tools"].is_array()) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'tools' - expected array",
+            "invalid_request_error",
+            "tools"));
+        return;
+    }
+
     if (body.contains("tools") && body["tools"].is_array()) {
         for (const auto& tool : body["tools"]) {
             std::string tool_type = tool.value("type", "");
@@ -350,8 +727,19 @@ void ResponsesController::createResponse(
                 has_mcp_tools = true;
                 // Parsed below via extract_mcp_tool_requests()
             } else if (tool_type == "function") {
+                json normalized_tool;
+                std::string error_message;
+                if (!normalize_function_tool(
+                        tool, normalized_tool, error_message)) {
+                    callback(make_error_response(
+                        400,
+                        error_message,
+                        "invalid_request_error",
+                        "tools"));
+                    return;
+                }
                 has_function_tools = true;
-                function_tools.push_back(tool);
+                function_tools.push_back(normalized_tool);
             } else if (tool_type == "web_search") {
                 // Map OpenAI built-in web_search → native tool (if registered).
                 // No HTTP 400 — if a web_search native tool is registered it
@@ -386,15 +774,37 @@ void ResponsesController::createResponse(
         }
     }
 
+    FunctionToolPolicy function_tool_policy;
+    std::string policy_error;
+    std::string policy_param;
+    if (!parse_function_tool_policy(
+            body,
+            function_tools,
+            function_tool_policy,
+            policy_error,
+            policy_param)) {
+        callback(make_error_response(
+            400,
+            policy_error,
+            "invalid_request_error",
+            policy_param));
+        return;
+    }
+    json function_tools_for_request =
+        select_function_tools_for_policy(function_tools, function_tool_policy);
+    bool expose_function_tools =
+        has_function_tools && !function_tools_for_request.empty();
+
     // ── Auto-inject native tools ──────────────────────────────────────────────
-    // Always include built-in native tools (datetime, calculator, etc.) so the
-    // model knows what capabilities are available on every request.
-    // Their schemas are injected into the model's tool context automatically.
+    // Native tools are only auto-injected after an explicit MCP/built-in tool
+    // request has selected the MCP path. Function-only requests must remain on
+    // the standard ResponseStore-backed path because the client executes them.
     {
         auto& native_reg = NativeToolRegistry::getInstance();
         auto& mcp_reg    = McpClientRegistry::getInstance();
 
-        if (native_reg.hasTools() && mcp_reg.hasServer("native")) {
+        if (has_mcp_tools && native_reg.hasTools()
+            && mcp_reg.hasServer("native")) {
             bool has_native = false;
             for (const auto& r : mcp_requests) {
                 if (r.server_label == "native") { has_native = true; break; }
@@ -681,7 +1091,9 @@ void ResponsesController::createResponse(
     std::string effective_system_prompt = base_system_prompt;
     json input_items =
         ResponsesUtils::normalize_input_items(response_id, body["input"]);
-    json tools_for_budget = has_function_tools ? function_tools : json::array();
+    json tools_for_budget = expose_function_tools
+        ? function_tools_for_request
+        : json::array();
 
     ResponseStore& store = ResponseStore::getInstance();
     BuildCandidateResult walk =
@@ -694,9 +1106,25 @@ void ResponsesController::createResponse(
             "previous_response_id"));
         return;
     }
+    std::string function_output_error;
+    if (!validate_function_call_outputs(
+            body["input"],
+            walk.ancestor_messages,
+            function_output_error)) {
+        callback(make_error_response(
+            400,
+            function_output_error,
+            "invalid_request_error",
+            "input"));
+        return;
+    }
     effective_system_prompt = ResponsesUtils::inject_summary_into_instructions(
         base_system_prompt,
         walk.applied_summary);
+    effective_system_prompt = append_function_tool_policy_instructions(
+        effective_system_prompt,
+        function_tool_policy,
+        expose_function_tools);
 
     const bool is_vlm = config_mgr.supportsVision(model);
     std::optional<int> requested_max_output_tokens =
@@ -764,10 +1192,27 @@ void ResponsesController::createResponse(
                         "previous_response_id"));
                     return;
                 }
+                function_output_error.clear();
+                if (!validate_function_call_outputs(
+                        body["input"],
+                        walk.ancestor_messages,
+                        function_output_error)) {
+                    callback(make_error_response(
+                        400,
+                        function_output_error,
+                        "invalid_request_error",
+                        "input"));
+                    return;
+                }
                 effective_system_prompt =
                     ResponsesUtils::inject_summary_into_instructions(
                         base_system_prompt,
                         walk.applied_summary);
+                effective_system_prompt =
+                    append_function_tool_policy_instructions(
+                        effective_system_prompt,
+                        function_tool_policy,
+                        expose_function_tools);
             }
         }
 
@@ -820,8 +1265,8 @@ void ResponsesController::createResponse(
             effective_system_prompt,
             reasoning_effort,
             reasoning_summary,
-            function_tools,
-            has_function_tools,
+            function_tools_for_request,
+            expose_function_tools,
             is_vlm ? requested_max_output_tokens : resolved_max_output_tokens);
     } catch (const std::exception& e) {
         json error_obj = make_store_error_object(
@@ -844,6 +1289,12 @@ void ResponsesController::createResponse(
     invoke_options.skip_summarization_middleware = true;
     invoke_options.use_response_history = true;
     invoke_options.response_history = begin.ancestor_messages;
+    if (current_turn_has_tool_response(begin.current_request_messages)
+        && !previous_response_id.empty()) {
+        invoke_options.previous_response_id = previous_response_id;
+        invoke_options.tool_output_submission = true;
+        invoke_options.allow_tool_chain_fallback = true;
+    }
 
     std::optional<StoredResponse> pre_submit = store.getResponse(response_id);
     if (!pre_submit.has_value()
@@ -868,6 +1319,8 @@ void ResponsesController::createResponse(
             auto resp = HttpResponse::newAsyncStreamResponse(
                 [standard_request, invoke_options, response_id, model,
                  previous_response_id, metadata,
+                 function_tool_policy, function_tools, has_function_tools,
+                 expose_function_tools,
                  begin_created_at = begin.created_at](ResponseStreamPtr stream) {
                     auto emit_event = [&stream](const std::string& event_type,
                                                  const json& data) {
@@ -888,26 +1341,28 @@ void ResponsesController::createResponse(
                         }}
                     });
 
-                    // response.output_item.added
-                    emit_event("response.output_item.added", {
-                        {"type",         "response.output_item.added"},
-                        {"output_index", 0},
-                        {"item", {
-                            {"type",    "message"},
-                            {"id",      "msg_" + response_id},
-                            {"role",    "assistant"},
-                            {"content", json::array()},
-                            {"status",  "in_progress"}
-                        }}
-                    });
+                    if (!expose_function_tools) {
+                        // response.output_item.added
+                        emit_event("response.output_item.added", {
+                            {"type",         "response.output_item.added"},
+                            {"output_index", 0},
+                            {"item", {
+                                {"type",    "message"},
+                                {"id",      "msg_" + response_id},
+                                {"role",    "assistant"},
+                                {"content", json::array()},
+                                {"status",  "in_progress"}
+                            }}
+                        });
 
-                    // response.content_part.added
-                    emit_event("response.content_part.added", {
-                        {"type",          "response.content_part.added"},
-                        {"output_index",  0},
-                        {"content_index", 0},
-                        {"part",          {{"type", "output_text"}, {"text", ""}}}
-                    });
+                        // response.content_part.added
+                        emit_event("response.content_part.added", {
+                            {"type",          "response.content_part.added"},
+                            {"output_index",  0},
+                            {"content_index", 0},
+                            {"part",          {{"type", "output_text"}, {"text", ""}}}
+                        });
+                    }
 
                     std::string full_text;
                     bool had_error = false;
@@ -926,12 +1381,14 @@ void ResponsesController::createResponse(
                                 if (chunk.content_delta.has_value()
                                     && !chunk.content_delta.value().empty()) {
                                     full_text += chunk.content_delta.value();
-                                    emit_event("response.output_text.delta", {
-                                        {"type",          "response.output_text.delta"},
-                                        {"output_index",  0},
-                                        {"content_index", 0},
-                                        {"delta",         chunk.content_delta.value()}
-                                    });
+                                    if (!expose_function_tools) {
+                                        emit_event("response.output_text.delta", {
+                                            {"type",          "response.output_text.delta"},
+                                            {"output_index",  0},
+                                            {"content_index", 0},
+                                            {"delta",         chunk.content_delta.value()}
+                                        });
+                                    }
                                 }
                                 if (chunk.reasoning_content.has_value()
                                     && !chunk.reasoning_content.value().empty()) {
@@ -967,27 +1424,72 @@ void ResponsesController::createResponse(
 
                     if (!had_error) {
                         if (!emit_cancelled_if_stored()) {
-                            emit_event("response.output_text.done", {
-                                {"type",          "response.output_text.done"},
-                                {"output_index",  0},
-                                {"content_index", 0},
-                                {"text",          full_text}
-                            });
-
-                            emit_event("response.output_item.done", {
-                                {"type",         "response.output_item.done"},
-                                {"output_index", 0},
-                                {"item", {
-                                    {"type",    "message"},
-                                    {"id",      "msg_" + response_id},
-                                    {"role",    "assistant"},
-                                    {"content", {{{"type", "output_text"},
-                                                  {"text", full_text}}}},
-                                    {"status",  "completed"}
-                                }}
-                            });
-
+                            apply_function_tool_policy(
+                                result, function_tool_policy);
                             json output = ResponsesUtils::build_output_array(result);
+                            if (expose_function_tools) {
+                                for (std::size_t i = 0; i < output.size(); ++i) {
+                                    const json& item = output[i];
+                                    emit_event("response.output_item.added", {
+                                        {"type", "response.output_item.added"},
+                                        {"output_index", i},
+                                        {"item", item}
+                                    });
+                                    if (item.value("type", "") == "message"
+                                        && item.contains("content")
+                                        && item["content"].is_array()
+                                        && !item["content"].empty()) {
+                                        const json& part = item["content"][0];
+                                        std::string text = part.value("text", "");
+                                        emit_event("response.content_part.added", {
+                                            {"type", "response.content_part.added"},
+                                            {"output_index", i},
+                                            {"content_index", 0},
+                                            {"part", part}
+                                        });
+                                        emit_event("response.output_text.delta", {
+                                            {"type", "response.output_text.delta"},
+                                            {"output_index", i},
+                                            {"content_index", 0},
+                                            {"delta", text}
+                                        });
+                                        emit_event("response.output_text.done", {
+                                            {"type", "response.output_text.done"},
+                                            {"output_index", i},
+                                            {"content_index", 0},
+                                            {"text", text}
+                                        });
+                                    }
+                                    emit_event("response.output_item.done", {
+                                        {"type", "response.output_item.done"},
+                                        {"output_index", i},
+                                        {"item", item}
+                                    });
+                                }
+                            } else {
+                                std::string clean_full_text =
+                                    ResponsesUtils::strip_tool_call_protocol_text(
+                                        full_text);
+                                emit_event("response.output_text.done", {
+                                    {"type",          "response.output_text.done"},
+                                    {"output_index",  0},
+                                    {"content_index", 0},
+                                    {"text",          clean_full_text}
+                                });
+
+                                emit_event("response.output_item.done", {
+                                    {"type",         "response.output_item.done"},
+                                    {"output_index", 0},
+                                    {"item", {
+                                        {"type",    "message"},
+                                        {"id",      "msg_" + response_id},
+                                        {"role",    "assistant"},
+                                        {"content", {{{"type", "output_text"},
+                                                      {"text", clean_full_text}}}},
+                                        {"status",  "completed"}
+                                    }}
+                                });
+                            }
                             json response_obj = ResponsesUtils::build_response_object(
                                 response_id,
                                 model,
@@ -1000,6 +1502,11 @@ void ResponsesController::createResponse(
                                 json(nullptr),
                                 previous_response_id,
                                 metadata);
+                            attach_function_tool_response_fields(
+                                response_obj,
+                                function_tools,
+                                function_tool_policy,
+                                has_function_tools);
                             add_reasoning_usage_details(response_obj, result);
                             bool completed =
                                 ResponseStore::getInstance().completeResponse(
@@ -1063,6 +1570,7 @@ void ResponsesController::createResponse(
             StandardResponse result =
                 scheduler::ModelScheduler::getInstance().runBlocking(
                     standard_request, invoke_options);
+            apply_function_tool_policy(result, function_tool_policy);
 
             // Build output array.
             // build_output_array() automatically emits a separate top-level
@@ -1076,6 +1584,11 @@ void ResponsesController::createResponse(
                 result.prompt_tokens, result.completion_tokens,
                 begin.created_at, json(nullptr), json(nullptr),
                 previous_response_id, metadata);
+            attach_function_tool_response_fields(
+                response_obj,
+                function_tools,
+                function_tool_policy,
+                has_function_tools);
 
             // Add output_tokens_details.reasoning_tokens when thinking occurred
             add_reasoning_usage_details(response_obj, result);

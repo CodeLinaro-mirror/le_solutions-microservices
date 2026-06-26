@@ -40,6 +40,13 @@ bool isCancellationRequested(
     return cancel_requested && cancel_requested();
 }
 
+bool requestHasTools(const CreateChatCompletionRequest& request) {
+    if (!request.tools.has_value() || !request.tools.value().is_array()) {
+        return false;
+    }
+    return !request.tools.value().empty();
+}
+
 std::string generateEventId() {
     static std::mt19937_64 rng(std::random_device{}());
     std::ostringstream oss;
@@ -62,6 +69,39 @@ void registerSessionHash(const CreateChatCompletionRequest& request,
     auto& session_mgr = SessionManager::getInstance();
     std::string hash = SessionManager::calculateMessagesHash(request.messages);
     session_mgr.registerHash(hash, session_id);
+}
+
+std::string renderToolCallsForPrompt(const json& tool_calls) {
+    if (!tool_calls.is_array() || tool_calls.empty()) {
+        return "";
+    }
+
+    std::ostringstream oss;
+    for (const auto& tool_call : tool_calls) {
+        if (!tool_call.is_object()) {
+            continue;
+        }
+        json function = tool_call.value("function", json::object());
+        std::string name = function.value("name", "");
+        if (name.empty()) {
+            continue;
+        }
+
+        json arguments = json::object();
+        std::string raw_arguments = function.value("arguments", "{}");
+        try {
+            arguments = json::parse(raw_arguments);
+        } catch (...) {
+            arguments = raw_arguments;
+        }
+
+        json protocol = {
+            {"name", name},
+            {"arguments", arguments}
+        };
+        oss << "<tool_call>\n" << protocol.dump() << "\n</tool_call>\n";
+    }
+    return oss.str();
 }
 
 ImageUtils::TempFileGuard preprocessImagesToTempFiles(
@@ -289,7 +329,11 @@ std::string ChatOrchestratorImpl::buildContextPrompt(const ConversationSession& 
         if (role == "user") {
             prompt << user_prefix << content << user_suffix;
         } else if (role == "assistant") {
-            prompt << assistant_prefix << content << assistant_suffix;
+            prompt << assistant_prefix << content;
+            if (msg.contains("tool_calls")) {
+                prompt << renderToolCallsForPrompt(msg["tool_calls"]);
+            }
+            prompt << assistant_suffix;
         }
     }
 
@@ -302,6 +346,12 @@ std::string ChatOrchestratorImpl::buildContextPrompt(const ConversationSession& 
             prompt << user_prefix << content << user_suffix;
         } else if (role == "tool") {
             prompt << user_prefix << adapter.formatToolResponse(json::array({msg})) << user_suffix;
+        } else if (role == "assistant") {
+            prompt << assistant_prefix << content;
+            if (msg.contains("tool_calls")) {
+                prompt << renderToolCallsForPrompt(msg["tool_calls"]);
+            }
+            prompt << assistant_suffix;
         }
     }
 
@@ -587,8 +637,11 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
         reasoning_token_count = router.getThinkingTokenCount();
     }
 
-    const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
-    json tool_calls = adapter.parseToolCalls(answer_content);
+    json tool_calls = json::array();
+    if (requestHasTools(request)) {
+        const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
+        tool_calls = adapter.parseToolCalls(answer_content);
+    }
 
     if (isCancellationRequested(cancel_requested)) {
         LOG_WARN("[ChatOrchestratorImpl] Blocking inference cancelled before session update: model="
@@ -823,8 +876,11 @@ StandardResponse ChatOrchestratorImpl::executeStreamingPrepared(
         reasoning_token_count = router.getThinkingTokenCount();
     }
 
-    const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
-    json tool_calls = adapter.parseToolCalls(answer_content);
+    json tool_calls = json::array();
+    if (requestHasTools(request)) {
+        const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
+        tool_calls = adapter.parseToolCalls(answer_content);
+    }
 
     draft.commit(*session);
     if (use_reasoning) {
