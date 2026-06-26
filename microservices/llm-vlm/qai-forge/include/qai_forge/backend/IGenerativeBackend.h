@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <stdexcept>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IGenerativeBackend — Layer 3 interface for generative AI inference
@@ -50,6 +51,28 @@ public:
      * The returned struct reflects the currently loaded model's constraints.
      */
     virtual BackendCapabilities capabilities() const = 0;
+
+    /**
+     * Load a model into this backend instance.
+     *
+     * Scheduler-owned backends override this to turn a model_id into backend
+     * config paths and start the appropriate worker. Legacy callers may still
+     * use ensureWorkerRunning() directly.
+     */
+    virtual void loadModel(const std::string& model_id) {
+        (void)model_id;
+        throw std::runtime_error("Backend does not implement loadModel()");
+    }
+
+    /**
+     * Unload the model owned by this backend instance.
+     *
+     * Default behavior preserves older backend implementations by terminating
+     * the active worker through the existing interface.
+     */
+    virtual void unloadModel(bool force = false) {
+        terminateWorker(force);
+    }
 
     /**
      * Ensure the worker subprocess is running with the correct model loaded.

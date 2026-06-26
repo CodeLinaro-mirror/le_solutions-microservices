@@ -23,16 +23,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "controllers/ResponsesController.h"
+#include "ResponsesUtils.h"
 #include "mcp/McpAgenticLoop.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
 #include "qai_forge/orchestration/ChatOrchestrator.h"
 #include "qai_forge/InternalDTOs.h"
+#include "qai_forge/utils/Logger.h"
+#include "scheduler/ModelScheduler.h"
 #include <nlohmann/json.hpp>
-#include <chrono>
-#include <sstream>
-#include <iomanip>
-#include <random>
+#include <cstdlib>
 #include <iostream>
 
 using json = nlohmann::ordered_json;
@@ -40,13 +40,6 @@ using json = nlohmann::ordered_json;
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static std::string generate_response_id() {
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << "resp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
-    return oss.str();
-}
-
 static HttpResponsePtr make_error_response(int status_code, const std::string& message,
                                             const std::string& error_type = "server_error") {
     json error_body = {
@@ -60,199 +53,6 @@ static HttpResponsePtr make_error_response(int status_code, const std::string& m
     auto resp = HttpResponse::newHttpJsonResponse(error_body.dump());
     resp->setStatusCode(static_cast<HttpStatusCode>(status_code));
     return resp;
-}
-
-static int current_unix_time() {
-    return static_cast<int>(
-        std::chrono::system_clock::now().time_since_epoch().count() / 1000000000LL);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Convert Responses API `input` to ChatCompletionRequest `messages[]`
-//
-// Responses API input formats:
-//   1. String: "Hello" → [{role: "user", content: "Hello"}]
-//   2. Array of message objects: [{role: "user", content: "..."}]
-//   3. Array of content parts: [{type: "text", text: "..."}]
-//   4. Array with function_call_output items (tool results from previous turn)
-// ─────────────────────────────────────────────────────────────────────────────
-static json input_to_messages(const json& input, const std::string& system_prompt = "") {
-    json messages = json::array();
-
-    if (!system_prompt.empty()) {
-        messages.push_back({{"role", "system"}, {"content", system_prompt}});
-    }
-
-    if (input.is_string()) {
-        messages.push_back({{"role", "user"}, {"content", input.get<std::string>()}});
-    } else if (input.is_array()) {
-        for (const auto& item : input) {
-            if (item.is_object()) {
-                std::string item_type = item.value("type", "");
-
-                // Handle function_call_output items (tool results from previous turn)
-                if (item_type == "function_call_output") {
-                    messages.push_back({
-                        {"role",         "tool"},
-                        {"tool_call_id", item.value("call_id", "")},
-                        {"content",      item.value("output", "")}
-                    });
-                    continue;
-                }
-
-                // Handle function_call items (assistant tool call from previous turn)
-                if (item_type == "function_call") {
-                    json tool_call = {
-                        {"id",   item.value("call_id", item.value("id", ""))},
-                        {"type", "function"},
-                        {"function", {
-                            {"name",      item.value("name", "")},
-                            {"arguments", item.value("arguments", "{}")}
-                        }}
-                    };
-                    messages.push_back({
-                        {"role",       "assistant"},
-                        {"content",    nullptr},
-                        {"tool_calls", json::array({tool_call})}
-                    });
-                    continue;
-                }
-
-                // Standard message object
-                std::string role = item.value("role", "user");
-                if (item.contains("content")) {
-                    messages.push_back({{"role", role}, {"content", item["content"]}});
-                } else if (item.contains("text")) {
-                    messages.push_back({{"role", role}, {"content", item["text"]}});
-                }
-            } else if (item.is_string()) {
-                messages.push_back({{"role", "user"}, {"content", item.get<std::string>()}});
-            }
-        }
-    }
-
-    return messages;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Build Responses API output[] from a StandardResponse DTO
-//
-// Per the OpenAI Responses API spec, the reasoning output item is a SEPARATE
-// top-level item in output[], NOT nested inside message.content[].
-// ─────────────────────────────────────────────────────────────────────────────
-static json build_output_array(const StandardResponse& result,
-                                 const std::vector<McpCallRecord>& mcp_records = {}) {
-    json output = json::array();
-
-    // MCP call records come first (they happened before the final answer)
-    for (const auto& record : mcp_records) {
-        output.push_back(record.to_output_item());
-    }
-
-    // ── Reasoning output item (separate top-level item, NOT inside message) ──
-    if (result.reasoning_content.has_value() && !result.reasoning_content.value().empty()) {
-        output.push_back({
-            {"type", "reasoning"},
-            {"id",   "rs_" + result.id},
-            {"summary", json::array({{
-                {"type", "summary_text"},
-                {"text", result.reasoning_content.value()}
-            }})}
-        });
-    }
-
-    // ── Message output item (answer text only) ────────────────────────────────
-    json content_array = json::array();
-    if (result.content.has_value() && !result.content.value().empty()) {
-        content_array.push_back({
-            {"type", "output_text"},
-            {"text", result.content.value()}
-        });
-    }
-
-    output.push_back({
-        {"type",    "message"},
-        {"id",      "msg_" + result.id},
-        {"role",    "assistant"},
-        {"content", content_array},
-        {"status",  "completed"}
-    });
-
-    // Function call output items (non-MCP tool calls, if any)
-    if (result.tool_calls.has_value() && !result.tool_calls.value().empty()) {
-        for (const auto& tc : result.tool_calls.value()) {
-            output.push_back({
-                {"type",      "function_call"},
-                {"id",        tc.value("id", "")},
-                {"call_id",   tc.value("id", "")},
-                {"name",      tc.value("function", json::object()).value("name", "")},
-                {"arguments", tc.value("function", json::object()).value("arguments", "")}
-            });
-        }
-    }
-
-    return output;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Build a complete Responses API response object
-// ─────────────────────────────────────────────────────────────────────────────
-static json build_response_object(const std::string& response_id,
-                                   const std::string& model,
-                                   const json& output,
-                                   const std::string& status,
-                                   int prompt_tokens, int completion_tokens,
-                                   bool truncated = false) {
-    json obj = {
-        {"id",               response_id},
-        {"object",           "response"},
-        {"created_at",       current_unix_time()},
-        {"model",            model},
-        {"status",           status},
-        {"output",           output},
-        {"usage", {
-            {"input_tokens",  prompt_tokens},
-            {"output_tokens", completion_tokens},
-            {"total_tokens",  prompt_tokens + completion_tokens}
-        }},
-        {"error",            nullptr},
-        {"incomplete_details", truncated
-            ? json({{"reason", "max_tool_calls"}})
-            : json(nullptr)}
-    };
-    return obj;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Parse MCP tool entries from the tools[] array
-//
-// Returns a struct describing what MCP servers are requested and their
-// allowed_tools filters.
-// ─────────────────────────────────────────────────────────────────────────────
-struct McpToolRequest {
-    std::string              server_label;
-    std::string              server_url;    // optional: dynamic server URL
-    std::vector<std::string> allowed_tools; // empty = all tools allowed
-};
-
-static std::vector<McpToolRequest> extract_mcp_tool_requests(const json& tools) {
-    std::vector<McpToolRequest> requests;
-    for (const auto& tool : tools) {
-        if (!tool.is_object()) continue;
-        if (tool.value("type", "") != "mcp") continue;
-
-        McpToolRequest req;
-        req.server_label = tool.value("server_label", "");
-        req.server_url   = tool.value("server_url", "");
-
-        if (tool.contains("allowed_tools") && tool["allowed_tools"].is_array()) {
-            for (const auto& t : tool["allowed_tools"]) {
-                req.allowed_tools.push_back(t.get<std::string>());
-            }
-        }
-        requests.push_back(req);
-    }
-    return requests;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -329,7 +129,7 @@ void ResponsesController::createResponse(
         if (has_mcp_tools) {
             // Merge any {type:"mcp"} entries from the body into mcp_requests,
             // avoiding duplicates with entries already added (e.g. web_search).
-            for (const auto& r : extract_mcp_tool_requests(body["tools"])) {
+            for (const auto& r : ResponsesUtils::extract_mcp_tool_requests(body["tools"])) {
                 bool already_present = false;
                 for (const auto& existing : mcp_requests) {
                     if (existing.server_label == r.server_label) {
@@ -366,7 +166,7 @@ void ResponsesController::createResponse(
     }
 
     // Convert input to messages format
-    json messages = input_to_messages(body["input"], system_prompt);
+    json messages = ResponsesUtils::input_to_messages(body["input"], system_prompt);
     if (messages.empty()) {
         callback(make_error_response(400, "Input produced no messages", "invalid_request_error"));
         return;
@@ -400,10 +200,20 @@ void ResponsesController::createResponse(
         return;
     }
 
-    std::string response_id = generate_response_id();
+    std::string response_id = ResponsesUtils::generate_response_id();
+    LOG_INFO("[ResponsesController] Create response: response=" << response_id
+             << " model=" << model
+             << " stream=" << (streaming ? "true" : "false")
+             << " previous=" << previous_response_id
+             << " has_mcp=" << (has_mcp_tools ? "true" : "false")
+             << " has_function_tools=" << (has_function_tools ? "true" : "false"));
 
     // ── MCP path ──────────────────────────────────────────────────────────────
     if (has_mcp_tools) {
+        LOG_INFO("[ResponsesController] Routing through MCP loop: response="
+                 << response_id << " model=" << model
+                 << " mcp_server_count=" << mcp_requests.size()
+                 << " stream=" << (streaming ? "true" : "false"));
         auto& registry = McpClientRegistry::getInstance();
 
         // Validate that all requested MCP servers are registered
@@ -449,7 +259,7 @@ void ResponsesController::createResponse(
                             stream->send("data: " + data.dump() + "\n\n");
                         };
 
-                        int created_time = current_unix_time();
+                        int created_time = ResponsesUtils::current_unix_time();
 
                         // response.created
                         emit_event("response.created", {
@@ -522,13 +332,13 @@ void ResponsesController::createResponse(
                             });
 
                             // Build final output array
-                            json output = build_output_array(
+                            json output = ResponsesUtils::build_output_array(
                                 loop_result.final_response, loop_result.call_records);
 
                             // response.completed
                             emit_event("response.completed", {
                                 {"type", "response.completed"},
-                                {"response", build_response_object(
+                                {"response", ResponsesUtils::build_response_object(
                                     response_id, model, output, "completed",
                                     loop_result.final_response.prompt_tokens,
                                     loop_result.final_response.completion_tokens,
@@ -554,11 +364,12 @@ void ResponsesController::createResponse(
             } else {
                 // ── MCP Non-streaming ─────────────────────────────────────────
                 McpAgenticLoop loop(registry, max_iterations);
-                McpLoopResult loop_result = loop.run(sdk_request, mcp_function_tools);
+                McpLoopResult loop_result =
+                    loop.run(sdk_request, mcp_function_tools, response_id);
 
-                json output = build_output_array(
+                json output = ResponsesUtils::build_output_array(
                     loop_result.final_response, loop_result.call_records);
-                json response_obj = build_response_object(
+                json response_obj = ResponsesUtils::build_response_object(
                     response_id, model, output,
                     loop_result.truncated ? "incomplete" : "completed",
                     loop_result.final_response.prompt_tokens,
@@ -586,21 +397,22 @@ void ResponsesController::createResponse(
     if (has_function_tools) {
         sdk_request.tools = function_tools;
     }
-
-    auto& orchestrator = ChatOrchestrator::getInstance();
+    LOG_INFO("[ResponsesController] Routing through standard path: response="
+             << response_id << " model=" << model
+             << " stream=" << (streaming ? "true" : "false"));
 
     try {
         if (streaming) {
             // ── Streaming: emit Responses API SSE events ──────────────────────
             auto resp = HttpResponse::newAsyncStreamResponse(
-                [&orchestrator, sdk_request, response_id, model](ResponseStreamPtr stream) {
+                [sdk_request, response_id, previous_response_id, model](ResponseStreamPtr stream) {
                     auto emit_event = [&stream](const std::string& event_type,
                                                  const json& data) {
                         stream->send("event: " + event_type + "\n");
                         stream->send("data: " + data.dump() + "\n\n");
                     };
 
-                    int created_time = current_unix_time();
+                    int created_time = ResponsesUtils::current_unix_time();
 
                     // response.created event
                     emit_event("response.created", {
@@ -646,7 +458,13 @@ void ResponsesController::createResponse(
                     streaming_req.stream = true;
 
                     try {
-                        orchestrator.handleStreaming(streaming_req,
+                        scheduler::SchedulerInvokeOptions invoke_options;
+                        invoke_options.response_id = response_id;
+                        invoke_options.previous_response_id = previous_response_id;
+                        invoke_options.kind = scheduler::JobKind::HTTP_STREAMING;
+
+                        scheduler::ModelScheduler::getInstance().runStreaming(
+                            streaming_req,
                             [&](const StreamChunk& chunk) {
                                 if (chunk.content_delta.has_value()
                                     && !chunk.content_delta.value().empty()) {
@@ -667,7 +485,8 @@ void ResponsesController::createResponse(
                                         {"delta",        chunk.reasoning_content.value()}
                                     });
                                 }
-                            });
+                            },
+                            invoke_options);
                     } catch (const GenAIException& e) {
                         had_error = true;
                         error_msg = e.message;
@@ -738,16 +557,23 @@ void ResponsesController::createResponse(
 
         } else {
             // ── Non-streaming ─────────────────────────────────────────────────
-            StandardResponse result = orchestrator.handleBlocking(sdk_request);
+            scheduler::SchedulerInvokeOptions invoke_options;
+            invoke_options.response_id = response_id;
+            invoke_options.previous_response_id = previous_response_id;
+            invoke_options.kind = scheduler::JobKind::HTTP_NON_STREAMING;
+
+            StandardResponse result =
+                scheduler::ModelScheduler::getInstance().runBlocking(
+                    sdk_request, invoke_options);
 
             // Build output array.
             // build_output_array() automatically emits a separate top-level
             // {"type":"reasoning"} item when reasoning_content is non-empty,
             // per the OpenAI Responses API spec.
-            json output = build_output_array(result);
+            json output = ResponsesUtils::build_output_array(result);
 
             // Build response object
-            json response_obj = build_response_object(
+            json response_obj = ResponsesUtils::build_response_object(
                 response_id, model, output, "completed",
                 result.prompt_tokens, result.completion_tokens);
 
@@ -806,6 +632,7 @@ void ResponsesController::deleteResponse(
     const std::string& response_id) {
 
     auto& orchestrator = ChatOrchestrator::getInstance();
+    LOG_INFO("[ResponsesController] Delete response: response=" << response_id);
     bool deleted = orchestrator.deleteSession(response_id);
 
     if (!deleted) {
@@ -832,8 +659,9 @@ void ResponsesController::cancelResponse(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& response_id) {
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
-    bool cancelled = orchestrator.cancelSession(response_id);
+    LOG_INFO("[ResponsesController] Cancel response: response=" << response_id);
+    bool cancelled =
+        scheduler::ModelScheduler::getInstance().cancelResponse(response_id);
 
     if (!cancelled) {
         callback(make_error_response(404,

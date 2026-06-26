@@ -6,6 +6,10 @@
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include <string>
 #include <atomic>
+#include <memory>
+
+class InferenceWorkerManager;
+class VlmInferenceWorkerManager;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GenIEBackend — IGenerativeBackend implementation for Qualcomm GenIE SDK
@@ -36,12 +40,16 @@ public:
      */
     static GenIEBackend& getInstance();
 
+    GenIEBackend();
+    ~GenIEBackend() override;
+
     std::string name() const override { return "GenIE"; }
 
     /**
      * GenIE capabilities:
      *   - RESET_KV context strategy (stateful KV cache; reset after summarization)
-     *   - EXCLUSIVE concurrency (one inference at a time — Snapdragon DSP lock)
+     *   - Per-handle exclusive execution. One loaded GenIE worker serializes its
+     *     own requests; separate scheduler-owned workers may submit concurrently.
      *   - backend_filters_think_tokens = true (GenIE SDK can filter internally)
      *   - supports_kv_save_restore = true for LLM; false for VLM
      *
@@ -49,6 +57,18 @@ public:
      * Returns defaults if no model is currently loaded.
      */
     BackendCapabilities capabilities() const override;
+
+    /**
+     * Load a model into this GenIEBackend instance.
+     * Resolves the model config through ModelConfigManager and starts the
+     * matching LLM or VLM worker.
+     */
+    void loadModel(const std::string& model_id) override;
+
+    /**
+     * Unload this backend instance's active worker.
+     */
+    void unloadModel(bool force = false) override;
 
     /**
      * Ensure the correct worker subprocess is running.
@@ -134,12 +154,17 @@ public:
     bool isHealthy() const override;
 
 private:
-    GenIEBackend() = default;
     GenIEBackend(const GenIEBackend&) = delete;
     GenIEBackend& operator=(const GenIEBackend&) = delete;
+
+    InferenceWorkerManager& llmWorker();
+    VlmInferenceWorkerManager& vlmWorker();
 
     // Track which worker is currently active.
     // Updated by ensureWorkerRunning() on each request.
     std::string current_model_id_;
     bool        current_is_vlm_ = false;
+
+    std::unique_ptr<InferenceWorkerManager>    llm_worker_;
+    std::unique_ptr<VlmInferenceWorkerManager> vlm_worker_;
 };

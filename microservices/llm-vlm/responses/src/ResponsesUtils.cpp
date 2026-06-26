@@ -91,31 +91,13 @@ json input_to_messages(const json& input, const std::string& system_prompt) {
             continue;
         }
 
-        // message — standard message object
-        if (item_type == "message" || item_type.empty()) {
-            std::string role = item.value("role", "user");
-            const auto& content = item.value("content", json{});
-
-            if (content.is_string()) {
-                messages.push_back({{"role", role}, {"content", content}});
-            } else if (content.is_array()) {
-                // Content parts array — extract text parts
-                std::string text_content;
-                for (const auto& part : content) {
-                    std::string part_type = part.value("type", "");
-                    if (part_type == "input_text" || part_type == "text") {
-                        text_content += part.value("text", "");
-                    } else if (part_type == "output_text") {
-                        text_content += part.value("text", "");
-                    }
-                }
-                if (!text_content.empty()) {
-                    messages.push_back({{"role", role}, {"content", text_content}});
-                }
-            } else if (item.contains("text")) {
-                messages.push_back({{"role", role}, {"content", item["text"]}});
-            }
-            continue;
+        // Standard message or content part. Preserve content arrays as-is so
+        // VLM image_url parts survive the shared HTTP/WebSocket conversion.
+        std::string role = item.value("role", "user");
+        if (item.contains("content")) {
+            messages.push_back({{"role", role}, {"content", item["content"]}});
+        } else if (item.contains("text")) {
+            messages.push_back({{"role", role}, {"content", item["text"]}});
         }
     }
 

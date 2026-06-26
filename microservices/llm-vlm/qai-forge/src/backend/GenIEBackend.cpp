@@ -16,26 +16,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/GenIEBackend.h"
+#include "qai_forge/InternalDTOs.h"
 #include "qai_forge/worker/InferenceWorkerManager.h"
 #include "qai_forge/worker/VlmInferenceWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
+#include <memory>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker singletons
-//
-// Previously these were static functions in ChatOrchestratorImpl.cpp.
-// They belong here — worker lifecycle is a backend concern.
+// Construction
 // ─────────────────────────────────────────────────────────────────────────────
 
-static InferenceWorkerManager& getLlmWorker() {
-    static InferenceWorkerManager llm_worker("llm");
-    return llm_worker;
-}
+GenIEBackend::GenIEBackend() = default;
 
-static VlmInferenceWorkerManager& getVlmWorker() {
-    return VlmInferenceWorkerManager::getInstance();
-}
+GenIEBackend::~GenIEBackend() = default;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
@@ -44,6 +38,20 @@ static VlmInferenceWorkerManager& getVlmWorker() {
 GenIEBackend& GenIEBackend::getInstance() {
     static GenIEBackend instance;
     return instance;
+}
+
+InferenceWorkerManager& GenIEBackend::llmWorker() {
+    if (!llm_worker_) {
+        llm_worker_ = std::make_unique<InferenceWorkerManager>("llm");
+    }
+    return *llm_worker_;
+}
+
+VlmInferenceWorkerManager& GenIEBackend::vlmWorker() {
+    if (!vlm_worker_) {
+        vlm_worker_ = std::make_unique<VlmInferenceWorkerManager>();
+    }
+    return *vlm_worker_;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +68,8 @@ BackendCapabilities GenIEBackend::capabilities() const {
                                             ? 4096
                                             : cfg.getContextSize(current_model_id_),
         .compaction_threshold         = 0.70f,
-        // Snapdragon DSP: only one inference at a time
+        // Per backend instance / loaded GenIE handle: one request at a time.
+        // Cross-model concurrency comes from separate scheduler-owned backends.
         .concurrency_model            = ConcurrencyModel::EXCLUSIVE,
         .max_concurrent               = 1,
         // GenIE SDK can filter <think> tokens internally via bypass_think_filter
@@ -71,21 +80,71 @@ BackendCapabilities GenIEBackend::capabilities() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// loadModel() / unloadModel()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void GenIEBackend::loadModel(const std::string& model_id) {
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id + "' not found. Check /v1/models for available models.",
+            404);
+    }
+
+    ensureWorkerRunning(model_id,
+                        model_config->config_file,
+                        model_config->sampler_config_file);
+}
+
+void GenIEBackend::unloadModel(bool force) {
+    LOG_INFO("[GenIEBackend] unloadModel: model=" << current_model_id_
+             << ", force=" << (force ? "true" : "false"));
+
+    if (vlm_worker_) {
+        if (force) {
+            vlm_worker_->terminateWorker(true);
+        } else {
+            vlm_worker_->shutdown();
+        }
+        vlm_worker_.reset();
+    }
+
+    if (llm_worker_) {
+        if (force) {
+            llm_worker_->terminateWorker(true);
+        } else {
+            llm_worker_->shutdown();
+        }
+        llm_worker_.reset();
+    }
+
+    current_model_id_.clear();
+    current_is_vlm_ = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ensureWorkerRunning()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
                                        const std::string& config_file,
                                        const std::string& sampler_file) {
+    const bool is_vlm = ModelConfigManager::getInstance().supportsVision(model_id);
+    if (!current_model_id_.empty() && current_is_vlm_ != is_vlm) {
+        unloadModel(false);
+    }
+
     current_model_id_ = model_id;
-    current_is_vlm_   = ModelConfigManager::getInstance().supportsVision(model_id);
+    current_is_vlm_   = is_vlm;
 
     if (current_is_vlm_) {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: VLM model=" << model_id);
-        getVlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
+        vlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
     } else {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: LLM model=" << model_id);
-        getLlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
+        llmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
     }
 }
 
@@ -113,7 +172,7 @@ void GenIEBackend::generate(
     // GenIEBackend maps it to bypass_think_filter here — invisible to Layer 2.
     const bool bypass_think_filter = use_reasoning;
 
-    getLlmWorker().executeRequest(
+    llmWorker().executeRequest(
         event_id,
         prompt,
         streaming,
@@ -148,7 +207,7 @@ void GenIEBackend::generateVlm(
     std::function<void(const IPCDoneEvent&)>   on_done,
     std::function<void(const IPCErrorEvent&)>  on_error)
 {
-    getVlmWorker().executeVlmRequest(
+    vlmWorker().executeVlmRequest(
         event_id,
         prompt,
         image_paths,
@@ -177,9 +236,13 @@ void GenIEBackend::onContextCompacted() {
              << (current_is_vlm_ ? " (VLM)" : " (LLM)"));
     try {
         if (current_is_vlm_) {
-            getVlmWorker().sendReset();
+            if (vlm_worker_) {
+                vlm_worker_->sendReset();
+            }
         } else {
-            getLlmWorker().sendReset();
+            if (llm_worker_) {
+                llm_worker_->sendReset();
+            }
         }
     } catch (const std::exception& e) {
         LOG_WARN("[GenIEBackend] KV cache reset failed: " << e.what()
@@ -192,15 +255,27 @@ void GenIEBackend::onContextCompacted() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::saveKv(const std::string& name) {
-    getLlmWorker().saveKvCache(name);
+    if (!llm_worker_) {
+        LOG_WARN("[GenIEBackend] saveKv skipped; no LLM worker loaded");
+        return;
+    }
+    llm_worker_->saveKvCache(name);
 }
 
 void GenIEBackend::restoreKv(const std::string& name) {
-    getLlmWorker().restoreKvCache(name);
+    if (!llm_worker_) {
+        LOG_WARN("[GenIEBackend] restoreKv skipped; no LLM worker loaded");
+        return;
+    }
+    llm_worker_->restoreKvCache(name);
 }
 
 void GenIEBackend::resetKv() {
-    getLlmWorker().sendReset();
+    if (!llm_worker_) {
+        LOG_WARN("[GenIEBackend] resetKv skipped; no LLM worker loaded");
+        return;
+    }
+    llm_worker_->sendReset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,10 +284,16 @@ void GenIEBackend::resetKv() {
 
 void GenIEBackend::terminateWorker(bool force) {
     if (current_is_vlm_) {
-        getVlmWorker().terminateWorker(force);
+        if (vlm_worker_) {
+            vlm_worker_->terminateWorker(force);
+        }
     } else {
-        getLlmWorker().terminateWorker(force);
+        if (llm_worker_) {
+            llm_worker_->terminateWorker(force);
+        }
     }
+    current_model_id_.clear();
+    current_is_vlm_ = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,7 +302,7 @@ void GenIEBackend::terminateWorker(bool force) {
 
 bool GenIEBackend::isHealthy() const {
     if (current_is_vlm_) {
-        return getVlmWorker().isWorkerRunning();
+        return vlm_worker_ && vlm_worker_->isWorkerRunning();
     }
-    return getLlmWorker().isWorkerRunning();
+    return llm_worker_ && llm_worker_->isWorkerRunning();
 }
