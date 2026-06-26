@@ -9,6 +9,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "ResponsesUtils.h"
+#include <algorithm>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
@@ -227,6 +228,163 @@ json build_response_object(const std::string& response_id,
             ? json(nullptr)
             : incomplete_details}
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// synthesize_in_progress
+// ─────────────────────────────────────────────────────────────────────────────
+json synthesize_in_progress(const std::string& response_id,
+                            const std::string& model,
+                            int created_at,
+                            const std::string& previous_response_id,
+                            const json& metadata) {
+    return {
+        {"id", response_id},
+        {"object", "response"},
+        {"created_at", created_at},
+        {"model", model},
+        {"status", "in_progress"},
+        {"output", json::array()},
+        {"usage", nullptr},
+        {"error", nullptr},
+        {"incomplete_details", nullptr},
+        {"previous_response_id", previous_response_id.empty()
+            ? json(nullptr)
+            : json(previous_response_id)},
+        {"metadata", metadata.is_null() ? json::object() : metadata}
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalize_input_items
+// ─────────────────────────────────────────────────────────────────────────────
+json normalize_input_items(const std::string& response_id,
+                           const json& raw_input) {
+    auto make_id = [&response_id](std::size_t index) {
+        std::ostringstream oss;
+        oss << "item_" << response_id << "_"
+            << std::setw(6) << std::setfill('0') << index;
+        return oss.str();
+    };
+
+    auto user_text_item = [&make_id](std::size_t index,
+                                     const std::string& text) {
+        return json{
+            {"id", make_id(index)},
+            {"type", "message"},
+            {"role", "user"},
+            {"content", json::array({{
+                {"type", "input_text"},
+                {"text", text}
+            }})}
+        };
+    };
+
+    json items = json::array();
+    if (raw_input.is_string()) {
+        items.push_back(user_text_item(0, raw_input.get<std::string>()));
+        return items;
+    }
+    if (!raw_input.is_array()) {
+        return items;
+    }
+
+    for (std::size_t i = 0; i < raw_input.size(); ++i) {
+        const auto& item = raw_input[i];
+        if (item.is_string()) {
+            items.push_back(user_text_item(i, item.get<std::string>()));
+            continue;
+        }
+        if (!item.is_object()) {
+            continue;
+        }
+
+        std::string type = item.value("type", "");
+        bool is_message = (type == "message")
+            || (type.empty() && item.contains("role"));
+
+        if (!type.empty() && !is_message) {
+            json normalized = item;
+            normalized["id"] = make_id(i);
+            items.push_back(std::move(normalized));
+            continue;
+        }
+
+        json normalized = item;
+        normalized["id"] = make_id(i);
+        normalized["type"] = "message";
+        std::string role = item.value("role", "user");
+        normalized["role"] = role;
+
+        json content = json::array();
+        if (item.contains("content")) {
+            const auto& raw_content = item["content"];
+            if (raw_content.is_string()) {
+                content = json::array({{
+                    {"type", "input_text"},
+                    {"text", raw_content.get<std::string>()}
+                }});
+            } else {
+                content = raw_content;
+            }
+        } else if (item.contains("text")) {
+            content = json::array({{
+                {"type", "input_text"},
+                {"text", item["text"]}
+            }});
+        }
+        normalized["content"] = content;
+        items.push_back(std::move(normalized));
+    }
+
+    return items;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// paginate_input_items
+// ─────────────────────────────────────────────────────────────────────────────
+PaginateResult paginate_input_items(const json& items,
+                                    int limit,
+                                    const std::string& order,
+                                    const std::string& after) {
+    PaginateResult result;
+    json view = items.is_array() ? items : json::array();
+    if (order == "desc") {
+        std::reverse(view.begin(), view.end());
+    }
+
+    std::size_t start = 0;
+    if (!after.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < view.size(); ++i) {
+            if (view[i].is_object() && view[i].value("id", "") == after) {
+                start = i + 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            result.error_message = "after cursor not found";
+            return result;
+        }
+    }
+
+    json page = json::array();
+    std::size_t count = static_cast<std::size_t>(limit);
+    std::size_t end = std::min(view.size(), start + count);
+    for (std::size_t i = start; i < end; ++i) {
+        page.push_back(view[i]);
+    }
+
+    result.ok = true;
+    result.envelope = {
+        {"object", "list"},
+        {"data", page},
+        {"first_id", page.empty() ? json(nullptr) : page.front()["id"]},
+        {"last_id", page.empty() ? json(nullptr) : page.back()["id"]},
+        {"has_more", end < view.size()}
+    };
+    return result;
 }
 
 } // namespace ResponsesUtils

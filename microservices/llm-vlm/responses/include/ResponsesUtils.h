@@ -15,6 +15,9 @@
 //   extract_mcp_tool_requests()  — parse MCP tool entries from tools[]
 //   build_output_array()         — StandardResponse + McpCallRecords → output[]
 //   build_response_object()      — assemble final Responses API response JSON
+//   synthesize_in_progress()     — assemble Retrieve JSON for active responses
+//   normalize_input_items()      — Responses API input → input_items list
+//   paginate_input_items()       — slice input_items into a list envelope
 //   current_unix_time()          — current time as Unix timestamp (seconds)
 //   generate_response_id()       — generate a unique "resp_XXXX" ID
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,5 +114,54 @@ json build_response_object(const std::string& response_id,
                             int created_at,
                             const json& error,
                             const json& incomplete_details);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// synthesize_in_progress — assemble Retrieve JSON for an active response
+//
+// @param response_id          The response ID (resp_XXXX)
+// @param model                The model ID
+// @param created_at           Unix timestamp captured when the response began
+// @param previous_response_id Parent response ID, or empty for root responses
+// @param metadata             Stored metadata object, or null
+// @return                     Minimal in-progress Responses API object
+// ─────────────────────────────────────────────────────────────────────────────
+json synthesize_in_progress(const std::string& response_id,
+                            const std::string& model,
+                            int created_at,
+                            const std::string& previous_response_id,
+                            const json& metadata);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalize_input_items — convert raw Responses API input to input_items[]
+//
+// @param response_id The response ID used to stamp stable item ids
+// @param raw_input   The request `input` value
+// @return            Normalized input_items array
+// ─────────────────────────────────────────────────────────────────────────────
+json normalize_input_items(const std::string& response_id,
+                           const json& raw_input);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PaginateResult — result of input_items list pagination
+// ─────────────────────────────────────────────────────────────────────────────
+struct PaginateResult {
+    bool ok = false;
+    json envelope = json::object();
+    std::string error_message;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// paginate_input_items — slice input_items by order, cursor, and limit
+//
+// @param items Stored input_items array
+// @param limit Maximum number of items to return
+// @param order "asc" or "desc"
+// @param after Optional item id cursor
+// @return      List envelope or cursor error
+// ─────────────────────────────────────────────────────────────────────────────
+PaginateResult paginate_input_items(const json& items,
+                                    int limit,
+                                    const std::string& order,
+                                    const std::string& after);
 
 } // namespace ResponsesUtils

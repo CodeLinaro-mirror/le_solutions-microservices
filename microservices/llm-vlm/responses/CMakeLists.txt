@@ -4,6 +4,8 @@ project(ResponsesServer CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+enable_testing()
+
 find_package(Drogon REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(qai_forge REQUIRED)
@@ -18,8 +20,16 @@ set(SERVER_SOURCES
 
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
+    src/ResponseStore.cpp
 
-    # MCP Layer 1.5 — client infrastructure
+    src/scheduler/EvictionPolicy.cpp
+    src/scheduler/ModelScheduler.cpp
+    src/scheduler/ModelRuntime.cpp
+    src/scheduler/PriorityModelQueue.cpp
+    src/scheduler/ToolChainTable.cpp
+    src/scheduler/WarmModelPool.cpp
+
+    # MCP — client infrastructure
     src/mcp/McpStdioClient.cpp
     src/mcp/McpHttpClient.cpp
     src/mcp/McpClientRegistry.cpp
@@ -61,6 +71,30 @@ target_link_libraries(responses-server PRIVATE
     nlohmann_json::nlohmann_json
     qai_forge::qai_forge
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unit tests (opt-in — not built as part of the service image)
+# Build with: cmake -DBUILD_TESTS=ON ...
+# ─────────────────────────────────────────────────────────────────────────────
+option(BUILD_TESTS "Build unit tests" OFF)
+
+if(BUILD_TESTS)
+    add_executable(response-store-unit-tests
+        tests/test_response_store.cpp
+        src/ResponseStore.cpp
+    )
+
+    target_include_directories(response-store-unit-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(response-store-unit-tests PRIVATE
+        nlohmann_json::nlohmann_json
+    )
+
+    add_test(NAME response-store-unit-tests
+             COMMAND response-store-unit-tests)
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Install

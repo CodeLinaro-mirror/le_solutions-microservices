@@ -23,7 +23,7 @@ using namespace drogon;
 //   - Output: `output[]` array with typed items (message, tool_call, etc.)
 //   - Built-in tools: web_search returns "not available on-device" gracefully
 //
-// This controller calls ChatOrchestrator (qai-forge SDK) and formats
+// This controller calls the model scheduler and formats
 // the results into the Responses API wire format.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -36,6 +36,9 @@ public:
 
         // GET /v1/responses/{response_id}
         ADD_METHOD_TO(ResponsesController::getResponse, "/v1/responses/{1}", Get, Options);
+
+        // GET /v1/responses/{response_id}/input_items
+        ADD_METHOD_TO(ResponsesController::listInputItems, "/v1/responses/{1}/input_items", Get, Options);
 
         // DELETE /v1/responses/{response_id}
         ADD_METHOD_TO(ResponsesController::deleteResponse, "/v1/responses/{1}", Delete, Options);
@@ -50,6 +53,10 @@ public:
     void getResponse(const HttpRequestPtr& req,
                      std::function<void(const HttpResponsePtr&)>&& callback,
                      const std::string& response_id);
+
+    void listInputItems(const HttpRequestPtr& req,
+                        std::function<void(const HttpResponsePtr&)>&& callback,
+                        const std::string& response_id);
 
     void deleteResponse(const HttpRequestPtr& req,
                         std::function<void(const HttpResponsePtr&)>&& callback,
