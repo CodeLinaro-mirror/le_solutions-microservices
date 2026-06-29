@@ -908,7 +908,10 @@ components:
           description: "If true, results will be streamed via WebSocket. If false, complete transcription returned in response."
           example: false
         channels:
-          type: integer
+          oneOf:
+            - type: integer
+            - type: string
+              pattern: '^\d+$'
           description: "Number of audio channels in the input stream (1=mono, 2=stereo). Takes priority over the channels key inside the parameters array."
           example: 1
         parameters:
@@ -923,13 +926,7 @@ components:
               items:
                 $ref: "#/components/schemas/KeyValueParam"
               description: "Array of key-value pairs (for multipart/form-data)"
-          example:
-            - key: "sampling_rate"
-              value: "16000"
-            - key: "channels"
-              value: "1"
-            - key: "server_timeout"
-              value: "60"
+          example: "[{\"key\": \"sampling_rate\", \"value\": \"16000\"}, {\"key\": \"channels\", \"value\": \"1\"}, {\"key\": \"server_timeout\", \"value\": \"60\"}]"
       required:
         - model
 

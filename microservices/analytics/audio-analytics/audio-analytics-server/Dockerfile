@@ -22,7 +22,7 @@ RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
 ENV VLM_BUILD_DIR="/mnt/work/build"
 ENV VLM_DEPLOY_DIR="/mnt/work/deploy"
 ENV VLM_ADSP_DIR=${VLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
-ENV VLM_QNP_VER=2.39.0.250925
+ENV VLM_QNP_VER=2.43.1.260218
 ENV VLM_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV VLM_QNN_LIB_PATH=${VLM_DOWNLOAD_DIR}/qairt/${VLM_QNP_VER}/lib
 ENV VLM_QNP_SDK=v${VLM_QNP_VER}.zip
@@ -93,9 +93,10 @@ COPY --chown=audioserver:audioserver app/ ./
 
 # Copy Python wrapper files and models config
 USER root
-RUN mkdir -p /usr/src/engine/python /opt/audio/models
+RUN mkdir -p /usr/src/engine/python
+#RUN mkdir -p /usr/src/engine/python /opt/audio/models
 COPY --chown=audioserver:audioserver engine/python/*.py /usr/src/engine/python/
-COPY --chown=audioserver:audioserver engine/config/models.json /opt/audio/models/models.json
+#COPY --chown=audioserver:audioserver engine/config/models.json /opt/audio/models/models.json
 
 # Copy native libraries (directory always exists, only populated when INSTALL_NATIVE_LIBS=true)
 COPY --from=native-libs /mnt/work/deploy/usr /usr

@@ -10,100 +10,103 @@ logger = get_logger(__name__)
 
 class ModelLoader:
     """
-    Utility class to load model configurations from the models.json file.
+    Utility class to load model configurations by scanning subdirectories
+    under ASR_MODELS_DIR, TRANSLATION_MODELS_DIR, and TTS_MODELS_DIR.
+
+    Each subdirectory is expected to contain a config.json that describes
+    the model.  The absolute path of the subdirectory is injected into the
+    loaded config as ``model_path`` so the engine wrappers can locate the
+    binary assets without any additional path resolution.
+
+    Environment Variables:
+        MODELS_DIR              Base models directory (default: /home/ubuntu/models/audio)
+        ASR_MODELS_DIR          ASR models directory  (default: <MODELS_DIR>/asr)
+        TRANSLATION_MODELS_DIR  Translation models directory (default: <MODELS_DIR>/translation)
+        TTS_MODELS_DIR          TTS models directory  (default: <MODELS_DIR>/tts)
     """
     
     @staticmethod
-    def load_models_config(dev_mode: bool = False) -> Dict[str, Any]:
+    def _get_models_dir() -> str:
+        return os.getenv('MODELS_DIR', '/home/ubuntu/models/audio')
+
+    @staticmethod
+    def _load_models_from_dir(service_dir: str) -> List[Dict[str, Any]]:
         """
-        Load the models configuration from the models.json file.
-        
-        Behavior:
-        - First checks MODELS_CONFIG environment variable
-        - Falls back to MODELS_DIR environment variable + /models.json
-        - Then tries default locations
-        
-        Environment Variables:
-        - MODELS_CONFIG: Full path to models.json file (default: /opt/audio/models/models.json)
-        - MODELS_DIR: Directory containing models (default: /opt/audio/models)
-        
-        Returns:
-            Dictionary containing the models configuration
+        Scan *service_dir* for subdirectories that contain a config.json.
+        Each config.json is read and the absolute subdirectory path is
+        injected as ``model_path`` so engine wrappers can find the assets.
+
+        Returns a list of model config dicts (one per subdirectory).
         """
-        # Default empty configuration
-        default_config = {
-            "asr": {"default_model": "", "models": []},
-            "translation": {"default_model": "", "models": []},
-            "tts": {"default_model": "", "models": []}
-        }
-        
+        models = []
+
+        if not service_dir or not os.path.isdir(service_dir):
+            logger.warning(f"Models directory not found or not a directory: {service_dir}")
+            return models
+
         try:
-            # Determine project root (audio-analytics-server)
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            
-            # Get environment variables with defaults
-            models_config_path = os.getenv('MODELS_CONFIG', '/opt/audio/models/models.json')
-            models_dir = os.getenv('MODELS_DIR', '/opt/audio/models')
-            
-            # Try different possible locations for the models.json file
-            possible_paths = [
-                # First priority: MODELS_CONFIG environment variable
-                models_config_path,
-                # Second priority: MODELS_DIR + /models.json
-                os.path.join(models_dir, "models.json"),
-                # Fallback locations
-                "/opt/audio/models/models.json",
-                "/opt/data/config/models.json",
-                "/opt/audio/models/config/models.json",
-                # Last resort: repo copy inside the image
-                os.path.join(project_root, "engine", "config", "models.json"),
-            ]
-            
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_paths = []
-            for path in possible_paths:
-                if path not in seen:
-                    seen.add(path)
-                    unique_paths.append(path)
-            
-            for path in unique_paths:
-                if os.path.exists(path):
-                    logger.info(f"Loading models configuration from {path}")
-                    with open(path, 'r') as f:
-                        return json.load(f)
-            
-            logger.warning(f"Models configuration file not found in any of these locations: {unique_paths}")
-            logger.warning("Using default configuration")
-            return default_config
-            
-        except Exception as e:
-            logger.error(f"Error loading models configuration: {e}", exc_info=True)
-            return default_config
-    
+            entries = sorted(os.listdir(service_dir))
+        except OSError as e:
+            logger.error(f"Cannot list models directory '{service_dir}': {e}")
+            return models
+
+        for entry in entries:
+            subdir = os.path.join(service_dir, entry)
+            if not os.path.isdir(subdir):
+                continue
+
+            config_path = os.path.join(subdir, 'config.json')
+            if not os.path.exists(config_path):
+                logger.debug(f"Skipping '{subdir}' — no config.json found")
+                continue
+
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                # Inject the absolute model directory path so engine wrappers
+                # can resolve asset filenames without extra path logic.
+                config['model_path'] = subdir
+                # TTS voices are looked up individually by the engine — propagate
+                # model_path into each voice so synthesize_speech_real can find it
+                # via voice_config.get("model_path").
+                for voice in config.get('voices', []):
+                    voice['model_path'] = subdir
+                models.append(config)
+                logger.info(f"Loaded model config: {config.get('name', entry)} from {subdir}")
+            except Exception as e:
+                logger.error(f"Error reading config.json in '{subdir}': {e}", exc_info=True)
+
+        return models
+
     @staticmethod
     def get_asr_models(dev_mode: bool = False) -> List[Dict[str, Any]]:
         """
-        Get the ASR models configuration from models.json.
+        Scan ASR_MODELS_DIR for model subdirectories and return their configs.
         """
-        config = ModelLoader.load_models_config(dev_mode)
-        return config.get("asr", {}).get("models", [])
-    
+        base = ModelLoader._get_models_dir()
+        asr_dir = os.getenv('ASR_MODELS_DIR', os.path.join(base, 'asr'))
+        logger.info(f"Loading ASR models from: {asr_dir}")
+        return ModelLoader._load_models_from_dir(asr_dir)
+
     @staticmethod
     def get_translation_models(dev_mode: bool = False) -> List[Dict[str, Any]]:
         """
-        Get the translation models configuration from models.json.
+        Scan TRANSLATION_MODELS_DIR for model subdirectories and return their configs.
         """
-        config = ModelLoader.load_models_config(dev_mode)
-        return config.get("translation", {}).get("models", [])
-    
+        base = ModelLoader._get_models_dir()
+        translation_dir = os.getenv('TRANSLATION_MODELS_DIR', os.path.join(base, 'translation'))
+        logger.info(f"Loading translation models from: {translation_dir}")
+        return ModelLoader._load_models_from_dir(translation_dir)
+
     @staticmethod
     def get_tts_models(dev_mode: bool = False) -> List[Dict[str, Any]]:
         """
-        Get the TTS models configuration from models.json.
+        Scan TTS_MODELS_DIR for model subdirectories and return their configs.
         """
-        config = ModelLoader.load_models_config(dev_mode)
-        return config.get("tts", {}).get("models", [])
+        base = ModelLoader._get_models_dir()
+        tts_dir = os.getenv('TTS_MODELS_DIR', os.path.join(base, 'tts'))
+        logger.info(f"Loading TTS models from: {tts_dir}")
+        return ModelLoader._load_models_from_dir(tts_dir)
     
     @staticmethod
     def convert_translation_models_to_api_format(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
