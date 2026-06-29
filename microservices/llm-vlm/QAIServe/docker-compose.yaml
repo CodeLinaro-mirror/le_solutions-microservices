@@ -67,6 +67,9 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-ERROR}
       - QAISERVE_PORT=${QAISERVE_PORT:-9002}
       - GENAI_MODELS_DIR=/mnt/work/models
+      - ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+      - CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+      - QAISERVE_MAX_BODY_SIZE=${QAISERVE_MAX_BODY_SIZE:-16777216}
 
       # Generative AI workers (GenIE — LLM + VLM)
       - GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker

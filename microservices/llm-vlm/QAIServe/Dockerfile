@@ -35,7 +35,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 0: LiteRT_builder
+# Stage 0: litert_builder
 #
 # Builds LiteRT v2.1.5 natively on AArch64 using Bazelisk.
 # Outputs staged artifacts to /mnt/work/deploy/usr:
@@ -46,7 +46,7 @@
 # Runs natively on ARM64 — no cross-compilation required.
 # Artifacts are copied into the ARM64 builder stage below.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS LiteRT_builder
+FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -212,17 +212,17 @@ RUN mkdir -p "${LITERT_DEPLOY_DIR}/lib" "${LITERT_DEPLOY_DIR}/bin" "${LITERT_DEP
     && test -f "${LITERT_DEPLOY_DIR}/bin/benchmark_model"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 0b: LiteRTLM_builder
+# Stage 0b: litert_lm_builder
 #
 # Builds LiteRT-LM incrementally on top of the already-built LiteRT.
-# Starts FROM LiteRT_builder — Docker layer caching means LiteRT is NOT
+# Starts FROM litert_builder — Docker layer caching means LiteRT is NOT
 # rebuilt; only LiteRT-LM is compiled in this stage.
 #
 # Key: --override_repository=litert=${LITERT_SRC_DIR} tells LiteRT-LM's Bazel
 # to use our already-cloned LiteRT source instead of downloading from GitHub.
 # Bazel's action cache also reuses compiled LiteRT artifacts from Stage 0.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM LiteRT_builder AS LiteRTLM_builder
+FROM litert_builder AS litert_lm_builder
 
 ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
@@ -257,7 +257,7 @@ RUN printf '\n# Shared library target for the LiteRT-LM C API.\n# Produces libli
 
 # Build LiteRT-LM using Bazel, overriding the @litert repository to use our
 # already-built LiteRT source (avoids a second LiteRT download/compile).
-# LITERT_QAIRT_SDK is inherited from LiteRT_builder so QAIRT 2.45.40.260406
+# LITERT_QAIRT_SDK is inherited from litert_builder so QAIRT 2.45.40.260406
 # is also reused for the LiteRT-LM QNN dispatch path.
 #
 # Key flags:
@@ -291,6 +291,7 @@ RUN bazel build \
     --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
     --linkopt=-fuse-ld=lld \
     --http_timeout_scaling=10 \
+    --experimental_repository_downloader_retries=10 \
     //c:litert_lm_c_api
 
 # Build the CLI tools separately with litert_link_capi_so=true so they
@@ -458,7 +459,8 @@ RUN cp /usr/lib/libcdsprpc.so* ${DEPLOY_DIR}/usr/lib/ && \
 # (liblitert_runtime_c_api.so) and dispatch/compiler-plugin .so files are
 # available for both build-time linking and runtime loading.
 # Headers land in /usr/include/litert/ and /usr/include/tflite/.
-COPY --from=LiteRT_builder /mnt/work/deploy/usr /usr
+COPY --from=litert_builder /mnt/work/deploy/usr /usr
+COPY --from=litert_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
 
 # ── Copy LiteRT-LM libraries and CLI tools (built on top of LiteRT) ──────────
 # LiteRT-LM was built with --override_repository=litert=${LITERT_SRC_DIR}
@@ -466,9 +468,10 @@ COPY --from=LiteRT_builder /mnt/work/deploy/usr /usr
 # The .so files land in /usr/lib/ alongside the LiteRT runtime libraries.
 # The CLI tools (litert-lm, litert-lm-advanced) land in ${DEPLOY_DIR}/usr/bin/
 # for inclusion in the final image as on-device debugging/benchmarking tools.
-COPY --from=LiteRTLM_builder /mnt/work/deploy/usr/lib /usr/lib
-COPY --from=LiteRTLM_builder /mnt/work/deploy/usr/include /usr/include
-COPY --from=LiteRTLM_builder /mnt/work/deploy/usr/bin ${DEPLOY_DIR}/usr/bin
+COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib /usr/lib
+COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
+COPY --from=litert_lm_builder /mnt/work/deploy/usr/include /usr/include
+COPY --from=litert_lm_builder /mnt/work/deploy/usr/bin ${DEPLOY_DIR}/usr/bin
 
 # ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
 WORKDIR /build
@@ -648,6 +651,9 @@ ENV LITERT_HW_ACCELERATORS=5
 ENV LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
 ENV LITERT_LM_BACKEND=npu
 ENV LOG_LEVEL=ERROR
+ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+ENV QAISERVE_MAX_BODY_SIZE=16777216
 
 EXPOSE 9002
 

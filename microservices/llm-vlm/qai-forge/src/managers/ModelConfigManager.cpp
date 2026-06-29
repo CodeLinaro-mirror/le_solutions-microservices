@@ -226,9 +226,23 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         } catch (...) {}
     }
 
+    // ── Model type ────────────────────────────────────────────────────────────
+    // Read from metadata.json "model_type" field. Defaults to "generative" for
+    // backward compatibility — all existing bundles are generative models.
+    // "predictive" is used for classification/detection/segmentation models.
+    config.model_type = metadata.value("model_type", "generative");
+
     auto pipeline_nodes = genie.value("pipeline", json::object()).value("nodes", json::object());
 
-    if (config.supports_vision) {
+    if (config.model_type == "predictive") {
+        auto model_files = metadata.value("model_files", json::object());
+        std::string model_file;
+        if (!model_files.empty()) {
+            model_file = model_files.begin().key();
+			config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
+        }
+    }
+    else if (config.supports_vision) {
         config.config_file = generateVlmGenieConfig(metadata, genie, pipeline_nodes, processed_config_dir);
     } else {
         std::string text_gen = pipeline_nodes.value("textGenerator", "");
@@ -250,12 +264,6 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     // Future values: "litert_lm", "onnxrt"
     // Used by BackendFactory to select the correct IGenerativeBackend.
     config.runtime = metadata.value("runtime", "genie");
-
-    // ── Model type ────────────────────────────────────────────────────────────
-    // Read from metadata.json "model_type" field. Defaults to "generative" for
-    // backward compatibility — all existing bundles are generative models.
-    // "predictive" is used for classification/detection/segmentation models.
-    config.model_type = metadata.value("model_type", "generative");
 
     // ── Tensor Specs (for Predictive AI) ────────────────────────────────────
     // Primary source: input_specs / output_specs (flat array format).

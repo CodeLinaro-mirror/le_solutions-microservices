@@ -24,6 +24,11 @@ int main() {
     if (!port_env) port_env = std::getenv("RESPONSES_PORT"); // fallback
     int port = port_env ? std::stoi(port_env) : 9002;
 
+    // Read max body size from env (bytes). Default 16 MB.
+    // Set higher for models with large input tensors.
+    const char* body_size_env = std::getenv("QAISERVE_MAX_BODY_SIZE");
+    size_t max_body_size = body_size_env ? std::stoull(body_size_env) : 16ULL * 1024 * 1024;
+
     // Log admin token status (never log the token value itself)
     const char* admin_token = std::getenv("QAISERVE_ADMIN_TOKEN");
     if (admin_token && admin_token[0] != '\0') {
@@ -33,7 +38,8 @@ int main() {
                   << "(set QAISERVE_ADMIN_TOKEN to enable /admin/models/* endpoints)" << std::endl;
     }
 
-    std::cout << "[main] Starting QAIServe unified inference server on port " << port << std::endl;
+    std::cout << "[main] Starting QAIServe unified inference server on port " << port
+              << "  max_body=" << (max_body_size) << "B" << std::endl;
 
     // Step 3: Configure and run the Drogon HTTP server
     // Log to stdout — standard practice for containerised services.
@@ -42,6 +48,7 @@ int main() {
         .addListener("0.0.0.0", port)
         .setThreadNum(4)
         .setMaxConnectionNum(1000)
+        .setClientMaxBodySize(max_body_size)
         .registerBeginningAdvice([]() {
             // ── Step 3a: Scan model bundles ───────────────────────────────────
             // ModelConfigManager is a lazy singleton — validateModel() always
