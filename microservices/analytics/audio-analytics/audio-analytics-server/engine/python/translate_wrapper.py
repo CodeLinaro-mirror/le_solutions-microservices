@@ -227,6 +227,8 @@ class TranslationWrapper:
     _current_engine_model = None  # Track what model is currently loaded in the C++ engine
     _current_engine_input_lang = None
     _current_engine_output_lang = None
+    _cache_writer_thread = None   # background .qnn cache writer thread
+    _cache_writer_path = None     # tmp .qnn path being written
 
     def __init__(self, model_path: bytes, model_dir:str, input_lang: bytes, output_lang: bytes, lib_path: str = None):
         # Increment instance count
@@ -334,15 +336,25 @@ class TranslationWrapper:
             if os.path.isfile(model_file_path):
                 print(f"[Instance {self.instance_id}] init_dir: using model_file from config: {model_file_path}")
                 self._initialize_engine_and_callbacks(model_file_path.encode("utf-8"), input_lang, output_lang)
+                self._resolved_qnn_path = model_file_path
                 return
             else:
                 print(f"[Instance {self.instance_id}] init_dir: model_file not found, continuing")
 
-        # Fast path 2: cached /tmp file
-        t2t_temp_file = f"{T2T_MODEL_STORE_DIR}/translation_{input_code}_{output_code}.qnn"
+        # Fast path 2: versioned cached /tmp file
+        _qnn_ver = config_json.get("runtime", {}).get("qnn_version", {})
+        _model_base = config_json.get("name", os.path.basename(model_dir))
+        t2t_temp_file = os.path.join(
+            T2T_MODEL_STORE_DIR,
+            f"{_model_base}"
+            f"_v{_qnn_ver.get('major', 0)}"
+            f".{_qnn_ver.get('minor', 0)}"
+            f".{_qnn_ver.get('patch', 0)}.qnn"
+        )
         if os.path.isfile(t2t_temp_file):
             print(f"[Instance {self.instance_id}] init_dir: using cached temp file: {t2t_temp_file}")
             self._initialize_engine_and_callbacks(t2t_temp_file.encode("utf-8"), input_lang, output_lang)
+            self._resolved_qnn_path = t2t_temp_file
             return
 
         # Slow path: build from assets
@@ -515,13 +527,25 @@ class TranslationWrapper:
         )
 
         # Start cache write immediately — runs concurrently with the 3-minute DSP init below
+        model_base_name = config_json.get("name", os.path.basename(model_dir))
+        qnn_ver = runtimes.get("qnn_version", {})
+        cache_filename = (
+            f"{model_base_name}"
+            f"_v{qnn_ver.get('major', 0)}"
+            f".{qnn_ver.get('minor', 0)}"
+            f".{qnn_ver.get('patch', 0)}.qnn"
+        )
+        cache_file_path = os.path.join(T2T_MODEL_STORE_DIR, cache_filename)
+        self._resolved_qnn_path = cache_file_path
         try:
             cache_thread = threading.Thread(
                 target=self._write_cache_file,
-                args=(model_buffer, input_code, output_code),
+                args=(model_buffer, input_code, output_code, model_base_name, qnn_ver),
                 daemon=True
             )
             cache_thread.start()
+            TranslationWrapper._cache_writer_thread = cache_thread
+            TranslationWrapper._cache_writer_path = cache_file_path
             print("Background cache file creation started")
         except Exception as e:
             print(f"Could not start background cache creation: {e}")
@@ -554,14 +578,39 @@ class TranslationWrapper:
         TranslationWrapper._current_engine_input_lang = input_lang
         TranslationWrapper._current_engine_output_lang = output_lang
 
-    def _write_cache_file(self, model_buffer, input_code, output_code):
+    def _write_cache_file(self, model_buffer, input_code, output_code,
+                          model_base_name: str = "", qnn_ver: dict = None):
         """Write model buffer to the cache directory (synchronous, run in a background thread)."""
         t2t_tmp_dir = T2T_MODEL_STORE_DIR
         try:
             os.makedirs(t2t_tmp_dir, exist_ok=True)
 
-            cache_filename = f"translation_{input_code}_{output_code}.qnn"
+            if model_base_name and qnn_ver:
+                cache_filename = (
+                    f"{model_base_name}"
+                    f"_v{qnn_ver.get('major', 0)}"
+                    f".{qnn_ver.get('minor', 0)}"
+                    f".{qnn_ver.get('patch', 0)}.qnn"
+                )
+            else:
+                cache_filename = f"translation_{input_code}_{output_code}.qnn"
             cache_file_path = os.path.join(t2t_tmp_dir, cache_filename)
+
+            # Remove stale versioned files for this model before writing
+            if model_base_name:
+                import fnmatch
+                stale_pattern = f"{model_base_name}_v*.qnn"
+                try:
+                    for fname in os.listdir(t2t_tmp_dir):
+                        if fnmatch.fnmatch(fname, stale_pattern) and fname != cache_filename:
+                            stale = os.path.join(t2t_tmp_dir, fname)
+                            try:
+                                os.remove(stale)
+                                print(f"[cache_writer] Removed stale T2T cache: {stale}")
+                            except Exception as e:
+                                print(f"[cache_writer] Could not remove stale {stale}: {e}")
+                except Exception as e:
+                    print(f"[cache_writer] Error scanning stale T2T caches: {e}")
 
             # Remove stale file for this language pair before writing
             if os.path.exists(cache_file_path):
@@ -990,6 +1039,165 @@ class TranslationWrapper:
                 on_error=self._instance_on_error
             )
 
+    def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
+        """Parse a translation benchmark metrics string into a dict.
+
+        Input: "init=200ms,proc=800ms,first_token=350ms"
+        Output: {"init": 200, "proc": 800, "first_token": 350}
+        """
+        result = {}
+        if not metrics_str:
+            return result
+        for part in metrics_str.split(','):
+            part = part.strip()
+            if '=' not in part:
+                continue
+            key, val = part.split('=', 1)
+            val = val.strip().rstrip('ms').strip()
+            try:
+                result[key.strip()] = int(val)
+            except ValueError:
+                result[key.strip()] = val
+        return result
+
+    def benchmark(self, text: str, model_dir: str, input_lang: bytes, output_lang: bytes) -> dict:
+        """Run a full T2T benchmark (init → process → deinit) and return metrics.
+
+        Resolves the model buffer from cache or generates it from assets, then
+        passes the bytes directly to the C translation_benchmark() function which
+        manages its own engine lifecycle internally.
+
+        Args:
+            text:        Source text to translate.
+            model_dir:   Path to the model directory containing config.json and assets.
+            input_lang:  Input language bytes, e.g. b"English".
+            output_lang: Output language bytes, e.g. b"Spanish".
+
+        Returns:
+            dict with keys: init, proc, first_token (all in milliseconds as ints),
+            and model_size (bytes). Empty dict on failure.
+        """
+        if isinstance(text, str):
+            text = text.encode('utf-8')
+        if isinstance(input_lang, str):
+            input_lang = input_lang.encode('utf-8')
+        if isinstance(output_lang, str):
+            output_lang = output_lang.encode('utf-8')
+
+        # ── Resolve model buffer ──────────────────────────────────────────────
+        # Check cache first, generate from assets if missing.
+        config_json = wu.get_config("config.json", model_dir)
+        if not config_json:
+            return {}
+
+        _qnn_ver = config_json.get("runtime", {}).get("qnn_version", {})
+        _model_base = config_json.get("name", os.path.basename(model_dir))
+        cache_filename = (
+            f"{_model_base}"
+            f"_v{_qnn_ver.get('major', 0)}"
+            f".{_qnn_ver.get('minor', 0)}"
+            f".{_qnn_ver.get('patch', 0)}.qnn"
+        )
+        cache_file_path = os.path.join(T2T_MODEL_STORE_DIR, cache_filename)
+
+        # Wait for any in-progress background cache writer for this model
+        _cw = TranslationWrapper._cache_writer_thread
+        if _cw is not None and _cw.is_alive() and TranslationWrapper._cache_writer_path == cache_file_path:
+            print(f"[benchmark] Waiting for background cache writer to finish...")
+            _cw.join()
+
+        model_buffer = None
+        model_size_bytes = 0
+
+        if os.path.isfile(cache_file_path):
+            print(f"[benchmark] Loading model from cache: {cache_file_path}")
+            with open(cache_file_path, 'rb') as f:
+                model_buffer = f.read()
+            model_size_bytes = len(model_buffer)
+        else:
+            print(f"[benchmark] Cache miss — generating model from assets")
+            input_code = self.get_language_code(input_lang)
+            runtimes = config_json["runtime"]
+            model_files = {
+                "encoder_path": config_json["assets"].get("encoder_path"),
+                "decoder_path": config_json["assets"].get("decoder_path"),
+                "tokenizer_path": config_json["assets"].get("tokenizer_path"),
+                "lookups_path": config_json["assets"].get("lookups_path")
+            }
+            models_dict = wu.check_assests(config_json, model_files, model_dir)
+            if not models_dict:
+                return {}
+
+            def _read(path):
+                with open(path, 'rb') as f:
+                    return f.read()
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                f_enc = pool.submit(_read, models_dict["encoder_path"])
+                f_dec = pool.submit(_read, models_dict["decoder_path"])
+                f_tok = pool.submit(_read, models_dict["tokenizer_path"])
+                f_lkp = pool.submit(_read, models_dict["lookups_path"])
+                encoder, decoder, tokenizer, lookups = (
+                    f_enc.result(), f_dec.result(), f_tok.result(), f_lkp.result()
+                )
+
+            model_buffer = generate_model_blob_from_bytes(
+                opus_encoder_model=encoder,
+                opus_decoder_model=decoder,
+                tokenizer_autogen=tokenizer,
+                tokenizer_autogen_lookups=lookups,
+                qnn_version_major=runtimes["qnn_version"].get("major"),
+                qnn_version_minor=runtimes["qnn_version"].get("minor"),
+                qnn_version_patch=runtimes["qnn_version"].get("patch"),
+                arch=runtimes.get("arch"),
+                enc_model_max_seq_len=runtimes.get("enc_model_max_seq_len"),
+                dec_model_max_seq_len=runtimes.get("dec_model_max_seq_len"),
+                rep_penalty=runtimes.get("rep_penalty"),
+                model_lang=runtimes.get("model_lang"),
+                scratch_mem_size_req=runtimes.get("scratch_mem_size_req"),
+            )
+            model_size_bytes = len(model_buffer)
+
+            # Kick off background cache write so next run hits the fast path
+            try:
+                cache_thread = threading.Thread(
+                    target=self._write_cache_file,
+                    args=(model_buffer, input_code,
+                          self.get_language_code(output_lang),
+                          _model_base, _qnn_ver),
+                    daemon=True
+                )
+                cache_thread.start()
+                TranslationWrapper._cache_writer_thread = cache_thread
+                TranslationWrapper._cache_writer_path = cache_file_path
+            except Exception as e:
+                print(f"[benchmark] Could not start background cache write: {e}")
+
+        if not model_buffer:
+            return {}
+
+        # ── Call C benchmark with buffer ──────────────────────────────────────
+        fn = self._wrapper.translation_benchmark
+        fn.argtypes = [
+            ctypes.c_void_p,   # model_data
+            ctypes.c_size_t,   # model_size
+            ctypes.c_char_p,   # text
+            ctypes.c_char_p,   # input_lang
+            ctypes.c_char_p,   # output_lang
+        ]
+        fn.restype = ctypes.c_char_p
+
+        model_buf_c = ctypes.create_string_buffer(model_buffer)
+        model_ptr = ctypes.cast(model_buf_c, ctypes.c_void_p)
+
+        raw = fn(model_ptr, ctypes.c_size_t(model_size_bytes), text, input_lang, output_lang)
+        if raw is None:
+            return {}
+        metrics_str = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+        result = self._parse_benchmark_metrics(metrics_str)
+        result['model_size'] = model_size_bytes
+        return result
+
     def close(self) -> None:
         """Clean up resources associated with the engine and callbacks."""
         
@@ -1023,6 +1231,8 @@ class TranslationWrapper:
                 self._wrapper.destroy_translation_engine(self._engine)
                 self._engine = None
                 print(f"[Instance {self.instance_id}] Engine wrapper destroyed")
+                # Allow DSP hardware to fully release before a new engine can claim it
+                time.sleep(2.0)
         except Exception as e:
             print(f"[Instance {self.instance_id}] Error destroying engine wrapper: {e}")
             traceback.print_exc()

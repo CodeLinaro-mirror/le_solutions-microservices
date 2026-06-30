@@ -27,7 +27,7 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
         const style = body.style;
         const sample_rate = body.sample_rate;
         const parameters = body.parameters || {};
-        
+
         // Validate required fields
         if (!text) {
             return res.status(400).json({
@@ -87,7 +87,20 @@ module.exports.synthesizeSpeech = async function synthesizeSpeech (req, res, nex
                     return;
                 }
 
-                if (parsed.status === 'done') {
+                if (parsed.error) {
+                    // Server error received - unsubscribe and return error response
+                    console.log('TTS server error:', parsed.result.message);
+                    messages.unsubscribeFromChannel(config.ttsAudioOut, audioHandler);
+                    return res.status(400).json({
+                        error: {
+                            message: parsed.result.message,
+                            type: parsed.result.type || "server_error",
+                            param: parsed.result.param || null,
+                            code: parsed.result.code || null
+                        }
+                    });
+                }
+                else if (parsed.status === 'done') {
                     console.log('TTS synthesis complete, closing response');
                     messages.unsubscribeFromChannel(config.ttsAudioOut, audioHandler);
                     return res.end();

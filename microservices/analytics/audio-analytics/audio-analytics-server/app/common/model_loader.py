@@ -181,6 +181,7 @@ class ModelLoader:
                     "display_name": voice.get("display_name", voice["name"]),
                     "language": voice["language"],
                     "language_name": voice.get("language_name", voice["language"]),
+                    "language_code": voice.get("language_code"),
                     "gender": voice.get("gender", "neutral"),
                     "style": voice.get("style", "neutral"),
                     "sample_rate": voice.get("sample_rate", 44100),

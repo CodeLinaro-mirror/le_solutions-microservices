@@ -136,7 +136,7 @@ class WhisperWrapper:
             c_char_p, c_char_p,
             c_char_p, c_char_p, c_char_p
         ]
-        lib.whisper_init.restype = c_bool
+        lib.whisper_init.restype = c_int32
 
         lib.whisper_deinit.argtypes = [c_void_p]
         lib.whisper_deinit.restype = None
@@ -243,7 +243,66 @@ class WhisperWrapper:
             speech_path,
             model_path,
         )
-        if not ok:
+        if ok != 0:
+            # The DSP may have a stale PD reservation that causes contextCreateFromBinary
+            # to fail (e.g. err 1002 on QCS8275).  On slower devices the PD takes longer
+            # to release than on faster ones.  Strategy:
+            #   1. Destroy the partially-initialised handle — a failed whisper_init
+            #      leaves the handle in a dirty state (VAD scratch mem = 0) that will
+            #      crash if used.  Always deinit+destroy before retrying.
+            #   2. Wait progressively longer between retries so the DSP has time to
+            #      complete its hard-reset of reserved memory.
+            #   3. Retry up to MAX_INIT_RETRIES times before giving up.
+            import time
+            MAX_INIT_RETRIES = 3
+            RETRY_DELAYS_S   = [2.0, 4.0, 6.0]   # cumulative: 2 s, 4 s, 6 s
+            for attempt in range(MAX_INIT_RETRIES):
+                delay = RETRY_DELAYS_S[attempt]
+                print(
+                    f"whisper_init failed with error {ok} (attempt {attempt + 1}/{MAX_INIT_RETRIES}) — "
+                    f"destroying dirty handle, waiting {delay:.1f}s for DSP self-recovery..."
+                )
+                # Destroy the dirty handle before retrying so the DSP can fully
+                # release the PD.  Ignore errors — the handle may be partially valid.
+                try:
+                    self.lib.whisper_deinit(self.handle)
+                except Exception:
+                    pass
+                try:
+                    self.lib.whisper_destroy(self.handle)
+                except Exception:
+                    pass
+                self.handle = None
+                time.sleep(delay)
+                # Recreate a fresh handle for the next attempt
+                self.handle = self.lib.whisper_create()
+                if not self.handle:
+                    print("whisper_create failed during retry — aborting")
+                    break
+                ok = self.lib.whisper_init(
+                    self.handle,
+                    encoder_path,
+                    decoder_path,
+                    vocab_path,
+                    speech_path,
+                    model_path,
+                )
+                if ok == 0:
+                    print(f"whisper_init succeeded on retry attempt {attempt + 1}")
+                    break
+        if ok != 0:
+            # All retries exhausted — destroy the handle so the caller does not
+            # receive a dirty pointer that would crash on first use.
+            if self.handle:
+                try:
+                    self.lib.whisper_deinit(self.handle)
+                except Exception:
+                    pass
+                try:
+                    self.lib.whisper_destroy(self.handle)
+                except Exception:
+                    pass
+                self.handle = None
             raise RuntimeError("whisper_init failed")
 
         # Basic settings
@@ -274,6 +333,76 @@ class WhisperWrapper:
         if self.data_listener:
             self.lib.input_stream_register_data_available_listener(self.stream, self.data_listener)
         return self.handle
+
+    def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
+        """Parse a Whisper benchmark metrics string into a dict.
+
+        Input: "init=622ms,proc=1105ms,first_token=350ms,tokens=30"
+        Output: {"init": 622, "proc": 1105, "first_token": 350, "tokens": 30}
+        """
+        result = {}
+        if not metrics_str:
+            return result
+        for part in metrics_str.split(','):
+            part = part.strip()
+            if '=' not in part:
+                continue
+            key, val = part.split('=', 1)
+            val = val.strip().rstrip('ms').strip()
+            try:
+                result[key.strip()] = int(val)
+            except ValueError:
+                result[key.strip()] = val
+        return result
+
+    def benchmark(self, audio_data: bytes, encoder_path: str, decoder_path: str,
+                  vocab_path: str, speech_path: str) -> dict:
+        """Run a full ASR benchmark (init → process → destruct) and return metrics.
+
+        Calls the C whisper_benchmark() function which constructs and destroys its
+        own WhisperImpl internally.  The ctypes binding is resolved lazily.
+
+        Args:
+            audio_data:   Raw PCM audio bytes to transcribe.
+            encoder_path: Path to the encoder model file.
+            decoder_path: Path to the decoder model file.
+            vocab_path:   Path to the vocabulary file.
+            speech_path:  Path to the speech model file.
+
+        Returns:
+            dict with keys: init, proc, first_token, tokens.
+            Values are ints (milliseconds, or token count for 'tokens').
+            Empty dict on failure.
+        """
+        if isinstance(encoder_path, str):
+            encoder_path = encoder_path.encode('utf-8')
+        if isinstance(decoder_path, str):
+            decoder_path = decoder_path.encode('utf-8')
+        if isinstance(vocab_path, str):
+            vocab_path = vocab_path.encode('utf-8')
+        if isinstance(speech_path, str):
+            speech_path = speech_path.encode('utf-8')
+
+        audio_buf = (c_uint8 * len(audio_data)).from_buffer_copy(audio_data)
+
+        fn = self.lib.whisper_benchmark
+        fn.argtypes = [
+            c_void_p,              # handle (unused by C impl, pass 0)
+            POINTER(c_uint8),      # audio
+            c_int32,               # len
+            c_char_p,              # encoder_path
+            c_char_p,              # decoder_path
+            c_char_p,              # vocab_path
+            c_char_p,              # speech_path
+        ]
+        fn.restype = c_char_p
+
+        raw = fn(self.handle or None, audio_buf, len(audio_data),
+                 encoder_path, decoder_path, vocab_path, speech_path)
+        if raw is None:
+            return {}
+        metrics_str = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+        return self._parse_benchmark_metrics(metrics_str)
 
     def close(self):
         """Cleanly stop and destroy everything, ensuring all DSP resources are released."""
@@ -340,10 +469,15 @@ class WhisperWrapper:
         #     import traceback
         #     traceback.print_exc()
         
-        # Add a small delay to allow DSP cleanup to complete
+        # Add a delay to allow the DSP protection domain to fully release.
+        # On constrained devices (e.g. QCS8275) the PD release takes longer —
+        # if a new session calls _init_whisper before the PD is free,
+        # contextCreateFromBinary fails with err 1002 (no available PD).
+        # The /close HTTP response is only sent after this completes, so the
+        # client naturally cannot start a new session until the DSP is ready.
         try:
             import time
-            time.sleep(0.2)  # Slightly longer delay for ASR cleanup
+            time.sleep(0.2)
             print("DSP cleanup delay completed")
         except Exception as e:
             print(f"Error during cleanup delay: {e}")

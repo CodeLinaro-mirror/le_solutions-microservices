@@ -5,7 +5,7 @@
 
 services:
   audio-analytics:
-    image: audio-analytics:latest
+    image: artifacts.codelinaro.org/iot-solutions-microservices/audio-analytics:1.0.2
     platform: linux/arm64
     container_name: audio-analytics
     hostname: audio-analytics
@@ -18,18 +18,13 @@ services:
       retries: 3
       start_period: 40s
     devices:
-      - /dev/dma_heap/system
-      - /dev/dma_heap/qcom,system
       - /dev/fastrpc-cdsp
+      # For devices that have 2 NPU devices, uncomment the line below to enable second NPU
+      #- /dev/fastrpc-cdsp1
       - /dev/fastrpc-adsp-secure
       - /dev/fastrpc-cdsp-secure
-      - /dev/snd:/dev/snd
-      - /dev/bus/usb:/dev/bus/usb
     environment:
-      - LOG_LEVEL=${LOG_LEVEL:-20}
-      - NODE_ENV=production
-      - BLACKBOX_CONTAINER=true
-      - DEV_MODE=false
+      - LOG_LEVEL=${LOG_LEVEL:-20} # 10 = DEBUG, 20 = INFO, 30 = WARNING, 40 = ERROR
       - MODELS_DIR=${MODELS_DIR:-/mnt/work/models}
       - ASR_MODELS_DIR=${ASR_MODELS_DIR:-/mnt/work/models/asr}
       - TRANSLATION_MODELS_DIR=${TRANSLATION_MODELS_DIR:-/mnt/work/models/translation}
@@ -51,38 +46,23 @@ services:
       - TTS_TEXT_IN=tts.text.in
       - TTS_AUDIO_OUT=tts.audio.out
       - TTS_MODELS=tts.models
-      # For pulseaudio
-      #- PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native
-      #- SD_ENABLE_PULSE=1
     expose:
       - '8085'
     network_mode: host
     volumes:
-      - /home/ubuntu/models/audio:/mnt/work/models:ro
+      - ~/models/audio:/mnt/work/models:ro
       - audio-sockets:/tmp/audio-sockets  # Unix domain socket for API ↔ server IPC
-      # Mount system libraries from host for DSP access
-      - /usr/lib/aarch64-linux-gnu/libdmabufheap.so.0:/usr/lib/libdmabufheap.so.0:ro
-      - /usr/lib/aarch64-linux-gnu/libcdsprpc.so:/usr/lib/libcdsprpc.so:ro
-      - /usr/lib/aarch64-linux-gnu/libadsprpc.so:/usr/lib/libadsprpc.so:ro
-      - /usr/lib/aarch64-linux-gnu/libatomic.so.1.2.0:/usr/lib/libatomic.so.1:ro
-      # For pulseaudio - mount with proper permissions
-      #- ${XDG_RUNTIME_DIR}/pulse:${XDG_RUNTIME_DIR}/pulse:rw
-      #- ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+      # fastrpc libs (libcdsprpc, libadsprpc, libdmabufheap, libatomic) are now baked into the image
       # Mount /run/user for additional runtime files
       - /run/user/${UID:-1000}:/run/user/${UID:-1000}:rw
+      - /sys/firmware/devicetree/base/model:/run/device-model
+      - /usr/share/qcom:/usr/share/qcom
     # Use tmpfs for uploads to ensure proper permissions
     tmpfs:
       - /app/uploads:rw,size=500m,mode=777
       - /tmp/audio-cache:rw,size=2g,mode=777
     # Override default command to fix device and audio permissions
-    command: >
-      bash -c "chmod 666 /dev/fastrpc* 2>/dev/null || true;
-               chmod 666 /dev/dma_heap/* 2>/dev/null || true;
-               chmod 666 /dev/snd/* 2>/dev/null || true;
-               chmod 644 /root/.config/pulse/cookie 2>/dev/null || true;
-               chmod -R 777 /var/log/supervisor;
-               chmod 666 /proc/1/fd/1 /proc/1/fd/2 2>/dev/null || true;
-               exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf"
+    # command: block removed — entrypoint.sh baked into the image handles this
 
 # persistent volumes for cache and IPC socket across container restarts
 volumes:

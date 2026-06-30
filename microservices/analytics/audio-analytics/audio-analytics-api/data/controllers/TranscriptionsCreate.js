@@ -49,7 +49,7 @@ module.exports.createTranscription = async function createTranscription (req, re
                 // Send Encoded Stream as message to message broker
                 // If model takes a long time to initialize, then do not respond to USER until an ACK is received
                 messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                    if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
+                    if (err) {return res.status(data && data.code === 'conflict' ? 409 : 400).json({error: {message: (data && data.message) || 'Transcription failed', type: (data && data.type) || 'server_error', code: (data && data.code) || null, sessions: (data && data.sessions) || undefined}});}
                     else {
                         return res.status(200).json({
                             session_id: data.session_id || "no_session_id",
@@ -109,7 +109,7 @@ module.exports.createTranscription = async function createTranscription (req, re
             body.message_type = 'transcriptions_create';
             // If model takes a long time to initialize, then do not respond to USER until an ACK is received
             messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
+                if (err) {return res.status(data && data.code === 'conflict' ? 409 : 400).json({error: {message: (data && data.message) || 'Transcription failed', type: (data && data.type) || 'server_error', code: (data && data.code) || null, sessions: (data && data.sessions) || undefined}});}
                 else {
                     return res.status(200).json({
                         session_id: data.session_id || "session123",
@@ -128,7 +128,7 @@ module.exports.createTranscription = async function createTranscription (req, re
             body.message_type = 'transcriptions_create';
             // If model takes a long time to initialize, then do not respond to USER until an ACK is received
             messages.publishAndListenOnce(config.asrTranscriptionIn, config.asrTranscriptionOut, body, (err, data) => {
-                if (err) {return res.status(400).json({error: {message: (data && data.message) || 'Transcription failed', type: 'server_error'}});}
+                if (err) {return res.status(data && data.code === 'conflict' ? 409 : 400).json({error: {message: (data && data.message) || 'Transcription failed', type: (data && data.type) || 'server_error', code: (data && data.code) || null, sessions: (data && data.sessions) || undefined}});}
                 else {
                     return res.status(200).json({
                         session_id: data.session_id || "session123",

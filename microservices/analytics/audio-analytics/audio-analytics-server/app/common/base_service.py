@@ -173,11 +173,12 @@ class BaseService(ABC):
         sync_id: Optional[str] = None,
         session_id: Optional[str] = None,
         param: Optional[str] = None,
-        code: Optional[str] = None
+        code: Optional[str] = None,
+        extra: Optional[dict] = None
     ):
         """
         Send an error message in the standard format.
-        
+
         Args:
             channel: Channel to send error on
             error_message: Error description
@@ -185,17 +186,22 @@ class BaseService(ABC):
             session_id: Optional session ID
             param: Optional parameter that caused the error
             code: Optional error code
+            extra: Optional extra fields merged into the result dict
         """
+        result = {
+            "message": error_message,
+            "type": code or "server_error",
+            "param": param,
+            "code": code
+        }
+        if extra:
+            result.update(extra)
+
         error_response = {
             "sync_id": sync_id,
             "message_type": "server_error",
             "error": True,
-            "result": {
-                "message": error_message,
-                "type": "server_error",
-                "param": param,
-                "code": code
-            }
+            "result": result
         }
         
         if session_id:

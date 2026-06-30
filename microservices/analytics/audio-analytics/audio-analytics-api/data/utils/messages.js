@@ -137,7 +137,7 @@ async function publishAndListenOnce (channelIn, channelOut, data, cb) {
                 console.log(`[${sync_id}] ⏰ Request timeout after 60 seconds`);
                 globalSocketClient.unsubscribe(channelOut, responseHandler);
                 cb(true, {message: 'Request timeout'});
-            }, 60000); // 60 second timeout
+            }, 300000); // 300 second timeout
             
             // Store timeout reference so we can clear it when response arrives
             responseHandler.timeout = timeout;

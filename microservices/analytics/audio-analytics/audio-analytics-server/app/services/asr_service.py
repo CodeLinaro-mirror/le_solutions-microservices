@@ -348,7 +348,7 @@ class ASRService(BaseService):
             
         self.logger.info(f'Cleaning up {len(self.active_sessions)} active session(s) before starting new request...')
         
-        # Close and destroy the wrapper fully — stale sessions mean the previous
+                # Close and destroy the wrapper fully — stale sessions mean the previous
         # request did not clean up normally, so the DSP state is unknown.
         # Reusing a potentially dirty wrapper risks memory corruption on the DSP.
         if not self.dev_mode and self.whisper_wrapper is not None:
@@ -356,13 +356,19 @@ class ASRService(BaseService):
                 self.logger.info('Closing wrapper fully due to stale session(s)')
                 await asyncio.to_thread(self.whisper_wrapper.close)
                 self.whisper_wrapper = None
+                # Wait for DSP PD to fully release before allowing a new session.
+                # Use a longer wait here than on a normal close because the session
+                # was stale (abnormal teardown) — the DSP may need more time.
+                self.logger.info('Waiting for DSP cleanup after stale session close...')
+                await asyncio.sleep(5.0)
+                self.logger.info('DSP cleanup wait complete')
             except Exception as e:
                 self.logger.error(f"Error closing wrapper during cleanup: {e}", exc_info=True)
                 self.whisper_wrapper = None
         
-        # Clear the session data - don't close the singleton wrapper
+        # Clear the session data
         self.active_sessions.clear()
-        self.logger.info('All sessions cleaned up (wrapper kept alive as singleton)')
+        self.logger.info('All sessions cleaned up')
     
     async def cleanup_resources_for_service_switch(self):
         """Cleanup ASR resources when switching to another service."""
@@ -536,12 +542,15 @@ class ASRService(BaseService):
                     self.logger.warning(
                         f'Rejecting new transcription_create: session(s) already active: {existing_ids}'
                     )
+                    active_ids = [sid for sid in existing_ids if not sid.startswith('pending-')]
                     await self.send_error(
                         Config.ASR_TRANSCRIPTION_OUT,
                         f'A transcription session is already active ({existing_ids[0]}). '
                         f'Please close it first via /transcriptions/close.',
                         sync_id=request.sync_id,
-                        param='session'
+                        param='session',
+                        code='conflict',
+                        extra={'sessions': active_ids}
                     )
                     return
 
@@ -780,8 +789,11 @@ class ASRService(BaseService):
                         
                         # Extract model paths from config
                         _model_dir = model_info.get("model_path", "")
-                        _assets = model_info.get("assets", {})
-                        encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
+                        _assets = model_info.get("assets", {})     
+                        # accept both for backwards-compatibility                   
+                        path_key = "encoder_path" if _assets.get("encoder_path") else "model_path"
+                        encoder_path = os.path.join(_model_dir, _assets.get(path_key, "")).encode("utf-8")
+                        #encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
                         decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
                         vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
                         speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"
@@ -948,15 +960,22 @@ class ASRService(BaseService):
                                     on_error=None
                                 )
                                 
-                                # Initialize Whisper with model paths
-                                await asyncio.to_thread(self.whisper_wrapper._init_whisper,
-                                    encoder_path=encoder_path,
-                                    decoder_path=decoder_path,
-                                    vocab_path=vocab_path,
-                                    speech_path=speech_path,
-                                    model_path=model_path
-                                )
-                                
+                                # Initialize Whisper with model paths — clear the singleton
+                                # on failure so the next request can create a fresh wrapper
+                                # rather than entering the broken "reuse" path with handle=None.
+                                try:
+                                    await asyncio.to_thread(self.whisper_wrapper._init_whisper,
+                                        encoder_path=encoder_path,
+                                        decoder_path=decoder_path,
+                                        vocab_path=vocab_path,
+                                        speech_path=speech_path,
+                                        model_path=model_path
+                                    )
+                                except Exception:
+                                    self.logger.error("WhisperWrapper init failed — clearing singleton so next request can retry")
+                                    self.whisper_wrapper = None
+                                    raise
+
                                 # Set VAD length hangover (custom or environment value)
                                 self.whisper_wrapper.set_vad_len_hangover(vad_hangover)
 
@@ -986,19 +1005,19 @@ class ASRService(BaseService):
                             
                             wrapper = self.whisper_wrapper
                         
-                        # Start processing
+                                                # Start processing
                         try:
                             await asyncio.to_thread(wrapper.start)
-                            
-                            # Calculate audio duration using post-resampling constants (raw_pcm is
-                            # already at ASR_TARGET_RATE/ASR_TARGET_CH regardless of what the client sent)
-                            audio_duration_sec = len(raw_pcm) / (ASR_TARGET_RATE * ASR_TARGET_CH * 2)  # 2 bytes per sample (16-bit)
+
+                            # Calculate audio duration
+                            audio_duration_sec = len(raw_pcm) / (ASR_TARGET_RATE * ASR_TARGET_CH * 2)
                             self.logger.info(f"Audio duration: {audio_duration_sec:.1f}s ({len(raw_pcm)} bytes)")
-                            
-                            # Write all audio at once - let continuous mode handle chunking
+
+                            # Set use_audio_file BEFORE writing the buffer so the
+                            # processing thread sees the flag when it wakes on mCv.
+                            wrapper.lib.input_stream_set_use_audio_file(wrapper.stream, True)
                             buf = (ctypes.c_uint8 * len(raw_pcm)).from_buffer_copy(raw_pcm)
                             wrapper.lib.input_stream_write_buffer(wrapper.stream, buf, len(raw_pcm))
-                            wrapper.lib.input_stream_set_use_audio_file(wrapper.stream, True)
                             self.logger.info(f"Wrote {len(raw_pcm)} bytes of raw PCM to input stream")
 
                             # Block in a thread until the C callback sets processing_complete,
@@ -1276,8 +1295,9 @@ class ASRService(BaseService):
 
     async def create_streaming_session(self, request: TranscriptionsCreateRequest):
         """Create a live streaming transcription session."""
-        # Clean up any existing sessions first (only one session allowed at a time)
-        await self._cleanup_all_sessions()
+        # Note: _cleanup_all_sessions is already called by handle_create_transcription
+        # before the sentinel is added. Do NOT call it again here — it would find
+        # the sentinel and trigger a spurious wrapper.close() or DSP wait.
         
         import uuid
         session_id = str(uuid.uuid4())
@@ -1347,7 +1367,10 @@ class ASRService(BaseService):
                 # Extract model paths from config
                 _model_dir = model_info.get("model_path", "")
                 _assets = model_info.get("assets", {})
-                encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
+                # support both for backwards-compatability
+                path_key = "encoder_path" if _assets.get("encoder_path") else "model_path"
+                encoder_path = os.path.join(_model_dir, _assets.get(path_key, "")).encode("utf-8")
+                #encoder_path = os.path.join(_model_dir, _assets.get("encoder_path", "")).encode("utf-8")
                 decoder_path = os.path.join(_model_dir, _assets.get("decoder_path", "")).encode("utf-8")
                 vocab_path = os.path.join(_model_dir, _assets.get("vocab_path", "")).encode("utf-8")
                 speech_path = b"/usr/src/engine/models/whisper/speech_float.eai"
@@ -1466,18 +1489,25 @@ class ASRService(BaseService):
                             on_error=None
                         )
                         
-                        # Initialize Whisper with model paths
-                        await asyncio.to_thread(self.whisper_wrapper._init_whisper,
-                            encoder_path=encoder_path,
-                            decoder_path=decoder_path,
-                            vocab_path=vocab_path,
-                            speech_path=speech_path,
-                            model_path=model_path
-                        )
-                        
+                        # Initialize Whisper with model paths — clear the singleton
+                        # on failure so the next request can create a fresh wrapper
+                        # rather than entering the broken "reuse" path with handle=None.
+                        try:
+                            await asyncio.to_thread(self.whisper_wrapper._init_whisper,
+                                encoder_path=encoder_path,
+                                decoder_path=decoder_path,
+                                vocab_path=vocab_path,
+                                speech_path=speech_path,
+                                model_path=model_path
+                            )
+                        except Exception:
+                            self.logger.error("WhisperWrapper init failed — clearing singleton so next request can retry")
+                            self.whisper_wrapper = None
+                            raise
+
                         # Set VAD length hangover (custom or environment value)
                         self.whisper_wrapper.set_vad_len_hangover(vad_hangover)
-                        
+
                         self.logger.info("Singleton WhisperWrapper created and initialized")
                     else:
                         self.logger.info("Reusing existing singleton WhisperWrapper instance")
@@ -1514,6 +1544,12 @@ class ASRService(BaseService):
                 self.logger.info(f"ASR engine initialized for streaming session {session_id}")
             except Exception as e:
                 self.logger.error(f"Error initializing ASR engine for streaming: {e}", exc_info=True)
+                await self.send_error(
+                    Config.ASR_TRANSCRIPTION_OUT,
+                    f'ASR engine failed to initialize: {e}',
+                    sync_id=request.sync_id
+                )
+                return
         else:
             if self.dev_mode:
                 self.logger.info("Running in dev mode - creating session without ASR engine")
@@ -1889,7 +1925,12 @@ class ASRService(BaseService):
                     return
                 
                 if session_id not in self.active_sessions:
-                    self.logger.warning(f'Session not found: {session_id}. Active sessions: {list(self.active_sessions.keys())}')
+                    self.logger.warning(f'Session {session_id} not found in active_sessions — sending error so client stops sending')
+                    await self.send_error(
+                        Config.ASR_TRANSCRIPTION_OUT,
+                        'ASR engine is not initialized for this session.',
+                        session_id=session_id
+                    )
                     return
                 
                 # Decode audio chunk
@@ -2057,7 +2098,14 @@ class ASRService(BaseService):
             if session_id and session_id in self.active_sessions:
                 session = self.active_sessions[session_id]
 
-                # Stop recorder first
+                # Cancel the inactivity watchdog immediately — before any async
+                # work — so it cannot fire concurrently and re-touch active_sessions
+                # while cleanup is in progress.
+                timeout_task = session.get('timeout_task')
+                if timeout_task and not timeout_task.done():
+                    timeout_task.cancel()
+                    self.logger.info(f"Cancelled inactivity watchdog for session {session_id}")
+
                 if self.recorder and not self.recorder.done_recording():
                     self.logger.info(f"Stopping recorder on close for session {session_id}")
                     self.recorder.stop_recording()
@@ -2074,37 +2122,36 @@ class ASRService(BaseService):
                             wrapper = session['whisper_wrapper']
                             self.logger.info(f"Flushing remaining audio buffer for session {session_id}")
 
-                            # Signal the C++ processing thread to stop.
-                            # whisper_stop() is non-blocking — it signals the thread and returns
-                            # immediately. The thread fires the final callback, then does its
-                            # post-stop reset ("Resetting state for next utterance in continuous
-                            # mode") before fully exiting. We must wait for all of that to finish
-                            # before calling deinit, otherwise the DSP transport is torn down
-                            # while the thread is still running → SIGSEGV.
-                            await asyncio.to_thread(wrapper.stop)
-
-                            # Wait for the final callback to arrive.
-                            final_sent = session.get("final_sent", False)
-                            if not final_sent:
-                                self.logger.info(f"Waiting for final callback for session {session_id}...")
-                                for _ in range(20):  # up to 2s in 100ms steps
-                                    await asyncio.sleep(0.1)
-                                    session = self.active_sessions.get(session_id, {})
-                                    if session.get("final_sent", False):
+                            # Run stop → wait for final callback → close all on the
+                            # same thread pool thread. The fastrpc/DSP async context
+                            # is thread-affine: if stop() and deinit() run on different
+                            # threads, the DSP sees "thread not setup for async execution"
+                            # → err 1004 on deInit.
+                            def _stop_wait_and_close():
+                                wrapper.stop()
+                                # Busy-wait for final callback (up to 2s)
+                                import time
+                                for _ in range(20):
+                                    if self.active_sessions.get(session_id, {}).get('final_sent', False):
                                         break
-                                final_sent = session.get("final_sent", False)
-                                if not final_sent:
-                                    self.logger.info(f"No final result sent yet for session {session_id}, sending now")
-                            else:
-                                self.logger.info(f"Final result already sent for session {session_id}, skipping")
-
-                            # Give the C++ thread time to finish its post-callback reset loop
-                            # before deinit tears down the DSP. The reset fires immediately after
-                            # the callback and takes <200ms, but we use 500ms to be safe.
-                            await asyncio.sleep(0.5)
+                                    time.sleep(0.1)
+                                # whisper_stop() now joins the processing thread,
+                                # so by the time stop() returns the C++ thread has
+                                # fully exited including DnnVad cleanup. No sleep needed.
+                                wrapper.close()
 
                             self.logger.info(f"Closing ASR wrapper for session {session_id}")
-                            await asyncio.to_thread(wrapper.close)  # stop (idempotent) + deinit + destroy
+                            await asyncio.to_thread(_stop_wait_and_close)
+
+                            final_sent = session.get('final_sent', False)
+
+                            # Wait for DSP PD to fully release before allowing
+                            # a new session. On slower devices (e.g. QCS8275)
+                            # the PD takes longer to release than on faster ones.
+                            # 3 s gives enough headroom without being excessive.
+                            self.logger.info("Waiting for DSP cleanup...")
+                            await asyncio.sleep(3.0)
+                            self.logger.info("DSP cleanup wait complete")
 
                             if not final_sent:
                                 await self.send_streaming_result(session_id, "", True)
@@ -2117,16 +2164,14 @@ class ASRService(BaseService):
                     except Exception as e:
                         self.logger.error(f"Error stopping ASR processing: {e}", exc_info=True)
 
-                    # recorder is a singleton on self, already stopped above
+                                        # recorder is a singleton on self, already stopped above
 
                 # Cleanup session
-                # Cancel the inactivity watchdog before removing the session
-                timeout_task = session.get('timeout_task')
-                if timeout_task and not timeout_task.done():
-                    timeout_task.cancel()
-                    self.logger.info(f"Cancelled inactivity watchdog for session {session_id}")
-                del self.active_sessions[session_id]
-                self.logger.info(f'Closed session: {session_id}')
+                if session_id in self.active_sessions:
+                    del self.active_sessions[session_id]
+                    self.logger.info(f'Closed session: {session_id}')
+                else:
+                    self.logger.info(f'Session {session_id} already removed from active_sessions')
             else:
                 self.logger.info('Received close message (no specific session)')
 
@@ -2140,8 +2185,11 @@ class ASRService(BaseService):
                     except Exception as e:
                         self.logger.error(f"Error deinitializing WhisperWrapper: {e}", exc_info=True)
 
-            # Mark keep_alive as False so the next service switch triggers a full cleanup
-            self.coordinator.set_asr_keep_alive(False)
+                        # Mark keep_alive as False so the next service switch triggers a full cleanup
+                        self.coordinator.set_asr_keep_alive(False)
+            # Ensure active_sessions is fully empty after close — removes any
+            # sentinel entries left over from a concurrent or failed /create.
+            self.active_sessions.clear()
             self.logger.info("ASR close complete")
 
             # Respond to the caller. sync_id is only present on explicit API closes;

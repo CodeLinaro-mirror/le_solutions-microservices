@@ -79,6 +79,38 @@ tags:
 security: []
 
 paths:
+  /kpi:
+    get:
+      tags: ["Health"]
+      summary: "Get service KPIs"
+      description: "Returns the KPIs"
+      operationId: "getKPIs"
+      x-swagger-router-controller: Health
+      responses:
+        "200":
+          description: "KPIs"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KPIResponse"
+              example:
+                status: "ok"
+                uptime: 12345
+                active_sessions: 2
+                version: "1.0.0"
+        "503":
+          description: "Service is unavailable or unhealthy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: "Server is down or overloaded"
+                  type: "service_unavailable"
+                  param: null
+                  code: null
+    
   /health:
     get:
       tags: ["Health"]
@@ -791,6 +823,48 @@ components:
           example: "1.0.0"
       required:
         - status
+    
+    KPIResponse:
+      type: object
+      description: "Server key performance indicators"
+      properties:
+        uptime:
+          type: integer
+          description: "Server uptime in seconds since last start"
+          example: 3600
+        active_service:
+          type: string
+          nullable: true
+          description: "Currently active service (ASR, T2T, or TTS), or null if idle"
+          example: "ASR"
+        asr_active_sessions:
+          type: integer
+          description: "Number of active ASR streaming sessions"
+          example: 2
+        tts_queue_depth:
+          type: integer
+          description: "Number of TTS synthesis requests pending in the queue"
+          example: 0
+        asr_models:
+          type: array
+          items:
+            type: string
+          description: "Available ASR model names"
+          example: ["whisper-small-en", "whisper-base"]
+        t2t_models:
+          type: array
+          items:
+            type: string
+          description: "Available translation model names"
+          example: ["opus-mt-en-fr"]
+        tts_models:
+          type: array
+          items:
+            type: string
+          description: "Available TTS model names"
+          example: ["melo-tts-en"]
+      required:
+        - uptime
 
     ErrorResponse:
       type: object

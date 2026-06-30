@@ -14,7 +14,7 @@ ARG INSTALL_PULSE_AUDIO=false
 
 ARG DISTRO=ubuntu
 ARG UBUNTU_VERSION=24.04
-FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS base
+FROM ubuntu:${UBUNTU_VERSION} AS base
 
 # Install common dependencies
 # NOTE: curl is only needed in builder stages; runtime uses python3 for healthcheck
@@ -58,7 +58,8 @@ RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
 ENV VLM_BUILD_DIR="/mnt/work/build"
 ENV VLM_DEPLOY_DIR="/mnt/work/deploy"
 ENV VLM_ADSP_DIR=${VLM_DEPLOY_DIR}/usr/lib/rfsa/adsp
-ENV VLM_QNP_VER=2.45.40.260406
+ENV VLM_QNP_VER=2.46.0.260424
+#ENV VLM_QNP_VER=2.45.0.260326
 #ENV VLM_QNP_VER=2.40.0.251030
 ENV VLM_DOWNLOAD_DIR="/mnt/work/downloads"
 ENV VLM_QNP_SDK=v${VLM_QNP_VER}.zip
@@ -140,7 +141,8 @@ RUN if [ "$INSTALL_NATIVE_LIBS" = "true" ]; then \
 # nodesource - but ONLY in this builder stage. The runtime stage copies just
 # the node binary + app files across, so the ~288 MB install never lands in
 # the final image.
-FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS api-builder
+# Inherits from base to reuse the already-pulled ubuntu:24.04 image and apt-get upgrade layer.
+FROM base AS api-builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -178,10 +180,13 @@ FROM base AS server-builder
 
 ARG INSTALL_NATIVE_LIBS
 ARG INSTALL_PULSE_AUDIO=false
+ARG VERSION_TAG=1.0.2
+ARG ARTIFACTORY_BASE_URL=https://artifacts.codelinaro.org/artifactory/iot-solutions-microservices-components/audio-analytics
 
 # Install default Python 3 packages
 RUN apt-get update --fix-missing && \
     apt-get install -y \
+    wget \
     python3 \
     python3-pip \
     python3-venv \
@@ -216,8 +221,19 @@ COPY --chown=iot-user:iot-user audio-analytics-server/app ./
 USER root
 RUN mkdir -p /usr/src/engine/python /opt/audio/models /usr/src/engine/native /usr/src/engine/models/whisper
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/*.py /usr/src/server/
+
+# Download melo & piper files from artifactory
+RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   -P "/usr/src/server/melo" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/python/melo/"
+RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   -P "/usr/src/server/piper" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/python/piper/"
+# Keep the COPY as these folders still exist and have .py source code files
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/melo /usr/src/server/melo
 COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/piper /usr/src/server/piper
+RUN chown -R iot-user:iot-user /usr/src/server/melo
+RUN chown -R iot-user:iot-user /usr/src/server/piper
 
 # Move .pyc files directly into their package dir (keeping cpython tag), remove __pycache__ and stub .py files.
 # Python can load .pyc files placed directly in the package directory without a .py source file.
@@ -231,26 +247,70 @@ RUN find /usr/src/server/melo -name '__pycache__' | while read cache_dir; do \
       rm -rf "$cache_dir"; \
     done && \
     find /usr/src/server/melo -mindepth 2 -name '*.py' ! -name '__init__.py' -delete
-COPY --chown=root:root audio-analytics-server/engine/native/aarch64-oe-linux/*.so /usr/src/engine/native/
-COPY --chown=iot-user:iot-user audio-analytics-server/engine/models/whisper/ /usr/src/engine/models/whisper/
-#COPY --chown=iot-user:iot-user audio-analytics-server/engine/config/models.json /opt/audio/models/models.json
+
+# Download .so files & whisper speech float files from artifactory
+RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   -P "/usr/src/engine/native/" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/native/aarch64-oe-linux/"
+RUN wget -r -np -nH --cut-dirs=5 --reject "index.html*" \
+   -P "/usr/src/engine/models/whisper/" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/whisper/"
+# Comment out COPYs when pulling from Artifactory
+# COPY --chown=root:root audio-analytics-server/engine/native/aarch64-oe-linux/*.so /usr/src/engine/native/
+# COPY --chown=iot-user:iot-user audio-analytics-server/engine/models/whisper/ /usr/src/engine/models/whisper/
+# COPY --chown=iot-user:iot-user audio-analytics-server/engine/config/models.json /opt/audio/models/models.json
+RUN chown -R root:root /usr/src/engine/native/
+RUN chown -R iot-user:iot-user /usr/src/engine/models/whisper/
+
+# Download Notice and License files from artifactory
+RUN wget -r -np -nH --cut-dirs=4 --reject "index.html*" \
+   -P "/usr/src/server/" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/NO.LOGIN.BINARY.LICENSE.QTI.pdf"
+RUN wget -r -np -nH --cut-dirs=4 --reject "index.html*" \
+   -P "/usr/src/server/" \
+     "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/NOTICE.FOR.AUDIO.ANALAYTICS.BINARIES.txt"
+RUN chown -R iot-user:iot-user /usr/src/server/
+
+# ============================
+# Stage: Build fastrpc (libcdsprpc.so + libadsprpc.so)
+# ============================
+# Builds fastrpc from source. Provides libcdsprpc.so and libadsprpc.so
+# which are required by libtranslation.so at runtime.
+# Inherits from base to reuse the already-pulled ubuntu:24.04 image and apt-get upgrade layer.
+FROM base AS fastrpc-builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git ca-certificates \
+      autoconf automake libtool make gcc pkg-config \
+      libyaml-dev libmd-dev libbsd-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/quic/fastrpc.git \
+    && cd fastrpc \
+    && autoreconf -is \
+    && CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
+       ./configure --prefix=/usr --libdir=/usr/lib \
+    && make -j1 \
+    && make install \
+    && rm -rf /fastrpc
 
 # ============================
 # Stage: Final Runtime Image
 # ============================
-# Use a clean base — do NOT inherit from `base` which carries curl + apt-get
-# upgrade baggage (~50-100 MB). Runtime only needs what's explicitly installed here.
-FROM docker-registry.qualcomm.com/library/ubuntu:${UBUNTU_VERSION} AS runtime
+# Inherits from base to reuse the already-pulled ubuntu:24.04 image and apt-get upgrade layer.
+# base already ran apt-get upgrade so we don't need to repeat it here.
+FROM base AS runtime
 
 ARG INSTALL_NATIVE_LIBS
 
-# Single combined layer: upgrade + runtime deps only.
-# No curl, no build tools, no nodesource. Node binary is copied from api-builder.
-# Healthcheck uses python3 so curl is not needed.
+# Single combined layer: runtime deps only.
+# base already ran apt-get upgrade. No build tools, no nodesource.
+# Node binary is copied from api-builder.
 RUN apt-get update && \
-    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-      python3 supervisor ca-certificates curl && \
+      python3 supervisor curl libyaml-0-2 libbsd0 libmd0 libatomic1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -277,30 +337,35 @@ RUN node --version
 RUN userdel -r ubuntu 2>/dev/null || true && \
     useradd -ms /bin/bash -u 1000 iot-user && \
     usermod -aG audio iot-user
-RUN mkdir -p /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /app/uploads /opt/audio/models /opt/cache /tmp/audio-sockets /usr/src/engine/models/whisper && \
-    chown iot-user:iot-user /usr/src/api /usr/src/server /usr/src/audio-chat /usr/src/audio-tester /opt/audio/models /opt/cache /var/run && \
+RUN mkdir -p /usr/src/api /usr/src/server /app/uploads /opt/audio/models /opt/cache /tmp/audio-sockets /usr/src/engine/models/whisper && \
+    chown iot-user:iot-user /usr/src/api /usr/src/server /opt/audio/models /opt/cache /var/run && \
     chmod 777 /tmp/audio-sockets /app/uploads && \
     chmod -R 777 /app
 
 COPY --from=api-builder --chown=iot-user:iot-user /usr/src/api /usr/src/api
-# Copy Audio Chat UI - root AnalyticsMicroservices is now the app
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/index.html /usr/src/audio-chat/index.html
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/style.css /usr/src/audio-chat/style.css
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/color-scheme.css /usr/src/audio-chat/color-scheme.css
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/script.js /usr/src/audio-chat/script.js
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/tailwind.min.css /usr/src/audio-chat/tailwind.min.css
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/lucide-icons.js /usr/src/audio-chat/lucide-icons.js
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/proxy.py /usr/src/audio-chat/proxy.py
-COPY --chown=iot-user:iot-user apps/AnalyticsMicroservices/assets /usr/src/audio-chat/assets
-# Copy Audio Analytics Tester UI
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/index.html /usr/src/audio-tester/index.html
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/styles.css /usr/src/audio-tester/styles.css
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/script.js /usr/src/audio-tester/script.js
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/proxy.py /usr/src/audio-tester/proxy.py
-COPY --chown=iot-user:iot-user apps/AudioAnalyticsTester/logo.png /usr/src/audio-tester/logo.png
 COPY --from=server-builder --chown=iot-user:iot-user /usr/src/server /usr/src/server
 # Copy native libraries (directory always exists, only populated when INSTALL_NATIVE_LIBS=true)
 COPY --from=native-libs /mnt/work/deploy/usr /usr
+
+# Copy fastrpc libs built from source
+COPY --from=fastrpc-builder /usr/lib/libcdsprpc* /usr/lib/
+COPY --from=fastrpc-builder /usr/lib/libadsprpc* /usr/lib/
+
+# Bake fastrpc DSP path config for all supported devices.
+# The entrypoint copies this to /usr/share/qcom/conf.d/ at runtime
+# after the bind-mount is in place, so fastrpc_shell resolves from the host.
+RUN mkdir -p /etc/fastrpc && \
+    { \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
+      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
+      echo 'machines:'; \
+      echo '  Qualcomm Technologies, Inc. Monaco Monza addons:'; \
+      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp'; \
+      echo '  Qualcomm Technologies, Inc. Addons IQ 9075 EVK:'; \
+      echo '    DSP_LIBRARY_PATH: sa8775p/Qualcomm/SA8775P-RIDE/dsp'; \
+      echo '  Qualcomm Technologies, Inc. IQ8 8275 Pro SKU EVK:'; \
+      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp'; \
+    } > /etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # Copy the virtual environment
 COPY --from=server-builder /venv /venv
@@ -312,6 +377,9 @@ COPY --from=server-builder --chown=iot-user:iot-user /usr/src/engine/models/whis
 # Using virtual environment Python packages
 ENV PYTHONPATH=/usr/src/server
 ENV PATH="/venv/bin:$PATH"
+# Use container libraries
+ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 
 RUN mkdir -p /etc/supervisor/conf.d
 COPY <<'EOF' /etc/supervisor/conf.d/supervisord.conf
@@ -320,7 +388,7 @@ nodaemon=true
 user=iot-user
 logfile=/dev/null
 logfile_maxbytes=0
-pidfile=/var/run/supervisord.pid
+pidfile=/tmp/supervisord.pid
 
 [program:server]
 priority=10
@@ -335,7 +403,7 @@ stderr_logfile=/proc/1/fd/2
 stderr_logfile_maxbytes=0
 stdout_events_enabled=true
 stderr_events_enabled=true
-environment=LOG_LEVEL="%(ENV_LOG_LEVEL)s",DEV_MODE="%(ENV_DEV_MODE)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s",DSP_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/src/server",LD_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/lib:/usr/src/server:/usr/src/engine/native:/mnt/work/deploy/usr/lib",PYTHONUNBUFFERED="1"
+environment=LOG_LEVEL="%(ENV_LOG_LEVEL)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s",LD_LIBRARY_PATH="/usr/lib/rfsa/adsp:/usr/lib:/usr/src/server:/usr/src/engine/native:/mnt/work/deploy/usr/lib",PYTHONUNBUFFERED="1"
 
 [program:api]
 priority=20
@@ -355,33 +423,6 @@ stdout_events_enabled=true
 stderr_events_enabled=true
 environment=NODE_ENV="%(ENV_NODE_ENV)s",BLACKBOX_CONTAINER="%(ENV_BLACKBOX_CONTAINER)s",SOCKET_PATH="%(ENV_SOCKET_PATH)s"
 
-[program:audio-chat]
-priority=30
-command=python3 proxy.py
-directory=/usr/src/audio-chat
-user=iot-user
-autostart=true
-autorestart=true
-stdout_logfile=/proc/1/fd/1
-stdout_logfile_maxbytes=0
-stderr_logfile=/proc/1/fd/2
-stderr_logfile_maxbytes=0
-stdout_events_enabled=true
-stderr_events_enabled=true
-
-[program:audio-tester]
-priority=31
-command=python3 proxy.py
-directory=/usr/src/audio-tester
-user=iot-user
-autostart=true
-autorestart=true
-stdout_logfile=/proc/1/fd/1
-stdout_logfile_maxbytes=0
-stderr_logfile=/proc/1/fd/2
-stderr_logfile_maxbytes=0
-stdout_events_enabled=true
-stderr_events_enabled=true
 EOF
 
 EXPOSE 8085 8001 8000
@@ -393,12 +434,28 @@ ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379
 ENV LOG_LEVEL=20
 ENV NODE_ENV=production
-ENV BLACKBOX_CONTAINER=false
+ENV BLACKBOX_CONTAINER=true
 ENV SOCKET_PATH=/tmp/audio-sockets/audio-analytics.sock
 
 # Set environment variables for native libraries
 #ENV DSP_LIBRARY_PATH=/usr/src/server
 #ENV LD_LIBRARY_PATH=/usr/lib/rfsa/adsp:/usr/lib:/usr/src/server
-#ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+# Entrypoint — copies yaml to /usr/share/qcom/conf.d/ after bind-mount is in place,
+# then sets ADSP_LIBRARY_PATH to container's skel directory before supervisord starts.
+COPY <<'EOF' /entrypoint.sh
+#!/bin/bash
+set -e
+chmod 666 /dev/fastrpc* 2>/dev/null || true
+chmod -R 777 /var/log/supervisor 2>/dev/null || true
+chmod 666 /proc/1/fd/1 /proc/1/fd/2 2>/dev/null || true
+mkdir -p /usr/share/qcom/conf.d
+cp /etc/fastrpc/hexagon-dsp-binaries.yaml /usr/share/qcom/conf.d/
+export ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+export CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+export DSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
+EOF
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]

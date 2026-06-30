@@ -42,9 +42,11 @@ var mainApp = express();
 
 console.log('🚀 STARTING API SERVER');
 
-// Log every single request that hits the server
+// Log every single request that hits the server (debug only)
 mainApp.use((req, res, next) => {
-    console.log(`🌐 INCOMING REQUEST: ${req.method} ${req.path} from ${req.ip}`);
+    if (config.logLevel <= 10) {
+        console.log(`🌐 INCOMING REQUEST: ${req.method} ${req.path} from ${req.ip}`);
+    }
     next();
 });
 
@@ -185,23 +187,23 @@ async function startWebsocket() {
 
 // Function to reset inactivity timer
 function resetInactivityTimer(wsc) {
-    if (inactivityTimer) {
-        console.info("Activity Detected, resetting WebSocket client timer");
-        clearTimeout(inactivityTimer);
-    } else {
-        console.info("Client connected. Starting WebSocket client timer");
-    }
-    inactivityTimer = setTimeout(() => {
-        console.warn(`No messages received for ${INACTIVITY_TIMER} seconds. Closing WebSocket...`);
-        if (wsc.readyState === WebSocket.OPEN) {
-            wsc.send(JSON.stringify({
-                message_type: 'connection_close',
-                message: `No Messages have been sent for ${INACTIVITY_TIMER} milliseconds. Connection Closing...`,
-                timestamp: new Date().toISOString()
-            }));
-            wsc.close(); // Custom close code & reason
-        }
-    }, INACTIVITY_TIMER);
+    // if (inactivityTimer) {
+    //     console.info("Activity Detected, resetting WebSocket client timer");
+    //     clearTimeout(inactivityTimer);
+    // } else {
+    //     console.info("Client connected. Starting WebSocket client timer");
+    // }
+    // inactivityTimer = setTimeout(() => {
+    //     console.warn(`No messages received for ${INACTIVITY_TIMER} seconds. Closing WebSocket...`);
+    //     if (wsc.readyState === WebSocket.OPEN) {
+    //         wsc.send(JSON.stringify({
+    //             message_type: 'connection_close',
+    //             message: `No Messages have been sent for ${INACTIVITY_TIMER} milliseconds. Connection Closing...`,
+    //             timestamp: new Date().toISOString()
+    //         }));
+    //         wsc.close(); // Custom close code & reason
+    //     }
+    // }, INACTIVITY_TIMER);
 }
 
 async function messageSwitch(msg, wsc) {

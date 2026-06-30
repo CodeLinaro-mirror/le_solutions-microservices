@@ -62,7 +62,8 @@ def build_structure_tts(
     phones_offset_list,
     g2p_token_list,
     g2p_phones_list,
-    phones_per_word_list
+    phones_per_word_list,
+    persistent_data_size
 ):
 
     body = bytes()
@@ -75,7 +76,7 @@ def build_structure_tts(
     bert_max_tokens = 400
     piper_max_token_len = 128
     bert_tokenstream_struct_size = 557060
-    split_sentence_struct_size = 10244
+    split_sentence_struct_size = 10224
     piper_speech_format_struct_size = 40
     header_size = 16
     dsp_kpps = 100000
@@ -99,6 +100,8 @@ def build_structure_tts(
         g2p_lang_prefix = "<spa>: "
     elif "de" == model_lang:
         g2p_lang_prefix = "<deu>: "
+    elif "it" == model_lang:
+        g2p_lang_prefix = "<ita>: "
     else:
         g2p_lang_prefix = ""
 
@@ -208,6 +211,8 @@ def build_structure_tts(
         body += struct.pack('I', 2)
     elif "es" == model_lang:
         body += struct.pack('I', 3)
+    elif "it" == model_lang:
+        body += struct.pack('I', 15)   # piper_it = 15 in PIPER_LANGUAGE_CODE enum
 
     # uint32_t input_text_size;
     body += struct.pack('I', 0)
@@ -234,18 +239,18 @@ def build_structure_tts(
     body += struct.pack('b', 1)
 
     # bool is_g2p_enabled;
-    if ("en" == model_lang) or ("de" == model_lang):
+    if ("en" == model_lang) or ("de" == model_lang) or ("it" == model_lang):
         body += struct.pack('b', 1)
     elif ("zh" == model_lang) or ("es" == model_lang):
         body += struct.pack('b', 0)
 
     # bool use_bert_tokenizer;
-    # false (0) for German: use PreTokenize path directly (skip BERT WordPiece + grouping)
-    # true  (1) for all others: use full BERT tokenization path
-    if ("de" == model_lang) or ("en" == model_lang) or ("zh" == model_lang) or ("es" == model_lang):
-        body += struct.pack('b', 0)
-    else:
+    # true  (1) only for Chinese (zh): use full BERT tokenization path
+    # false (0) for all others: use PreTokenize path directly
+    if "zh" == model_lang:
         body += struct.pack('b', 1)
+    else:
+        body += struct.pack('b', 0)
 
     #========================================
     # uint32_t sample_rate;
@@ -387,8 +392,14 @@ def build_structure_tts(
     # split_sentence split_sentence;
     body += struct.pack('b' * split_sentence_struct_size, *[0] * split_sentence_struct_size)
 
-    # int8_t reserved_4[4];
-    body += struct.pack('b' * 4, *[0] * 4)
+    # uint64_t persistent_data_size;
+    body += struct.pack('Q', persistent_data_size)
+
+    # uint8_t* persistent_data_ptr;  (pointer placeholder, initialized at runtime)
+    body += struct.pack('b' * 8, *[0] * 8)
+
+    # int8_t reserved_4[8];
+    body += struct.pack('b' * 8, *[0] * 8)
 
     #========================================
     # piper_config_t  piper_config;
@@ -480,6 +491,7 @@ def generate_model(
     arch_bit,
     is_model_quantized,
     model_lang,
+    persistent_data_size=2048000,
     scratch_mem_size_req=3200000
 ):
     """
@@ -546,14 +558,24 @@ def generate_model(
         import piper.zh_dict_generation.phones_per_word_dict as phones_per_word
     elif model_lang == "de":
         print("DE MODEL DICTIONARY LOADED ...")
-        import piper.de_phonemes_gen.word_dict as word_dict
-        import piper.de_phonemes_gen.phones_dict as phones_dict
-        import piper.de_phonemes_gen.word_offset as word_offset
-        import piper.de_phonemes_gen.phones_offset as phones_offset
-        import piper.de_phonemes_gen.phones_per_word_dict as phones_per_word
+        import piper.de_dict_generation.word_dict as word_dict
+        import piper.de_dict_generation.phones_dict as phones_dict
+        import piper.de_dict_generation.word_offset as word_offset
+        import piper.de_dict_generation.phones_offset as phones_offset
+        import piper.de_dict_generation.phones_per_word_dict as phones_per_word
 
         import piper.de_g2p_dict_generation.g2p_token_dict as g2p_token_dict
         import piper.de_g2p_dict_generation.g2p_phones_dict as g2p_phones_dict
+    elif model_lang == "it":
+        print("IT MODEL DICTIONARY LOADED ...")
+        import piper.it_dict_generation.word_dict as word_dict
+        import piper.it_dict_generation.phones_dict as phones_dict
+        import piper.it_dict_generation.word_offset as word_offset
+        import piper.it_dict_generation.phones_offset as phones_offset
+        import piper.it_dict_generation.phones_per_word_dict as phones_per_word
+
+        import piper.it_g2p_dict_generation.g2p_token_dict as g2p_token_dict
+        import piper.it_g2p_dict_generation.g2p_phones_dict as g2p_phones_dict
     else:
         print("Error: Model type does not exist!")
 
@@ -578,7 +600,7 @@ def generate_model(
     except NameError:
         g2p_phones_list = []
 
-    # Piper Encoder Model network
+    # piper Encoder Model network
     f = open(piper_encoder_model, 'rb')
     piper_encoder_model = f.read()
     f.close()
@@ -750,15 +772,15 @@ def generate_model(
         model_byte_dict += struct.pack('b' * dict_pad_size, *[0] * dict_pad_size)
     print("DICTIONARY SIZE = ", dict_size)
 
-    # BERT Tokenizer binary
-    if bert_tokenizer is not None:
+    # BERT Tokenizer binary — only needed for Chinese (zh)
+    if model_lang == "zh" and bert_tokenizer is not None:
         f = open(bert_tokenizer, 'rb')
         bert_tokenizer = f.read()
         f.close()
 
         bert_tokenizer_org_size = len(bert_tokenizer)
     else:
-        # Initialize empty BERT tokenizer in case BERT is disabled
+        # use_bert_tokenizer is False for this language — skip tokenizer file
         bert_tokenizer_org_size = 0
         bert_tokenizer = b''
 
@@ -796,6 +818,90 @@ def generate_model(
     scratch_memory , scratch_mem_size = allocate_mem(scratch_mem_size_req)
     print("SCRATCH MEM SIZE = ", scratch_mem_size)
 
+    # Replacement dictionary packing (EN and ES only; ZH has no abbreviation dict)
+    model_byte_replacement_dict = bytes()
+    if model_lang in ("en", "es"):
+        if model_lang == "en":
+            import piper.en_replacement_dict_generation.original_word_list as orig_wl
+            import piper.en_replacement_dict_generation.original_word_offset as orig_wo
+            import piper.en_replacement_dict_generation.replacement_word_list as repl_wl
+            import piper.en_replacement_dict_generation.replacement_word_offset as repl_wo
+        # else:
+        #     import es_replacement_dict_generation.original_word_list as orig_wl
+        #     import es_replacement_dict_generation.original_word_offset as orig_wo
+        #     import es_replacement_dict_generation.replacement_word_list as repl_wl
+        #     import es_replacement_dict_generation.replacement_word_offset as repl_wo
+
+        orig_word_list_bytes = orig_wl.dict_original_word_byte
+        orig_word_offsets    = orig_wo.dict_original_word_offset
+        repl_word_list_bytes = repl_wl.dict_replacement_word_byte
+        repl_word_offsets    = repl_wo.dict_replacement_word_offset
+        num_entries          = len(orig_word_offsets)
+
+        # replacement_dict fixed header:
+        #   uint32_t num_entries
+        #   uint32_t original_word_list_size
+        #   uint32_t replacement_word_list_size
+        #   uint32_t reserved
+        model_byte_replacement_dict += struct.pack('IIII',
+            num_entries,
+            len(orig_word_list_bytes),
+            len(repl_word_list_bytes),
+            0)
+
+        # Pointer placeholders (4 pointers x 8 bytes each, initialized at runtime)
+        model_byte_replacement_dict += struct.pack('b' * 8, *[0] * 8)  # original_word_offset ptr
+        model_byte_replacement_dict += struct.pack('b' * 8, *[0] * 8)  # replacement_word_offset ptr
+        model_byte_replacement_dict += struct.pack('b' * 8, *[0] * 8)  # original_word_list ptr
+        model_byte_replacement_dict += struct.pack('b' * 8, *[0] * 8)  # replacement_word_list ptr
+
+        # original_word_offset array (8-byte aligned)
+        temp_org_size = len(model_byte_replacement_dict)
+        temp_pad_size = align_n(temp_org_size, 8) - temp_org_size
+        if temp_pad_size > 0:
+            model_byte_replacement_dict += struct.pack('b' * temp_pad_size, *[0] * temp_pad_size)
+        model_byte_replacement_dict += struct.pack('I' * num_entries, *orig_word_offsets)
+
+        # replacement_word_offset array (8-byte aligned)
+        temp_org_size = len(model_byte_replacement_dict)
+        temp_pad_size = align_n(temp_org_size, 8) - temp_org_size
+        if temp_pad_size > 0:
+            model_byte_replacement_dict += struct.pack('b' * temp_pad_size, *[0] * temp_pad_size)
+        model_byte_replacement_dict += struct.pack('I' * num_entries, *repl_word_offsets)
+
+        # original_word_list blob (8-byte aligned)
+        temp_org_size = len(model_byte_replacement_dict)
+        temp_pad_size = align_n(temp_org_size, 8) - temp_org_size
+        if temp_pad_size > 0:
+            model_byte_replacement_dict += struct.pack('b' * temp_pad_size, *[0] * temp_pad_size)
+        model_byte_replacement_dict += struct.pack(f'{len(orig_word_list_bytes)}s', orig_word_list_bytes)
+
+        # replacement_word_list blob (8-byte aligned)
+        temp_org_size = len(model_byte_replacement_dict)
+        temp_pad_size = align_n(temp_org_size, 8) - temp_org_size
+        if temp_pad_size > 0:
+            model_byte_replacement_dict += struct.pack('b' * temp_pad_size, *[0] * temp_pad_size)
+        model_byte_replacement_dict += struct.pack(f'{len(repl_word_list_bytes)}s', repl_word_list_bytes)
+
+    replacement_dict_packed_size = len(model_byte_replacement_dict)
+    # 256-byte align the replacement dict
+    replacement_dict_pad_size = align_n(replacement_dict_packed_size, ALIGN_NUM) - replacement_dict_packed_size
+    replacement_dict_size = replacement_dict_packed_size + replacement_dict_pad_size
+    if replacement_dict_pad_size > 0:
+        model_byte_replacement_dict += struct.pack('b' * replacement_dict_pad_size, *[0] * replacement_dict_pad_size)
+    print("REPLACEMENT DICT SIZE = ", replacement_dict_size)
+
+    # Build persistent data section: replacement dict at the start, zero-padded to persistent_data_size
+    persistent_data_size_req = int(persistent_data_size)
+    persistent_data_size = align_n(persistent_data_size_req, ALIGN_NUM)
+    if replacement_dict_size > persistent_data_size:
+        print('ERROR: replacement dict size ({}) exceeds persistent_data_size ({}). Exiting...'.format(
+            replacement_dict_size, persistent_data_size))
+        exit(1)
+    persistent_data_pad_size = persistent_data_size - replacement_dict_size
+    model_byte_persistent_data = model_byte_replacement_dict + struct.pack('b' * persistent_data_pad_size, *[0] * persistent_data_pad_size)
+    print(f"PERSISTENT DATA PAD SIZE = {persistent_data_pad_size}, PERSISTENT DATA TOTAL SIZE {persistent_data_size}")
+
     structure_tts = build_structure_tts(
         dict_size,
         piper_encoder_model_org_size,
@@ -829,13 +935,14 @@ def generate_model(
         phones_offset_list,
         g2p_token_list,
         g2p_phones_list,
-        phones_per_word_list
+        phones_per_word_list,
+        persistent_data_size
     )
 
     model_buffer_gen_time = time.time()
     print(f"Model Buffer Generation Time: {model_buffer_gen_time - start:.2f} seconds")
     
-    model_body = structure_tts+model_byte_dict+piper_encoder_model+piper_sdp_model+piper_flow_model+piper_decoder_model+g2p_enc_model+g2p_dec_model+bert_tokenizer+bert_normalizer+scratch_memory
+    model_body = structure_tts+model_byte_dict+piper_encoder_model+piper_sdp_model+piper_flow_model+piper_decoder_model+g2p_enc_model+g2p_dec_model+bert_tokenizer+bert_normalizer+scratch_memory+model_byte_persistent_data
     
     full_model_data = pack_model_body('0PIP', 'PIP0MODE', model_version_major, model_version_minor, model_body)
     print(f"Full Model Buffer (with model body and footer) Time: {time.time() - model_buffer_gen_time:.2f} seconds")
@@ -867,6 +974,7 @@ def main():
     parser.add_argument('--is_model_quantized', default=None, help='are enc/dec models quantized or not')
     parser.add_argument('--model_lang', default=None, help='English/Multi-lingual model')
     parser.add_argument('--scratch_mem_size_req', help='General scratch memory size')
+    parser.add_argument('--persistent_data_size', default=2048000, help='Persistent data section size in bytes (default: 2MB)')
     parser.add_argument('--path_out_model', help='Output file name for tts model')
     args = parser.parse_args()
     print(args)
@@ -900,6 +1008,7 @@ def main():
         arch_bit=arch_bit,
         is_model_quantized=is_model_quantized,
         model_lang=model_lang,
+        persistent_data_size=int(args.persistent_data_size),
         scratch_mem_size_req=int(args.scratch_mem_size_req)
     )
 

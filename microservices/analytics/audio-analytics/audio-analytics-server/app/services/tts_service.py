@@ -89,6 +89,9 @@ class TTSService(BaseService):
             "piper": Config.PIPER_LANGUAGE_CODE_MAP
         }
 
+        # Previous TTS Parameters
+        self._prev_tts_param = None
+
         if not self.dev_mode:
             self.logger.info("Running in production mode - initializing TTS engine")
             try:
@@ -946,9 +949,9 @@ class TTSService(BaseService):
                 return
             
             # Get TTS parameters from request or use defaults
-            speaking_rate = 1.0
-            pitch = 0.0
-            volume_gain = 0.0
+            speaking_rate = None
+            pitch = None
+            volume_gain = None
             sample_rate = request.sample_rate or 44100
             output_speaker = request.output_speaker
             on_device_playback = request.on_device_playback 
@@ -956,17 +959,29 @@ class TTSService(BaseService):
 
             # Parse parameters if provided
             if request.parameters:
-                speaking_rate = float(request.parameters.get("speaking_rate", 1.0))
-                pitch = float(request.parameters.get("pitch", 0.0))
-                volume_gain = float(request.parameters.get("gain", 0.0))
+                speaking_rate = request.parameters.get("speaking_rate")
+                pitch = request.parameters.get("pitch")
+                volume_gain = request.parameters.get("gain")
             
             # Get the appropriate language code map based on model type
             language_code_map = self.TTS_LANGUAGE_CODE_MAPPING[model_config["model_type"]]
             language_code = language_code_map.get(request.language.lower() if request.language else "", 0)
             
+            tts_param = {}
+            if speaking_rate is not None:
+                tts_param["speaking_rate"] = float(speaking_rate)
+            if pitch is not None:
+                tts_param["pitch"] = float(pitch)
+            if volume_gain is not None:
+                tts_param["volume_gain"] = float(volume_gain)
+            # What else?
+
+            def is_matching_prev_tts_config(config):
+                return tts_param == self._prev_tts_param
+
             # Get or create singleton TTS instance (only reinit if model changed)
             async with self.tts_instance_lock:
-                if self.tts_instance is None or self.current_model_path != model_path:
+                if self.tts_instance is None or self.current_model_path != model_path or not is_matching_prev_tts_config(tts_param):
                     self.logger.info(
                         f"TTS instance state: instance={'exists' if self.tts_instance else 'None'}, "
                         f"current_path={self.current_model_path}, requested_path={model_path}, "
@@ -984,12 +999,16 @@ class TTSService(BaseService):
                     
                     self.logger.info(f"Creating new TTS instance for model: {model_path}")
                     self.tts_instance = self.tts_wrapper_class()
-                    
+
+                    # Set the previous tts param
+                    self._prev_tts_param = tts_param
+
                     # Initialize the TTS engine with the model directory
                     t_init = time.time()
                     handle = await asyncio.to_thread(
                         self.tts_instance.init_dir,
-                        model_path
+                        model_path,
+                        tts_param,
                     )
                     self.logger.info(
                         f"TTS init_dir completed in {time.time() - t_init:.1f}s "
@@ -1011,6 +1030,8 @@ class TTSService(BaseService):
                     self.logger.info(f"TTS engine initialized with handle: {handle}")
                 else:
                     self.logger.info(f"Reusing existing TTS instance for model: {model_path}")
+                    # Note: tts_configs overrides only apply when the engine is
+                    # (re)initialised.
                 
                 # Use the singleton instance
                 tts_instance = self.tts_instance
@@ -1026,7 +1047,8 @@ class TTSService(BaseService):
             engine_channels = 1
             
             # Get requested sample rate (default to 44100 if not specified)
-            target_sample_rate = request.sample_rate or 44100
+            target_sample_rate = request.sample_rate or engine_sample_rate
+            logger.info(f"Target Sample Rate: {target_sample_rate}")
 
             # Create a thread-safe queue for chunks
             chunk_queue = queue.Queue()

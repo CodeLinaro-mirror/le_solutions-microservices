@@ -68,6 +68,9 @@ class Config:
 
     # ASR Device Channel
     ASR_DEVICES = os.environ.get('ASR_DEVICES', 'asr.devices')
+
+    # KPI Channel
+    KPI_CHANNEL = os.environ.get('KPI_CHANNEL', 'audio.kpi')
     
     # Map language to language code
     MELO_LANGUAGE_CODE_MAP = {

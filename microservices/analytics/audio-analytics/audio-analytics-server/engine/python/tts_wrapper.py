@@ -1,4 +1,4 @@
-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+﻿# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #!/usr/bin/env python3
@@ -250,6 +250,51 @@ class TTS:
         self._define_init_model_buffer_ctype(c_lib)
         self._define_process_ctype(c_lib)
         self._define_deinit_ctype(c_lib)
+        c_lib.tts_benchmark.argtypes = [
+            ctypes.c_void_p,  # model_data
+            ctypes.c_size_t,  # model_size
+            ctypes.c_char_p,  # text
+            self.TTSParams,   # tts_params
+        ]
+        c_lib.tts_benchmark.restype = ctypes.c_char_p
+
+    @staticmethod
+    def _validate_model_params(model_params: dict) -> bool:
+        """Validate TTS model parameters against the CSIM constraints.
+
+        Args:
+            model_params: dict with keys audio_encoding, speaking_rate, pitch,
+                          volume_gain, and sample_rate.
+
+        Returns:
+            True if all parameters are valid, False otherwise.
+        """
+        VALID_AUDIO_ENCODINGS = {0, 1, 2, 3, 4}  # LINEAR16, MP3, OGG_OPUS, MULAW, ALAW
+        if model_params["audio_encoding"] not in VALID_AUDIO_ENCODINGS:
+            print(
+                f"Invalid audio_encoding {model_params['audio_encoding']}. "
+                f"Must be one of {VALID_AUDIO_ENCODINGS} (LINEAR16=0, MP3=1, OGG_OPUS=2, MULAW=3, ALAW=4)"
+            )
+            return False
+        if not (0.25 <= model_params["speaking_rate"] <= 4.0):
+            print(
+                f"Invalid speaking_rate {model_params['speaking_rate']}. "
+                f"Must be between 0.25 and 4.0"
+            )
+            return False
+        if not (-20.0 <= model_params["pitch"] <= 20.0):
+            print(
+                f"Invalid pitch {model_params['pitch']}. "
+                f"Must be between -20.0 and 20.0"
+            )
+            return False
+        if not (-96.0 <= model_params["volume_gain"] <= 16.0):
+            print(
+                f"Invalid volume_gain {model_params['volume_gain']}. "
+                f"Must be between -96.0 and 16.0 dB"
+            )
+            return False
+        return True
 
     @staticmethod
     def _cleanup_cache_dir(cache_dir: str):
@@ -269,55 +314,56 @@ class TTS:
             print(f"[cache_writer] Error during cache cleanup: {e}")
 
     @staticmethod
-    def _write_cache_files_bg(model_buffer, source_cache_location,
-                              tmp_cache_location, store_location_dir,
-                              cancel_event: threading.Event, model_type):
-        """Write packed .qnn cache files in a background thread."""
-        # Get the appropriate generator based on model type
+    def _write_cache_files_bg(model_buffer, tmp_cache_location, store_location_dir,
+                              cancel_event: threading.Event, model_type,
+                              model_base_name: str = ""):
+        """Write packed .qnn cache file to TTS_MODEL_STORE_DIR in a background thread."""
         try:
             model_config = get_model_config(model_type)
             generate_packed_model_file = model_config.generate_packed_file_func
         except ValueError as e:
             print(f"[cache_writer] Error: {e}")
             return
-        
-        # ── Write persistent cache (alongside model assets) ───────────────────
-        if cancel_event.is_set():
-            print(f"[cache_writer] Cancelled before persistent cache write")
-            return
-        try:
-            if os.path.exists(source_cache_location):
-                os.remove(source_cache_location)
-            t = time.time()
-            generate_packed_model_file(source_cache_location, model_buffer)
-            print(f"[cache_writer] Wrote persistent cache to {source_cache_location} "
-                  f"in {time.time() - t:.2f}s")
-        except OSError as e:
-            print(f"[cache_writer] Could not write persistent cache to "
-                  f"{source_cache_location}: {e} — skipping")
 
-        # ── Write /tmp cache ──────────────────────────────────────────────────
+        def _remove_stale(cache_dir: str, current_filename: str):
+            if not model_base_name:
+                return
+            try:
+                import fnmatch
+                pattern = f"{model_base_name}_v*.qnn"
+                for fname in os.listdir(cache_dir):
+                    if fnmatch.fnmatch(fname, pattern) and fname != current_filename:
+                        stale = os.path.join(cache_dir, fname)
+                        try:
+                            os.remove(stale)
+                            print(f"[cache_writer] Removed stale cache: {stale}")
+                        except Exception as e:
+                            print(f"[cache_writer] Could not remove stale {stale}: {e}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[cache_writer] Error scanning for stale caches: {e}")
+
         if cancel_event.is_set():
-            print(f"[cache_writer] Cancelled before /tmp cache write")
+            print(f"[cache_writer] Cancelled before cache write")
             return
         try:
             if not os.path.isdir(store_location_dir):
                 os.makedirs(store_location_dir)
+            tmp_filename = os.path.basename(tmp_cache_location)
+            _remove_stale(store_location_dir, tmp_filename)
             if os.path.exists(tmp_cache_location):
                 os.remove(tmp_cache_location)
             t = time.time()
             generate_packed_model_file(tmp_cache_location, model_buffer)
-            print(f"[cache_writer] Wrote /tmp cache to {tmp_cache_location} "
+            print(f"[cache_writer] Wrote cache to {tmp_cache_location} "
                   f"in {time.time() - t:.2f}s")
         except OSError as e:
-            print(f"[cache_writer] Could not write /tmp cache to "
-                  f"{tmp_cache_location}: {e}")
+            print(f"[cache_writer] Could not write cache to {tmp_cache_location}: {e}")
         finally:
-            # Release the buffer reference as soon as we are done so the
-            # calling thread's gc.collect() can reclaim it promptly.
             model_buffer = None
 
-    def init_dir(self, model_dir_location):
+    def init_dir(self, model_dir_location, tts_param):
         """
         Initialize the TTS engine with path to model files instead of generated blob.
 
@@ -349,6 +395,19 @@ class TTS:
             config_json = wu.open_file(config_path)
             print(f"Successfully loaded config.json with keys: {list(config_json.keys())}")
             
+            voices = config_json["voices"]
+            model_params = {
+                "audio_encoding": tts_param.get("audio_encoding") or voices[0]["audio_encoding"],
+                "speaking_rate": tts_param.get("speaking_rate") or voices[0]["speaking_rate"],
+                "pitch": tts_param.get("pitch") or voices[0]["pitch"],
+                "volume_gain": tts_param.get("volume_gain") or voices[0]["volume_gain"],
+                "sample_rate": voices[0]["sample_rate"], # Use voice default sample rate unless CSIM changes to accomodate sample rate changes
+            }
+            
+            # Validate model_params against tts_config_t constraints
+            if not self._validate_model_params(model_params):
+                return
+
             # Check if there's a pre-built model file specified in the config
             if "model_file" in config_json:
                 try:
@@ -362,11 +421,11 @@ class TTS:
                         # Use the pre-built model file directly
                         return self.init_model(
                             model_file_path,
-                            audio_encoding=voices[0]["audio_encoding"],
-                            speaking_rate=voices[0]["speaking_rate"],
-                            pitch=voices[0]["pitch"],
-                            volume_gain=voices[0]["volume_gain"],
-                            sample_rate=voices[0]["sample_rate"],
+                            audio_encoding=model_params["audio_encoding"],
+                            speaking_rate=model_params["speaking_rate"],
+                            pitch=model_params["pitch"],
+                            volume_gain=model_params["volume_gain"],
+                            sample_rate=model_params["sample_rate"],
                             language_code=voices[0]["language_code"]
                         )
                     else:
@@ -445,34 +504,33 @@ class TTS:
 
         voices = config_json["voices"]
 
-        # Use default voice for now
+        print(model_params)
+
         tts_params = self.TTSParams(
-            audio_encoding_code=voices[0]["audio_encoding"],
-            speaking_rate=voices[0]["speaking_rate"],
-            pitch=voices[0]["pitch"],
-            volume_gain=voices[0]["volume_gain"],
-            sample_rate=voices[0]["sample_rate"],
+            audio_encoding=model_params["audio_encoding"],
+            speaking_rate=model_params["speaking_rate"],
+            pitch=model_params["pitch"],
+            volume_gain=model_params["volume_gain"],
+            sample_rate=model_params["sample_rate"],
             language_code=voices[0]["language_code"]
         )
 
         runtimes = config_json["runtime"]
 
-        model_name = f"{config_json['name']}.qnn"
+        qnn_ver = runtimes.get("qnn_version", {})
+        model_base_name = config_json['name']
+        model_name = (
+            f"{model_base_name}"
+            f"_v{qnn_ver.get('major', 0)}"
+            f".{qnn_ver.get('minor', 0)}"
+            f".{qnn_ver.get('patch', 0)}.qnn"
+        )
 
-        # ── Cache location 1: alongside the model source directory ────────────
-        # This path survives container restarts because it lives on the same
-        # persistent volume as the model assets themselves.
-        source_cache_location = os.path.join(model_dir_location, model_name)
-
-        # ── Cache location 2: TTS_MODEL_STORE_DIR (/tmp/tts) ─────────────────
+        # ── Single cache location: TTS_MODEL_STORE_DIR (/tmp/audio-cache) ─────
         store_location_dir = TTS_MODEL_STORE_DIR
         tmp_cache_location = os.path.join(store_location_dir, model_name)
 
         # ── Cancel or wait for any in-progress cache write ────────────────────
-        # Different model → cancel immediately so the old model_buffer is
-        # released before we allocate a new one (prevents OOM on low-memory
-        # devices where two large buffers cannot coexist).
-        # Same model → wait so we can use the cache it's writing.
         t = TTS._cache_writer_thread
         if t is not None and t.is_alive():
             if TTS._cache_writer_path != tmp_cache_location:
@@ -488,25 +546,7 @@ class TTS:
                 t.join()
                 print(f"[init_dir] Cache writer finished in {time.time() - t_wait:.2f}s")
 
-        # ── Try cache location 1 first (persistent, survives restarts) ───────
-        if os.path.isfile(source_cache_location):
-            print(f"[init_dir] Using persistent cache: {source_cache_location} "
-                  f"({time.time() - t_start:.2f}s so far)")
-            t_init = time.time()
-            self.handle = self.init_model(
-                source_cache_location,
-                audio_encoding=tts_params.audio_encoding_code,
-                speaking_rate=tts_params.speaking_rate,
-                pitch=tts_params.pitch,
-                volume_gain=tts_params.volume_gain,
-                sample_rate=tts_params.sample_rate,
-                language_code=tts_params.language_code
-            )
-            print(f"[init_dir] init_model_file took {time.time() - t_init:.2f}s "
-                  f"(total {time.time() - t_start:.2f}s)")
-            return self.handle
-
-        # ── Try cache location 2 (/tmp/tts) ──────────────────────────────────
+        # ── Try cache (/tmp/audio-cache) ──────────────────────────────────────
         if os.path.isfile(tmp_cache_location):
             print(f"[init_dir] Using /tmp cache: {tmp_cache_location} "
                   f"({time.time() - t_start:.2f}s so far)")
@@ -522,6 +562,7 @@ class TTS:
             )
             print(f"[init_dir] init_model_file took {time.time() - t_init:.2f}s "
                   f"(total {time.time() - t_start:.2f}s)")
+            self._resolved_qnn_path = tmp_cache_location
             return self.handle
 
         # ── Cache miss: generate the packed model buffer ──────────────────────
@@ -610,11 +651,11 @@ class TTS:
             target=TTS._write_cache_files_bg,
             args=(
                 model_buffer,
-                source_cache_location,
                 tmp_cache_location,
                 store_location_dir,
                 TTS._cache_writer_cancel,
                 model_type,
+                model_base_name,
             ),
             daemon=True,
             name="tts-cache-writer",
@@ -624,6 +665,7 @@ class TTS:
         del model_buffer
         TTS._cache_writer_thread = cache_thread
         TTS._cache_writer_path = tmp_cache_location
+        self._resolved_qnn_path = tmp_cache_location
         cache_thread.start()
         print(f"[init_dir] Cache write dispatched to background thread "
               f"(total so far: {time.time() - t_start:.2f}s)")
@@ -756,6 +798,163 @@ class TTS:
             print(f"Received chunk: {pcm_size} bytes")
         
         return chunk_callback
+
+    def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
+        """Parse a TTS benchmark metrics string into a dict.
+
+        Input: "init=622ms, total_latency=1030ms, latency_first=350ms, latency_subsequent=75ms"
+        Output: {"init": 622, "total_latency": 1030, "latency_first": 350, "latency_subsequent": 75}
+        """
+        result = {}
+        if not metrics_str:
+            return result
+        for part in metrics_str.split(','):
+            part = part.strip()
+            if '=' not in part:
+                continue
+            key, val = part.split('=', 1)
+            val = val.strip().rstrip('ms').strip()
+            try:
+                result[key.strip()] = int(val)
+            except ValueError:
+                result[key.strip()] = val
+        return result
+
+    def benchmark(self, text: str, model_dir: str, tts_param: dict) -> dict:
+        """Run a full TTS benchmark (init → synthesize → deinit) and return metrics.
+
+        Resolves the model buffer from cache or generates it from assets, then
+        passes the bytes directly to the C tts_benchmark() function which manages
+        its own TTS lifecycle internally.
+
+        Args:
+            text:      Text to synthesize during the benchmark.
+            model_dir: Path to the model directory.
+            tts_param: Dict with optional TTS parameter overrides.
+
+        Returns:
+            dict with keys: init, total_latency, latency_first, latency_subsequent,
+            model_size (all values in milliseconds as ints, model_size in bytes).
+            Empty dict on failure.
+        """
+        if isinstance(text, str):
+            text = text.encode('utf-8')
+
+        model_dir_str = model_dir if isinstance(model_dir, str) else model_dir.decode('utf-8')
+
+        config_path = wu.search_file("config.json", model_dir_str)
+        config_json = wu.open_file(config_path)
+        voices = config_json["voices"]
+        model_params = {
+            "audio_encoding": tts_param.get("audio_encoding") or voices[0]["audio_encoding"],
+            "speaking_rate":  tts_param.get("speaking_rate")  or voices[0]["speaking_rate"],
+            "pitch":          tts_param.get("pitch")          or voices[0]["pitch"],
+            "volume_gain":    tts_param.get("volume_gain")    or voices[0]["volume_gain"],
+            "sample_rate":    voices[0]["sample_rate"],
+        }
+        tts_params = self.TTSParams(
+            audio_encoding_code=model_params["audio_encoding"],
+            speaking_rate=model_params["speaking_rate"],
+            pitch=model_params["pitch"],
+            volume_gain=model_params["volume_gain"],
+            sample_rate=model_params["sample_rate"],
+            language_code=voices[0]["language_code"],
+        )
+
+        runtimes = config_json["runtime"]
+        qnn_ver = runtimes.get("qnn_version", {})
+        model_base_name = config_json['name']
+        model_name = (
+            f"{model_base_name}"
+            f"_v{qnn_ver.get('major', 0)}"
+            f".{qnn_ver.get('minor', 0)}"
+            f".{qnn_ver.get('patch', 0)}.qnn"
+        )
+        tmp_cache_location = os.path.join(TTS_MODEL_STORE_DIR, model_name)
+
+        # ── Resolve model buffer ──────────────────────────────────────────────
+        # Wait for any in-progress background cache write for this model
+        t = TTS._cache_writer_thread
+        if t is not None and t.is_alive() and TTS._cache_writer_path == tmp_cache_location:
+            print(f"[benchmark] Waiting for background cache writer to finish...")
+            t_wait = time.time()
+            t.join()
+            print(f"[benchmark] Cache writer finished in {time.time() - t_wait:.2f}s")
+
+        model_buffer = None
+        if os.path.isfile(tmp_cache_location):
+            print(f"[benchmark] Loading model from cache: {tmp_cache_location}")
+            with open(tmp_cache_location, 'rb') as f:
+                model_buffer = f.read()
+        else:
+            print(f"[benchmark] Cache miss — generating model from assets")
+            models_dict = wu.match_files_to_assets(config_json, model_dir_str)
+            model_type = config_json.get("model_type", "melo").lower()
+            if not is_model_registered(model_type):
+                raise ValueError(f"Unknown model type: {model_type}")
+            model_config = get_model_config(model_type)
+
+            is_model_quantized = 1 if runtimes.get("is_model_quantized") else 0
+            model_gen_params = {
+                "bert_model":        models_dict.get("model") or models_dict.get("bert_model"),
+                "bert_tokenizer":    models_dict.get("tokenizer") or models_dict.get("bert_tokenizer"),
+                "bert_normalizer":   models_dict.get("normalizer") or models_dict.get("bert_normalizer"),
+                "g2p_enc_model":     models_dict.get("g2p_encoder"),
+                "g2p_dec_model":     models_dict.get("g2p_decoder"),
+                "model_version_major": 2 if is_model_quantized else 1,
+                "model_version_minor": 0,
+                "qnn_version_major": int(qnn_ver.get("major")),
+                "qnn_version_minor": int(qnn_ver.get("minor")),
+                "qnn_version_patch": int(qnn_ver.get("patch")),
+                "arch_bit":          int(runtimes.get("arch_bit")),
+                "is_model_quantized": is_model_quantized,
+                "model_lang":        runtimes.get("language"),
+                "scratch_mem_size_req": int(runtimes.get("scratch_mem_size_req"))
+            }
+            if model_type == "piper":
+                model_gen_params.update({
+                    "piper_encoder_model": models_dict.get("encoder"),
+                    "piper_sdp_model":     models_dict.get("sdp"),
+                    "piper_flow_model":    models_dict.get("flow"),
+                    "piper_decoder_model": models_dict.get("decoder"),
+                })
+            else:
+                model_gen_params.update({
+                    "melo_encoder_model": models_dict.get("encoder") or models_dict.get("melo_encoder"),
+                    "melo_flow_model":    models_dict.get("flow") or models_dict.get("melo_flow"),
+                    "melo_decoder_model": models_dict.get("decoder") or models_dict.get("melo_decoder"),
+                    "melo_sdp_model":     models_dict.get("sdp") or models_dict.get("sdp_model"),
+                })
+            model_buffer = model_config.generate_model_func(**model_gen_params)
+
+            # Kick off background cache write for next run
+            store_location_dir = TTS_MODEL_STORE_DIR
+            cache_thread = threading.Thread(
+                target=TTS._write_cache_files_bg,
+                args=(model_buffer, tmp_cache_location, store_location_dir,
+                      TTS._cache_writer_cancel, model_type, model_base_name),
+                daemon=True,
+                name="tts-cache-writer",
+            )
+            TTS._cache_writer_thread = cache_thread
+            TTS._cache_writer_path = tmp_cache_location
+            cache_thread.start()
+
+        if not model_buffer:
+            return {}
+
+        # ── Call C benchmark with buffer ──────────────────────────────────────
+        model_buf_c = ctypes.create_string_buffer(model_buffer)
+        model_ptr = ctypes.cast(model_buf_c, ctypes.c_void_p)
+        model_size = len(model_buffer)
+
+        raw = self.c_lib.tts_benchmark(model_ptr, ctypes.c_size_t(model_size), text, tts_params)
+        if raw is None:
+            return {}
+        metrics_str = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+        result = self._parse_benchmark_metrics(metrics_str)
+        result["model_size"] = model_size
+        return result
 
     def close(self):
         """Alias for deinit() for consistency with other wrappers."""
