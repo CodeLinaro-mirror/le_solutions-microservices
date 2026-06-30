@@ -119,10 +119,11 @@ class VisionConversationEvent(ConversationEvent):
                 if msg.get('role') != 'system'
             )
 
-            output_reserve = int(min(
-                getattr(request_data, 'max_completion_tokens', None) or self.default_max_completion_tokens,
-                self.context_size * 0.5,
-            ))
+            # Use a fixed DEFAULT_MAX_COMPLETION_TOKENS reservation for the
+            # pre-flight guard (same logic as _check_user_query_length in LLM).
+            # This ensures the model always has a minimum breather space to
+            # respond, regardless of what the client requested.
+            output_reserve = self.default_max_completion_tokens
             total_input = image_tokens + text_tokens
             available = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
 
@@ -144,13 +145,29 @@ class VisionConversationEvent(ConversationEvent):
                     },
                 )
 
+            # Cap max_completion_tokens at whatever budget remains after the
+            # prompt is assembled.  This mirrors the silent-cap behaviour of
+            # _resolve_max_completion_tokens() in TextConversationEvent so that
+            # clients requesting more tokens than available simply get fewer
+            # tokens rather than a 400 error.
+            requested_max = getattr(request_data, 'max_completion_tokens', None)
+            available_for_response = max(0, self.context_size - total_input - MAX_COMPLETION_SAFETY_MARGIN)
+            if requested_max is not None and requested_max > available_for_response:
+                logger.debug(
+                    f"Event {self.event_id}: VLM max_completion_tokens={requested_max} "
+                    f"exceeds available={available_for_response} — capping silently"
+                )
+                effective_max_completion = available_for_response
+            else:
+                effective_max_completion = requested_max
+
             # raw_messages already built above — pass to VLM handler
 
             raw_json = {
                 'messages': raw_messages,
                 'model': self.model_id,
                 'stream': getattr(request_data, 'stream', False),
-                'max_completion_tokens': getattr(request_data, 'max_completion_tokens', None),
+                'max_completion_tokens': effective_max_completion,
                 'temperature': getattr(request_data, 'temperature', None),
                 'top_p': getattr(request_data, 'top_p', None),
                 'top_k': getattr(request_data, 'top_k', None),
