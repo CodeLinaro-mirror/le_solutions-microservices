@@ -1067,6 +1067,42 @@ class TextConversationEvent(ConversationEvent):
             "is_streaming": True
         }
 
+    def _is_tool_call_loop(self, new_tool_calls) -> bool:
+        """
+        Detect if any of new_tool_calls is a repeated call with identical
+        (name, arguments) that has already appeared ≥ 2 times in this event.
+
+        Legitimate chained tool calling uses different arguments each time
+        (e.g. different line ranges for read_source). A loop is when the exact
+        same (name, arguments) pair is requested again after already being
+        answered.
+        """
+        call_counts: dict = {}
+        for idx in self.message_indices:
+            if idx >= len(self.session.messages):
+                continue
+            msg = self.session.messages[idx]
+            if msg.get('role') != 'assistant':
+                continue
+            tool_calls = msg.get('tool_calls') or []
+            for tc in tool_calls:
+                # Handle both Pydantic model objects and plain dicts
+                if hasattr(tc, 'function'):
+                    name = tc.function.name or ''
+                    args = tc.function.arguments or ''
+                else:
+                    fn = tc.get('function', {})
+                    name = fn.get('name', '')
+                    args = fn.get('arguments', '')
+                key = (name, str(args))
+                call_counts[key] = call_counts.get(key, 0) + 1
+
+        for tc in new_tool_calls:
+            key = (tc.function.name or '', str(tc.function.arguments or ''))
+            if call_counts.get(key, 0) >= 2:
+                return True
+        return False
+
     async def continue_with_tool_response(self, tool_response: str, request_data) -> dict:
         """Continue turn after receiving tool response."""
         try:
@@ -1077,27 +1113,68 @@ class TextConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Generating final answer after tool call")
 
-            # Build Prompt
-            import copy
-            context_messages = copy.deepcopy(self.session.get_event_messages(self))
-            system_message = TextEventHelpers._build_effective_system_message(
-                self.session,
-                include_summary=False
+            # ── Minimal prompt for tool continuation ──────────────────────────
+            # Use a focused task + tool-result prompt instead of the full
+            # slot-based conversation history.  The full history approach
+            # consumes ~1500 tokens when tool responses contain raw source code,
+            # leaving too little room for the generated answer given that Trip 1
+            # tokens are already resident in the KV cache (cached_context).
+            #
+            # Minimal structure:
+            #   system  — session's original system prompt (preserves agent-
+            #             specific output format instructions, e.g. "Output ONLY
+            #             valid JSON array" for the Pruner agent)
+            #   user    — original task + tool result + answer instruction
+            #
+            # We use session.system_prompt_content (set by
+            # sync_system_prompt_from_request() BEFORE inject_tool_instructions()
+            # runs) so the tool-call block is NOT included — we want a final
+            # answer, not another tool call.
+            #
+            # This cuts the Trip 2 prompt from ~1500 tokens to ~700 tokens,
+            # freeing ~800 tokens for the LLM to generate the final answer.
+            system_content = (
+                getattr(self.session, 'system_prompt_content', None)
+                or "You are a helpful coding assistant."
             )
-            if system_message:
-                context_messages.insert(0, system_message)
 
-            if hasattr(request_data, 'tools') and request_data.tools:
-                context_messages = ToolHandler.inject_tool_instructions(
-                    context_messages, request_data.tools, model_id=self.model_id
+            original_task_full = next(
+                (
+                    self.session.messages[idx].get('content', '')
+                    for idx in self.message_indices
+                    if idx < len(self.session.messages)
+                    and self.session.messages[idx].get('role') == 'user'
+                ),
+                "",
+            )
+
+            # Truncate the original task to avoid blowing the context window.
+            # Agent user messages can be large (e.g. the Pruner includes full
+            # navigator observations).  We keep the first ~300 tokens which
+            # always contains the task description and key constraints.
+            _MAX_TASK_TOKENS = 300
+            _task_tokens = TokenCounter.estimate_tokens(original_task_full)
+            if _task_tokens > _MAX_TASK_TOKENS:
+                # Rough truncation: 1 token ≈ 4 chars
+                original_task = original_task_full[: _MAX_TASK_TOKENS * 4] + "..."
+                logger.debug(
+                    f"Event {self.event_id}: Truncated original task "
+                    f"from {_task_tokens} to ~{_MAX_TASK_TOKENS} tokens for minimal prompt"
                 )
+            else:
+                original_task = original_task_full
 
-            # Filter existing tools and append new result
-            prompt_messages = [msg for msg in context_messages if msg.get('role', '') != 'tool']
-            prompt_messages.append({
-                "role": "user",
-                "content": f"{tool_response}\n\nBased on the tool result above, please provide a helpful response."
-            })
+            prompt_messages = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task: {original_task}\n\n"
+                        f"Tool result:\n{tool_response}\n\n"
+                        "Please provide your response now."
+                    ),
+                },
+            ]
 
             formatted_content = CommonUtils.build_chat_prompt(
                 model_id=self.model_id,
@@ -1137,6 +1214,86 @@ class TextConversationEvent(ConversationEvent):
 
             self._cap_prompt_tokens_total += prompt_tokens
             self._cap_completion_tokens_total += TokenCounter.estimate_tokens(final_response or "")
+
+            # ── Chained tool call detection ───────────────────────────────────
+            # Some smaller LLMs (e.g. Qwen 4B) respond to a tool result by
+            # immediately requesting another tool call instead of producing a
+            # final answer.  Detect this here so the service can keep the event
+            # in tool-calling state and return finish_reason="tool_calls" to the
+            # client, rather than leaking the raw JSON as finish_reason="stop".
+            chained_tool_calls = ToolHandler.parse_tool_response(final_response)
+            if chained_tool_calls:
+                if not self._is_tool_call_loop(chained_tool_calls):
+                    # Normal chained call — different arguments, allow it
+                    self._is_tool_calling = True
+                    self._pending_tool_calls = chained_tool_calls
+                    self._tool_response_received = False  # reset for next trip
+                    logger.info(
+                        f"Event {self.event_id}: Chained tool calling initiated "
+                        f"({len(chained_tool_calls)} call(s))"
+                    )
+                    return {
+                        "response": chained_tool_calls,
+                        "finish_reason": "tool_calls",
+                        "needs_tool_response": True,
+                        "turn_complete": False,
+                    }
+                else:
+                    # Loop detected — same (name, arguments) called ≥ 2 times.
+                    # Re-run inference with an explicit stop instruction so the
+                    # LLM produces a useful final answer instead of looping.
+                    loop_tool_name = chained_tool_calls[0].function.name
+                    logger.warning(
+                        f"Event {self.event_id}: Tool call loop detected "
+                        f"('{loop_tool_name}' repeated with identical arguments) — "
+                        "forcing final answer"
+                    )
+                    # Replace the last user message with a stop instruction
+                    if prompt_messages and prompt_messages[-1].get('role') == 'user':
+                        prompt_messages[-1] = {
+                            "role": "user",
+                            "content": (
+                                f"{tool_response}\n\n"
+                                "You have already retrieved this information. "
+                                "Please provide your final answer now without calling any more tools."
+                            ),
+                        }
+                    forced_content = CommonUtils.build_chat_prompt(
+                        model_id=self.model_id,
+                        messages=prompt_messages,
+                        include_assistant_prefix=True,
+                        has_vision=False,
+                    )
+                    try:
+                        forced_max, _, _ = self._resolve_max_completion_tokens(
+                            request_data, forced_content
+                        )
+                    except HTTPException:
+                        # Context too full even for the forced prompt — use fallback
+                        forced_max = 256
+                    forced_tokens = []
+                    async for token in llm_manager.execute_request(
+                        event_id=self.event_id,
+                        session_id=self.session.session_id,
+                        model=self.model_id,
+                        prompt=forced_content,
+                        streaming=False,
+                        max_tokens=forced_max,
+                        temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
+                        top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
+                        top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
+                        presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
+                        frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY,
+                    ):
+                        forced_tokens.append(token)
+                    forced_response = "".join(forced_tokens).strip()
+                    # If the LLM is still calling tools, use a safe fallback
+                    if not forced_response or ToolHandler.parse_tool_response(forced_response):
+                        forced_response = (
+                            "I have gathered the necessary information from the codebase."
+                        )
+                    final_response = forced_response
+                    # Fall through to the normal turn-complete path below
 
             self.assistant_message = final_response
             self._is_tool_calling = False
