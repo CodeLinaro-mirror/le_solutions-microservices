@@ -292,8 +292,8 @@ RUN apt-get update && \
 # /usr/share/qcom/conf.d/ at runtime after the bind-mount is in place.
 RUN mkdir -p /etc/fastrpc                                                                       && \
     {                                                                                              \
-      echo '# SPDX-License-Identifier: MIT';                                                       \
       echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.';                 \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear';                                        \
       echo 'machines:';                                                                            \
       echo '  Qualcomm Technologies, Inc. Monaco Monza addons:';                                   \
       echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp';                              \
