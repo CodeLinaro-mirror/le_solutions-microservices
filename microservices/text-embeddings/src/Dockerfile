@@ -1,4 +1,4 @@
-ARG T2E_QNP_VER=2.44.0.260225
+ARG T2E_QNP_VER=2.47.0.260601
 
 ###############################################
 # Dedicated QNN SDK Downloader Stage
@@ -36,6 +36,9 @@ RUN wget -t 20 -T 120 -P ${T2E_DOWNLOAD_DIR}                                    
     rm -f ${T2E_QNP_SDK}                                                                        && \
     cp -r ${T2E_QNN_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so /usr/lib/                    && \
     cp -r ${T2E_DOWNLOAD_DIR}/qairt/${T2E_QNP_VER}/include/Genie/* /usr/include/                && \
+    mkdir -p ${T2E_DEPLOY_DIR}/usr/include                                                      && \
+    cp -r ${T2E_DOWNLOAD_DIR}/qairt/${T2E_QNP_VER}/include/SNPE/* /usr/include/                 && \
+    cp -r ${T2E_DOWNLOAD_DIR}/qairt/${T2E_QNP_VER}/include/SNPE/* ${T2E_DEPLOY_DIR}/usr/include/ && \
     mkdir -p ${T2E_ADSP_DIR}                                                                    && \
     mkdir -p ${T2E_DEPLOY_DIR}/usr/bin                                                          && \
     cp ${T2E_QNN_LIB_PATH}/hexagon-v66/unsigned/* ${T2E_ADSP_DIR}/                              && \

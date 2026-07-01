@@ -30,6 +30,7 @@ from openapi_server.impl.litert_backend.backend import (
     normalize_encoding_format,
 )
 from openapi_server.impl.text_embed_qnn import SimpleQnnEmbeddingApp
+from openapi_server.impl.snpe_backend.backend import SimpleSnpeEmbeddingApp
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -37,16 +38,18 @@ logger = LoggerConfig.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Supported file-extension → backend mapping
 # ---------------------------------------------------------------------------
-# .tflite  →  NomicEmbedBackend   (LiteRT / TFLite compiled model)
-# .bin     →  SimpleQnnEmbeddingApp (QNN pre-compiled context binary)
+# .tflite  →  NomicEmbedBackend      (LiteRT / TFLite compiled model)
+# .bin     →  SimpleQnnEmbeddingApp  (QNN pre-compiled context binary)
+# .dlc     →  SimpleSnpeEmbeddingApp (SNPE Deep Learning Container model)
 #
-# Both classes implement EmbeddingBackend, so all downstream code in
+# All classes implement EmbeddingBackend, so all downstream code in
 # _get_embeddings_from_component is backend-agnostic.
 # ---------------------------------------------------------------------------
 
 _EXTENSION_TO_BACKEND: Dict[str, type] = {
     ".tflite": NomicEmbedBackend,
     ".bin":    SimpleQnnEmbeddingApp,
+    ".dlc":    SimpleSnpeEmbeddingApp,
 }
 
 
@@ -58,6 +61,7 @@ def _backend_factory(model_path: str) -> EmbeddingBackend:
 
     * ``.tflite`` → :class:`NomicEmbedBackend` (LiteRT / TFLite path)
     * ``.bin``    → :class:`SimpleQnnEmbeddingApp` (QNN binary path)
+    * ``.dlc``    → :class:`SimpleSnpeEmbeddingApp` (SNPE binary path)
 
     Parameters
     ----------
@@ -83,8 +87,9 @@ def _backend_factory(model_path: str) -> EmbeddingBackend:
         raise ValueError(
             f"Unrecognised model file extension '{ext}' for path '{model_path}'. "
             f"Supported extensions: {supported}. "
-            "Use a .tflite file for the LiteRT/TFLite backend or a .bin file "
-            "for the QNN pre-compiled context binary backend."
+            "Use a .tflite file for the LiteRT/TFLite backend, a .bin file "
+            "for the QNN pre-compiled context binary backend, or a .dlc file "
+            "for the SNPE Deep Learning Container backend."
         )
 
     logger.info(
@@ -102,6 +107,7 @@ def _backend_factory(model_path: str) -> EmbeddingBackend:
 #                             allocates DMA tensor buffers.
 #   - SimpleQnnEmbeddingApp:  loads libQnnHtp.so + libQnnSystem.so, creates
 #                             QNN backend/context, deserialises the graph.
+#   - SimpleSnpeEmbeddingApp: loads libSNPE.so, builds SNPE engine from DLC container.
 #
 # Re-creating the backend on every request adds 200–800 ms of cold-start
 # latency and prevents the HTP hardware from staying warm.
@@ -278,7 +284,8 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             List of input strings to embed.
         model:
             Absolute path to the model file.  Extension determines backend:
-            ``.tflite`` → NomicEmbedBackend, ``.bin`` → SimpleQnnEmbeddingApp.
+            ``.tflite`` → NomicEmbedBackend, ``.bin`` → SimpleQnnEmbeddingApp,
+            ``.dlc`` → SimpleSnpeEmbeddingApp.
         dimensions:
             If set, truncate each embedding vector to this many dimensions.
         encoding_format:
