@@ -312,7 +312,39 @@ class EventBasedChatHandler:
                     )
                     raise
 
-                if result['turn_complete']:
+                if result['finish_reason'] == 'tool_calls':
+                    # ── Chained tool call ─────────────────────────────────────
+                    # The LLM responded to the tool result with another tool call
+                    # instead of a final answer (common with smaller models).
+                    # Register the new tool call so the client can send the next
+                    # tool result back, exactly as in the new-turn path.
+                    chained_tool_calls = result['response']
+
+                    assistant_msg = {
+                        'role': 'assistant',
+                        'content': None,
+                        'tool_calls': chained_tool_calls,
+                    }
+                    assistant_idx = session.add_message(assistant_msg)
+                    current_event.message_indices.append(assistant_idx)
+
+                    # Re-register with the tool calling map so the next tool
+                    # response can be routed back to this session.
+                    user_message_indices = [
+                        idx for idx in current_event.message_indices
+                        if session.messages[idx].get('role') == 'user'
+                    ]
+                    user_messages = [session.messages[idx] for idx in user_message_indices]
+                    event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
+                    session_mgr.register_tool_calling_event(event_hash, session.session_id)
+                    current_event.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
+
+                    logger.info(
+                        f"Chained tool call registered for session {session.session_id} "
+                        f"(hash={event_hash[:8]}...)"
+                    )
+
+                elif result['turn_complete']:
                     # Add assistant response to session
                     assistant_msg = {
                         'role': 'assistant',
