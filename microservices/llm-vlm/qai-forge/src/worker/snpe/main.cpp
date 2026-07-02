@@ -21,6 +21,7 @@
 #include <sys/select.h>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -156,31 +157,50 @@ int main() {
             }
 
             try {
-                // Decode input tensors
+                // Decode input tensors into 128-byte aligned buffers.
+                // SNPE DSP (ExecuteUserBuffers) requires 128-byte alignment;
+                // unaligned addresses produce error 407 (MEMORY_MAPPING_FAILED).
                 const auto& inputs_json = msg["inputs"];
-                std::vector<std::vector<uint8_t>> input_bufs;
-                std::vector<const uint8_t*>       input_ptrs;
-                std::vector<size_t>               input_sizes;
+                struct AlignedBuf {
+                    void*  ptr  = nullptr;
+                    size_t size = 0;
+                    ~AlignedBuf() { if (ptr) free(ptr); }
+                };
+                std::vector<AlignedBuf>       input_bufs(inputs_json.size());
+                std::vector<const uint8_t*>   input_ptrs;
+                std::vector<size_t>           input_sizes;
 
-                for (const auto& t : inputs_json) {
-                    auto buf = base64Decode(t.value("data_b64", ""));
-                    input_bufs.push_back(std::move(buf));
+                for (size_t i = 0; i < inputs_json.size(); ++i) {
+                    auto decoded = base64Decode(inputs_json[i].value("data_b64", ""));
+                    size_t sz = decoded.size();
+                    void* aligned = nullptr;
+                    if (posix_memalign(&aligned, 128, sz ? sz : 1) != 0)
+                        throw std::runtime_error("posix_memalign failed for input " + std::to_string(i));
+                    memcpy(aligned, decoded.data(), sz);
+                    input_bufs[i].ptr  = aligned;
+                    input_bufs[i].size = sz;
                 }
                 for (auto& buf : input_bufs) {
-                    input_ptrs.push_back(buf.data());
-                    input_sizes.push_back(buf.size());
+                    input_ptrs.push_back(static_cast<const uint8_t*>(buf.ptr));
+                    input_sizes.push_back(buf.size);
                 }
 
-                // Allocate output buffers based on engine output specs
+                // Allocate output buffers — 128-byte aligned, same requirement as inputs.
                 const auto& out_specs = engine->outputSpecs();
-                std::vector<std::vector<uint8_t>> output_bufs(out_specs.size());
-                std::vector<uint8_t*>             output_ptrs;
-                std::vector<size_t>               output_sizes;
+                std::vector<AlignedBuf> output_bufs(out_specs.size());
+                std::vector<uint8_t*>   output_ptrs;
+                std::vector<size_t>     output_sizes;
 
                 for (size_t i = 0; i < out_specs.size(); ++i) {
-                    output_bufs[i].resize(out_specs[i].bytes);
-                    output_ptrs.push_back(output_bufs[i].data());
-                    output_sizes.push_back(out_specs[i].bytes);
+                    size_t sz = out_specs[i].bytes;
+                    void* aligned = nullptr;
+                    if (posix_memalign(&aligned, 128, sz ? sz : 1) != 0)
+                        throw std::runtime_error("posix_memalign failed for output " + std::to_string(i));
+                    memset(aligned, 0, sz);
+                    output_bufs[i].ptr  = aligned;
+                    output_bufs[i].size = sz;
+                    output_ptrs.push_back(static_cast<uint8_t*>(aligned));
+                    output_sizes.push_back(sz);
                 }
 
                 // Run inference
@@ -195,7 +215,7 @@ int main() {
                     json shape_arr = json::array();
                     for (auto d : out_specs[i].shape) shape_arr.push_back(d);
                     t["shape"]    = shape_arr;
-                    t["data_b64"] = base64Encode(output_bufs[i].data(), output_bufs[i].size());
+                    t["data_b64"] = base64Encode(static_cast<const uint8_t*>(output_bufs[i].ptr), output_bufs[i].size);
                     outputs_json.push_back(t);
                 }
 

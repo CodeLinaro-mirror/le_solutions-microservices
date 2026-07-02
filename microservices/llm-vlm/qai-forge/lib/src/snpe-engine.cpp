@@ -427,11 +427,11 @@ SNPEEngine::SNPEEngine(const std::string&              model_file,
         Snpe_TensorShape_Handle_t stride_shape =
             fn.TensorShapeCreateDimsSize(strides.data(), rank);
 
-        // Use float encoding for output (SNPE outputs are typically float)
-        Snpe_UserBufferEncoding_Handle_t float_enc = fn.UserBufferEncodingFloatCreate();
+        // Use the model's native output encoding (preserves quantized types like UINT8/TF8).
+        // Forcing float encoding here causes a type mismatch for quantized models.
+        Snpe_UserBufferEncoding_Handle_t native_enc = fn.IBufferAttributesGetEncoding(attribs);
         Snpe_IUserBuffer_Handle_t usrbuf =
-            fn.UtilCreateUserBuffer(nullptr, spec.bytes, stride_shape, float_enc);
-        fn.UserBufferEncodingFloatDelete(float_enc);
+            fn.UtilCreateUserBuffer(nullptr, spec.bytes, stride_shape, native_enc);
 
         fn.TensorShapeDelete(stride_shape);
         fn.TensorShapeDelete(shape);
