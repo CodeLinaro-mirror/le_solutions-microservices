@@ -158,11 +158,13 @@ class TextConversationEvent(ConversationEvent):
         if current_turn_tokens == 0:
             return
 
-        # Compute output reservation
-        output_reserve = int(min(
-            requested_max_completion or self.default_max_completion_tokens,
-            self.context_size * 0.5,
-        ))
+        # Compute output reservation.
+        # Use a fixed DEFAULT_MAX_COMPLETION_TOKENS reservation regardless of what
+        # the client requested.  This guard is only meant to prevent prompts so
+        # large that the model has no room to respond at all; the actual per-request
+        # cap is enforced later in _resolve_max_completion_tokens() which silently
+        # clamps the requested value to whatever budget remains after assembly.
+        output_reserve = self.default_max_completion_tokens
         input_budget = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
 
         # Estimate tokens consumed by fixed slots (system prompt, facts, summary)
@@ -280,22 +282,14 @@ class TextConversationEvent(ConversationEvent):
             )
 
         if requested is not None and requested > cap:
-            template = (
-                ErrorMessages.CONTEXT_LENGTH_EXCEEDED_TOOL_RESPONSE
-                if tool_response_dominates
-                else ErrorMessages.CONTEXT_LENGTH_EXCEEDED
+            # Silently cap at the available budget instead of rejecting.
+            # The pre-assembly guard (_check_user_query_length) already ensures
+            # the prompt fits; here we just give the model whatever room remains.
+            logger.debug(
+                f"Event {self.event_id}: max_completion_tokens={requested} exceeds "
+                f"available cap={cap} — capping silently"
             )
-            raise HTTPException(
-                status_code=HttpStatusCodes.BAD_REQUEST,
-                detail={
-                    "message": template.format(
-                        requested=requested, cap=cap, context_size=self.context_size,
-                    ),
-                    "type": "invalid_request_error",
-                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
-                    "param": "max_completion_tokens",
-                },
-            )
+            return cap, prompt_tokens, started_from_clean_kv
 
         if requested is not None:
             return requested, prompt_tokens, started_from_clean_kv

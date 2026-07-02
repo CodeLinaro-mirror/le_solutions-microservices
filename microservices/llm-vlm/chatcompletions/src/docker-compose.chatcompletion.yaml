@@ -56,6 +56,8 @@ services:
       - GENAI_PORT=${GENAI_PORT:-9001}
       - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
       - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
+      # Max tokens reserved for model output; caps the output budget when the client omits max_tokens
+      - DEFAULT_MAX_COMPLETION_TOKENS=${DEFAULT_MAX_COMPLETION_TOKENS:-512}
     devices:
       - /dev/dma_heap/system
       - /dev/dma_heap/qcom,system

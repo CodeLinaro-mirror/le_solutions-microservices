@@ -87,9 +87,15 @@ class TextEventHelpers:
                 session, request_data, current_turn_body
             )
         else:
-            # Standard path: full slot-based context assembly
+            # Standard path: full slot-based context assembly.
+            # Pass message_indices so _fill_history_queue() can use index-based
+            # exclusion instead of object identity.  The current_turn_body is a
+            # deep copy (different id() values), so identity-based exclusion
+            # would fail to exclude the current turn from the history queue,
+            # causing the user message to appear twice in the assembled prompt.
             messages = TextEventHelpers._build_complete_prompt_context(
-                event_id, model_id, session, current_turn_body, request_data
+                event_id, model_id, session, current_turn_body, request_data,
+                current_turn_indices=set(message_indices),
             )
 
         # Inject tool instructions into the assembled messages.
@@ -117,6 +123,7 @@ class TextEventHelpers:
         session,
         current_turn_body: list,
         request_data,
+        current_turn_indices=None,
     ) -> list:
         """
         Assemble the full prompt context from named slots.
@@ -146,19 +153,24 @@ class TextEventHelpers:
             SLOT_TOOLS_CEILING,
             SLOT_FACTS_CEILING,
             SLOT_SUMMARY_CEILING,
+            DEFAULT_MAX_COMPLETION_TOKENS,
         )
 
         config_manager = ModelConfigManager()
         context_size = config_manager.get_context_size(model_id)
 
-        # Dynamic output reserve: use actual requested max_completion_tokens
-        # rather than a fixed ratio. Cap at 50% of context to prevent
-        # degenerate cases where the caller requests an unreasonably large output.
+        # Output reserve: use the minimum of what the client requested and
+        # DEFAULT_MAX_COMPLETION_TOKENS.  This keeps the assembler consistent
+        # with _check_user_query_length() which uses the same ceiling.
+        # If the client requests fewer tokens (e.g. max_tokens=64) the reserve
+        # shrinks accordingly, giving more room to the history queue.
+        # If the client requests more (or nothing), the reserve is capped at
+        # DEFAULT_MAX_COMPLETION_TOKENS so the input budget is predictable.
         requested_output = (
             getattr(request_data, 'max_completion_tokens', None)
             or int(context_size * 0.5)
         )
-        output_reserve = min(int(requested_output), int(context_size * 0.5))
+        output_reserve = min(int(requested_output), DEFAULT_MAX_COMPLETION_TOKENS)
         input_budget = context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
 
         messages = []
@@ -202,7 +214,8 @@ class TextEventHelpers:
         history_budget = max(0, history_budget)
 
         history_messages = TextEventHelpers._fill_history_queue(
-            session, current_turn_body, history_budget
+            session, current_turn_body, history_budget,
+            current_turn_indices=current_turn_indices,
         )
         messages.extend(history_messages)
 
@@ -257,6 +270,7 @@ class TextEventHelpers:
         session,
         current_turn_body: list,
         budget_tokens: int,
+        current_turn_indices=None,
     ) -> list:
         """
         Fill the history queue (Slot 5) with recent messages, newest-first,
@@ -264,14 +278,21 @@ class TextEventHelpers:
 
         Excludes:
           - Messages in session.eviction_batch (pending summarization)
-          - Messages in current_turn_body (added separately as current turn)
+          - Messages belonging to the current turn (added separately as current turn)
           - System messages (handled by Slot 1)
           - Tool-only assistant messages (no content, only tool_calls)
 
         Args:
-            session:           ConversationSession with message history.
-            current_turn_body: Current turn messages to exclude.
-            budget_tokens:     Maximum tokens for the history queue.
+            session:               ConversationSession with message history.
+            current_turn_body:     Current turn messages (may be deep copies).
+            budget_tokens:         Maximum tokens for the history queue.
+            current_turn_indices:  Set of session.messages indices belonging to
+                                   the current turn.  When provided, exclusion is
+                                   done by index (correct even when current_turn_body
+                                   is a deep copy whose id() values differ from the
+                                   originals).  When None, falls back to object
+                                   identity (legacy behaviour, only correct when
+                                   current_turn_body holds the original objects).
 
         Returns:
             List of message dicts, ordered oldest-first (for correct prompt order).
@@ -281,14 +302,30 @@ class TextEventHelpers:
         if budget_tokens <= 0:
             return []
 
-        # Build exclusion sets using object identity
+        # Eviction batch exclusion always uses object identity (the batch holds
+        # direct references to session.messages entries, never deep copies).
         eviction_ids = {id(m) for m in getattr(session, 'eviction_batch', [])}
-        current_ids = {id(m) for m in current_turn_body}
 
-        # Collect eligible messages in session order
+        # Collect eligible messages in session order.
+        # Use index-based exclusion for the current turn when indices are
+        # available.  This is necessary because build_prompt_content() passes
+        # deep copies of the session messages as current_turn_body; those copies
+        # have different id() values than the originals stored in session.messages,
+        # so identity-based exclusion would silently fail and include the current
+        # turn's user message in the history queue a second time — doubling the
+        # prompt size and causing spurious HTTP 400 "Only 0 tokens remain" errors
+        # for prompts in the ~1800–2000 token range.
         eligible = []
-        for msg in session.messages:
-            if id(msg) in eviction_ids or id(msg) in current_ids:
+        for idx, msg in enumerate(session.messages):
+            # Exclude current-turn messages
+            if current_turn_indices is not None:
+                if idx in current_turn_indices:
+                    continue
+            else:
+                # Fallback: object identity (only correct without deep copies)
+                if id(msg) in {id(m) for m in current_turn_body}:
+                    continue
+            if id(msg) in eviction_ids:
                 continue
             role = msg.get('role', '')
             if role == 'system':

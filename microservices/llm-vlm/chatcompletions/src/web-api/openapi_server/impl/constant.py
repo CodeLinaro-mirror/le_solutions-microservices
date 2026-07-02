@@ -81,10 +81,12 @@ MIN_USEFUL_COMPLETION_TOKENS = 64
 TOKEN_ESTIMATION_BUFFER_RATIO = float(os.getenv("TOKEN_ESTIMATION_BUFFER_RATIO", "0.10"))
 
 # Default max completion tokens when the client does not specify max_completion_tokens
-# or max_tokens. This is the output reservation used for prompt budget calculations.
-# Capped at 50% of context_size when the client requests a larger value.
-# 512 is a practical default for conversational chat; increase for code generation
-# or long-form tasks by setting the DEFAULT_MAX_COMPLETION_TOKENS env variable.
+# or max_tokens. Used as the output reservation ceiling in both the pre-assembly query
+# length guard (_check_user_query_length) and the prompt assembler (_build_complete_prompt_context).
+# The assembler uses min(requested, DEFAULT_MAX_COMPLETION_TOKENS) so clients requesting
+# fewer tokens get a proportionally larger input budget, while clients requesting more
+# are capped at this value for budget accounting purposes.
+# Override via DEFAULT_MAX_COMPLETION_TOKENS env variable.
 DEFAULT_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_MAX_COMPLETION_TOKENS", "512"))
 
 # Fraction of raw image token count to use for VLM budget estimation.
@@ -248,7 +250,7 @@ class ErrorMessages:
         "(image: {image_tokens}, text: {text_tokens}), but only {available} tokens "
         "are available after reserving space for response output ({output_tokens} tokens) "
         "and other internal settings. "
-        "Please use a smaller image or shorter text and retry."
+        "Please use shorter text and retry."
     )
 
 class LLMServiceKeys:
