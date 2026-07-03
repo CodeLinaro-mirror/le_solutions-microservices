@@ -4,6 +4,7 @@
 #include <drogon/drogon.h>
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/PrivilegeDrop.h"
+#include "qai_forge/QaiForge.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
 #include "tools/DateTimeTool.h"
@@ -55,6 +56,9 @@ int main() {
             // returns false until scanModelBundles() is called at least once.
             ModelConfigManager::getInstance().scanModelBundles();
             std::cout << "[main] Model bundles scanned." << std::endl;
+
+            qai_forge::QaiForge::getInstance().start();
+            std::cout << "[main] Inference engine started." << std::endl;
 
             // ── Step 3b: Register built-in native tools ───────────────────────
             // Native tools run in-process (no subprocess, no network).
@@ -119,7 +123,8 @@ int main() {
         })
         .run();
 
-    // Cleanup: disconnect MCP servers on shutdown
+    // Cleanup: shut down inference engine and disconnect MCP servers on shutdown
+    qai_forge::QaiForge::getInstance().shutdown();
     McpClientRegistry::getInstance().disconnectAll();
 
     return 0;

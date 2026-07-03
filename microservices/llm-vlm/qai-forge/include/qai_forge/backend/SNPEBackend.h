@@ -25,6 +25,13 @@ class PredictiveWorkerManager;
 
 class SNPEBackend : public IInferenceBackend {
 public:
+    /**
+     * Public constructor — creates an owned (non-singleton) instance.
+     * Used by BackendFactory::createPredictiveBackend() for scheduler-owned
+     * instances. Each PredictiveModelRuntime owns its own SNPEBackend.
+     */
+    SNPEBackend();
+
     static SNPEBackend& getInstance();
 
     std::string name() const override { return "SNPE"; }
@@ -38,7 +45,6 @@ public:
     void shutdown() override;
 
 private:
-    SNPEBackend();
     SNPEBackend(const SNPEBackend&) = delete;
     SNPEBackend& operator=(const SNPEBackend&) = delete;
 

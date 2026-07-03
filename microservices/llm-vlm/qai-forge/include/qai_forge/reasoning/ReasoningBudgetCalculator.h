@@ -81,22 +81,25 @@ public:
     /**
      * Compute the thinking budget for a reasoning model request.
      *
-     * @param assembled_prompt   The full prompt string from buildContextPrompt()
-     *                           (includes system prompt, history, tool defs, user msg)
-     * @param context_size       Model's context window size in tokens
-     *                           (from ModelConfigManager::getContextSize())
-     * @param effort             Reasoning effort level: "none"/"minimal"/"low"/
-     *                           "medium"/"high"/"xhigh"
-     *                           Unknown values are treated as "medium".
-     * @param max_output_tokens  Optional client-requested output token cap.
-     *                           Covers both thinking + answer tokens combined.
-     * @return                   ReasoningBudgetResult with all computed values
+     * @param assembled_prompt    The full prompt string from buildContextPrompt()
+     *                            (includes system prompt, history, tool defs, user msg)
+     * @param context_size        Model's context window size in tokens
+     *                            (from ModelConfigManager::getContextSize())
+     * @param effort              Reasoning effort level: "none"/"minimal"/"low"/
+     *                            "medium"/"high"/"xhigh"
+     *                            Unknown values are treated as "medium".
+     * @param max_output_tokens   Optional client-requested output token cap.
+     *                            Covers both thinking + answer tokens combined.
+     * @param max_reasoning_tokens Optional explicit cap on thinking tokens only.
+     *                            Takes precedence over effort-based calculation.
+     * @return                    ReasoningBudgetResult with all computed values
      */
     static ReasoningBudgetResult compute(
         const std::string&   assembled_prompt,
         int                  context_size,
         const std::string&   effort,
-        std::optional<int>   max_output_tokens = std::nullopt
+        std::optional<int>   max_output_tokens = std::nullopt,
+        std::optional<int>   max_reasoning_tokens = std::nullopt
     );
 
     // ── Helpers (exposed for testing) ─────────────────────────────────────────

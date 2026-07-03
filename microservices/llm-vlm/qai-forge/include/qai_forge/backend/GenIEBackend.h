@@ -124,14 +124,24 @@ public:
         std::function<void(const IPCErrorEvent&)>  on_error) override;
 
     /**
-     * Called by SummarizationMiddleware after summarization completes.
-     * Resets the active worker's KV cache so the next turn starts fresh
-     * with the compacted context.
-     *
-     * GenIE-specific: calls InferenceWorkerManager::sendReset() (LLM) or
-     * VlmInferenceWorkerManager::sendReset() (VLM) depending on current model.
+     * No-op: KV cache reset is now handled by resetKvAsync() which is called
+     * by GenieOrchestrator immediately after every generate() / generateVlm()
+     * call. Kept for interface compatibility with IGenerativeBackend.
      */
     void onContextCompacted() override;
+
+    /**
+     * Initiate an eager background KV cache reset after inference completes.
+     *
+     * Called by GenieOrchestrator immediately after generate() / generateVlm()
+     * returns. Delegates to InferenceWorkerManager::initiateBackgroundReset()
+     * (LLM) or VlmInferenceWorkerManager::initiateBackgroundReset() (VLM).
+     *
+     * The reset runs in a background thread so it overlaps with returning the
+     * response to the HTTP layer. The next generate() call waits for the reset
+     * to complete via waitForPendingReset() inside executeRequest().
+     */
+    void resetKvAsync() override;
 
     /**
      * KV cache checkpoint operations (LLM only; VLM does not support these).

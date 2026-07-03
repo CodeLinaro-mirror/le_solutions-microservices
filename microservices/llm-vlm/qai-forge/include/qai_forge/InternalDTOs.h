@@ -115,6 +115,10 @@ struct CreateChatCompletionRequest {
     // When set, a "reasoning" output item is included in the Responses API output[].
     std::optional<std::string> reasoning_summary;
 
+    // reasoning_max_tokens: explicit cap on thinking tokens (overrides effort-based budget)
+    // When set, limits the number of tokens the model can use for reasoning/thinking.
+    std::optional<int> reasoning_max_tokens;
+
     // ── OIP raw prompt mode ───────────────────────────────────────────────────
     // Set by InferController when the OIP /generate request uses "text_input"
     // (raw pre-formatted prompt) instead of "messages" (server applies template).
@@ -147,6 +151,8 @@ struct CreateChatCompletionRequest {
             req.reasoning_effort = j["reasoning_effort"].get<std::string>();
         if (j.contains("reasoning_summary") && !j["reasoning_summary"].is_null())
             req.reasoning_summary = j["reasoning_summary"].get<std::string>();
+        if (j.contains("reasoning_max_tokens") && !j["reasoning_max_tokens"].is_null())
+            req.reasoning_max_tokens = j["reasoning_max_tokens"].get<int>();
         return req;
     }
 };

@@ -1,8 +1,10 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
-#include "scheduler/ModelScheduler.h"
+#include "qai_forge/scheduler/ModelScheduler.h"
 
+#include "qai_forge/QaiForge.h"
+#include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 
@@ -357,9 +359,9 @@ void setPromiseOnce(const std::shared_ptr<PromiseT>& promise,
 } // namespace
 
 ModelScheduler::ModelScheduler(ModelSchedulerConfig config,
-                               ModelBackendFactory backend_factory)
+                               ModelRuntimePairFactory runtime_factory)
     : config_(normalizedConfig(std::move(config))),
-      pool_(config_.pool_config, std::move(backend_factory)) {
+      pool_(config_.pool_config, std::move(runtime_factory)) {
     LOG_INFO("[ModelScheduler] Configured: max_active_models="
              << config_.pool_config.max_active_models
              << " tool_response_timeout_ms="
@@ -376,7 +378,11 @@ ModelScheduler::~ModelScheduler() {
 }
 
 ModelScheduler& ModelScheduler::getInstance() {
-    static ModelScheduler instance(configFromEnvironment());
+    static ModelScheduler instance(
+        configFromEnvironment(),
+        [](const std::string& model_id) {
+            return BackendFactory::createRuntimePair(model_id);
+        });
     return instance;
 }
 
@@ -543,6 +549,66 @@ StandardResponse ModelScheduler::runStreaming(
 
     submitOrThrow(*this, job);
     return future.get();
+}
+
+void ModelScheduler::runStreamingAsync(
+    const CreateChatCompletionRequest& request,
+    qai_forge::StreamCallbacks callbacks,
+    const SchedulerInvokeOptions& options) {
+    validateSchedulableOrThrow(request, "StreamingAsync");
+
+    SchedulerInvokeOptions effective_options = options;
+    if (effective_options.kind == JobKind::HTTP_NON_STREAMING) {
+        effective_options.kind = JobKind::HTTP_STREAMING;
+    }
+
+    InferenceJobPtr job = buildJob(request, effective_options);
+    job->request.stream = true;
+    LOG_INFO("[ModelScheduler] Submitting async streaming request: job="
+             << job->job_id << " response=" << job->response_id
+             << " model=" << job->model_id
+             << " session=" << job->session_id
+             << " previous=" << job->previous_response_id
+             << " kind=" << kindToString(job->kind)
+             << " priority=" << priorityToString(job->priority)
+             << " tool_output="
+             << (job->is_tool_output_submission ? "true" : "false"));
+
+    // Wire callbacks directly - no promise/future blocking
+    job->callbacks.on_token = std::move(callbacks.onToken);
+    job->callbacks.on_complete =
+        [user_callback = std::move(callbacks.onComplete),
+         job_id = job->job_id](const StandardResponse& response) {
+            LOG_INFO("[ModelScheduler] Async streaming request completed: job="
+                     << job_id << " finish_reason=" << response.finish_reason);
+            if (user_callback) {
+                user_callback(response);
+            }
+        };
+
+    job->callbacks.on_error =
+        [user_callback = std::move(callbacks.onError),
+         job_id = job->job_id](const GenAIException& error) {
+            LOG_WARN("[ModelScheduler] Async streaming request failed: job="
+                     << job_id << " status=" << error.http_status
+                     << " message=\"" << error.message << "\"");
+            if (user_callback) {
+                user_callback(error);
+            }
+        };
+
+    job->callbacks.on_cancelled =
+        [user_callback = std::move(callbacks.onCancelled),
+         job_id = job->job_id]() {
+            LOG_WARN("[ModelScheduler] Async streaming request cancelled: job="
+                     << job_id);
+            if (user_callback) {
+                user_callback();
+            }
+        };
+
+    // Submit and return immediately - non-blocking
+    submitOrThrow(*this, job);
 }
 
 bool ModelScheduler::cancelResponse(const std::string& response_id) {

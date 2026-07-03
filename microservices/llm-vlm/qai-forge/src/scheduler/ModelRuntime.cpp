@@ -1,15 +1,17 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
-#include "scheduler/ModelRuntime.h"
+#include "qai_forge/scheduler/ModelRuntime.h"
 
 #include "qai_forge/backend/IGenerativeBackend.h"
-#include "qai_forge/orchestration/ChatOrchestratorImpl.h"
+#include "qai_forge/orchestration/IOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace scheduler {
@@ -92,10 +94,12 @@ bool shouldRecoverBackend(const GenAIException& error) {
 
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<IGenerativeBackend> backend,
+                     std::unique_ptr<IOrchestrator> orchestrator,
                      ModelRuntimeEvents events,
                      RunningCancelMode running_cancel_mode)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
+      orchestrator_(std::move(orchestrator)),
       events_(std::move(events)),
       new_request_aging_threshold_(queueAgingThresholdFromEnv()),
       running_cancel_mode_(running_cancel_mode) {
@@ -104,6 +108,9 @@ ModelRuntime::ModelRuntime(std::string model_id,
     }
     if (!backend_) {
         throw std::invalid_argument("ModelRuntime requires a model backend");
+    }
+    if (!orchestrator_) {
+        throw std::invalid_argument("ModelRuntime requires an orchestrator");
     }
 }
 
@@ -443,7 +450,24 @@ void ModelRuntime::executorLoop() {
                 LOG_ERROR("[ModelRuntime] Backend load failed: model=" << model_id_
                           << " status=" << error.http_status
                           << " message=\"" << error.message << "\"");
-                unloadBackend(true);
+                // Force-kill the worker subprocess (SIGKILL) so the kernel
+                // reclaims all its file descriptors and DSP SMMU mappings.
+                unloadBackend(/*force=*/true);
+                // Wait for the DSP kernel to reclaim leaked mappings from the
+                // failed worker before the next load attempt.  Without this
+                // delay, repeated failures exhaust DSP SMMU address space.
+                // Default: 2000ms.  Override: MODEL_LOAD_FAILURE_DELAY_MS env var.
+                {
+                    const long delay_ms =
+                        parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
+                    if (delay_ms > 0 && !stop_requested_) {
+                        LOG_INFO("[ModelRuntime] Waiting " << delay_ms
+                                 << "ms after load failure for DSP memory reclaim: model="
+                                 << model_id_);
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(delay_ms));
+                    }
+                }
                 std::vector<ModelRuntimeState> failure_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -455,7 +479,20 @@ void ModelRuntime::executorLoop() {
             } catch (const std::exception& error) {
                 LOG_ERROR("[ModelRuntime] Backend load failed: model=" << model_id_
                           << " message=\"" << error.what() << "\"");
-                unloadBackend(true);
+                // Force-kill the worker subprocess (SIGKILL).
+                unloadBackend(/*force=*/true);
+                // Wait for DSP memory reclaim before next retry.
+                {
+                    const long delay_ms =
+                        parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
+                    if (delay_ms > 0 && !stop_requested_) {
+                        LOG_INFO("[ModelRuntime] Waiting " << delay_ms
+                                 << "ms after load failure for DSP memory reclaim: model="
+                                 << model_id_);
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(delay_ms));
+                    }
+                }
                 std::vector<ModelRuntimeState> failure_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -639,7 +676,7 @@ void ModelRuntime::runJob(InferenceJob& job) {
         }
     };
 
-    auto cancel_requested = [&job]() {
+    auto cancel_requested = [&job]() -> bool {
         return job.isCancelled();
     };
 
@@ -648,87 +685,74 @@ void ModelRuntime::runJob(InferenceJob& job) {
         return;
     }
 
-    ChatOrchestratorImpl& orchestrator = ChatOrchestratorImpl::getInstance();
+    // Build the response_history: use job's history if use_response_history is
+    // set, otherwise pass an empty array (orchestrator creates a fresh session).
+    const json& response_history =
+        job.use_response_history ? job.response_history : json::array();
+
+    // Build the stream callback: non-null for streaming jobs, null for blocking.
+    OrchestratorStreamCallback stream_callback = nullptr;
+    std::string finish_reason = "stop";
+    std::string response_id = job.session_id;
+
+    if (job.request.stream) {
+        stream_callback = [&job, &finish_reason, &response_id](
+                              const StreamChunk& chunk) {
+            if (chunk.finish_reason.has_value()) {
+                finish_reason = chunk.finish_reason.value();
+            }
+            if (!chunk.id.empty()) {
+                response_id = chunk.id;
+            }
+            if (job.isCancelled()) {
+                return;
+            }
+            if (job.callbacks.on_token) {
+                job.callbacks.on_token(chunk);
+            }
+        };
+    }
+
     try {
         if (job.request.stream) {
             LOG_INFO("[ModelRuntime] Streaming execution started: job="
                      << job.job_id << " model=" << model_id_);
-            std::string finish_reason = "stop";
-            std::string response_id = job.session_id;
-            auto on_token =
-                [&job, &finish_reason, &response_id](const StreamChunk& chunk) {
-                if (chunk.finish_reason.has_value()) {
-                    finish_reason = chunk.finish_reason.value();
-                }
-                if (!chunk.id.empty()) {
-                    response_id = chunk.id;
-                }
-                if (job.isCancelled()) {
-                    return;
-                }
-                if (job.callbacks.on_token) {
-                    job.callbacks.on_token(chunk);
-                }
-            };
-            StandardResponse response = job.use_response_history
-                ? orchestrator.executeFromMessages(
-                    job.request,
-                    job.response_history,
-                    *backend_,
-                    on_token,
-                    cancel_requested,
-                    job.skip_summarization_middleware)
-                : orchestrator.executeStreaming(
-                    job.request,
-                    *backend_,
-                    on_token,
-                    cancel_requested,
-                    job.skip_summarization_middleware);
-
-            if (job.isCancelled()) {
-                notify_cancelled();
-                return;
-            }
-
-            if (job.callbacks.on_complete) {
-                if (response.id.empty()) {
-                    response.id = response_id;
-                }
-                if (response.finish_reason.empty()) {
-                    response.finish_reason = finish_reason;
-                }
-                job.callbacks.on_complete(response);
-            }
-            LOG_INFO("[ModelRuntime] Streaming execution completed: job="
-                     << job.job_id << " model=" << model_id_
-                     << " finish_reason=" << finish_reason);
-            return;
+        } else {
+            LOG_INFO("[ModelRuntime] Blocking execution started: job="
+                     << job.job_id << " model=" << model_id_);
         }
 
-        LOG_INFO("[ModelRuntime] Blocking execution started: job="
-                 << job.job_id << " model=" << model_id_);
-        StandardResponse response = job.use_response_history
-            ? orchestrator.executeFromMessages(
-                job.request,
-                job.response_history,
-                *backend_,
-                cancel_requested,
-                job.skip_summarization_middleware)
-            : orchestrator.executeBlocking(
-                job.request,
-                *backend_,
-                cancel_requested,
-                job.skip_summarization_middleware);
+        StandardResponse response = orchestrator_->execute(
+            job.request,
+            response_history,
+            *backend_,
+            stream_callback,
+            cancel_requested);
+
         if (job.isCancelled()) {
             notify_cancelled();
             return;
         }
+
         if (job.callbacks.on_complete) {
+            if (response.id.empty()) {
+                response.id = response_id;
+            }
+            if (response.finish_reason.empty()) {
+                response.finish_reason = finish_reason;
+            }
             job.callbacks.on_complete(response);
         }
-        LOG_INFO("[ModelRuntime] Blocking execution completed: job="
-                 << job.job_id << " model=" << model_id_
-                 << " finish_reason=" << response.finish_reason);
+
+        if (job.request.stream) {
+            LOG_INFO("[ModelRuntime] Streaming execution completed: job="
+                     << job.job_id << " model=" << model_id_
+                     << " finish_reason=" << finish_reason);
+        } else {
+            LOG_INFO("[ModelRuntime] Blocking execution completed: job="
+                     << job.job_id << " model=" << model_id_
+                     << " finish_reason=" << response.finish_reason);
+        }
     } catch (...) {
         if (job.isCancelled()) {
             notify_cancelled();

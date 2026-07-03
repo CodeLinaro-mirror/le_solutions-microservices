@@ -225,28 +225,46 @@ void GenIEBackend::generateVlm(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // onContextCompacted()
+//
+// No-op: KV cache reset is now handled by resetKvAsync() which is called by
+// GenieOrchestrator immediately after every generate() / generateVlm() call.
+// The eager background reset runs concurrently with returning the response to
+// the HTTP layer, eliminating the pre-inference reset latency.
+// Kept for interface compatibility with IGenerativeBackend.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::onContextCompacted() {
-    // GenIE-specific: reset the KV cache after summarization so the next turn
-    // starts fresh with the compacted context.
-    // Select the correct worker based on the current model type.
-    LOG_INFO("[GenIEBackend] Context compacted — resetting KV cache for model: "
+    LOG_DEBUG("[GenIEBackend] onContextCompacted() called — no-op "
+              "(KV reset handled by resetKvAsync after each inference)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resetKvAsync() — Eager background KV cache reset
+//
+// Called by GenieOrchestrator immediately after generate() / generateVlm()
+// returns. Initiates a background reset on the active worker so the reset
+// runs concurrently with returning the response to the HTTP layer.
+// The next generate() call waits for the reset to complete via
+// InferenceWorkerManager::waitForPendingReset() (called inside executeRequest).
+// ─────────────────────────────────────────────────────────────────────────────
+
+void GenIEBackend::resetKvAsync() {
+    LOG_INFO("[GenIEBackend] Initiating background KV reset for model: "
              << current_model_id_
              << (current_is_vlm_ ? " (VLM)" : " (LLM)"));
     try {
         if (current_is_vlm_) {
             if (vlm_worker_) {
-                vlm_worker_->sendReset();
+                vlm_worker_->initiateBackgroundReset();
             }
         } else {
             if (llm_worker_) {
-                llm_worker_->sendReset();
+                llm_worker_->initiateBackgroundReset();
             }
         }
     } catch (const std::exception& e) {
-        LOG_WARN("[GenIEBackend] KV cache reset failed: " << e.what()
-                 << " (non-fatal — continuing with summary)");
+        LOG_WARN("[GenIEBackend] Failed to initiate background KV reset: " << e.what()
+                 << " (non-fatal — next request will rebuild from scratch)");
     }
 }
 

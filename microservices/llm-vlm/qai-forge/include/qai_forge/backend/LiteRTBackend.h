@@ -31,6 +31,13 @@ class PredictiveWorkerManager;
 
 class LiteRTBackend : public IInferenceBackend {
 public:
+    /**
+     * Public constructor — creates an owned (non-singleton) instance.
+     * Used by BackendFactory::createPredictiveBackend() for scheduler-owned
+     * instances. Each PredictiveModelRuntime owns its own LiteRTBackend.
+     */
+    LiteRTBackend();
+
     static LiteRTBackend& getInstance();
 
     std::string name() const override { return "LiteRT"; }
@@ -44,7 +51,6 @@ public:
     void shutdown() override;
 
 private:
-    LiteRTBackend();
     LiteRTBackend(const LiteRTBackend&)            = delete;
     LiteRTBackend& operator=(const LiteRTBackend&) = delete;
 

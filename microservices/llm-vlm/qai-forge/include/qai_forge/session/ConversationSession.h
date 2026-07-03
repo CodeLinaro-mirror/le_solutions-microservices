@@ -8,6 +8,8 @@
 #include <optional>
 #include <memory>
 #include <chrono>
+#include <sstream>
+#include <unordered_map>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
@@ -26,6 +28,11 @@ using json = nlohmann::ordered_json;
 //     before being committed to this session's history.
 //   - Thinking content is stored with a private "_thinking_content" key and
 //     stripped before being sent to the model (Section 3.F).
+//   - Post-turn memory management (Phase 5):
+//       evicted_message_count — number of oldest messages already summarized.
+//       summary_content       — rolling summary of evicted messages (Slot 3).
+//       facts                 — persistent key-value facts extracted from
+//                               evicted messages (Slot 2).
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ConversationSession {
@@ -36,13 +43,27 @@ struct ConversationSession {
     // Shared OpenAI-format message history
     std::vector<json> messages;
 
-    // Summarization state
+    // ── Post-turn memory management ───────────────────────────────────────────
+
+    // Number of oldest messages that have been evicted (summarized).
+    // Messages at indices [0, evicted_message_count) are excluded from the
+    // history queue (Slot 4) — they are represented by summary_content.
+    size_t evicted_message_count = 0;
+
+    // Rolling summary of evicted messages.
+    // Injected into Slot 3 of the prompt by buildContextPrompt().
+    // Updated by GenieOrchestrator::postTurnProcessing() after each eviction.
     std::string summary_content;
     int summary_token_count = 0;
+
+    // Persistent key-value facts extracted from evicted messages.
+    // Injected into Slot 2 of the prompt by buildContextPrompt().
+    // Updated by GenieOrchestrator::postTurnProcessing() after each eviction.
+    std::unordered_map<std::string, std::string> facts;
+
+    // ── Legacy fields (kept for compatibility) ────────────────────────────────
     int system_prompt_tokens = 0;
     std::string system_prompt_content;
-
-    // Token tracking
     int total_cumulative_tokens = 0;
 
     // Timestamps
@@ -61,7 +82,13 @@ struct ConversationSession {
         return messages.size() - 1;
     }
 
-    // Get messages suitable for sending to the model (strips private "_*" keys)
+    /**
+     * @brief Get messages suitable for sending to the model.
+     *
+     * Strips private "_*" keys (e.g. "_thinking_content").
+     * Returns ALL messages (including evicted ones).
+     * Use getHistoryMessages() for the history queue slot.
+     */
     std::vector<json> getCleanMessages() const {
         std::vector<json> clean;
         clean.reserve(messages.size());
@@ -75,6 +102,85 @@ struct ConversationSession {
             clean.push_back(clean_msg);
         }
         return clean;
+    }
+
+    /**
+     * @brief Get messages for the history queue slot (Slot 4).
+     *
+     * Returns only messages AFTER evicted_message_count — i.e., messages that
+     * have NOT been evicted and summarized. Strips private "_*" keys.
+     * System messages are excluded (they belong in Slot 1).
+     */
+    std::vector<json> getHistoryMessages() const {
+        std::vector<json> result;
+        for (size_t i = evicted_message_count; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            std::string role = msg.value("role", "");
+            if (role == "system") continue;  // System messages go in Slot 1
+
+            json clean_msg = json::object();
+            for (const auto& [k, v] : msg.items()) {
+                if (k.empty() || k[0] != '_') {
+                    clean_msg[k] = v;
+                }
+            }
+            result.push_back(std::move(clean_msg));
+        }
+        return result;
+    }
+
+    /**
+     * @brief Estimate total tokens in the active history queue.
+     *
+     * Counts tokens in messages[evicted_message_count..end], excluding system
+     * messages. Uses a simple heuristic: 1 token ≈ 4 characters.
+     */
+    int estimateHistoryTokens() const {
+        int total = 0;
+        for (size_t i = evicted_message_count; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            if (msg.value("role", "") == "system") continue;
+            std::string content = msg.value("content", "");
+            total += static_cast<int>(content.size() / 4) + 4;  // +4 per-message overhead
+        }
+        return total;
+    }
+
+    /**
+     * @brief Format persistent facts as a compact string for Slot 2.
+     *
+     * Returns empty string if no facts are stored.
+     */
+    std::string formatFacts() const {
+        if (facts.empty()) return "";
+        std::ostringstream oss;
+        for (const auto& [k, v] : facts) {
+            oss << k << ": " << v << "\n";
+        }
+        return oss.str();
+    }
+
+    /**
+     * @brief Merge new facts into the existing facts store.
+     *
+     * New facts override existing ones for the same key.
+     * Keys are never deleted — only overwritten.
+     */
+    void updateFacts(const std::unordered_map<std::string, std::string>& new_facts) {
+        for (const auto& [k, v] : new_facts) {
+            facts[k] = v;
+        }
+    }
+
+    /**
+     * @brief Limit facts to a maximum count by removing arbitrary entries.
+     *
+     * Called after updateFacts() to prevent unbounded growth.
+     */
+    void enforceFactsCeiling(size_t max_facts) {
+        while (facts.size() > max_facts) {
+            facts.erase(facts.begin());
+        }
     }
 };
 

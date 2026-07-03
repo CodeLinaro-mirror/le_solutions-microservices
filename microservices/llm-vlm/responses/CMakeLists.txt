@@ -17,20 +17,13 @@ set(SERVER_SOURCES
     # HTTP layer
     src/main.cpp
     src/controllers/ResponsesController.cpp
+    src/controllers/ModelsController.cpp
 
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
     src/ResponseStore.cpp
     src/ResponsesCompactionService.cpp
     src/TokenBudgetUtils.cpp
-
-    # Scheduler / model residency layer
-    src/scheduler/EvictionPolicy.cpp
-    src/scheduler/ModelScheduler.cpp
-    src/scheduler/ModelRuntime.cpp
-    src/scheduler/PriorityModelQueue.cpp
-    src/scheduler/ToolChainTable.cpp
-    src/scheduler/WarmModelPool.cpp
 
     # MCP — client infrastructure
     src/mcp/McpStdioClient.cpp
@@ -43,7 +36,7 @@ set(SERVER_SOURCES
     src/mcp/NativeToolRegistry.cpp
     src/mcp/McpNativeClient.cpp
 
-    # Built-in native tools — add new tools here + one line in main.cpp
+    # Built-in native tools — add new tools here
     src/tools/DateTimeTool.cpp
     src/tools/CalculatorTool.cpp
 

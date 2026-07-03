@@ -158,14 +158,31 @@ public:
     /**
      * Called by SummarizationMiddleware immediately after summarization completes.
      *
-     * GenIEBackend:    calls sendReset() on the active worker to clear the KV
-     *                  cache. The next turn re-feeds the compacted context.
-     * LiteRTLMBackend: calls LlmInference::ResetContext() (future).
-     * OnnxRTBackend:   no-op — OnnxRT recomputes full context each turn anyway.
+     * With the universal post-inference reset (resetKvAsync), this method is
+     * now a no-op for GenIEBackend — the KV cache is reset automatically after
+     * every generate() / generateVlm() call. Kept for interface compatibility.
      *
      * Default implementation is a no-op.
      */
     virtual void onContextCompacted() {}
+
+    /**
+     * Initiate an eager background KV cache reset after inference completes.
+     *
+     * Called by GenieOrchestrator immediately after generate() / generateVlm()
+     * returns. The reset runs in a background thread so it overlaps with
+     * returning the response to the HTTP layer and sending it to the client.
+     * The next generate() call waits for the reset to complete before sending
+     * the EXECUTE command, ensuring clean KV state with minimal added latency.
+     *
+     * GenIEBackend:    calls InferenceWorkerManager::initiateBackgroundReset()
+     *                  on the active worker.
+     * LiteRTLMBackend: calls LlmInference::ResetContext() asynchronously (future).
+     * OnnxRTBackend:   no-op — OnnxRT recomputes full context each turn anyway.
+     *
+     * Default implementation is a no-op.
+     */
+    virtual void resetKvAsync() {}
 
     /**
      * KV cache checkpoint operations.

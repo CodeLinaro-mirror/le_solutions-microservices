@@ -165,6 +165,9 @@ endif() # QAI_FORGE_BUILD_GENAILIB
 # Does NOT link genai-lib — only the worker binaries do.
 # ─────────────────────────────────────────────────────────────────────────────
 set(QAI_FORGE_SOURCES
+    # Public facade — unified entry point for all inference
+    src/QaiForge.cpp
+
     # C API — Flat C FFI bridge to Layer 2 (Python/Go/Rust/C bindings)
     src/c_api/qai_forge_c_api.cpp
 
@@ -183,10 +186,20 @@ set(QAI_FORGE_SOURCES
     src/managers/ModelConfigManager.cpp
     src/managers/SystemResourceManager.cpp
 
+    # Scheduler (Layer 2 — model residency, job queuing, tool-chain continuity)
+    src/scheduler/PriorityModelQueue.cpp
+    src/scheduler/ToolChainTable.cpp
+    src/scheduler/EvictionPolicy.cpp
+    src/scheduler/ModelRuntime.cpp
+    src/scheduler/WarmModelPool.cpp
+    src/scheduler/ModelScheduler.cpp
+
+    # Predictive AI scheduler (Phase 4 — pool + runtime for tensor inference)
+    src/scheduler/PredictiveModelRuntime.cpp
+    src/scheduler/PredictiveModelPool.cpp
+
     # Orchestration (Layer 2)
-    src/orchestration/ChatOrchestratorImpl.cpp
-    src/orchestration/ConcurrencyMiddleware.cpp
-    src/orchestration/SummarizationMiddleware.cpp
+    src/orchestration/GenieOrchestrator.cpp
 
     # Reasoning (Layer 2)
     src/reasoning/ReasoningRouter.cpp
@@ -211,16 +224,6 @@ set(QAI_FORGE_SOURCES
     # Generative AI backends (Layer 3 — IGenerativeBackend implementations)
     src/backend/LiteRTLMBackend.cpp
 
-    # Routing (Layer 2 — InferenceRouter)
-    src/routing/InferenceRouter.cpp
-
-    # Middleware (Layer 2 — pluggable middleware pipeline)
-    src/orchestration/ExclusiveLockMiddleware.cpp
-    src/orchestration/ContextCompactionMiddleware.cpp
-
-    # Predictive AI orchestration (Layer 2)
-    src/orchestration/PredictiveAIOrchestrator.cpp
-
     # Worker management (Layer 3)
     src/worker/InferenceWorkerManager.cpp
     src/worker/VlmInferenceWorkerManager.cpp
@@ -235,7 +238,7 @@ target_include_directories(qai_forge
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
-        # genai-lib headers needed by SummarizationMiddleware and ChatOrchestratorImpl
+        # genai-lib headers needed by SummarizationMiddleware and GenieOrchestrator
         # (they include InferenceProtocol.h which uses nlohmann/json)
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/include
         # stb_image.h — header-only image decoder used by ImageUtils.cpp

@@ -17,9 +17,19 @@
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/backend/GenIEBackend.h"
+#include "qai_forge/backend/LiteRTBackend.h"
 #include "qai_forge/backend/LiteRTLMBackend.h"
+#include "qai_forge/backend/QNNBackend.h"
+#include "qai_forge/backend/SNPEBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/orchestration/GenieOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
+// PredictiveWorkerManager must be a complete type here because
+// std::make_unique<QNNBackend/SNPEBackend/LiteRTBackend>() instantiates
+// std::default_delete<T>, which calls ~T(), which destroys the
+// std::unique_ptr<PredictiveWorkerManager> member inside each backend.
+// The forward declaration in the backend headers is not sufficient.
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include <memory>
 
 std::unique_ptr<IGenerativeBackend>
@@ -55,6 +65,13 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
     return createGenerativeBackend(model_config->runtime);
 }
 
+RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
+    RuntimePair pair;
+    pair.backend = createGenerativeBackendForModel(model_id);
+    pair.orchestrator = std::make_unique<GenieOrchestrator>();
+    return pair;
+}
+
 IGenerativeBackend& BackendFactory::getGenerativeBackend(const std::string& runtime) {
     if (runtime == "genie") {
         return GenIEBackend::getInstance();
@@ -73,4 +90,46 @@ IGenerativeBackend& BackendFactory::getGenerativeBackend(const std::string& runt
     LOG_WARN("[BackendFactory] Unknown runtime '" << runtime
              << "' — falling back to GenIEBackend");
     return GenIEBackend::getInstance();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Predictive AI backends
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::unique_ptr<IInferenceBackend>
+BackendFactory::createPredictiveBackend(const std::string& runtime) {
+    // QNN context binary (HTP/GPU/CPU)
+    if (runtime == "qnn" || runtime == "qnn_context_binary") {
+        return std::make_unique<QNNBackend>();
+    }
+
+    // SNPE DLC container (DSP/GPU/AIP/CPU)
+    if (runtime == "snpe" || runtime == "qnn_dlc") {
+        return std::make_unique<SNPEBackend>();
+    }
+
+    // LiteRT / TFLite (NPU dispatch + CPU fallback)
+    if (runtime == "litert" || runtime == "tflite") {
+        return std::make_unique<LiteRTBackend>();
+    }
+
+    throw GenAIException(
+        GenAIErrorCode::INVALID_REQUEST,
+        "Unknown predictive AI runtime '" + runtime + "'. "
+        "Supported runtimes: qnn, qnn_context_binary, snpe, qnn_dlc, litert, tflite.",
+        400);
+}
+
+std::unique_ptr<IInferenceBackend>
+BackendFactory::createPredictiveBackendForModel(const std::string& model_id) {
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id + "' not found. Check /v1/models for available models.",
+            404);
+    }
+
+    return createPredictiveBackend(model_config->runtime);
 }

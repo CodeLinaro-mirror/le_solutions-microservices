@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "scheduler/WarmModelPool.h"
+#include "qai_forge/scheduler/WarmModelPool.h"
 
 #include <chrono>
 #include <string>

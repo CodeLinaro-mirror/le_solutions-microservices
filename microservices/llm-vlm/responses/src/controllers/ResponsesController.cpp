@@ -34,7 +34,7 @@
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
-#include "scheduler/ModelScheduler.h"
+#include "qai_forge/QaiForge.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
@@ -567,6 +567,7 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     const std::string& instructions,
     const std::string& reasoning_effort,
     const std::string& reasoning_summary,
+    std::optional<int> reasoning_max_tokens,
     const json& function_tools,
     bool has_function_tools,
     std::optional<int> max_completion_tokens) {
@@ -590,6 +591,9 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     }
     if (!reasoning_summary.empty()) {
         sdk_body["reasoning_summary"] = reasoning_summary;
+    }
+    if (reasoning_max_tokens.has_value()) {
+        sdk_body["reasoning_max_tokens"] = reasoning_max_tokens.value();
     }
     if (has_function_tools) {
         sdk_body["tools"] = function_tools;
@@ -615,16 +619,14 @@ static std::string generate_summary_with_scheduler(
     CreateChatCompletionRequest request =
         CreateChatCompletionRequest::from_json(sdk_body);
 
-    scheduler::SchedulerInvokeOptions options;
+    qai_forge::GenerateOptions options;
     options.response_id = ResponsesUtils::generate_compaction_id();
     options.session_id = options.response_id;
-    options.kind = scheduler::JobKind::INTERNAL_SUMMARIZATION;
-    options.skip_summarization_middleware = true;
     options.use_response_history = true;
     options.response_history = json::array();
 
     StandardResponse result =
-        scheduler::ModelScheduler::getInstance().runBlocking(request, options);
+        qai_forge::QaiForge::getInstance().generate(request, options);
     return result.content.value_or("");
 }
 
@@ -697,9 +699,14 @@ void ResponsesController::createResponse(
     // ── Parse reasoning parameters ────────────────────────────────────────────
     std::string reasoning_effort  = "medium";  // default
     std::string reasoning_summary = "";         // "" = no summary output item
+    std::optional<int> reasoning_max_tokens = std::nullopt;
     if (body.contains("reasoning") && body["reasoning"].is_object()) {
         reasoning_effort  = body["reasoning"].value("effort",  "medium");
         reasoning_summary = body["reasoning"].value("summary", "");
+        if (body["reasoning"].contains("max_reasoning_tokens")
+            && !body["reasoning"]["max_reasoning_tokens"].is_null()) {
+            reasoning_max_tokens = body["reasoning"]["max_reasoning_tokens"].get<int>();
+        }
     }
 
     // ── Tool type analysis ────────────────────────────────────────────────────
@@ -927,6 +934,8 @@ void ResponsesController::createResponse(
                                                      const json& data) {
                             stream->send("event: " + event_type + "\n");
                             stream->send("data: " + data.dump() + "\n\n");
+                            // Yield control to allow Drogon's event loop to flush the stream
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         };
 
                         int created_time = ResponsesUtils::current_unix_time();
@@ -1271,6 +1280,7 @@ void ResponsesController::createResponse(
             effective_system_prompt,
             reasoning_effort,
             reasoning_summary,
+            reasoning_max_tokens,
             function_tools_for_request,
             expose_function_tools,
             is_vlm ? requested_max_output_tokens : resolved_max_output_tokens);
@@ -1286,13 +1296,9 @@ void ResponsesController::createResponse(
         return;
     }
 
-    scheduler::SchedulerInvokeOptions invoke_options;
+    qai_forge::GenerateOptions invoke_options;
     invoke_options.response_id = response_id;
     invoke_options.session_id = response_id;
-    invoke_options.kind = streaming
-        ? scheduler::JobKind::HTTP_STREAMING
-        : scheduler::JobKind::HTTP_NON_STREAMING;
-    invoke_options.skip_summarization_middleware = true;
     invoke_options.use_response_history = true;
     invoke_options.response_history = is_vlm
         ? json::array()
@@ -1330,11 +1336,23 @@ void ResponsesController::createResponse(
                  function_tool_policy, function_tools, has_function_tools,
                  expose_function_tools,
                  begin_created_at = begin.created_at](ResponseStreamPtr stream) {
-                    auto emit_event = [&stream](const std::string& event_type,
-                                                 const json& data) {
-                        stream->send("event: " + event_type + "\n");
-                        stream->send("data: " + data.dump() + "\n\n");
-                    };
+                // Convert unique_ptr to shared_ptr so callbacks can keep stream alive
+                auto shared_stream = std::shared_ptr<ResponseStream>(std::move(stream));
+                auto stream_ptr = shared_stream.get();
+
+                // Create emit_event as a shared function that can be captured in callbacks
+                auto emit_event_impl = [](ResponseStream* stream, const std::string& event_type,
+                                          const json& data) {
+                    stream->send("event: " + event_type + "\n");
+                    stream->send("data: " + data.dump() + "\n\n");
+                    // Yield control to allow Drogon's event loop to flush the stream
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                };
+
+                auto emit_event = [stream_ptr, emit_event_impl](const std::string& event_type,
+                                                                 const json& data) {
+                    emit_event_impl(stream_ptr, event_type, data);
+                };
 
                     // response.created event
                     emit_event("response.created", {
@@ -1372,200 +1390,279 @@ void ResponsesController::createResponse(
                         });
                     }
 
-                    std::string full_text;
-                    bool had_error = false;
-                    std::string error_msg;
-                    int http_status = 500;
-                    StandardResponse result;
-
                     // Re-enable streaming for the SDK call
                     CreateChatCompletionRequest streaming_req = standard_request;
                     streaming_req.stream = true;
 
-                    try {
-                        result = scheduler::ModelScheduler::getInstance().runStreaming(
-                            streaming_req,
-                            [&](const StreamChunk& chunk) {
-                                if (chunk.content_delta.has_value()
-                                    && !chunk.content_delta.value().empty()) {
-                                    full_text += chunk.content_delta.value();
-                                    if (!expose_function_tools) {
-                                        emit_event("response.output_text.delta", {
-                                            {"type",          "response.output_text.delta"},
-                                            {"output_index",  0},
-                                            {"content_index", 0},
-                                            {"delta",         chunk.content_delta.value()}
-                                        });
-                                    }
-                                }
-                                if (chunk.reasoning_content.has_value()
-                                    && !chunk.reasoning_content.value().empty()) {
-                                    emit_event("response.reasoning.delta", {
-                                        {"type",         "response.reasoning.delta"},
-                                        {"output_index", 0},
-                                        {"delta",        chunk.reasoning_content.value()}
-                                    });
-                                }
-                            },
-                            invoke_options);
-                    } catch (const GenAIException& e) {
-                        had_error = true;
-                        error_msg = e.message;
-                        http_status = e.http_status;
-                    } catch (const std::exception& e) {
-                        had_error = true;
-                        error_msg = e.what();
-                    }
+                        // Use shared state for async callbacks
+                        auto shared_full_text = std::make_shared<std::string>();
+                        auto shared_callback_count = std::make_shared<int>(0);
 
-                    auto emit_cancelled_if_stored = [&]() {
-                        std::optional<json> cancelled_response =
-                            get_stored_cancelled_response_object(response_id);
-                        if (!cancelled_response.has_value()) {
-                            return false;
-                        }
-                        emit_event("response.cancelled", {
-                            {"type", "response.cancelled"},
-                            {"response", cancelled_response.value()}
-                        });
-                        return true;
-                    };
+                        try {
+                            LOG_INFO("[ResponsesController] Starting generateStream: response="
+                                     << response_id << " expose_function_tools="
+                                     << (expose_function_tools ? "true" : "false"));
 
-                    if (!had_error) {
-                        if (!emit_cancelled_if_stored()) {
-                            apply_function_tool_policy(
-                                result, function_tool_policy);
-                            json output = ResponsesUtils::build_output_array(result);
-                            if (expose_function_tools) {
-                                for (std::size_t i = 0; i < output.size(); ++i) {
-                                    const json& item = output[i];
-                                    emit_event("response.output_item.added", {
-                                        {"type", "response.output_item.added"},
-                                        {"output_index", i},
-                                        {"item", item}
-                                    });
-                                    if (item.value("type", "") == "message"
-                                        && item.contains("content")
-                                        && item["content"].is_array()
-                                        && !item["content"].empty()) {
-                                        const json& part = item["content"][0];
-                                        std::string text = part.value("text", "");
-                                        emit_event("response.content_part.added", {
-                                            {"type", "response.content_part.added"},
-                                            {"output_index", i},
-                                            {"content_index", 0},
-                                            {"part", part}
-                                        });
-                                        emit_event("response.output_text.delta", {
-                                            {"type", "response.output_text.delta"},
-                                            {"output_index", i},
-                                            {"content_index", 0},
-                                            {"delta", text}
-                                        });
-                                        emit_event("response.output_text.done", {
-                                            {"type", "response.output_text.done"},
-                                            {"output_index", i},
-                                            {"content_index", 0},
-                                            {"text", text}
-                                        });
-                                    }
-                                    emit_event("response.output_item.done", {
-                                        {"type", "response.output_item.done"},
-                                        {"output_index", i},
-                                        {"item", item}
-                                    });
+                            // Use new async API - callbacks will handle completion
+                            qai_forge::StreamCallbacks callbacks;
+
+                            callbacks.onToken = [shared_stream, expose_function_tools, response_id,
+                                                shared_full_text, shared_callback_count](const StreamChunk& chunk) {
+                                auto stream_ptr = shared_stream.get();
+                            (*shared_callback_count)++;
+
+                            if (chunk.content_delta.has_value()
+                                && !chunk.content_delta.value().empty()) {
+                                *shared_full_text += chunk.content_delta.value();
+
+                                if (!expose_function_tools) {
+                                    stream_ptr->send("event: response.output_text.delta\n");
+                                    stream_ptr->send("data: " + json({
+                                        {"type",          "response.output_text.delta"},
+                                        {"output_index",  0},
+                                        {"content_index", 0},
+                                        {"delta",         chunk.content_delta.value()}
+                                    }).dump() + "\n\n");
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                                 }
-                            } else {
-                                std::string clean_full_text =
-                                    ResponsesUtils::strip_tool_call_protocol_text(
-                                        full_text);
-                                emit_event("response.output_text.done", {
-                                    {"type",          "response.output_text.done"},
-                                    {"output_index",  0},
-                                    {"content_index", 0},
-                                    {"text",          clean_full_text}
-                                });
-
-                                emit_event("response.output_item.done", {
-                                    {"type",         "response.output_item.done"},
-                                    {"output_index", 0},
-                                    {"item", {
-                                        {"type",    "message"},
-                                        {"id",      "msg_" + response_id},
-                                        {"role",    "assistant"},
-                                        {"content", {{{"type", "output_text"},
-                                                      {"text", clean_full_text}}}},
-                                        {"status",  "completed"}
-                                    }}
-                                });
                             }
-                            json response_obj = ResponsesUtils::build_response_object(
-                                response_id,
-                                model,
-                                output,
-                                "completed",
-                                result.prompt_tokens,
-                                result.completion_tokens,
-                                begin_created_at,
-                                json(nullptr),
-                                json(nullptr),
-                                previous_response_id,
-                                metadata);
-                            attach_function_tool_response_fields(
-                                response_obj,
-                                function_tools,
-                                function_tool_policy,
-                                has_function_tools);
-                            add_reasoning_usage_details(response_obj, result);
-                            bool completed =
-                                ResponseStore::getInstance().completeResponse(
-                                response_id,
-                                make_assistant_messages(result),
-                                output,
-                                response_obj,
-                                response_obj["usage"]);
-                            if (!completed) {
-                                if (!emit_cancelled_if_stored()) {
-                                    std::optional<StoredResponse> stored =
-                                        ResponseStore::getInstance().getResponse(
-                                            response_id);
-                                    if (stored.has_value()
-                                        && stored->response_object.is_object()) {
-                                        response_obj = stored->response_object;
+                            if (chunk.reasoning_content.has_value()
+                                && !chunk.reasoning_content.value().empty()) {
+                                stream_ptr->send("event: response.reasoning.delta\n");
+                                stream_ptr->send("data: " + json({
+                                    {"type",         "response.reasoning.delta"},
+                                    {"output_index", 0},
+                                    {"delta",        chunk.reasoning_content.value()}
+                                }).dump() + "\n\n");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                        };
+
+                        callbacks.onComplete = [shared_stream, response_id, model,
+                                               previous_response_id, metadata, function_tool_policy,
+                                               function_tools, has_function_tools, expose_function_tools,
+                                               begin_created_at, shared_full_text](const StandardResponse& response) {
+                            LOG_INFO("[ResponsesController] generateStream completed: response=" << response_id);
+
+                            auto stream_ptr = shared_stream.get();
+                            auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                                stream_ptr->send("event: " + event_type + "\n");
+                                stream_ptr->send("data: " + data.dump() + "\n\n");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            };
+
+                            auto emit_cancelled_if_stored = [&]() {
+                                std::optional<json> cancelled_response =
+                                    get_stored_cancelled_response_object(response_id);
+                                if (!cancelled_response.has_value()) {
+                                    return false;
+                                }
+                                emit_event("response.cancelled", {
+                                    {"type", "response.cancelled"},
+                                    {"response", cancelled_response.value()}
+                                });
+                                return true;
+                            };
+
+                            if (!emit_cancelled_if_stored()) {
+                                StandardResponse result = response;
+                                apply_function_tool_policy(result, function_tool_policy);
+                                json output = ResponsesUtils::build_output_array(result);
+
+                                if (expose_function_tools) {
+                                    for (std::size_t i = 0; i < output.size(); ++i) {
+                                        const json& item = output[i];
+                                        emit_event("response.output_item.added", {
+                                            {"type", "response.output_item.added"},
+                                            {"output_index", i},
+                                            {"item", item}
+                                        });
+                                        if (item.value("type", "") == "message"
+                                            && item.contains("content")
+                                            && item["content"].is_array()
+                                            && !item["content"].empty()) {
+                                            const json& part = item["content"][0];
+                                            std::string text = part.value("text", "");
+                                            emit_event("response.content_part.added", {
+                                                {"type", "response.content_part.added"},
+                                                {"output_index", i},
+                                                {"content_index", 0},
+                                                {"part", part}
+                                            });
+                                            emit_event("response.output_text.delta", {
+                                                {"type", "response.output_text.delta"},
+                                                {"output_index", i},
+                                                {"content_index", 0},
+                                                {"delta", text}
+                                            });
+                                            emit_event("response.output_text.done", {
+                                                {"type", "response.output_text.done"},
+                                                {"output_index", i},
+                                                {"content_index", 0},
+                                                {"text", text}
+                                            });
+                                        }
+                                        emit_event("response.output_item.done", {
+                                            {"type", "response.output_item.done"},
+                                            {"output_index", i},
+                                            {"item", item}
+                                        });
                                     }
+                                } else {
+                                    std::string clean_full_text =
+                                        ResponsesUtils::strip_tool_call_protocol_text(*shared_full_text);
+                                    emit_event("response.output_text.done", {
+                                        {"type",          "response.output_text.done"},
+                                        {"output_index",  0},
+                                        {"content_index", 0},
+                                        {"text",          clean_full_text}
+                                    });
+
+                                    emit_event("response.output_item.done", {
+                                        {"type",         "response.output_item.done"},
+                                        {"output_index", 0},
+                                        {"item", {
+                                            {"type",    "message"},
+                                            {"id",      "msg_" + response_id},
+                                            {"role",    "assistant"},
+                                            {"content", {{{"type", "output_text"},
+                                                          {"text", clean_full_text}}}},
+                                            {"status",  "completed"}
+                                        }}
+                                    });
+                                }
+
+                                json response_obj = ResponsesUtils::build_response_object(
+                                    response_id, model, output, "completed",
+                                    result.prompt_tokens, result.completion_tokens,
+                                    begin_created_at, json(nullptr), json(nullptr),
+                                    previous_response_id, metadata);
+                                attach_function_tool_response_fields(
+                                    response_obj, function_tools, function_tool_policy, has_function_tools);
+                                add_reasoning_usage_details(response_obj, result);
+
+                                bool completed = ResponseStore::getInstance().completeResponse(
+                                    response_id, make_assistant_messages(result),
+                                    output, response_obj, response_obj["usage"]);
+
+                                if (!completed) {
+                                    if (!emit_cancelled_if_stored()) {
+                                        std::optional<StoredResponse> stored =
+                                            ResponseStore::getInstance().getResponse(response_id);
+                                        if (stored.has_value() && stored->response_object.is_object()) {
+                                            response_obj = stored->response_object;
+                                        }
+                                        emit_event("response.completed", {
+                                            {"type", "response.completed"},
+                                            {"response", response_obj}
+                                        });
+                                    }
+                                } else {
                                     emit_event("response.completed", {
                                         {"type", "response.completed"},
                                         {"response", response_obj}
                                     });
                                 }
+                            }
+
+                            stream_ptr->send("data: [DONE]\n\n");
+                            stream_ptr->close();
+                        };
+
+                        callbacks.onError = [shared_stream, response_id](const GenAIException& error) {
+                            LOG_ERROR("[ResponsesController] generateStream error: response="
+                                     << response_id << " error=" << error.message);
+
+                            auto stream_ptr = shared_stream.get();
+                            auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                                stream_ptr->send("event: " + event_type + "\n");
+                                stream_ptr->send("data: " + data.dump() + "\n\n");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            };
+
+                            auto emit_cancelled_if_stored = [&]() {
+                                std::optional<json> cancelled_response =
+                                    get_stored_cancelled_response_object(response_id);
+                                if (!cancelled_response.has_value()) {
+                                    return false;
+                                }
+                                emit_event("response.cancelled", {
+                                    {"type", "response.cancelled"},
+                                    {"response", cancelled_response.value()}
+                                });
+                                return true;
+                            };
+
+                            bool failed = ResponseStore::getInstance().failResponse(
+                                response_id,
+                                make_store_error_object(
+                                    error.http_status >= 500 ? "server_error" : "invalid_request_error",
+                                    error.message));
+
+                            if (!failed && emit_cancelled_if_stored()) {
+                                // Already cancelled, don't emit error
                             } else {
-                                emit_event("response.completed", {
-                                    {"type", "response.completed"},
-                                    {"response", response_obj}
+                                emit_event("error", {
+                                    {"type",    "error"},
+                                    {"code",    "server_error"},
+                                    {"message", error.message}
                                 });
                             }
-                        }
-                    } else {
-                        bool failed = ResponseStore::getInstance().failResponse(
-                            response_id,
-                            make_store_error_object(
-                                http_status >= 500
-                                    ? "server_error"
-                                    : "invalid_request_error",
-                                error_msg));
-                        if (!failed && emit_cancelled_if_stored()) {
-                            // Public state is already cancelled; do not emit
-                            // a failure event for a user-initiated cancel.
-                        } else {
-                            emit_event("error", {
-                                {"type",    "error"},
-                                {"code",    "server_error"},
-                                {"message", error_msg}
-                            });
-                        }
-                    }
 
-                    stream->send("data: [DONE]\n\n");
-                    stream->close();
+                            stream_ptr->send("data: [DONE]\n\n");
+                            stream_ptr->close();
+                        };
+
+                        callbacks.onCancelled = [shared_stream, response_id]() {
+                            LOG_INFO("[ResponsesController] generateStream cancelled: response=" << response_id);
+
+                            auto stream_ptr = shared_stream.get();
+                            auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                                stream_ptr->send("event: " + event_type + "\n");
+                                stream_ptr->send("data: " + data.dump() + "\n\n");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            };
+
+                            std::optional<json> cancelled_response =
+                                get_stored_cancelled_response_object(response_id);
+                            if (cancelled_response.has_value()) {
+                                emit_event("response.cancelled", {
+                                    {"type", "response.cancelled"},
+                                    {"response", cancelled_response.value()}
+                                });
+                            }
+
+                            stream_ptr->send("data: [DONE]\n\n");
+                            stream_ptr->close();
+                        };
+
+                        // Submit async - returns immediately, callbacks handle completion
+                        qai_forge::QaiForge::getInstance().generateStream(
+                            streaming_req,
+                            std::move(callbacks),
+                            invoke_options);
+
+                        LOG_INFO("[ResponsesController] generateStream submitted, returning from lambda: response=" << response_id);
+
+                    } catch (const GenAIException& e) {
+                        LOG_ERROR("[ResponsesController] Exception in generateStream setup: " << e.message);
+                        emit_event("error", {
+                            {"type",    "error"},
+                            {"code",    "server_error"},
+                            {"message", e.message}
+                        });
+                        stream->send("data: [DONE]\n\n");
+                        stream->close();
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("[ResponsesController] Exception in generateStream setup: " << e.what());
+                        emit_event("error", {
+                            {"type",    "error"},
+                            {"code",    "server_error"},
+                            {"message", e.what()}
+                        });
+                        stream->send("data: [DONE]\n\n");
+                        stream->close();
+                    }
                 }
             );
             resp->addHeader("Content-Type", "text/event-stream");
@@ -1576,7 +1673,7 @@ void ResponsesController::createResponse(
         } else {
             // ── Non-streaming ─────────────────────────────────────────────────
             StandardResponse result =
-                scheduler::ModelScheduler::getInstance().runBlocking(
+                qai_forge::QaiForge::getInstance().generate(
                     standard_request, invoke_options);
             apply_function_tool_policy(result, function_tool_policy);
 
@@ -1989,13 +2086,10 @@ void ResponsesController::cancelResponse(
     }
 
     if (!result.active_job_id.empty()) {
-        scheduler::CancelResult scheduler_cancel =
-            scheduler::ModelScheduler::getInstance().cancel(
-                result.active_job_id);
+        bool cancelled = qai_forge::QaiForge::getInstance().cancel(result.active_job_id);
         LOG_INFO("[ResponsesController] Cancel scheduler cleanup: response="
                  << response_id << " job=" << result.active_job_id
-                 << " status=" << static_cast<int>(scheduler_cancel.status)
-                 << " message=\"" << scheduler_cancel.message << "\"");
+                 << " cancelled=" << (cancelled ? "true" : "false"));
     }
 
     auto resp = make_json_response(result.response_object, k200OK);

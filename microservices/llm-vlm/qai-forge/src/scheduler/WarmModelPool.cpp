@@ -1,9 +1,9 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
-#include "scheduler/WarmModelPool.h"
+#include "qai_forge/scheduler/WarmModelPool.h"
 
-#include "scheduler/EvictionPolicy.h"
+#include "qai_forge/scheduler/EvictionPolicy.h"
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/managers/SystemResourceManager.h"
@@ -17,9 +17,9 @@ namespace scheduler {
 
 namespace {
 
-ModelBackendFactory defaultBackendFactory() {
+ModelRuntimePairFactory defaultRuntimeFactory() {
     return [](const std::string& model_id) {
-        return BackendFactory::createGenerativeBackendForModel(model_id);
+        return BackendFactory::createRuntimePair(model_id);
     };
 }
 
@@ -88,13 +88,13 @@ const char* runningCancelModeToString(RunningCancelMode mode) {
 } // namespace
 
 WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
-                             ModelBackendFactory backend_factory)
+                             ModelRuntimePairFactory runtime_factory)
     : config_(config),
-      backend_factory_(backend_factory ? std::move(backend_factory)
-                                       : defaultBackendFactory()),
+      runtime_factory_(runtime_factory ? std::move(runtime_factory)
+                                       : defaultRuntimeFactory()),
       eviction_policy_(std::make_unique<EvictionPolicy>()) {
-    if (!backend_factory_) {
-        throw std::invalid_argument("WarmModelPool requires a backend factory");
+    if (!runtime_factory_) {
+        throw std::invalid_argument("WarmModelPool requires a runtime factory");
     }
     if (config_.max_concurrent_model_loads == 0) {
         config_.max_concurrent_model_loads = 1;
@@ -655,9 +655,13 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
             handleRuntimeStateChanged(changed_model_id, state);
         };
 
+    // Create backend + orchestrator pair via factory
+    RuntimePair pair = runtime_factory_(model_id);
+
     auto runtime = std::make_unique<ModelRuntime>(
         model_id,
-        backend_factory_(model_id),
+        std::move(pair.backend),
+        std::move(pair.orchestrator),
         std::move(events),
         config_.running_cancel_mode);
     runtime->start();

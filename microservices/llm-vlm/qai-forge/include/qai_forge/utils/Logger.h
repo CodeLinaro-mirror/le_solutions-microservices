@@ -178,6 +178,31 @@ private:
         }                                                                       \
     } while (0)
 
+// Undefine Trantor's logging macros if they exist (from Drogon framework).
+// Trantor uses stream-style syntax (LOG_INFO << "msg"), while QAI uses
+// parenthesized syntax (LOG_INFO("msg")). We must undefine Trantor's macros
+// to ensure QAI's macros are used throughout the codebase.
+#ifdef LOG_TRACE
+#undef LOG_TRACE
+#endif
+
+#ifdef LOG_DEBUG
+#undef LOG_DEBUG
+#endif
+
+#ifdef LOG_INFO
+#undef LOG_INFO
+#endif
+
+#ifdef LOG_WARN
+#undef LOG_WARN
+#endif
+
+#ifdef LOG_ERROR
+#undef LOG_ERROR
+#endif
+
+// Now define QAI's logging macros with parenthesized syntax
 #define LOG_TRACE(msg) QAI_LOG_(TRACE, msg)
 #define LOG_DEBUG(msg) QAI_LOG_(DEBUG, msg)
 #define LOG_INFO(msg)  QAI_LOG_(INFO,  msg)

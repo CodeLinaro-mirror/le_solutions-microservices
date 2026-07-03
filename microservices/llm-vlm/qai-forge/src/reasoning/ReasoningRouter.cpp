@@ -30,9 +30,12 @@ void ReasoningBudgetTracker::deactivate() {
 
 BudgetState ReasoningBudgetTracker::accept(const std::string& text_fragment) {
     if (state_ == BudgetState::COUNTING) {
-        counted_++;
+        // Estimate tokens using the same heuristic as GenieOrchestrator (1 token ≈ 4 chars)
+        int fragment_tokens = static_cast<int>(text_fragment.size() / 4);
+        if (fragment_tokens < 1) fragment_tokens = 1;  // Minimum 1 token per fragment
+        counted_ += fragment_tokens;
         if (budget_ >= 0) {
-            remaining_--;
+            remaining_ -= fragment_tokens;
             if (remaining_ <= 0) {
                 state_ = BudgetState::FORCING;
             }
