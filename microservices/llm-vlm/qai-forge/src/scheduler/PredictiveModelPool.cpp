@@ -108,11 +108,11 @@ ModelPoolSnapshot PredictiveModelPool::snapshot() const {
     for (const auto& [model_id, record] : runtimes_) {
         ModelPoolRuntimeSnapshot runtime_snap;
         runtime_snap.model_id = model_id;
-        runtime_snap.state = record.state;
+        runtime_snap.state = record.runtime->state();
         runtime_snap.last_used_at = record.last_used_at;
         runtime_snap.idle_since = record.idle_since;
-        runtime_snap.healthy = (record.state == ModelRuntimeState::Idle ||
-                                record.state == ModelRuntimeState::Running);
+        runtime_snap.healthy = (runtime_snap.state == ModelRuntimeState::Idle ||
+                                runtime_snap.state == ModelRuntimeState::Running);
 
         // Get detailed snapshot from runtime
         if (record.runtime) {
@@ -172,7 +172,6 @@ PredictiveModelRuntime& PredictiveModelPool::getOrLoadModel(
 }
 
 void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
-    const auto now = std::chrono::steady_clock::now();
     const size_t active_count = activeModelCount();
 
     // Check if we're at capacity
@@ -199,7 +198,7 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
     std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> candidates;
     for (const auto& [model_id, record] : runtimes_) {
         // Only evict idle models
-        if (record.state == ModelRuntimeState::Idle) {
+        if (record.runtime->state() == ModelRuntimeState::Idle) {
             candidates.emplace_back(model_id, record.last_used_at);
         }
     }
@@ -240,24 +239,30 @@ void PredictiveModelPool::evictIdleModels() {
     std::vector<std::string> to_evict;
 
     for (auto& [model_id, record] : runtimes_) {
+        if (record.runtime->state() != ModelRuntimeState::Idle) {
+            // Not idle right now (e.g. Running/Loading) — any previously
+            // recorded idle_since is stale.
+            record.idle_since.reset();
+            continue;
+        }
+
         // Update idle_since if model just became idle
-        if (record.state == ModelRuntimeState::Idle && !record.idle_since) {
+        if (!record.idle_since) {
             record.idle_since = now;
+            continue;
         }
 
         // Check if model has been idle too long
-        if (record.idle_since) {
-            const auto idle_duration =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - *record.idle_since);
+        const auto idle_duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - *record.idle_since);
 
-            if (idle_duration >= config_.idle_timeout) {
-                LOG_INFO("[PredictiveModelPool] Model '" << model_id
-                         << "' idle for " << idle_duration.count()
-                         << "ms (threshold: " << config_.idle_timeout.count()
-                         << "ms) — marking for eviction");
-                to_evict.push_back(model_id);
-            }
+        if (idle_duration >= config_.idle_timeout) {
+            LOG_INFO("[PredictiveModelPool] Model '" << model_id
+                     << "' idle for " << idle_duration.count()
+                     << "ms (threshold: " << config_.idle_timeout.count()
+                     << "ms) — marking for eviction");
+            to_evict.push_back(model_id);
         }
     }
 
@@ -291,22 +296,18 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
         throw;
     }
 
-    // Create runtime with state change callback
-    ModelRuntimeEvents events;
-    events.on_state_changed = [this](const std::string& model_id,
-                                     ModelRuntimeState state) {
-        handleRuntimeStateChanged(model_id, state);
-    };
-
+    // No state-change callback: PredictiveModelRuntime has no executor thread,
+    // so every transition happens synchronously on the caller's thread inside
+    // a call the pool itself made. The pool queries live state via
+    // record.runtime->state() instead of caching a mirrored copy.
     auto runtime = std::make_unique<PredictiveModelRuntime>(
-        model_id, std::move(backend), events);
+        model_id, std::move(backend), ModelRuntimeEvents{});
 
     runtime->start();
 
     // Insert into map
     RuntimeRecord record;
     record.runtime = std::move(runtime);
-    record.state = ModelRuntimeState::NotResident;
     record.last_used_at = std::chrono::steady_clock::now();
 
     auto [it, inserted] = runtimes_.emplace(model_id, std::move(record));
@@ -321,33 +322,13 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
     return it->second;
 }
 
-void PredictiveModelPool::handleRuntimeStateChanged(
-    const std::string& model_id,
-    ModelRuntimeState state) {
-
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = runtimes_.find(model_id);
-    if (it != runtimes_.end()) {
-        it->second.state = state;
-
-        // Reset idle_since when model becomes active
-        if (state == ModelRuntimeState::Running ||
-            state == ModelRuntimeState::Loading) {
-            it->second.idle_since.reset();
-        }
-
-        LOG_DEBUG("[PredictiveModelPool] Model '" << model_id
-                  << "' state changed to " << static_cast<int>(state));
-    }
-}
-
 size_t PredictiveModelPool::activeModelCount() const {
     size_t count = 0;
     for (const auto& [model_id, record] : runtimes_) {
-        if (record.state != ModelRuntimeState::NotResident &&
-            record.state != ModelRuntimeState::Stopped &&
-            record.state != ModelRuntimeState::Failed) {
+        const ModelRuntimeState state = record.runtime->state();
+        if (state != ModelRuntimeState::NotResident &&
+            state != ModelRuntimeState::Stopped &&
+            state != ModelRuntimeState::Failed) {
             ++count;
         }
     }

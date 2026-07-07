@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -337,8 +338,16 @@ void PredictiveWorkerManager::shutdown() {
 
 bool PredictiveWorkerManager::isWorkerRunning() const {
     if (worker_pid_ <= 0 || sock_fd_ < 0) return false;
-    // Check if process is still alive
-    return kill(worker_pid_, 0) == 0;
+
+    // Poll the IPC socket instead of signaling the pid: when the worker exits
+    // (crash, or its own idle self-timeout) the kernel closes its end of the
+    // socketpair, which surfaces here as POLLHUP/POLLERR without blocking.
+    struct pollfd pfd{sock_fd_, POLLIN, 0};
+    int ret = poll(&pfd, 1, 0);
+    if (ret > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        return false;
+
+    return true;
 }
 
 std::string PredictiveWorkerManager::getCurrentModelId() const {

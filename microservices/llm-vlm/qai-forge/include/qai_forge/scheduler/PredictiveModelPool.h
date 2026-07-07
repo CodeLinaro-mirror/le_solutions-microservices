@@ -101,7 +101,6 @@ public:
 private:
     struct RuntimeRecord {
         std::unique_ptr<PredictiveModelRuntime> runtime;
-        ModelRuntimeState state = ModelRuntimeState::NotResident;
         std::chrono::steady_clock::time_point last_used_at =
             std::chrono::steady_clock::now();
         std::optional<std::chrono::steady_clock::time_point> idle_since;
@@ -111,8 +110,6 @@ private:
     void evictIfNeeded(const std::string& model_id_to_load);
     void evictIdleModels();
     RuntimeRecord& createRuntimeLocked(const std::string& model_id);
-    void handleRuntimeStateChanged(const std::string& model_id,
-                                    ModelRuntimeState state);
     size_t activeModelCount() const;
     long availableMemoryMb() const;
     long modelMemoryMb(const std::string& model_id) const;
