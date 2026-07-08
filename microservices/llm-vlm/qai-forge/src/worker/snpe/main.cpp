@@ -91,6 +91,13 @@ static std::vector<uint8_t> base64Decode(const std::string& s) {
 
 static int g_sock_fd = -1;
 
+// Thrown by readMsg() instead of calling exit() directly. exit() would skip
+// destruction of main()'s local `engine` unique_ptr, leaving the SNPE DSP
+// session/FastRPC handles torn down only by the SDK's own atexit hooks —
+// which double-frees driver-owned buffers the engine's destructor also owns.
+// Throwing lets main() unwind normally so `engine` is destroyed before exit.
+struct WorkerExit { int code; };
+
 static void sendMsg(const json& msg) {
     std::string line = msg.dump() + "\n";
     write(g_sock_fd, line.c_str(), line.size());
@@ -103,9 +110,9 @@ static json readMsg() {
         fd_set fds; FD_ZERO(&fds); FD_SET(g_sock_fd, &fds);
         struct timeval tv{300, 0};
         int r = select(g_sock_fd + 1, &fds, nullptr, nullptr, &tv);
-        if (r <= 0) { std::cerr << "[snpe-worker] read timeout/error\n"; exit(1); }
+        if (r <= 0) { std::cerr << "[snpe-worker] read timeout/error\n"; throw WorkerExit{1}; }
         ssize_t n = read(g_sock_fd, &ch, 1);
-        if (n <= 0) { std::cerr << "[snpe-worker] server disconnected\n"; exit(0); }
+        if (n <= 0) { std::cerr << "[snpe-worker] server disconnected\n"; throw WorkerExit{0}; }
         if (ch == '\n') break;
         line += ch;
     }
@@ -125,7 +132,12 @@ int main() {
 
     std::unique_ptr<SNPEEngine> engine;
 
-    while (true) {
+    // readMsg() throws WorkerExit on timeout/disconnect instead of calling
+    // exit() so that `engine` unwinds through its destructor here before
+    // the process exits, rather than being torn down implicitly by the SDK's
+    // atexit hooks (which previously raced with it and caused a double free).
+    try {
+        while (true) {
         json msg = readMsg();
         std::string type = msg.value("type", "");
 
@@ -228,6 +240,9 @@ int main() {
         }
 
         std::cerr << "[snpe-worker] unknown command: " << type << "\n";
+    }
+    } catch (const WorkerExit& e) {
+        return e.code;
     }
 
     return 0;

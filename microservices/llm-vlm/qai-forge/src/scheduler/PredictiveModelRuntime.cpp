@@ -62,8 +62,11 @@ TensorInferenceResponse PredictiveModelRuntime::infer(
             503);
     }
 
-    // Load model if not yet resident
-    if (state_ == ModelRuntimeState::NotResident) {
+    // Load model if not yet resident, and retry a previously failed load
+    // (otherwise a model stays permanently stuck in Failed after one bad
+    // attempt, surfacing a misleading "not in Idle state" 503 forever).
+    if (state_ == ModelRuntimeState::NotResident ||
+        state_ == ModelRuntimeState::Failed) {
         loadModelLocked();
     }
 

@@ -235,6 +235,16 @@ private:
     void cleanupWorker(bool force = false);
 
     /**
+     * Non-locking liveness check — caller must already hold mutex_.
+     * kill(pid, 0) alone can't tell a live process apart from a zombie: an
+     * exited-but-unreaped child still holds its PID, so kill() keeps
+     * returning 0 until something waitpid()s it. This reaps the child if it
+     * has exited so a crash is detected immediately instead of on the next
+     * request's IPC write failure.
+     */
+    bool isWorkerRunningLocked() const;
+
+    /**
      * Entry point for the watchdog background thread.
      * Periodically checks last_activity_time_ against the configured
      * timeout and calls terminateWorker(true) if the worker is unresponsive.
