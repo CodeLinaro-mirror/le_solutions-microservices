@@ -153,6 +153,12 @@ def _proto_eager(dll: ctypes.CDLL) -> Dict[str, Any]:
     except AttributeError:
         pass
 
+    try:
+        bind("LiteRtGetSignatureInputName", LiteRtStatus, [c_void_p, LiteRtParamIndex, POINTER(c_char_p)])
+        bind("LiteRtGetSignatureOutputName", LiteRtStatus, [c_void_p, LiteRtParamIndex, POINTER(c_char_p)])
+    except AttributeError:
+        pass
+
     return f
 
 
@@ -410,7 +416,7 @@ class LiteRtInterpreter:
 
     def enable_npu_htp(self, qualcomm_opts: Optional[QualcommOptions], require_npu: bool = False) -> bool:
         _log.info(
-            "enable_npu_htp: qualcomm_opts=%s require_npu=%s baseline_hw=0x%x",
+            "enable_npu_htp: starting. qualcomm_opts=%s require_npu=%s baseline_hw=0x%x",
             qualcomm_opts is not None, require_npu, self._last_hw_mask,
         )
         baseline_compiled = self.compiled
@@ -419,21 +425,24 @@ class LiteRtInterpreter:
 
         def _restore_baseline():
             """Restore compiled model and re-sync options to baseline hw_mask."""
+            _log.debug("enable_npu_htp._restore_baseline: restoring compile model state back to baseline_hw=0x%x", baseline_hw)
             self.compiled = baseline_compiled
             self._npu_compiled = baseline_npu
             # Re-create options with baseline hw_mask so options stay in sync
             # with the compiled model (avoids options/compiled desync).
             try:
                 self._reset_options(baseline_hw)
-            except Exception:
+            except Exception as e:
+                _log.warning("enable_npu_htp._restore_baseline: failed resetting options to baseline_hw: %s", e)
                 self._last_hw_mask = baseline_hw
 
         # Try NPU-only first
+        _log.info("enable_npu_htp: attempting compilation with HW_NPU")
         try:
             self._reset_options(HW_NPU)
             self._recompile_or_raise()
             npu_possible = True
-            _log.debug("enable_npu_htp: NPU-only compilation succeeded")
+            _log.info("enable_npu_htp: NPU-only compilation succeeded")
         except Exception as _npu_exc:
             _log.warning("enable_npu_htp: NPU-only compilation failed (%s); restoring baseline", _npu_exc)
             npu_possible = False
@@ -442,11 +451,12 @@ class LiteRtInterpreter:
         if npu_possible:
             try:
                 if qualcomm_opts is not None:
+                    _log.info("enable_npu_htp: attaching QualcommOptions to HW_NPU options and recompiling")
                     self._reset_options(HW_NPU)
                     qualcomm_opts.attach_to_litert_options(self.options)
                     self._recompile_or_raise()
                 self._npu_compiled = True
-                _log.info("enable_npu_htp: HTP/NPU enabled with Qualcomm options")
+                _log.info("enable_npu_htp: HTP/NPU enabled successfully with Qualcomm options")
                 return True
             except Exception as _qopt_exc:
                 _log.warning(
@@ -454,6 +464,7 @@ class LiteRtInterpreter:
                 )
                 # Qualcomm options failed; fall back to plain HW_NPU
                 try:
+                    _log.info("enable_npu_htp: retrying plain HW_NPU compilation without Qualcomm options")
                     self._reset_options(HW_NPU)
                     self._recompile_or_raise()
                     self._npu_compiled = True
@@ -465,102 +476,125 @@ class LiteRtInterpreter:
                     npu_possible = False
 
         if require_npu:
-            _log.error("enable_npu_htp: HTP/NPU required but unavailable on this system")
+            _log.error("enable_npu_htp: HTP/NPU was explicitly required but failed to compile. raising RuntimeError.")
             raise RuntimeError("HTP/NPU requested but HW_NPU compilation is not possible on this system.")
 
         # Fallback: try HW_ALL then HW_CPU
         try:
+            _log.info("enable_npu_htp: attempting fallback compilation with HW_ALL (CPU+GPU+NPU partition)")
             self._reset_options(HW_ALL)
             self._recompile_or_raise()
             self._npu_compiled = False
-            _log.info("enable_npu_htp: fell back to HW_ALL (CPU+GPU+NPU partitioning)")
+            _log.info("enable_npu_htp: fell back to HW_ALL successfully")
             return False
         except Exception as _all_exc:
-            _log.warning("enable_npu_htp: HW_ALL failed (%s); falling back to CPU-only", _all_exc)
-            self._reset_options(HW_CPU)
-            self._recompile_or_raise()
-            self._npu_compiled = False
-            _log.info("enable_npu_htp: fell back to CPU-only")
-            return False
+            _log.warning("enable_npu_htp: HW_ALL fallback failed (%s); attempting final CPU-only compilation", _all_exc)
+            try:
+                self._reset_options(HW_CPU)
+                self._recompile_or_raise()
+                self._npu_compiled = False
+                _log.info("enable_npu_htp: fell back to CPU-only (XNNPACK) successfully")
+                return False
+            except Exception as _cpu_exc:
+                _log.error("enable_npu_htp: final CPU fallback compilation failed: %s", _cpu_exc, exc_info=True)
+                raise
 
     def allocate_tensors(self, signature_index: int = 0):
-        _log.debug("allocate_tensors: signature_index=%d", signature_index)
-        sig = LiteRtSignature(None)
-        st = self.fns["LiteRtGetModelSignature"](self.model, LiteRtParamIndex(signature_index), byref(sig))
-        _check_ok(self.fns, st, "LiteRtGetModelSignature")
+        _log.info("LiteRtInterpreter.allocate_tensors: signature_index=%d", signature_index)
+        try:
+            sig = LiteRtSignature(None)
+            st = self.fns["LiteRtGetModelSignature"](self.model, LiteRtParamIndex(signature_index), byref(sig))
+            _check_ok(self.fns, st, "LiteRtGetModelSignature")
 
-        n_in = LiteRtParamIndex(0)
-        st = self.fns["LiteRtGetNumSignatureInputs"](sig, byref(n_in))
-        _check_ok(self.fns, st, "LiteRtGetNumSignatureInputs")
+            n_in = LiteRtParamIndex(0)
+            st = self.fns["LiteRtGetNumSignatureInputs"](sig, byref(n_in))
+            _check_ok(self.fns, st, "LiteRtGetNumSignatureInputs")
 
-        n_out = LiteRtParamIndex(0)
-        st = self.fns["LiteRtGetNumSignatureOutputs"](sig, byref(n_out))
-        _check_ok(self.fns, st, "LiteRtGetNumSignatureOutputs")
+            n_out = LiteRtParamIndex(0)
+            st = self.fns["LiteRtGetNumSignatureOutputs"](sig, byref(n_out))
+            _check_ok(self.fns, st, "LiteRtGetNumSignatureOutputs")
 
-        _log.debug(
-            "allocate_tensors: n_in=%d n_out=%d",
-            int(n_in.value), int(n_out.value),
-        )
-        self._in_bufs, self._out_bufs = [], []
-        self._in_req_sizes, self._out_req_sizes = [], []
-
-        for i in range(int(n_in.value)):
-            t = LiteRtTensor(None)
-            st = self.fns["LiteRtGetSignatureInputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
-            _check_ok(self.fns, st, "LiteRtGetSignatureInputTensorByIndex")
-
-            ty = LiteRtRankedTensorType(None)
-            st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
-            _check_ok(self.fns, st, "LiteRtGetRankedTensorType")
-
-            req = LiteRtTensorBufferRequirements(None)
-            st = self.fns["LiteRtGetCompiledModelInputBufferRequirements"](
-                self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
+            _log.info(
+                "LiteRtInterpreter.allocate_tensors: resolved signature. inputs_count=%d outputs_count=%d",
+                int(n_in.value), int(n_out.value),
             )
-            _check_ok(self.fns, st, "LiteRtGetCompiledModelInputBufferRequirements")
+            self._in_bufs, self._out_bufs = [], []
+            self._in_req_sizes, self._out_req_sizes = [], []
 
-            buf_sz = c_size_t(0)
-            st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
-            _check_ok(self.fns, st, "LiteRtGetTensorBufferRequirementsBufferSize")
-            self._in_req_sizes.append(int(buf_sz.value))
+            for i in range(int(n_in.value)):
+                _log.debug("LiteRtInterpreter.allocate_tensors: processing input index %d", i)
+                t = LiteRtTensor(None)
+                st = self.fns["LiteRtGetSignatureInputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
+                _check_ok(self.fns, st, f"LiteRtGetSignatureInputTensorByIndex({i})")
 
-            buf_type = c_int(0)
-            st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
-            _check_ok(self.fns, st, "LiteRtGetTensorBufferRequirementsSupportedTensorBufferType")
+                ty = LiteRtRankedTensorType(None)
+                st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
+                _check_ok(self.fns, st, f"LiteRtGetRankedTensorType(input {i})")
 
-            tb = LiteRtTensorBuffer(None)
-            st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
-            _check_ok(self.fns, st, "LiteRtCreateManagedTensorBuffer(input)")
-            self._in_bufs.append(tb)
+                req = LiteRtTensorBufferRequirements(None)
+                st = self.fns["LiteRtGetCompiledModelInputBufferRequirements"](
+                    self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
+                )
+                _check_ok(self.fns, st, f"LiteRtGetCompiledModelInputBufferRequirements(input {i})")
 
-        for i in range(int(n_out.value)):
-            t = LiteRtTensor(None)
-            st = self.fns["LiteRtGetSignatureOutputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
-            _check_ok(self.fns, st, "LiteRtGetSignatureOutputTensorByIndex")
+                buf_sz = c_size_t(0)
+                st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
+                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(input {i})")
+                self._in_req_sizes.append(int(buf_sz.value))
 
-            ty = LiteRtRankedTensorType(None)
-            st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
-            _check_ok(self.fns, st, "LiteRtGetRankedTensorType")
+                buf_type = c_int(0)
+                st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
+                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(input {i})")
 
-            req = LiteRtTensorBufferRequirements(None)
-            st = self.fns["LiteRtGetCompiledModelOutputBufferRequirements"](
-                self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
-            )
-            _check_ok(self.fns, st, "LiteRtGetCompiledModelOutputBufferRequirements")
+                _log.debug(
+                    "LiteRtInterpreter.allocate_tensors: input %d buffer size=%d type=%d",
+                    i, int(buf_sz.value), int(buf_type.value)
+                )
 
-            buf_sz = c_size_t(0)
-            st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
-            _check_ok(self.fns, st, "LiteRtGetTensorBufferRequirementsBufferSize")
-            self._out_req_sizes.append(int(buf_sz.value))
+                tb = LiteRtTensorBuffer(None)
+                st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
+                _check_ok(self.fns, st, f"LiteRtCreateManagedTensorBuffer(input {i})")
+                self._in_bufs.append(tb)
 
-            buf_type = c_int(0)
-            st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
-            _check_ok(self.fns, st, "LiteRtGetTensorBufferRequirementsSupportedTensorBufferType")
+            for i in range(int(n_out.value)):
+                _log.debug("LiteRtInterpreter.allocate_tensors: processing output index %d", i)
+                t = LiteRtTensor(None)
+                st = self.fns["LiteRtGetSignatureOutputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
+                _check_ok(self.fns, st, f"LiteRtGetSignatureOutputTensorByIndex({i})")
 
-            tb = LiteRtTensorBuffer(None)
-            st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
-            _check_ok(self.fns, st, "LiteRtCreateManagedTensorBuffer(output)")
-            self._out_bufs.append(tb)
+                ty = LiteRtRankedTensorType(None)
+                st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
+                _check_ok(self.fns, st, f"LiteRtGetRankedTensorType(output {i})")
+
+                req = LiteRtTensorBufferRequirements(None)
+                st = self.fns["LiteRtGetCompiledModelOutputBufferRequirements"](
+                    self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
+                )
+                _check_ok(self.fns, st, f"LiteRtGetCompiledModelOutputBufferRequirements(output {i})")
+
+                buf_sz = c_size_t(0)
+                st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
+                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(output {i})")
+                self._out_req_sizes.append(int(buf_sz.value))
+
+                buf_type = c_int(0)
+                st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
+                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(output {i})")
+
+                _log.debug(
+                    "LiteRtInterpreter.allocate_tensors: output %d buffer size=%d type=%d",
+                    i, int(buf_sz.value), int(buf_type.value)
+                )
+
+                tb = LiteRtTensorBuffer(None)
+                st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
+                _check_ok(self.fns, st, f"LiteRtCreateManagedTensorBuffer(output {i})")
+                self._out_bufs.append(tb)
+
+            _log.info("LiteRtInterpreter.allocate_tensors: successfully allocated all tensor buffers")
+        except Exception as e:
+            _log.error("LiteRtInterpreter.allocate_tensors failed: %s", e, exc_info=True)
+            raise
 
     def get_io_requirements(self) -> IoRequirements:
         return IoRequirements(

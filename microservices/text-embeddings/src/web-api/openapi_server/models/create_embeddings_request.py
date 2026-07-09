@@ -36,7 +36,7 @@ class CreateEmbeddingsRequest(BaseModel):
     """
     Request schema for creating embeddings.
     """ # noqa: E501
-    model: StrictStr = Field(description="ID of the model to use (e.g., nomic-embed-text,text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002).")
+    model: Optional[StrictStr] = Field(default=None, description="ID of the model to use (e.g., nomic-embed-text,text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002).")
     input: CreateEmbeddingsRequestInput
     encoding_format: Optional[StrictStr] = Field(default='float', description="Format to return the embeddings in. Defaults to float.")
     dimensions: Optional[Annotated[int, Field(strict=True, ge=1)]] = Field(default=None, description="Number of dimensions for the output embeddings (supported in text-embedding-3 and later).")

@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import ctypes
 import importlib.util
+import time
 from typing import List, Optional
 from ctypes import (
     c_void_p,
@@ -17,7 +18,11 @@ from ctypes import (
     POINTER,
 )
 
+from openapi_server.logger.logger_config import LoggerConfig
 from openapi_server.impl.qnn_runtime.lib_provider import QnnLibrary, QnnProvider, SystemProvider, CORE_LOG_CB
+
+LoggerConfig.initialize()
+logger = LoggerConfig.get_logger(__name__)
 from openapi_server.impl.embedding_backend import EmbeddingBackend
 from openapi_server.impl.qnn_runtime.qnn_types import (
     Qnn_Tensor_t,
@@ -176,7 +181,46 @@ class CustomTokenizer(TokenizerAdapter):
         return [int(x) for x in out]
 
 
-def load_tokenizer_auto() -> TokenizerAdapter:
+def load_tokenizer_auto(model_path: Optional[str] = None) -> TokenizerAdapter:
+    # 1. Try to find dynamically near the model_path if provided
+    if model_path:
+        model_dir = os.path.dirname(model_path)
+        if os.path.isdir(model_dir):
+            json_path = os.path.join(model_dir, "tokenizer.json")
+            if os.path.exists(json_path):
+                logger.info(f"Dynamically discovered tokenizer.json near model: {json_path}")
+                return HFTokenizerJSON(json_path)
+            # Recursively walk to find it
+            try:
+                for root, dirs, files in os.walk(model_dir):
+                    depth = root[len(model_dir):].count(os.sep)
+                    if depth > 2:
+                        dirs.clear()
+                        continue
+                    if "tokenizer.json" in files:
+                        found_json = os.path.join(root, "tokenizer.json")
+                        logger.info(f"Dynamically discovered tokenizer.json in model subdirectory: {found_json}")
+                        return HFTokenizerJSON(found_json)
+            except Exception as e:
+                logger.warning(f"Error while dynamically searching for tokenizer.json near {model_path}: {e}")
+
+    # 2. Try to find dynamically in the models root directory
+    models_dir = os.getenv("T2E_MODEL_DIR", "/mnt/work/models")
+    if os.path.isdir(models_dir):
+        try:
+            for root, dirs, files in os.walk(models_dir):
+                depth = root[len(models_dir):].count(os.sep)
+                if depth > 3:
+                    dirs.clear()
+                    continue
+                if "tokenizer.json" in files:
+                    found_json = os.path.join(root, "tokenizer.json")
+                    logger.info(f"Dynamically discovered tokenizer.json in T2E_MODEL_DIR: {found_json}")
+                    return HFTokenizerJSON(found_json)
+        except Exception as e:
+            logger.warning(f"Error while dynamically searching for tokenizer.json in T2E_MODEL_DIR {models_dir}: {e}")
+
+    # 3. Fallback to TOKENIZER_DIR
     tok_dir = os.getenv("TOKENIZER_DIR")
     if not tok_dir:
         raise RuntimeError("TOKENIZER_DIR is not set")
@@ -300,11 +344,13 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
 
     # ------------------------------------------------------------------
     def _load_and_compose_dlc(self):
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: entry with DLC path {self.binary_path}")
         if self.system_provider is None:
             raise RuntimeError("System provider not available for QNN DLC loading.")
 
         # 1. Create context
         null_ctx_cfg = POINTER(POINTER(c_void_p))()
+        logger.info("SimpleQnnEmbeddingApp._load_and_compose_dlc: creating QNN context...")
         rc = self.provider.contextCreate(
             self.backend_handle,
             self.device_handle,
@@ -313,9 +359,11 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         )
         if rc != 0:
             raise RuntimeError(f"contextCreate failed rc={rc}")
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: context created successfully. Handle: {self.context_handle}")
 
         # 2. Create DLC handle from file
         dlc = c_void_p()
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: loading DLC file {self.binary_path}...")
         rc = self.system_provider.systemDlcCreateFromFile(
             self.logger_handle,
             self.binary_path.encode("utf-8"),
@@ -324,6 +372,7 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         if rc != 0:
             raise RuntimeError(f"systemDlcCreateFromFile failed rc={rc}")
         self.dlc_handle = dlc
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: systemDlcCreateFromFile succeeded. Handle: {self.dlc_handle}")
 
         # 3. Compose graphs
         from openapi_server.impl.qnn_runtime.system_structs import QnnSystemContext_GraphInfo_t
@@ -331,6 +380,7 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         num_graphs = c_uint32(0)
 
         interface_addr = self.provider._ptr_val
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: composing graphs using interface_addr={hex(interface_addr)}...")
 
         rc = self.system_provider.systemDlcComposeGraphs(
             self.dlc_handle,
@@ -346,6 +396,7 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
 
         n_graphs = int(num_graphs.value)
         graphs_val = ctypes.cast(graphs_pp, c_void_p).value
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: systemDlcComposeGraphs returned rc={rc}, num_graphs={n_graphs}")
 
         if rc != 0 or n_graphs == 0 or not graphs_val:
             raise RuntimeError(f"systemDlcComposeGraphs failed or no graphs composed. rc={rc}")
@@ -356,6 +407,7 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         idx = 0
         if self.graph_name:
             wanted = self.graph_name.encode()
+            logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: searching for graph named {self.graph_name}...")
             for i in range(n_graphs):
                 g_info = graphs_pp_typed[i]
                 gver = int(g_info.version)
@@ -365,12 +417,12 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
                     name = g_info.u.graphInfoV2.graphName
                 else:
                     name = g_info.u.graphInfoV3.graphName
+                logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: found graph index {i} name: {name.decode(errors='replace')}")
                 if name == wanted:
                     idx = i
                     break
 
         g_info = graphs_pp_typed[idx]
-        gver = int(g_info.version)
         gver = int(g_info.version)
         if gver == 1:
             g = g_info.u.graphInfoV1
@@ -380,12 +432,14 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
             g = g_info.u.graphInfoV3
 
         self._graph_name = (g.graphName or b"").decode(errors="replace")
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: selected graph index {idx} with name {self._graph_name}")
 
         n_in, in_ptr = int(g.numGraphInputs), g.graphInputs
         n_out, out_ptr = int(g.numGraphOutputs), g.graphOutputs
 
         in_names = [_tensor_name(in_ptr[i]) for i in range(n_in)]
         out_names = [_tensor_name(out_ptr[i]) for i in range(n_out)]
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: graph inputs: {in_names}, graph outputs: {out_names}")
 
         self._in_meta = (n_in, in_ptr, in_names)
         self._out_meta = (n_out, out_ptr, out_names)
@@ -398,9 +452,19 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         self._resolved_output = self.output_name or (
             "embeddings" if "embeddings" in out_names else (out_names[0] if out_names else None)
         )
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: resolved_input={self._resolved_input}, resolved_output={self._resolved_output}")
 
         # 4. Retrieve graph handle
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: retrieving graph handle for {self._graph_name}...")
         self._retrieve_graph(self._graph_name)
+        logger.info(f"SimpleQnnEmbeddingApp._load_and_compose_dlc: retrieved graph handle successfully. Handle: {self.graph_handle}")
+
+        # 5. Finalize composed graph
+        logger.info("SimpleQnnEmbeddingApp._load_and_compose_dlc: finalising composed QNN graph for DLC...")
+        rc = self.provider.graphFinalize(self.graph_handle, c_void_p(None), c_void_p(None))
+        if rc != 0:
+            raise RuntimeError(f"graphFinalize failed rc={rc}")
+        logger.info("SimpleQnnEmbeddingApp._load_and_compose_dlc: composed QNN graph finalized successfully!")
 
     # ------------------------------------------------------------------
     def _init_logging(self):
@@ -419,11 +483,6 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
     # ------------------------------------------------------------------
     @classmethod
     def from_model_path(cls, model_path: str):
-        # Automatically select the context binary file if it exists in the models directory
-        bin_path = model_path.replace(".dlc", ".bin")
-        if model_path.lower().endswith(".dlc") and os.path.exists(bin_path):
-            model_path = bin_path
-
         backend = os.getenv("QNN_BACKEND_LIB", "libQnnHtp.so")
         system = os.getenv("QNN_SYSTEM_LIB", "libQnnSystem.so")
 
@@ -433,7 +492,7 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
 
         pad_token = int(os.getenv("QNN_PAD_TOKEN", "0"))
 
-        tokenizer = load_tokenizer_auto()
+        tokenizer = load_tokenizer_auto(model_path)
 
         return cls(
             backend_lib=backend,
@@ -448,21 +507,27 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         )
 
     # ------------------------------------------------------------------
+    def __del__(self):
+        try:
+            self.close()
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+
     def close(self):
         # 0. Free DLC context
         try:
             if self.system_provider and self.dlc_handle and self.dlc_handle.value:
                 self.system_provider.systemDlcFree(self.dlc_handle)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
         self.dlc_handle = c_void_p(None)
 
         # 1. Free system context (holds binary-info pointer; must go first)
         try:
             if self.system_provider and self._sys_ctx_handle:
                 self.system_provider.systemContextFree(self._sys_ctx_handle)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
         self._sys_ctx_handle = None
         self._binary_info_ptr = None
 
@@ -470,32 +535,33 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         try:
             if self.context_handle and self.context_handle.value:
                 self.provider.contextFree(self.context_handle, c_void_p(None))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
         self.context_handle = c_void_p()
 
         # 3. Free device
         try:
             if self.device_handle and self.device_handle.value:
                 self.provider.deviceFree(self.device_handle)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
         self.device_handle = c_void_p(None)
 
         # 4. Free backend
         try:
             if self.backend_handle and self.backend_handle.value:
                 self.provider.backendFree(self.backend_handle)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
         self.backend_handle = c_void_p()
 
         # 5. Free logger (must be last – backend may still log during its own teardown)
         try:
             if self.logger_handle and self.logger_handle.value:
                 self.provider.logFree(self.logger_handle)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+
         self.logger_handle = c_void_p()
 
     def _init_backend(self):
@@ -651,15 +717,22 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
 
         Implements :meth:`EmbeddingBackend.embed_texts`.
         """
+        logger.info(f"SimpleQnnEmbeddingApp.embed_texts: embedding batch of {len(texts)} texts")
         if self.tokenizer is None:
+            logger.error("SimpleQnnEmbeddingApp.embed_texts: tokenizer is not available")
             raise RuntimeError("Tokenizer not available.")
 
         vectors = []
-        for text in texts:
+        for idx, text in enumerate(texts):
+            logger.debug(f"SimpleQnnEmbeddingApp.embed_texts: processing sequence {idx + 1}/{len(texts)}")
+            t0 = time.time()
             tokens = self.tokenizer.encode(text)
+            logger.debug(f"SimpleQnnEmbeddingApp.embed_texts: tokenized string length={len(text)} into {len(tokens)} tokens: {tokens[:15]}")
             vec = self._run_single(tokens)
+            logger.debug(f"SimpleQnnEmbeddingApp.embed_texts: sequence {idx + 1} execution completed in {time.time() - t0:.4f}s")
             vectors.append(vec)
 
+        logger.info(f"SimpleQnnEmbeddingApp.embed_texts: successfully completed embedding batch")
         return vectors
 
     def encode_tokens(self, text: str) -> List[int]:
@@ -773,6 +846,8 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         dump_tensors(outputs, n_out, kind="OUTPUTS")
 
         # Execute
+        logger.debug(f"SimpleQnnEmbeddingApp._run_single: executing graph via graphExecute")
+        t_exec = time.time()
         rc = self.provider.graphExecute(
             self.graph_handle,
             ctypes.cast(inputs, POINTER(Qnn_Tensor_t)),
@@ -784,7 +859,9 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         )
 
         if rc != 0:
+            logger.error(f"SimpleQnnEmbeddingApp._run_single: graphExecute failed with status code {rc}")
             raise RuntimeError(f"graphExecute failed rc={rc}")
+        logger.debug(f"SimpleQnnEmbeddingApp._run_single: graphExecute succeeded in {time.time() - t_exec:.4f}s")
 
         dump_tensors(outputs, n_out, kind="OUTPUTS_POST_EXEC")
 
