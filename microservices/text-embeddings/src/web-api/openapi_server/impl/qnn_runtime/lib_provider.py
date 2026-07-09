@@ -511,7 +511,7 @@ QnnSystemDlc_composeGraphsFn_t = CFUNCTYPE(
     c_void_p,                      # context
     c_void_p,                      # interface (opaque QnnInterface_t)
     c_uint32,                      # graphVersion (enum/uint32)
-    POINTER(POINTER(c_void_p)),    # graphs (T** out)
+    c_void_p,                      # graphs (T*** out)
     POINTER(c_uint32)              # numGraphs (uint32_t*)
 )
 
@@ -764,6 +764,7 @@ class QnnLibrary:
 class QnnProvider:
     def __init__(self, provider_ptr: POINTER(QnnInterface_t)):
         self._p = provider_ptr.contents
+        self._ptr_val = ctypes.cast(provider_ptr, c_void_p).value
         self._iface = None
 
         self.make_callable()
