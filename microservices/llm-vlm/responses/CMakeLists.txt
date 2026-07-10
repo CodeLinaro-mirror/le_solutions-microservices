@@ -9,6 +9,7 @@ enable_testing()
 find_package(Drogon REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(qai_forge REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Source files
@@ -18,6 +19,11 @@ set(SERVER_SOURCES
     src/main.cpp
     src/controllers/ResponsesController.cpp
     src/controllers/ModelsController.cpp
+
+    # Chat Completions endpoint (OpenAI-compatible API)
+    src/ChatCompletionUtils.cpp
+    src/ChatCompletionStore.cpp
+    src/controllers/ChatCompletionsController.cpp
 
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
@@ -66,6 +72,7 @@ target_link_libraries(responses-server PRIVATE
     Drogon::Drogon
     nlohmann_json::nlohmann_json
     qai_forge::qai_forge
+    OpenSSL::Crypto
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
