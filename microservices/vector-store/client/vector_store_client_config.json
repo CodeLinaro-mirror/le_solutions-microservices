@@ -1,0 +1,10 @@
+{
+  "postgres_port": 5432,
+  "swagger_port": 8081,
+  "server_port": 9005,
+  "embedding_port": 9090,
+  "input_prompt": "<input_prompt>",
+  "input_file": "<path_to_input_file>",
+  "profiling_enabled": "true",
+  "store_id": "<input_store_id>"
+}
