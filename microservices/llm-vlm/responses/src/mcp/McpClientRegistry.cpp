@@ -247,7 +247,7 @@ bool McpClientRegistry::hasConnectedServers() const {
 
 size_t McpClientRegistry::serverCount() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    return clients_.size();
+    return configs_.size();
 }
 
 bool McpClientRegistry::hasServer(const std::string& server_label) const {
