@@ -62,7 +62,7 @@ public:
      * @param process_type  "llm" or "vlm" — used for logging and socket naming.
      */
     explicit InferenceWorkerManager(const std::string& process_type);
-    ~InferenceWorkerManager();
+    virtual ~InferenceWorkerManager();
 
     // ── Worker lifecycle ───────────────────────────────────────────────────────
 
@@ -75,9 +75,9 @@ public:
      * @param config_file       Absolute path to the processed genie_config.json
      * @param sampler_config    Absolute path to the sampler config
      */
-    void ensureWorkerRunning(const std::string& model_id,
-                              const std::string& config_file,
-                              const std::string& sampler_config);
+    virtual void ensureWorkerRunning(const std::string& model_id,
+                                      const std::string& config_file,
+                                      const std::string& sampler_config);
 
     /**
      * Execute an inference request and stream tokens back to Layer 2.

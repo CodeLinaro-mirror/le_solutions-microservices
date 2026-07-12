@@ -200,6 +200,7 @@ set(QAI_FORGE_SOURCES
 
     # Orchestration (Layer 2)
     src/orchestration/GenieOrchestrator.cpp
+    src/orchestration/LiteRTLMOrchestrator.cpp
 
     # Reasoning (Layer 2)
     src/reasoning/ReasoningRouter.cpp
@@ -228,6 +229,7 @@ set(QAI_FORGE_SOURCES
     src/worker/InferenceWorkerManager.cpp
     src/worker/VlmInferenceWorkerManager.cpp
     src/worker/PredictiveWorkerManager.cpp
+    src/worker/LiteRTLMWorkerManager.cpp
 )
 
 add_library(qai_forge SHARED ${QAI_FORGE_SOURCES})

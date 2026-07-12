@@ -251,6 +251,9 @@ std::string render_candidate_prompt(
 
     auto& config_mgr = ModelConfigManager::getInstance();
     json chat_template = config_mgr.getChatTemplate(model);
+    if (!chat_template.is_object()) {
+        chat_template = json::object();  // Guard: LiteRT-LM models have no metadata.json
+    }
     const auto& adapter = ModelAdapterFactory::getAdapter(model);
 
     std::string system_prefix =
