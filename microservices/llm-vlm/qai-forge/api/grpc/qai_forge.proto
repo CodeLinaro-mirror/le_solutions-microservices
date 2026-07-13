@@ -86,3 +86,41 @@ message ChatCompletionChunk {
     // Role — populated only on the first chunk
     string role            = 6;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InferService — Predictive AI (tensor) inference
+// Mirrors the OIP v2 HTTP `POST /v2/models/{model}/infer` KFServing v2-style
+// binary-extension protocol. Tensor payloads are always raw bytes (never
+// base64) — see qai_forge/dto/TensorDTOs.h.
+// ─────────────────────────────────────────────────────────────────────────────
+service InferService {
+    // Blocking predictive inference. Stateless — no session, no queuing,
+    // same semantics as qai_forge::QaiForge::infer().
+    rpc Infer(InferRequest) returns (InferResponse);
+}
+
+// A single named tensor — used for both inputs and outputs.
+message Tensor {
+    string          name     = 1;  // e.g. "input_0"
+    repeated int64  shape    = 2;  // e.g. [1, 224, 224, 3]
+    // KFServing v2 datatype string: "FP32","FP16","INT32","INT16","INT8",
+    // "UINT8","BOOL","BYTES" — matches tensorDataTypeToString()/FromString()
+    // exactly, so proto<->DTO conversion is a direct passthrough, no mapping table.
+    string          datatype = 3;
+    bytes           contents = 4;  // raw tensor bytes, never base64
+}
+
+message InferRequest {
+    string          model        = 1;
+    string          request_id   = 2;  // optional — server generates one if empty
+    repeated Tensor inputs       = 3;
+    repeated string output_names = 4;  // which outputs to return; empty = all
+}
+
+message InferResponse {
+    string          model        = 1;
+    string          request_id   = 2;
+    repeated Tensor outputs      = 3;
+    double          latency_ms   = 4;  // from InferenceStats.latency_ms
+    string          backend_name = 5;  // from InferenceStats.backend_name
+}

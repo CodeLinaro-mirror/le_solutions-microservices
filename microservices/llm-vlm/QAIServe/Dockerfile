@@ -376,6 +376,11 @@ RUN apt-get update && \
         libmd-dev \
         libyaml-dev \
         binutils \
+        protobuf-compiler \
+        libprotobuf-dev \
+        libgrpc++-dev \
+        protobuf-compiler-grpc \
+        libc-ares-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -538,6 +543,16 @@ RUN find ${DEPLOY_DIR}/usr/bin -type f \
 FROM --platform=linux/arm64 debian:bookworm-slim AS stager
 
 # Install runtime deps to make their .so files available for cherry-picking.
+# libgrpc++1.51/libgrpc29/libprotobuf32 pull in abseil + re2 + c-ares
+# transitively — apt resolves the exact versioned packages; we only
+# cherry-pick the .so files below, not the packages themselves.
+#
+# NOTE: bookworm's runtime gRPC C++ package is named libgrpc++1.51 (SONAME-
+# versioned), not "libgrpc++1" — that plain name doesn't exist on bookworm
+# and silently resolves to nothing being installed, which is what caused
+# qaiserve to fail at startup with "libgrpc++.so.1.51: cannot open shared
+# object file". Likewise there is no separate "libgpr" package on this gRPC
+# version; the gpr symbols live inside libgrpc29.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libyaml-0-2 \
@@ -563,6 +578,9 @@ RUN apt-get update && \
         libsasl2-2 \
         libunistring2 \
         libgnutls30 \
+        libgrpc++1.51 \
+        libgrpc29 \
+        libprotobuf32 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -589,13 +607,20 @@ COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 #   fastrpc deps:  libyaml-0-2, libbsd, libmd
 #   Drogon deps:   libjsoncpp, libssl, libcrypto, libz, libuuid
 #   C++ atomics:   libatomic
+#   gRPC/protobuf: libgrpc++, libgrpc, libprotobuf, and their transitive deps
+#                  (abseil, re2, c-ares, gpr, upb, address_sorting)
 # distroless/cc already provides: libc, libstdc++, libgcc_s, libm
 #
 # Uses find to locate .so files regardless of whether Debian placed them under
 # /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap-2.5" "liblber-2.5" libbrotlidec libbrotlicommon libzstd libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1; do \
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap-2.5" "liblber-2.5" libbrotlidec libbrotlicommon libzstd libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb; do \
       find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
-    done
+    done && \
+    find /usr/lib /lib -name "libabsl_*.so*" -exec cp -dp {} /export/usr/lib/ \;
+# Debian packages abseil as dozens of separately-named component libraries
+# (libabsl_base.so.*, libabsl_strings.so.*, libabsl_synchronization.so.*, ...)
+# rather than a single libabsl.so — the plain "${lib}.so*" glob above never
+# matches any of them, so it is cherry-picked separately right above.
 
 # Bake fastrpc DSP path config for all supported Qualcomm devices.
 RUN { \
@@ -657,8 +682,10 @@ ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 ENV GENAI_WORKER_IDLE_TIMEOUT=120
 ENV GENAI_WORKER_ACTIVE_TIMEOUT=600
 ENV QAISERVE_MAX_BODY_SIZE=16777216
+ENV GRPC_SERVER_PORT=50051
 
 EXPOSE 9002
+EXPOSE 50051
 
 WORKDIR /mnt/work/models
 

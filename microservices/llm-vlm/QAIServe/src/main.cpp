@@ -9,9 +9,14 @@
 #include "mcp/NativeToolRegistry.h"
 #include "tools/DateTimeTool.h"
 #include "tools/CalculatorTool.h"
+#include "grpc/ChatServiceImpl.h"
+#include "grpc/InferServiceImpl.h"
+#include <grpcpp/grpcpp.h>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <thread>
 
 int main() {
     // Step 1: Drop privileges before any threads or sockets are opened.
@@ -42,6 +47,19 @@ int main() {
     std::cout << "[main] Starting QAIServe unified inference server on port " << port
               << "  max_body=" << (max_body_size) << "B" << std::endl;
 
+    // Read gRPC listener port from environment variable (default 50051).
+    const char* grpc_port_env = std::getenv("GRPC_SERVER_PORT");
+    int grpc_port = grpc_port_env ? std::stoi(grpc_port_env) : 50051;
+
+    // gRPC server + ChatService live for the duration of main() — started
+    // inside registerBeginningAdvice (once Drogon's event loop is up) and
+    // torn down after drogon::app()....run() returns below. Declared here,
+    // not inside the advice lambda, so they outlive that one-shot callback.
+    ChatServiceImpl chat_service;
+    InferServiceImpl infer_service;
+    std::unique_ptr<grpc::Server> grpc_server;
+    std::thread grpc_thread;
+
     // Step 3: Configure and run the Drogon HTTP server
     // Log to stdout — standard practice for containerised services.
     drogon::app()
@@ -50,7 +68,7 @@ int main() {
         .setThreadNum(4)
         .setMaxConnectionNum(1000)
         .setClientMaxBodySize(max_body_size)
-        .registerBeginningAdvice([]() {
+        .registerBeginningAdvice([&]() {
             // ── Step 3a: Scan model bundles ───────────────────────────────────
             // ModelConfigManager is a lazy singleton — validateModel() always
             // returns false until scanModelBundles() is called at least once.
@@ -119,11 +137,33 @@ int main() {
                           << "to enable MCP tool support)." << std::endl;
             }
 
+            // ── Step 3d: Build and start the gRPC ChatService server ──────────
+            // Runs on its own background thread since grpc::Server::Wait() is
+            // a blocking call, same shape as drogon::app()....run() below —
+            // rather than intertwine the two event loops, each blocking call
+            // gets its own thread. Shares the same QaiForge singleton/worker
+            // pool as the HTTP/WS transport started above.
+            grpc::ServerBuilder builder;
+            std::string grpc_address = "0.0.0.0:" + std::to_string(grpc_port);
+            builder.AddListeningPort(grpc_address, grpc::InsecureServerCredentials());
+            builder.RegisterService(&chat_service);
+            builder.RegisterService(&infer_service);
+            grpc_server = builder.BuildAndStart();
+            grpc_thread = std::thread([&grpc_server]() { grpc_server->Wait(); });
+            std::cout << "[main] gRPC ChatService + InferService server listening on " << grpc_address << std::endl;
+
             std::cout << "[main] QAIServe server started." << std::endl;
         })
         .run();
 
-    // Cleanup: shut down inference engine and disconnect MCP servers on shutdown
+    // Cleanup: shut down the gRPC server first, then the inference engine,
+    // then disconnect MCP servers.
+    if (grpc_server) {
+        grpc_server->Shutdown();
+    }
+    if (grpc_thread.joinable()) {
+        grpc_thread.join();
+    }
     qai_forge::QaiForge::getInstance().shutdown();
     McpClientRegistry::getInstance().disconnectAll();
 
