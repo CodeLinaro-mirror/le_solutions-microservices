@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Build arguments for modular backend configuration
+# ─────────────────────────────────────────────────────────────────────────────
+ARG BUILD_LITERT_LM=true
+ARG BUILD_LLAMACPP=false
+
+# ─────────────────────────────────────────────────────────────────────────────
 # responses/Dockerfile
 #
 # Builds the Responses API server container.
@@ -25,395 +31,375 @@
 # libpq dependency that the apt-packaged libdrogon-dev pulls in.
 #
 # Four-stage build for minimal image size:
-#   Stage 0  (litert_builder):     Build LiteRT v2.1.5 from source (Bazel, AArch64).
-#   Stage 0b (litert_lm_builder):  Build LiteRT-LM v0.13.0 on top of LiteRT.
-#   Stage 1  (builder):            Compile everything; strip our own ELF artifacts.
-#   Stage 2  (stager):             Cherry-pick only the required system .so files from
+#   Stage 0  (litert_lm_builder):  Build LiteRT-LM v0.14.0 (conditional via shell if)
+#   Stage 1  (llamacpp_builder):   Build llama.cpp with Hexagon NPU (conditional via shell if)
+#   Stage 2  (builder):            Compile everything; strip our own ELF artifacts.
+#   Stage 3  (stager):             Cherry-pick only the required system .so files from
 #                                  a full Debian environment; assemble /export tree.
-#   Stage 3  (runtime):            gcr.io/distroless/cc-debian12 — COPY /export in.
+#   Stage 4  (runtime):            gcr.io/distroless/cc-debian12 — COPY /export in.
 #                                  No shell, no package manager, no apt cache.
 #
 #   Privilege drop: handled natively by the C++ server binary at startup.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Base Image Strategy (TEMPORARY):
+# ─────────────────────────────────────────────────────────────────────────────
+# Current state:
+#   - litert_lm_builder:  ubuntu:22.04 (temporary, due to image availability)
+#   - llamacpp_builder:   ubuntu:22.04 (temporary, due to image availability)
+#   - builder:            ubuntu:22.04 (temporary, due to image availability)
+#   - stager:             ubuntu:22.04 (temporary, due to image availability)
+#   - runtime:            gcr.io/distroless/cc-debian12
+#
+# Future plan:
+#   Migrate all builder and stager stages to debian:bookworm-slim for consistency
+#   once the image is available on the build host. This will provide:
+#   - Consistent glibc version across all build stages (2.36)
+#   - Simplified dependency management
+#   - Reduced image size (bookworm-slim is smaller than ubuntu:22.04)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 0: litert_lm_builder
+# Stage 0: LiteRT-LM Builder (conditional via shell if)
 #
-# Builds LiteRT-LM v0.14.0 natively on AArch64 using Bazelisk.
-# LiteRT-LM will build LiteRT as a dependency (no separate LiteRT stage needed).
-# Outputs staged artifacts to /mnt/work/deploy/usr:
-#   /mnt/work/deploy/usr/lib/     — liblitert_lm_c_api.so, liblitert_runtime_c_api.so,
-#                                    dispatch .so, plugin .so
-#   /mnt/work/deploy/usr/bin/     — litert-lm, litert-lm-advanced
-#   /mnt/work/deploy/usr/include/ — litert_lm/c/ and litert/ and tflite/ C API headers
+# Builds LiteRT-LM v0.14.0 natively on AArch64 using Bazelisk when BUILD_LITERT_LM=true.
+# When BUILD_LITERT_LM=false, only creates minimal directory structure (zero build cost).
 #
-# Runs natively on ARM64 — no cross-compilation required.
-# Artifacts are copied into the ARM64 builder stage below.
+# This stage uses shell conditionals (if [ "$BUILD_LITERT_LM" = "true" ]; then ...; fi)
+# instead of dynamic FROM statements, making it compatible with classic Docker builder.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 ubuntu:22.04 AS litert_lm_builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        clang \
-        clang-15 \
-        lld \
-        lld-15 \
-        llvm \
-        g++ \
-        wget \
-        git \
-        git-lfs \
-        unzip \
-        zip \
-        python3 \
-        python3-dev \
-        python3-numpy \
-        python-is-python3 \
-        ca-certificates \
-        patch \
-        pkg-config \
-        file \
-        default-jdk-headless \
-        binutils \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Re-declare ARG after FROM (required for ARG to be available in this stage)
+ARG BUILD_LITERT_LM=false
 
-# Use ARM64 Bazelisk for native AArch64 build
-ENV BAZELISK_VERSION=v1.28.1
-RUN wget -t 3 -T 120 --no-verbose \
-        -O /usr/local/bin/bazel \
-        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" \
-    && chmod +x /usr/local/bin/bazel
+# Always create minimal directory structure (required for COPY --from= to succeed)
+RUN mkdir -p /mnt/work/deploy/usr/lib /mnt/work/deploy/usr/include /mnt/work/deploy/usr/bin
 
-ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
-ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
-# Clone LiteRT-LM at tag v0.14.0 for a stable, reproducible build.
-RUN git lfs install \
-    && for i in {1..5}; do \
-        git clone --branch v0.14.0 --depth 1 \
-            https://github.com/google-ai-edge/LiteRT-LM.git "${LITERT_LM_SRC_DIR}" && break || { \
-            echo "Clone failed, retrying in 15 seconds..."; \
-            rm -rf "${LITERT_LM_SRC_DIR}"; \
-            sleep 15; \
-        }; \
-    done \
-    && cd "${LITERT_LM_SRC_DIR}" \
-    && git lfs pull
+# Conditional build: Only execute expensive operations when BUILD_LITERT_LM=true
+RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
+        echo "=== Building LiteRT-LM (BUILD_LITERT_LM=true) ===" && \
+        apt-get update && apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            clang-15 \
+            lld \
+            lld-15 \
+            llvm \
+            g++ \
+            wget \
+            git \
+            git-lfs \
+            unzip \
+            zip \
+            python3 \
+            python3-dev \
+            python3-numpy \
+            python-is-python3 \
+            ca-certificates \
+            patch \
+            pkg-config \
+            file \
+            default-jdk-headless \
+            binutils \
+            patchelf \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "=== Skipping LiteRT-LM build (BUILD_LITERT_LM=false) ==="; \
+    fi
 
-# ── Download QAIRT 2.45.40.260406 for LiteRT QNN dispatch + compiler plugin ──
-# LiteRT (built as a dependency of LiteRT-LM) defaults to QAIRT 2.44.0.260225.
-# We create a compatibility symlink: qairt/2.44.0.260225 → qairt/2.45.40.260406
-# so that both LiteRT and the main builder use the same QAIRT version.
-ENV QAIRT_VERSION=2.45.40.260406
-ENV QAIRT_DIR=/tmp/qairt
-RUN mkdir -p ${QAIRT_DIR} \
-    && wget -t 3 -T 120 --no-verbose \
-        -P ${QAIRT_DIR} \
-        "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip" \
-    && cd ${QAIRT_DIR} \
-    && unzip v${QAIRT_VERSION}.zip \
-    && rm -f v${QAIRT_VERSION}.zip \
-    && ln -sf ${QAIRT_DIR}/qairt/${QAIRT_VERSION} \
-              ${QAIRT_DIR}/qairt/2.44.0.260225 \
-    && echo "QAIRT ${QAIRT_VERSION} ready; symlink 2.44.0.260225 → ${QAIRT_VERSION}"
+# Download Bazelisk (only if BUILD_LITERT_LM=true)
+RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
+        export BAZELISK_VERSION=v1.28.1 && \
+        wget -t 3 -T 120 --no-verbose \
+            -O /usr/local/bin/bazel \
+            "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" \
+        && chmod +x /usr/local/bin/bazel; \
+    fi
 
-# LITERT_QAIRT_SDK must end with "/" for Bazel's configurable_repo path concatenation.
-ENV LITERT_QAIRT_SDK=${QAIRT_DIR}/
+# Clone LiteRT-LM and download QAIRT (only if BUILD_LITERT_LM=true)
+RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
+        export LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm && \
+        export QAIRT_VERSION=2.45.40.260406 && \
+        export QAIRT_DIR=/tmp/qairt && \
+        git lfs install \
+        && for i in {1..5}; do \
+            git clone --branch v0.14.0 --depth 1 \
+                https://github.com/google-ai-edge/LiteRT-LM.git "${LITERT_LM_SRC_DIR}" && break || { \
+                echo "Clone failed, retrying in 15 seconds..."; \
+                rm -rf "${LITERT_LM_SRC_DIR}"; \
+                sleep 15; \
+            }; \
+        done \
+        && cd "${LITERT_LM_SRC_DIR}" \
+        && git lfs pull \
+        && mkdir -p ${QAIRT_DIR} \
+        && wget -t 3 -T 120 --no-verbose \
+            -P ${QAIRT_DIR} \
+            "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip" \
+        && cd ${QAIRT_DIR} \
+        && unzip v${QAIRT_VERSION}.zip \
+        && rm -f v${QAIRT_VERSION}.zip \
+        && ln -sf ${QAIRT_DIR}/qairt/${QAIRT_VERSION} \
+                  ${QAIRT_DIR}/qairt/2.44.0.260225 \
+        && echo "QAIRT ${QAIRT_VERSION} ready; symlink 2.44.0.260225 → ${QAIRT_VERSION}"; \
+    fi
 
-WORKDIR ${LITERT_LM_SRC_DIR}
-
-# ── Add cc_shared_library target for the LiteRT-LM C API ──────────────────────
-# cc_shared_library statically links all transitive deps and exports the
-# symbols from targets listed in exports_filter, producing a self-contained
-# .so that CMake consumers can link against without needing companion .so files.
-# The deps = [":engine"] should transitively include the llguidance rlib through
-# the normal dependency chain. Without --define=resolve_symbols_in_exec=false,
-# the linker should embed the llg_* symbols into the .so.
-ARG CACHE_BUSTER=2
-RUN printf '\n# Shared library target for the LiteRT-LM C API.\n# Produces liblitert_lm_c_api.so that can be loaded at runtime.\n# Used by litert-lm-inference-worker in the responses service.\ncc_shared_library(\n    name = "litert_lm_c_api",\n    exports_filter = ["//c:engine"],\n    deps = [":engine"],\n    user_link_flags = ["-Wl,--export-dynamic"],\n    visibility = ["//visibility:public"],\n)\n' >> c/BUILD \
-    && echo "Added cc_shared_library target to c/BUILD" \
-    && echo "Skipping Bazel cc_shared_library for tokenizers_cpp (will build with Cargo)"
-
-# Build LiteRT-LM using Bazel. LiteRT-LM will build LiteRT as a dependency.
-# LITERT_QAIRT_SDK points to QAIRT 2.45.40.260406 with the 2.44.0.260225 symlink.
-# Use clang-15 (not clang-14) for std::source_location support in C++20.
-# The --define flags:
-#   litert_enable_qnn=true: Enable QNN backend support
-#   litert_link_capi_so=true: Link the constraint provider into the C API .so
-# NOTE: --define=resolve_symbols_in_exec=false is REMOVED. This flag was causing
-# the llg_* symbols to be left unresolved (UND) in the .so, expecting the loading
-# executable to provide them. Since our litert-lm-inference-worker is built by
-# CMake (not Bazel), it never links the Rust rlib. Without this flag, the
-# cc_shared_library rule should transitively link the llguidance rlib and embed
-# the symbols into the .so.
-RUN bazel build \
-    --config=linux \
-    --config=linux_arm64 \
-    --compilation_mode=opt \
-    --action_env=CC=clang-15 \
-    --action_env=CXX=clang++-15 \
-    --cxxopt=-std=c++20 \
-    --host_cxxopt=-std=c++20 \
-    --define=litert_enable_qnn=true \
-    --define=litert_link_capi_so=true \
-    --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --linkopt=-fuse-ld=lld \
-    --http_timeout_scaling=10 \
-    --experimental_repository_downloader_retries=10 \
-    //c:litert_lm_c_api
-
-# Install patchelf to fix Bazel-embedded RUNPATH after build
-RUN apt-get update && apt-get install -y --no-install-recommends patchelf \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Stage LiteRT-LM shared library, C API headers, and extract LiteRT artifacts.
-RUN mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
-             "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c" \
-             "${LITERT_LM_DEPLOY_DIR}/include/litert" \
-             "${LITERT_LM_DEPLOY_DIR}/include/tflite" \
-    && echo "Searching for litert_lm_c_api .so in bazel outputs:" \
-    && find -L bazel-bin bazel-out \( -type f -o -type l \) \
-        \( -name "liblitert_lm_c_api.so" -o -name "liblitert_lm_c_api.so.*" \
-           -o -name "litert_lm_c_api.so" -o -name "litert_lm_c_api.so.*" \
-           -o -name "libGemmaModelConstraintProvider.so" \
-           -o -name "libllguidance*.so" -o -name "libllguidance*.so.*" \
-           -o -name "liblitert_lm_llguidance*.so" -o -name "liblitert_lm_llguidance*.so.*" \) \
-        2>/dev/null | tee /tmp/litert_lm_so_files.txt \
-    && echo "Copying LiteRT-LM .so files:" \
-    && while IFS= read -r f; do \
-            base=$(basename "$f"); \
-            if echo "$base" | grep -q "^lib"; then \
-                cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/" || true; \
-            else \
-                cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/lib${base}" || true; \
-            fi; \
-       done < /tmp/litert_lm_so_files.txt \
-    && echo "Resolving NEEDED dependencies of liblitert_lm_c_api.so:" \
-    && if [ -f "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" ]; then \
-           readelf -d "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" \
-               | grep NEEDED | sed 's/.*\[//;s/\]//' \
-               | while IFS= read -r needed_lib; do \
-                   echo "  NEEDED: $needed_lib"; \
-                   if [ ! -f "${LITERT_LM_DEPLOY_DIR}/lib/$needed_lib" ]; then \
-                       found=$(find -L bazel-bin bazel-out -name "$needed_lib" 2>/dev/null | head -1); \
-                       if [ -n "$found" ]; then \
-                           echo "  Staging from Bazel: $found"; \
-                           cp -avL "$found" "${LITERT_LM_DEPLOY_DIR}/lib/"; \
-                       else \
-                           echo "  Not in Bazel outputs (system lib): $needed_lib"; \
+# Add cc_shared_library target and build LiteRT-LM (only if BUILD_LITERT_LM=true)
+RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
+        export LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm && \
+        export LITERT_QAIRT_SDK=/tmp/qairt/ && \
+        export LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr && \
+        cd ${LITERT_LM_SRC_DIR} \
+        && printf '\n# Shared library target for the LiteRT-LM C API.\ncc_shared_library(\n    name = "litert_lm_c_api",\n    exports_filter = ["//c:engine"],\n    deps = [":engine"],\n    user_link_flags = ["-Wl,--export-dynamic"],\n    visibility = ["//visibility:public"],\n)\n' >> c/BUILD \
+        && bazel build \
+            --config=linux \
+            --config=linux_arm64 \
+            --compilation_mode=opt \
+            --action_env=CC=clang-15 \
+            --action_env=CXX=clang++-15 \
+            --cxxopt=-std=c++20 \
+            --host_cxxopt=-std=c++20 \
+            --define=litert_enable_qnn=true \
+            --define=litert_link_capi_so=true \
+            --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+            --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+            --linkopt=-fuse-ld=lld \
+            --http_timeout_scaling=10 \
+            --experimental_repository_downloader_retries=10 \
+            //c:litert_lm_c_api \
+        && mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
+                     "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c" \
+                     "${LITERT_LM_DEPLOY_DIR}/include/litert" \
+                     "${LITERT_LM_DEPLOY_DIR}/include/tflite" \
+        && find -L bazel-bin bazel-out \( -type f -o -type l \) \
+            \( -name "liblitert_lm_c_api.so" -o -name "liblitert_lm_c_api.so.*" \
+               -o -name "litert_lm_c_api.so" -o -name "litert_lm_c_api.so.*" \
+               -o -name "libGemmaModelConstraintProvider.so" \
+               -o -name "libllguidance*.so" -o -name "libllguidance*.so.*" \
+               -o -name "liblitert_lm_llguidance*.so" -o -name "liblitert_lm_llguidance*.so.*" \) \
+            2>/dev/null | while IFS= read -r f; do \
+                base=$(basename "$f"); \
+                if echo "$base" | grep -q "^lib"; then \
+                    cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/" || true; \
+                else \
+                    cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/lib${base}" || true; \
+                fi; \
+            done \
+        && if [ -f "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" ]; then \
+               readelf -d "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" \
+                   | grep NEEDED | sed 's/.*\[//;s/\]//' \
+                   | while IFS= read -r needed_lib; do \
+                       if [ ! -f "${LITERT_LM_DEPLOY_DIR}/lib/$needed_lib" ]; then \
+                           found=$(find -L bazel-bin bazel-out -name "$needed_lib" 2>/dev/null | head -1); \
+                           if [ -n "$found" ]; then \
+                               cp -avL "$found" "${LITERT_LM_DEPLOY_DIR}/lib/"; \
+                           fi; \
                        fi; \
-                   else \
-                       echo "  Already staged: $needed_lib"; \
-                   fi; \
-               done; \
-       fi \
-    && cp c/engine.h "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c/" \
-    && echo "Extracting LiteRT artifacts from Bazel external directory:" \
-    && LITERT_EXTERNAL=$(find bazel-* -type d -path "*/external/litert" 2>/dev/null | head -1) \
-    && if [ -n "$LITERT_EXTERNAL" ] && [ -d "$LITERT_EXTERNAL" ]; then \
-           echo "Found LiteRT external at: $LITERT_EXTERNAL"; \
-           find "$LITERT_EXTERNAL" -type f \( -name "*.so" -o -name "*.so.*" \) \
-               -exec cp -avL {} "${LITERT_LM_DEPLOY_DIR}/lib/" \; 2>/dev/null || true; \
-           if [ -d "$LITERT_EXTERNAL/litert" ]; then \
-               cp -a "$LITERT_EXTERNAL/litert" "${LITERT_LM_DEPLOY_DIR}/include/" || true; \
-           fi; \
-           if [ -d "$LITERT_EXTERNAL/tflite" ]; then \
-               cp -a "$LITERT_EXTERNAL/tflite" "${LITERT_LM_DEPLOY_DIR}/include/" || true; \
-           fi; \
-       else \
-           echo "Warning: LiteRT external directory not found in Bazel cache"; \
-       fi \
-    && echo "Staged LiteRT-LM library:" \
-    && ls -lah "${LITERT_LM_DEPLOY_DIR}/lib/" \
-    && test -f "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" \
-    && echo "✓ liblitert_lm_c_api.so staged successfully"
-
-
-# ── Build Rust cdylib wrappers for FFI (Cargo) ───────────────────────────────
-# The cc_shared_library rule does not compile the Rust FFI symbols because it
-# does not build the rlib dependencies as cdylibs. We must build them separately
-# using Cargo, then stage them alongside liblitert_lm_c_api.so.
-# We build against the Bazel-cached source to ensure all LiteRT-LM patches are applied.
-RUN wget -q -O /tmp/rustup.sh https://sh.rustup.rs \
-    && sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal \
-    && . /root/.cargo/env \
-    \
-    && echo "--- Building libllguidance.so ---" \
-    && LLGUIDANCE_SRC=$(find /root/.cache/bazel -path "*/crate_index__llguidance-1.3.0" -type d 2>/dev/null | head -1) \
-    && if [ -z "$LLGUIDANCE_SRC" ]; then \
-           echo "ERROR: llguidance source not found in Bazel cache"; \
-           exit 1; \
-       fi \
-    && echo "Found llguidance source at: $LLGUIDANCE_SRC" \
-    && mkdir -p /tmp/llg-build \
-    && cd /tmp/llg-build \
-    && echo "Creating wrapper Cargo project to build llguidance..." \
-    && printf '[package]\nname = "llguidance-cdylib"\nversion = "1.3.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\nllguidance = { path = "%s", default-features = false, features = ["ahash", "lark", "rayon"] }\n' "$LLGUIDANCE_SRC" > Cargo.toml \
-    && mkdir -p src \
-    && echo 'pub use llguidance::*;' > src/lib.rs \
-    && echo "Building libllguidance_cdylib.so..." \
-    && cargo build --release \
-    && CAPI_SO=$(find target/release -name "libllguidance_cdylib.so" -type f 2>/dev/null | head -1) \
-    && if [ -z "$CAPI_SO" ]; then \
-           echo "ERROR: cargo build failed to produce libllguidance_cdylib.so"; \
-           exit 1; \
-       fi \
-    && echo "Staging libllguidance.so..." \
-    && cp -avL "$CAPI_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libllguidance.so" \
-    && echo "✓ libllguidance.so built and staged successfully" \
-    && rm -rf /tmp/llg-build \
-    \
-    && echo "--- Building libhuggingface_tokenizer.so from tokenizers_cpp ---" \
-    && TOKENIZERS_CPP_SRC=$(find /root/.cache/bazel -path "*/external/tokenizers_cpp" -type d 2>/dev/null | head -1) \
-    && if [ -z "$TOKENIZERS_CPP_SRC" ]; then \
-           echo "ERROR: tokenizers_cpp external not found in Bazel cache"; \
-           exit 1; \
-       fi \
-    && echo "Found tokenizers_cpp at: $TOKENIZERS_CPP_SRC" \
-    && if [ ! -d "$TOKENIZERS_CPP_SRC/rust" ] || [ ! -f "$TOKENIZERS_CPP_SRC/rust/Cargo.toml" ]; then \
-           echo "ERROR: tokenizers_cpp/rust directory or Cargo.toml not found"; \
-           exit 1; \
-       fi \
-    && TOKENIZERS_EXACT_SRC=$(find /root/.cache/bazel -path "*/crate_index__tokenizers-0.21.0" -type d 2>/dev/null | head -1) \
-    && if [ -z "$TOKENIZERS_EXACT_SRC" ]; then \
-           echo "ERROR: tokenizers v0.21.0 source not found in Bazel cache"; \
-           exit 1; \
-       fi \
-    && echo "Found tokenizers v0.21.0 at: $TOKENIZERS_EXACT_SRC" \
-    && cd "$TOKENIZERS_CPP_SRC/rust" \
-    && echo "Patching Cargo.toml to change crate-type to cdylib and pin tokenizers to v0.21.0..." \
-    && python3 -c "import re; content=open('Cargo.toml').read(); patched=re.sub(r'crate-type\s*=\s*\[.*?\]', 'crate-type = [\"cdylib\"]', content); patched=patched if patched!=content else (content+'\n[lib]\ncrate-type = [\"cdylib\"]\n' if '[lib]' not in content else content); open('Cargo.toml','w').write(patched)" \
-    && printf '\n[patch.crates-io]\ntokenizers = { path = "%s" }\n' "$TOKENIZERS_EXACT_SRC" >> Cargo.toml \
-    && echo "Patched Cargo.toml [lib] section:" \
-    && grep -A 2 '\[lib\]' Cargo.toml || echo "WARNING: No [lib] section found" \
-    && echo "Patching src/lib.rs to fix implicit autoref errors..." \
-    && sed -i 's/\*out_len = (\*handle)\.decode_str\.len();/*out_len = (\&(*handle).decode_str).len();/' src/lib.rs \
-    && sed -i 's/\*out_len = (\*handle)\.id_to_token_result\.len();/*out_len = (\&(*handle).id_to_token_result).len();/' src/lib.rs \
-    && echo "Building tokenizers_cpp Rust FFI wrapper as cdylib..." \
-    && cargo build --release \
-    && echo "Cargo build artifacts produced:" \
-    && find target/release -maxdepth 1 \( -name "*.so" -o -name "*.rlib" -o -name "libtokenizers*" \) -type f 2>/dev/null | head -10 \
-    && TOK_SO=$(find target/release -name "libtokenizers_c.so" -type f 2>/dev/null | head -1) \
-    && if [ -z "$TOK_SO" ]; then \
-           echo "ERROR: cargo build failed to produce libtokenizers_c.so"; \
-           exit 1; \
-       fi \
-    && echo "Staging libtokenizers_c.so..." \
-    && cp -avL "$TOK_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libtokenizers_c.so" \
-    && echo "Verifying tokenizers_* symbols in libtokenizers_c.so:" \
-    && if ! nm -D "${LITERT_LM_DEPLOY_DIR}/lib/libtokenizers_c.so" | grep -q " T tokenizers_"; then \
-           echo "ERROR: No tokenizers_* symbols found in libtokenizers_c.so"; \
-           echo "Symbol table:"; \
-           nm -D "${LITERT_LM_DEPLOY_DIR}/lib/libtokenizers_c.so" | head -20; \
-           exit 1; \
-       fi \
-    && echo "Found tokenizers_* symbols:" \
-    && nm -D "${LITERT_LM_DEPLOY_DIR}/lib/libtokenizers_c.so" | grep " T tokenizers_" | head -5 \
-    && echo "✓ libtokenizers_c.so built and staged successfully"
-
-# ── Patch Bazel RUNPATH out of ALL staged .so files ──────────────────────────
-# Bazel embeds sandbox-relative RUNPATH entries (_solib_aarch64/..., .runfiles/...)
-# that don't exist at runtime on the device. Replace with $ORIGIN so the dynamic
-# linker finds companion libraries (e.g., LLGuidance) in the same directory (/usr/lib/).
-RUN for so in "${LITERT_LM_DEPLOY_DIR}/lib/"*.so; do \
-        [ -f "$so" ] && patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true; \
-    done \
-    && echo "Patched RUNPATH for all staged .so files:" \
-    && readelf -d "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" \
-        | grep -E 'NEEDED|RUNPATH|RPATH'
-
-
-# ── Verify library dependencies at build time ────────────────────────────────
-# Confirms all NEEDED libraries are present. Note that liblitert_lm_c_api.so
-# will have UND llg_* symbols by design. At runtime, the dynamic linker will
-# resolve these from the executable or dynamically loaded libraries.
-RUN echo "Verifying liblitert_lm_c_api.so NEEDED dependencies:" \
-    && export LD_LIBRARY_PATH="${LITERT_LM_DEPLOY_DIR}/lib:$LD_LIBRARY_PATH" \
-    && ldd "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" | tee /tmp/ldd_litert_lm.txt \
-    && if grep -q "not found" /tmp/ldd_litert_lm.txt; then \
-           echo "ERROR: Unresolved library dependencies:"; \
-           grep "not found" /tmp/ldd_litert_lm.txt; \
-           exit 1; \
-       fi \
-    && echo "✓ All liblitert_lm_c_api.so NEEDED dependencies are present" \
-    && echo "Scanning all staged libraries for unresolved Rust-like symbols..." \
-    && UNRESOLVED_FOUND=false \
-    && for so in "${LITERT_LM_DEPLOY_DIR}/lib/"*.so*; do \
-           [ -f "$so" ] || continue; \
-           # Look for UND symbols that match known Rust FFI prefixes
-           for sym in $(nm -D "$so" 2>/dev/null | awk '$1 == "U" {print $2}' | grep -E '^(llg|toktrie|tokenizers|cxxbridge1)_'); do \
-               # Check if any OTHER staged library provides this symbol
-               resolved=false; \
-               for provider in "${LITERT_LM_DEPLOY_DIR}/lib/"*.so*; do \
-                   if nm -D "$provider" 2>/dev/null | grep -q " T $sym"; then \
-                       resolved=true; \
-                       break; \
-                   fi; \
-               done; \
-               if [ "$resolved" = "false" ]; then \
-                   echo "  WARNING: Unresolved symbol '$sym' in $(basename "$so")"; \
-                   UNRESOLVED_FOUND=true; \
+                   done; \
+           fi \
+        && cp c/engine.h "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c/" \
+        && LITERT_EXTERNAL=$(find bazel-* -type d -path "*/external/litert" 2>/dev/null | head -1) \
+        && if [ -n "$LITERT_EXTERNAL" ] && [ -d "$LITERT_EXTERNAL" ]; then \
+               find "$LITERT_EXTERNAL" -type f \( -name "*.so" -o -name "*.so.*" \) \
+                   -exec cp -avL {} "${LITERT_LM_DEPLOY_DIR}/lib/" \; 2>/dev/null || true; \
+               if [ -d "$LITERT_EXTERNAL/litert" ]; then \
+                   cp -a "$LITERT_EXTERNAL/litert" "${LITERT_LM_DEPLOY_DIR}/include/" || true; \
                fi; \
-           done; \
-       done \
-    && if [ "$UNRESOLVED_FOUND" = "true" ]; then \
-           echo "⚠️ WARNING: Found unresolved Rust FFI symbols. These may cause runtime errors."; \
-           echo "If you encounter runtime 'undefined symbol' errors, you may need to build"; \
-           echo "and stage a cdylib wrapper for the corresponding Rust crate."; \
-       else \
-           echo "✓ No unresolved Rust FFI symbols found."; \
-       fi
-
-# ── Detailed diagnostic for libGemmaModelConstraintProvider.so ───────────────
-# This library is the constraint provider that uses llguidance. Check whether
-# llg_new_tokenizer and other llg_* symbols are embedded (T) or external (U).
-RUN echo "=== Detailed diagnostic for libGemmaModelConstraintProvider.so ===" \
-    && if [ -f "${LITERT_LM_DEPLOY_DIR}/lib/libGemmaModelConstraintProvider.so" ]; then \
-           echo "Library dependencies (ldd):"; \
-           export LD_LIBRARY_PATH="${LITERT_LM_DEPLOY_DIR}/lib:$LD_LIBRARY_PATH"; \
-           ldd "${LITERT_LM_DEPLOY_DIR}/lib/libGemmaModelConstraintProvider.so" || true; \
-           echo ""; \
-           echo "llg_* symbols (T=defined, U=undefined):"; \
-           nm -D "${LITERT_LM_DEPLOY_DIR}/lib/libGemmaModelConstraintProvider.so" \
-               | grep " llg_" | head -20 || echo "  (no llg_* symbols found)"; \
-           echo ""; \
-           echo "Checking for unresolved llg_* symbols:"; \
-           UNRESOLVED_LLG=false; \
-           for sym in $(nm -D "${LITERT_LM_DEPLOY_DIR}/lib/libGemmaModelConstraintProvider.so" 2>/dev/null \
-                        | awk '$1 == "U" && $2 ~ /^llg_/ {print $2}'); do \
-               resolved=false; \
-               for provider in "${LITERT_LM_DEPLOY_DIR}/lib/"*.so*; do \
-                   if nm -D "$provider" 2>/dev/null | grep -q " T $sym"; then \
-                       echo "  ✓ $sym resolved by $(basename "$provider")"; \
-                       resolved=true; \
-                       break; \
-                   fi; \
-               done; \
-               if [ "$resolved" = "false" ]; then \
-                   echo "  ✗ ERROR: $sym is UND and not provided by any staged library"; \
-                   UNRESOLVED_LLG=true; \
+               if [ -d "$LITERT_EXTERNAL/tflite" ]; then \
+                   cp -a "$LITERT_EXTERNAL/tflite" "${LITERT_LM_DEPLOY_DIR}/include/" || true; \
                fi; \
-           done; \
-           if [ "$UNRESOLVED_LLG" = "true" ]; then \
-               echo "ERROR: libGemmaModelConstraintProvider.so has unresolved llg_* symbols"; \
-               exit 1; \
-           else \
-               echo "✓ All llg_* symbols in libGemmaModelConstraintProvider.so are resolved"; \
            fi; \
-       else \
-           echo "WARNING: libGemmaModelConstraintProvider.so not found in staged libraries"; \
-       fi
+    fi
+
+# Build Rust cdylib wrappers (only if BUILD_LITERT_LM=true)
+RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
+        export LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr && \
+        wget -q -O /tmp/rustup.sh https://raw.githubusercontent.com/rust-lang/rustup/main/rustup-init.sh \
+        && sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal \
+        && . /root/.cargo/env \
+        && LLGUIDANCE_SRC=$(find /root/.cache/bazel -path "*/crate_index__llguidance-1.3.0" -type d 2>/dev/null | head -1) \
+        && if [ -n "$LLGUIDANCE_SRC" ]; then \
+               mkdir -p /tmp/llg-build && cd /tmp/llg-build \
+               && printf '[package]\nname = "llguidance-cdylib"\nversion = "1.3.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\nllguidance = { path = "%s", default-features = false, features = ["ahash", "lark", "rayon"] }\n' "$LLGUIDANCE_SRC" > Cargo.toml \
+               && mkdir -p src && echo 'pub use llguidance::*;' > src/lib.rs \
+               && cargo build --release \
+               && CAPI_SO=$(find target/release -name "libllguidance_cdylib.so" -type f 2>/dev/null | head -1) \
+               && if [ -n "$CAPI_SO" ]; then \
+                      cp -avL "$CAPI_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libllguidance.so"; \
+                  fi \
+               && rm -rf /tmp/llg-build; \
+           fi \
+        && TOKENIZERS_CPP_SRC=$(find /root/.cache/bazel -path "*/external/tokenizers_cpp" -type d 2>/dev/null | head -1) \
+        && TOKENIZERS_EXACT_SRC=$(find /root/.cache/bazel -path "*/crate_index__tokenizers-0.21.0" -type d 2>/dev/null | head -1) \
+        && if [ -n "$TOKENIZERS_CPP_SRC" ] && [ -n "$TOKENIZERS_EXACT_SRC" ] && [ -d "$TOKENIZERS_CPP_SRC/rust" ]; then \
+               cd "$TOKENIZERS_CPP_SRC/rust" \
+               && python3 -c "import re; content=open('Cargo.toml').read(); patched=re.sub(r'crate-type\s*=\s*\[.*?\]', 'crate-type = [\"cdylib\"]', content); patched=patched if patched!=content else (content+'\n[lib]\ncrate-type = [\"cdylib\"]\n' if '[lib]' not in content else content); open('Cargo.toml','w').write(patched)" \
+               && printf '\n[patch.crates-io]\ntokenizers = { path = "%s" }\n' "$TOKENIZERS_EXACT_SRC" >> Cargo.toml \
+               && sed -i 's/\*out_len = (\*handle)\.decode_str\.len();/*out_len = (\&(*handle).decode_str).len();/' src/lib.rs \
+               && sed -i 's/\*out_len = (\*handle)\.id_to_token_result\.len();/*out_len = (\&(*handle).id_to_token_result).len();/' src/lib.rs \
+               && cargo build --release \
+               && TOK_SO=$(find target/release -name "libtokenizers_c.so" -type f 2>/dev/null | head -1) \
+               && if [ -n "$TOK_SO" ]; then \
+                      cp -avL "$TOK_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libtokenizers_c.so"; \
+                  fi; \
+           fi \
+        && for so in "${LITERT_LM_DEPLOY_DIR}/lib/"*.so; do \
+               [ -f "$so" ] && patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true; \
+           done; \
+    fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1: Builder
+# Stage 1: llama.cpp Builder (conditional via shell if)
+#
+# Builds llama.cpp with Hexagon NPU backend when BUILD_LLAMACPP=true.
+# When BUILD_LLAMACPP=false, only creates minimal directory structure (zero build cost).
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:bookworm-slim AS builder
+FROM --platform=linux/arm64 ubuntu:22.04 AS llamacpp_builder
 
-# Install build dependencies:
-#   - Drogon hard deps (no DB client libs)
-#   - fastrpc build deps: autoconf/automake/libtool/libbsd-dev/libmd-dev/libyaml-dev
-#   - binutils for strip
+# Re-declare ARG after FROM
+ARG BUILD_LLAMACPP=false
+
+# Always create minimal directory structure
+RUN mkdir -p /install/bin /install/lib /install/lib/rfsa/adsp
+
+# Conditional build: Only execute expensive operations when BUILD_LLAMACPP=true
+RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
+        echo "=== Building llama.cpp (BUILD_LLAMACPP=true) ===" && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            git \
+            wget \
+            unzip \
+            ca-certificates \
+            autoconf \
+            automake \
+            libtool \
+            m4 \
+            libbsd-dev \
+            libmd-dev \
+            libyaml-dev \
+            binutils \
+            python3 \
+            python3-pip \
+            python-is-python3 \
+            qemu-user-static \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/* \
+        && pip3 install cmake --upgrade; \
+    else \
+        echo "=== Skipping llama.cpp build (BUILD_LLAMACPP=false) ==="; \
+    fi
+
+# Build FastRPC, download Hexagon SDK, and build llama.cpp (only if BUILD_LLAMACPP=true)
+RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
+        git clone --depth 1 https://github.com/quic/fastrpc.git /tmp/fastrpc \
+        && cd /tmp/fastrpc \
+        && autoreconf -is \
+        && CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
+            ./configure --prefix=/usr --libdir=/usr/lib \
+        && make -j$(nproc) \
+        && make install \
+        && find /tmp/fastrpc -name 'remote.h' -exec cp {} /usr/include/ \; \
+        && rm -rf /tmp/fastrpc \
+        && wget --no-check-certificate \
+            https://softwarecenter.qualcomm.com/api/download/software/sdks/Hexagon_SDK/Linux/Debian/6.6.0.0/Hexagon_SDK_Linux.zip \
+            -O /tmp/hexagon_sdk.zip \
+        && unzip -q /tmp/hexagon_sdk.zip -d /opt \
+        && rm /tmp/hexagon_sdk.zip \
+        && wget --no-check-certificate \
+            https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/ARM64/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-ARM64.tar.gz \
+            -O /tmp/hexagon_tools.tar.gz \
+        && mkdir -p /opt/hexagon \
+        && tar -xzf /tmp/hexagon_tools.tar.gz -C /opt/hexagon/ \
+        && rm /tmp/hexagon_tools.tar.gz \
+        && export HEXAGON_SDK_ROOT=/opt/Hexagon_SDK/6.6.0.0 \
+        && export HEXAGON_CMAKE_ROOT=/opt/Hexagon_SDK/6.6.0.0/build/cmake \
+        && export HEXAGON_TOOLS_ROOT=/opt/hexagon \
+        && export PATH=/opt/hexagon/Tools/bin:${PATH} \
+        && cp /usr/include/remote.h ${HEXAGON_SDK_ROOT}/ipc/fastrpc/remote/ship/UbuntuARM_aarch64/ \
+        && cp /usr/include/remote.h ${HEXAGON_SDK_ROOT}/ipc/fastrpc/remote/ship/android_aarch64/ 2>/dev/null || true \
+        && sed -i 's/string(FIND \${PREBUILT_LIB_DIR} /string(FIND "${PREBUILT_LIB_DIR}" /g' \
+            ${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake \
+        && dpkg --add-architecture amd64 \
+        && echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list \
+        && echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list \
+        && echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list \
+        && sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+            libc6:amd64 \
+            libstdc++6:amd64 \
+            libgmp10:amd64 \
+        && apt-get clean && rm -rf /var/lib/apt/lists/* \
+        && mkdir -p ${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin \
+        && printf '#!/bin/sh\nexec qemu-x86_64-static %s "$@"\n' \
+            "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/Ubuntu/qaic" \
+            > ${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic \
+        && chmod +x ${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic \
+        && mkdir -p /build \
+        && cd /build \
+        && git clone --depth 1 https://github.com/ggerganov/llama.cpp.git \
+        && cd llama.cpp \
+        && sed -i 's/GGML_SCHED_MAX_SPLIT_INPUTS [0-9]*/GGML_SCHED_MAX_SPLIT_INPUTS 256/' ggml/src/ggml-backend.cpp \
+        && cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HEXAGON=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT} \
+            -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT} \
+            -DHEXAGON_CMAKE_ROOT=${HEXAGON_CMAKE_ROOT} \
+            -DHEXAGON_ARCH=v73 \
+            -DPREBUILT_LIB_DIR=linux_aarch64 \
+            -DCMAKE_INSTALL_PREFIX=/install \
+            -GNinja \
+        && cmake --build build -j4 \
+        && echo "=== Verifying build artifacts ===" \
+        && find build -name "*.so" -type f \
+        && find build -name "llama-server" -type f \
+        && cmake --install build \
+        && echo "=== Verifying installation ===" \
+        && ls -la /install/lib/ \
+        && ls -la /install/bin/ \
+        && if [ -z "$(ls -A /install/lib/*.so 2>/dev/null)" ]; then \
+               echo "WARNING: Libraries not installed, copying manually..."; \
+               find build -name "*.so" -type f -exec cp -v {} /install/lib/ \; ; \
+           fi \
+        && if [ ! -f "/install/bin/llama-server" ]; then \
+               echo "WARNING: llama-server not installed, copying manually..."; \
+               find build -name "llama-server" -type f -exec cp -v {} /install/bin/ \; ; \
+           fi \
+        && find /install/bin -type f -exec strip --strip-unneeded {} \; 2>/dev/null || true \
+        && mkdir -p /install/lib/rfsa/adsp \
+        && find /install/lib -maxdepth 1 -name 'libggml-htp-v*.so' \
+            -exec cp {} /install/lib/rfsa/adsp/ \; 2>/dev/null || true; \
+    fi
+
+# Collect llama.cpp headers into /install/include for use by qai-forge build
+RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
+        mkdir -p /install/include/ggml/include \
+        && cp -r /build/llama.cpp/ggml/include/* /install/include/ggml/include/ \
+        && cp -r /build/llama.cpp/include/* /install/include/ 2>/dev/null || true; \
+    else \
+        mkdir -p /install/include; \
+    fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: Builder
+# ─────────────────────────────────────────────────────────────────────────────
+FROM --platform=linux/arm64 ubuntu:22.04 AS builder
+
+# Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -440,13 +426,9 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Deploy directory (all runtime artifacts staged here) ─────────────────────
-# Defined early so all subsequent build steps can install directly into it.
 ENV DEPLOY_DIR=/build/deploy
 
-# ── Build fastrpc from source ─────────────────────────────────────────────────
-# Sets MACHINE_NAME_PATH to /run/device-model (required for Qualcomm Linux).
-# Provides libcdsprpc.so and libadsprpc.so used by libGenie.so at runtime.
+# Build fastrpc from source
 RUN git clone --depth 1 https://github.com/quic/fastrpc.git /tmp/fastrpc && \
     cd /tmp/fastrpc && \
     autoreconf -is && \
@@ -456,9 +438,7 @@ RUN git clone --depth 1 https://github.com/quic/fastrpc.git /tmp/fastrpc && \
     make install && \
     rm -rf /tmp/fastrpc
 
-# ── Build lightweight Drogon from source ──────────────────────────────────────
-# Installed directly into ${DEPLOY_DIR}/usr so its shared libraries
-# (libdrogon.so, libtrantor.so) land in the deploy tree.
+# Build Drogon from source
 RUN git clone --depth 1 --branch v1.9.6 \
         https://github.com/drogonframework/drogon.git /tmp/drogon && \
     cd /tmp/drogon && \
@@ -480,12 +460,7 @@ RUN git clone --depth 1 --branch v1.9.6 \
     cmake --install build && \
     rm -rf /tmp/drogon
 
-# ── Fetch and install Qualcomm AI Runtime Community (QAIRT) SDK ───────────────
-# Downloads the SDK zip from softwarecenter.qualcomm.com, extracts:
-#   - Genie headers  → /usr/include/  (for build)
-#   - libGenie.so    → /usr/lib/      (for build)
-#   - All aarch64 runtime libs + libGenie.so → ${DEPLOY_DIR}/usr/lib/
-#   - Hexagon DSP blobs (v68/v73/v75) → ${DEPLOY_DIR}/usr/lib/rfsa/adsp/
+# Fetch and install QAIRT SDK
 ENV QAIRT_VERSION=2.45.40.260406
 ENV QAIRT_DOWNLOAD_DIR=/tmp/qairt-download
 ENV QAIRT_LIB_PATH=${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/lib
@@ -547,36 +522,53 @@ RUN mkdir -p ${QAIRT_DOWNLOAD_DIR} \
         ${DEPLOY_DIR}/usr/lib/libhta_hexagon_runtime_snpe.so && \
     rm -rf ${QAIRT_DOWNLOAD_DIR}/qairt
 
-# Copy fastrpc runtime libraries into deploy staging
+# Copy fastrpc runtime libraries
 RUN cp /usr/lib/libcdsprpc.so* ${DEPLOY_DIR}/usr/lib/ && \
     cp /usr/lib/libadsprpc.so* ${DEPLOY_DIR}/usr/lib/
 
-# ── Copy LiteRT-LM and LiteRT libraries (built together) ──────────────────────
-# LiteRT-LM built LiteRT as a dependency, so all artifacts are in one place.
-# The .so files land in /usr/lib/ for build-time linking.
-# Headers land in /usr/include/ for qai-forge compilation.
-# Note: CLI tools (litert-lm, litert-lm-advanced) are not built; only the C API library.
-# The litert-lm-inference-worker is built by qai-forge, not by LiteRT-LM.
+# Copy LiteRT-LM artifacts
 COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib /usr/lib
 COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
 COPY --from=litert_lm_builder /mnt/work/deploy/usr/include /usr/include
 
-# ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
+# Copy llama.cpp artifacts
+COPY --from=llamacpp_builder /install/bin ${DEPLOY_DIR}/usr/bin
+COPY --from=llamacpp_builder /install/lib /usr/lib
+COPY --from=llamacpp_builder /install/lib ${DEPLOY_DIR}/usr/lib
+COPY --from=llamacpp_builder /install/lib/rfsa/adsp ${DEPLOY_DIR}/usr/lib/rfsa/adsp
+COPY --from=llamacpp_builder /install/include /usr/include
+
+# Diagnostic: locate gguf.h to verify include path structure
+RUN echo "=== [DIAGNOSTIC] Searching for gguf.h under /usr/include ===" \
+    && find /usr/include -name "gguf.h" 2>/dev/null \
+    && echo "=== [DIAGNOSTIC] ggml-related files under /usr/include ===" \
+    && find /usr/include -name "ggml*" -o -name "gguf*" -o -name "llama*" 2>/dev/null | head -20 \
+    && echo "=== [DIAGNOSTIC] /usr/include/ggml directory (if exists) ===" \
+    && (ls -laR /usr/include/ggml/ 2>/dev/null || echo "(no /usr/include/ggml/ directory)") \
+    && echo "=== [DIAGNOSTIC] Top-level /usr/include contents ===" \
+    && ls /usr/include/ | grep -E "(ggml|gguf|llama)" 2>/dev/null || echo "(no llama.cpp headers at top level)" \
+    && echo "=== [DIAGNOSTIC] done ==="
+
+# Build qai-forge
 WORKDIR /build
 COPY qai-forge /build/qai-forge
 
+ARG BUILD_LITERT_LM
+ARG BUILD_LLAMACPP
 RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGENIE_INCLUDE_PATH=/usr/include \
         -DGENIE_LIB_PATH=/usr/lib \
-        -DQAI_FORGE_BUILD_LITERT_LM=ON \
+        -DQAI_FORGE_BUILD_LITERT_LM=${BUILD_LITERT_LM} \
         -DLITERT_LM_INCLUDE_PATH=/usr/include \
+        -DQAI_FORGE_BUILD_LLAMACPP=${BUILD_LLAMACPP} \
+        -DLLAMACPP_INCLUDE_PATH=/usr/include \
         -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
         -DCMAKE_PREFIX_PATH=${DEPLOY_DIR}/usr && \
     cmake --build /build/qai-forge/build -j$(nproc) && \
     cmake --install /build/qai-forge/build --prefix ${DEPLOY_DIR}/usr
 
-# ── Build responses server (Layer 1: Drogon HTTP server) ──────────────────────
+# Build responses server
 COPY responses /build/responses
 
 RUN cmake -S /build/responses -B /build/responses/build \
@@ -586,43 +578,29 @@ RUN cmake -S /build/responses -B /build/responses/build \
     cmake --build /build/responses/build -j$(nproc) && \
     cmake --install /build/responses/build
 
-# ── Verify LiteRT-LM dependencies before stripping ───────────────────────────
-# Check that liblitert_lm_c_api.so has all required symbols resolved.
-# This catches missing llguidance libraries early in the build process.
+# Verify LiteRT-LM dependencies
 RUN echo "Verifying LiteRT-LM library dependencies:" \
     && export LD_LIBRARY_PATH=${DEPLOY_DIR}/usr/lib:/usr/lib:$LD_LIBRARY_PATH \
     && if [ -f "${DEPLOY_DIR}/usr/lib/liblitert_lm_c_api.so" ]; then \
            ldd ${DEPLOY_DIR}/usr/lib/liblitert_lm_c_api.so || { \
                echo "ERROR: liblitert_lm_c_api.so has unresolved dependencies"; \
-               echo "Available .so files in ${DEPLOY_DIR}/usr/lib/:"; \
-               ls -lh ${DEPLOY_DIR}/usr/lib/*.so* 2>/dev/null || true; \
                exit 1; \
            }; \
        fi \
     && echo "✓ LiteRT-LM dependencies verified"
 
-# ── Strip our own compiled ELF artifacts to reduce size ──────────────────────
-# Strips debug symbols from:
-#   - All executables in bin/ (our server + worker binaries)
-#   - Our own compiled .so files (Drogon, trantor, qai_forge, fastrpc)
-# Deliberately skips ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ — those are Hexagon DSP
-# blobs compiled for the DSP core, not ARM64; stripping them would corrupt them.
-# Vendor QAIRT .so files are already stripped release binaries; strip is a no-op.
+# Strip binaries
 RUN find ${DEPLOY_DIR}/usr/bin -type f \
         -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
     find ${DEPLOY_DIR}/usr/lib -maxdepth 1 -type f -name "*.so*" \
         -exec strip --strip-unneeded {} \; 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 2: Stager
-#
-# Installs runtime apt packages solely to obtain their .so files, then
-# cherry-picks only the required libraries into /export. Nothing else from
-# this stage's OS lands in the final image.
+# Stage 3: Stager
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:bookworm-slim AS stager
+FROM --platform=linux/arm64 ubuntu:22.04 AS stager
 
-# Install runtime deps to make their .so files available for cherry-picking.
+# Install runtime deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libyaml-0-2 \
@@ -633,36 +611,24 @@ RUN apt-get update && \
         zlib1g \
         libuuid1 \
         libatomic1 \
+        libgomp1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Assemble the /export tree that will be COPY'd into the distroless runtime.
+# Assemble /export tree
 RUN mkdir -p /export/usr/bin \
              /export/usr/lib/rfsa/adsp \
              /export/etc/fastrpc
 
-# Copy stripped binaries from the builder deploy tree.
-# Deliberately excludes qai-forge-daemon — the HTTP server spawns workers directly.
-COPY --from=builder /build/deploy/usr/bin/responses-server /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/genai-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/genai-vlm-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert-lm-inference-worker /export/usr/bin/
+COPY --from=builder /build/deploy/usr/bin /export/usr/bin
 COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 
-# Cherry-pick only the required system .so files (with symlinks preserved).
-# These are the libraries NOT present in gcr.io/distroless/cc-debian12:
-#   fastrpc deps:  libyaml-0-2, libbsd, libmd
-#   Drogon deps:   libjsoncpp, libssl, libcrypto, libz, libuuid
-#   C++ atomics:   libatomic
-# distroless/cc already provides: libc, libstdc++, libgcc_s, libm
-#
-# Uses find to locate .so files regardless of whether Debian placed them under
-# /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic; do \
+# Cherry-pick system libraries
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libgomp; do \
       find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
     done
 
-# Bake fastrpc DSP path config for all supported Qualcomm devices.
+# Create fastrpc config
 RUN { \
       echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
       echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
@@ -676,26 +642,10 @@ RUN { \
     } > /export/etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3: Runtime (distroless)
-#
-# gcr.io/distroless/cc-debian12 provides only:
-#   libc6, libstdc++6, libgcc-s1, libm6 — nothing else.
-# No shell, no package manager, no apt cache, no /usr/share docs.
-# All additional .so files were cherry-picked into /export by the stager.
+# Stage 4: Runtime (distroless)
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12 AS responses-runtime
 
-# Single COPY brings in:
-#   /usr/bin/   - responses-server, genai-inference-worker,
-#                 genai-vlm-inference-worker, litert-lm-inference-worker
-#   /usr/lib/   - libqai_forge.so, libdrogon.so, libtrantor.so,
-#                 libGenie.so, QNN DSP/HTP/HTA aarch64 libs (GPU/LPAI/SNPE excluded),
-#                 libcdsprpc.so*, libadsprpc.so*,
-#                 liblitert_runtime_c_api.so, LiteRT dispatch + compiler plugin .so,
-#                 liblitert_lm_c_api.so,
-#                 cherry-picked system .so files
-#   /usr/lib/rfsa/adsp/ - Hexagon DSP blobs (v68/v73/v75)
-#   /etc/fastrpc/       - hexagon-dsp-binaries.yaml
 COPY --from=stager /export /
 
 # Set environment defaults
@@ -706,7 +656,6 @@ ENV GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
 ENV LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
 ENV LITERT_LM_BACKEND=npu
 ENV LOG_LEVEL=ERROR
-# Watchdog timeouts — override in docker-compose.yaml as needed
 ENV GENAI_WORKER_IDLE_TIMEOUT=120
 ENV GENAI_WORKER_ACTIVE_TIMEOUT=600
 
@@ -714,12 +663,7 @@ EXPOSE 9002
 
 WORKDIR /mnt/work/models
 
-# The C++ server binary is the entrypoint.
-# It calls drop_privileges_and_bind_devices() before starting Drogon.
-# Child processes (genai-inference-worker) inherit the dropped privileges.
 ENTRYPOINT ["/usr/bin/responses-server"]
 
-# ADSP library path for Hexagon DSP firmware lookup at runtime.
-# The DSP blobs are staged at /usr/lib/rfsa/adsp/ by the stager.
 ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp

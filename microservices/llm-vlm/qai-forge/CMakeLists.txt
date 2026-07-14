@@ -43,6 +43,7 @@ option(QAI_FORGE_BUILD_QNN       "Build QNN Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_SNPE      "Build SNPE Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_LITERT    "Build LiteRT Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_LITERT_LM "Build LiteRT-LM generative worker" OFF)
+option(QAI_FORGE_BUILD_LLAMACPP  "Build llama.cpp backend support" OFF)
 option(QAI_FORGE_INSTALL         "Install targets and CMake package config" ON)
 
 # ── Required dependencies ─────────────────────────────────────────────────────
@@ -99,6 +100,14 @@ endif()
 # The include root must contain litert_lm/c/engine.h (staged by LiteRTLM_builder).
 if(NOT DEFINED LITERT_LM_INCLUDE_PATH)
     set(LITERT_LM_INCLUDE_PATH "" CACHE PATH "Path to LiteRT-LM C API headers (root containing litert_lm/c/engine.h)")
+endif()
+
+# ── llama.cpp SDK paths ───────────────────────────────────────────────────────
+# Set LLAMACPP_INCLUDE_PATH on the cmake command line:
+#   cmake -DLLAMACPP_INCLUDE_PATH=/install/include
+# The include root must contain ggml/include/gguf.h (from llama.cpp install).
+if(NOT DEFINED LLAMACPP_INCLUDE_PATH)
+    set(LLAMACPP_INCLUDE_PATH "" CACHE PATH "Path to llama.cpp headers (root containing ggml/include/gguf.h)")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +241,28 @@ set(QAI_FORGE_SOURCES
     src/worker/LiteRTLMWorkerManager.cpp
 )
 
+# ── Conditionally add llama.cpp backend sources ──────────────────────────────
+if(QAI_FORGE_BUILD_LLAMACPP)
+    list(APPEND QAI_FORGE_SOURCES
+        # llama.cpp backend (Layer 3 — IGenerativeBackend implementation)
+        src/backend/LlamaCppBackend.cpp
+
+        # llama.cpp orchestrator (Layer 2)
+        src/orchestration/LlamaCppOrchestrator.cpp
+
+        # llama.cpp worker management (Layer 3)
+        src/worker/LlamaCppWorkerManager.cpp
+
+        # GGUF metadata reader (Layer 2 — zero-copy header parser)
+        src/utils/GgufMetadataReader.cpp
+    )
+
+    # Define preprocessor macro for conditional compilation
+    add_compile_definitions(QAI_FORGE_BUILD_LLAMACPP)
+
+    message(STATUS "[qai-forge] llama.cpp backend support enabled")
+endif()
+
 add_library(qai_forge SHARED ${QAI_FORGE_SOURCES})
 
 target_include_directories(qai_forge
@@ -247,6 +278,93 @@ target_include_directories(qai_forge
         ${stb_SOURCE_DIR}
 )
 
+# ── Add llama.cpp include path if enabled ────────────────────────────────────
+if(QAI_FORGE_BUILD_LLAMACPP)
+    if(NOT LLAMACPP_INCLUDE_PATH)
+        message(FATAL_ERROR
+            "[qai-forge] QAI_FORGE_BUILD_LLAMACPP=ON but LLAMACPP_INCLUDE_PATH is not set.\n"
+            "  Pass -DLLAMACPP_INCLUDE_PATH=<path> where <path> contains ggml/include/gguf.h.\n"
+            "  Example: -DLLAMACPP_INCLUDE_PATH=/install/include")
+    endif()
+
+    target_include_directories(qai_forge PRIVATE ${LLAMACPP_INCLUDE_PATH})
+    message(STATUS "[qai-forge] Added llama.cpp include path: ${LLAMACPP_INCLUDE_PATH}")
+
+    # Locate libllama, libggml, and its modular dependencies (base, cpu, common)
+    find_library(LLAMACPP_LLAMA_LIB
+        NAMES llama libllama
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
+    find_library(LLAMACPP_GGML_LIB
+        NAMES ggml libggml
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
+    find_library(LLAMACPP_GGML_BASE_LIB
+        NAMES ggml-base libggml-base
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
+    find_library(LLAMACPP_GGML_CPU_LIB
+        NAMES ggml-cpu libggml-cpu
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
+    find_library(LLAMACPP_COMMON_LIB
+        NAMES llama-common libllama-common common libcommon
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
+
+    if (NOT LLAMACPP_LLAMA_LIB OR NOT LLAMACPP_GGML_LIB)
+        message(WARNING "[qai-forge] Core llama.cpp libraries (libllama/libggml) not found. Build may fail during linking.")
+    else()
+        message(STATUS "[qai-forge] Found libllama: ${LLAMACPP_LLAMA_LIB}")
+        message(STATUS "[qai-forge] Found libggml: ${LLAMACPP_GGML_LIB}")
+
+        if (LLAMACPP_GGML_BASE_LIB)
+            message(STATUS "[qai-forge] Found libggml-base: ${LLAMACPP_GGML_BASE_LIB}")
+        endif()
+        if (LLAMACPP_GGML_CPU_LIB)
+            message(STATUS "[qai-forge] Found libggml-cpu: ${LLAMACPP_GGML_CPU_LIB}")
+        endif()
+        if (LLAMACPP_COMMON_LIB)
+            message(STATUS "[qai-forge] Found libllama-common: ${LLAMACPP_COMMON_LIB}")
+        endif()
+    endif()
+endif()
+
 target_link_libraries(qai_forge
     PUBLIC
         nlohmann_json::nlohmann_json
@@ -255,6 +373,24 @@ target_link_libraries(qai_forge
         # pthread is needed for std::mutex, std::condition_variable
         Threads::Threads
 )
+
+if(QAI_FORGE_BUILD_LLAMACPP AND LLAMACPP_LLAMA_LIB AND LLAMACPP_GGML_LIB)
+    # Important: llama-common must come before llama/ggml in the link order
+    # to resolve GGUF symbols properly when statically or modularly linked
+    if(LLAMACPP_COMMON_LIB)
+        target_link_libraries(qai_forge PUBLIC ${LLAMACPP_COMMON_LIB})
+    endif()
+
+    target_link_libraries(qai_forge PUBLIC ${LLAMACPP_LLAMA_LIB} ${LLAMACPP_GGML_LIB})
+
+    # Link modular libraries if they exist on the target system
+    if(LLAMACPP_GGML_BASE_LIB)
+        target_link_libraries(qai_forge PUBLIC ${LLAMACPP_GGML_BASE_LIB})
+    endif()
+    if(LLAMACPP_GGML_CPU_LIB)
+        target_link_libraries(qai_forge PUBLIC ${LLAMACPP_GGML_CPU_LIB})
+    endif()
+endif()
 
 set_target_properties(qai_forge PROPERTIES
     OUTPUT_NAME "qai_forge"

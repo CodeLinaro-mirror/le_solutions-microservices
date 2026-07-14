@@ -237,7 +237,7 @@ struct McpCallRecord {
             {"server_label", server_label},
             {"name",         tool_name},
             {"arguments",    arguments},
-            {"output",       is_error ? nullptr : json(output)},
+            {"output",       is_error ? json(nullptr) : json(output)},
             {"error",        is_error ? json(error_message) : json(nullptr)}
         };
     }

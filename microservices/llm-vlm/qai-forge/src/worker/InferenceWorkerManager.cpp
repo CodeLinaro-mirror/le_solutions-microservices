@@ -148,7 +148,7 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
 
         // If exec fails — use write() directly; Logger mutex may be locked in parent
         const char msg[] = "[Worker] execl failed\n";
-        ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        [[maybe_unused]] ssize_t result = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
         ::_exit(1);
     }
 
