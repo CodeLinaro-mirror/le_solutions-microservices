@@ -10,6 +10,9 @@
 # Usage (from llm-vlm/):
 #   docker build -f QAIServe/Dockerfile -t qaiserve-server .
 #
+# To build against a different QAIRT SDK version:
+#   docker build -f QAIServe/Dockerfile --build-arg QAIRT_SDK_VERSION=2.46.0.260500 -t qaiserve-server .
+#
 # The build context must include both:
 #   - qai-forge/  (shared SDK: Layers 2-4 + worker binaries + daemon)
 #   - QAIServe/ (Layer 1: Drogon HTTP server for Responses & KFServe API)
@@ -35,6 +38,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Build arguments (override with --build-arg at `docker build` time)
+#
+#   QAIRT_SDK_VERSION  Qualcomm AI Runtime Community SDK version. Used both
+#                       for the LiteRT QNN dispatch/compiler-plugin build
+#                       (Stage 0) and for the QAIServe application build
+#                       (Stage 1). Defaults to the version validated for
+#                       this Dockerfile.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG QAIRT_SDK_VERSION=2.45.40.260406
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: litert_builder
 #
 # Builds LiteRT v2.1.5 natively on AArch64 using Bazelisk.
@@ -47,6 +61,9 @@
 # Artifacts are copied into the ARM64 builder stage below.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
+
+# Re-declare to bring the global ARG into this stage's scope.
+ARG QAIRT_SDK_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -119,7 +136,7 @@ RUN git config --global http.postBuffer 1048576000 \
        elif [ -f configure.py ]; then yes n | python3 configure.py; \
        else echo "No configure script found; using env-based configuration"; fi
 
-# ── Download QAIRT 2.45.40.260406 for LiteRT QNN dispatch + compiler plugin ──
+# ── Download QAIRT ${QAIRT_SDK_VERSION} for LiteRT QNN dispatch + compiler plugin ──
 # LiteRT v2.1.5 defaults to QAIRT 2.44.0.260225 (third_party/qairt/workspace.bzl).
 # Setting LITERT_QAIRT_SDK overrides the default via configurable_repo's
 # local_path_env mechanism — Bazel uses the local directory instead of
@@ -130,8 +147,8 @@ RUN git config --global http.postBuffer 1048576000 \
 # where strip_prefix = "qairt/2.44.0.260225"
 # So LITERT_QAIRT_SDK must end with "/" and the path
 #   ${LITERT_QAIRT_SDK}qairt/2.44.0.260225  must exist.
-# We create a compatibility symlink: qairt/2.44.0.260225 → qairt/2.45.40.260406
-ENV QAIRT_LITERT_VERSION=2.45.40.260406
+# We create a compatibility symlink: qairt/2.44.0.260225 → qairt/${QAIRT_SDK_VERSION}
+ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
 ENV QAIRT_LITERT_DIR=/tmp/qairt-litert
 RUN mkdir -p ${QAIRT_LITERT_DIR} \
     && wget -t 3 -T 120 --no-verbose \
@@ -349,6 +366,9 @@ RUN mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 debian:trixie-slim AS builder
 
+# Re-declare to bring the global ARG into this stage's scope.
+ARG QAIRT_SDK_VERSION
+
 # Install build dependencies:
 #   - Drogon hard deps (no DB client libs)
 #   - fastrpc build deps: autoconf/automake/libtool/libbsd-dev/libmd-dev/libyaml-dev
@@ -431,7 +451,7 @@ RUN git clone --depth 1 --branch v1.9.6 \
 #   - All aarch64 runtime libs + libGenie.so → ${DEPLOY_DIR}/usr/lib/
 #   - Hexagon DSP blobs (v68/v73/v75) → ${DEPLOY_DIR}/usr/lib/rfsa/adsp/
 # Note: For QAIServe we KEEP the QNN and SNPE libraries, unlike the responses server.
-ENV QAIRT_VERSION=2.45.40.260406
+ENV QAIRT_VERSION=${QAIRT_SDK_VERSION}
 ENV QAIRT_DOWNLOAD_DIR=/tmp/qairt-download
 ENV QAIRT_LIB_PATH=${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/lib
 
