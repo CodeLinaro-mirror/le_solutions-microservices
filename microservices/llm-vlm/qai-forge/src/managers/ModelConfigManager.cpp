@@ -131,6 +131,33 @@ void ModelConfigManager::scanModelBundles() {
                           << bundle_name << ": " << e.what());
             }
         }
+        // ── GenieX format: geniex.json manifest ────────────────────────────
+        // Written by the GenieX SDK (libgeniex.so) after a `geniex pull`.
+        // AI-Hub-sourced pulls also carry a metadata.json (handled above);
+        // this branch covers HuggingFace/GGUF pulls that ship only geniex.json.
+        else if (fs::exists(bundle_path + "/geniex.json")) {
+            try {
+                std::ifstream f(bundle_path + "/geniex.json");
+                json manifest = json::parse(f);
+
+                ModelConfig config = parseGenieXJson(manifest, bundle_path);
+                if (config.id.empty()) {
+                    LOG_WARN("[ModelConfigManager] Could not derive id from geniex.json: "
+                             << bundle_name);
+                    continue;
+                }
+                std::string geniex_id = config.id;
+                new_models[geniex_id] = std::move(config);
+
+                if (new_default.empty()) new_default = geniex_id;
+                LOG_INFO("[ModelConfigManager] Loaded GenieX model: "
+                         << geniex_id << " from " << bundle_name);
+
+            } catch (const std::exception& e) {
+                LOG_ERROR("[ModelConfigManager] Error processing GenieX bundle "
+                          << bundle_name << ": " << e.what());
+            }
+        }
     }
 
     // ── LiteRT-LM: discover bare .litertlm files ──────────────────────────────
@@ -514,8 +541,82 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateVlmGenieConfig — Synthesize genie_config.json for VLM models
+// parseGenieXJson — Build a ModelConfig from a GenieX SDK manifest
+//
+// The geniex.json schema is written by the closed-source GenieX SDK. Its real
+// keys are PascalCase (confirmed against an AI-Hub pull on-device):
+//   {"Name":"qualcomm/Qwen3-4B-Instruct-2507","ModelName":"qwen3_4b_instruct_2507",
+//    "ModelType":"llm","PluginId":"qairt","Precision":"W4A16",
+//    "ModelFile":{...},"MMProjFile":{...},"ExtraFiles":[...]}
+// We read the PascalCase keys first and keep snake_case fallbacks for forward
+// compatibility. Note: AI-Hub pulls also ship metadata.json (handled by the
+// earlier branch, which wins); this branch primarily serves HuggingFace/GGUF
+// pulls that ship only geniex.json.
 // ─────────────────────────────────────────────────────────────────────────────
+ModelConfig ModelConfigManager::parseGenieXJson(const json& manifest,
+                                                const std::string& bundle_path) {
+    ModelConfig config;
+
+    // ── Runtime / plugin id ───────────────────────────────────────────────────
+    std::string runtime = manifest.value("PluginId",
+                          manifest.value("plugin_id",
+                          manifest.value("runtime", std::string("qairt"))));
+    config.runtime = runtime;
+
+    // ── Model name / id ───────────────────────────────────────────────────────
+    // Prefer ModelName (architecture id, already filesystem-friendly); fall back
+    // to Name ("org/repo"), then the on-disk bundle directory name.
+    std::string bundle_name = fs::path(bundle_path).filename().string();
+    std::string model_id = manifest.value("ModelName",
+                           manifest.value("model_name",
+                           manifest.value("Name",
+                           manifest.value("name", bundle_name))));
+    // Name may be "org/repo"; keep only the leaf.
+    if (auto slash = model_id.find_last_of('/'); slash != std::string::npos) {
+        model_id = model_id.substr(slash + 1);
+    }
+
+    config.display_name = manifest.value("display_name", model_id);
+    config.id = model_id + "-" + runtime;
+
+    // ── Modality ──────────────────────────────────────────────────────────────
+    // ModelType is "llm"/"vlm" (string). Also honor an int form (0=LLM,1=VLM)
+    // and a presence of a non-empty MMProjFile as a VLM signal.
+    bool is_vlm = false;
+    const char* mt_key = manifest.contains("ModelType") ? "ModelType"
+                       : (manifest.contains("model_type") ? "model_type" : nullptr);
+    if (mt_key) {
+        const auto& mt = manifest[mt_key];
+        if (mt.is_string()) {
+            std::string s = mt.get<std::string>();
+            is_vlm = (s == "vlm" || s == "VLM");
+        } else if (mt.is_number_integer()) {
+            is_vlm = (mt.get<int>() == 1);  // geniex_ModelType: 0=LLM, 1=VLM
+        }
+    }
+    // MMProjFile.Name non-empty ⇒ multimodal.
+    if (manifest.contains("MMProjFile") && manifest["MMProjFile"].is_object()) {
+        std::string mmproj = manifest["MMProjFile"].value("Name", "");
+        if (!mmproj.empty()) is_vlm = true;
+    }
+    config.supports_vision = is_vlm;
+    // GenieX models are generative (LLM/VLM), routed to the generative pipeline.
+    config.model_type = "generative";
+    config.supports_streaming = true;
+
+    // ── Config / entry file ───────────────────────────────────────────────────
+    // qairt bundles carry a Genie-style config. The manifest doesn't name it
+    // directly, but ExtraFiles lists it; if genie_config.json exists in the
+    // bundle, point at it so the backend can load it.
+    fs::path genie_cfg = fs::path(bundle_path) / "genie_config.json";
+    if (fs::exists(genie_cfg)) {
+        config.config_file = genie_cfg.string();
+    }
+
+    return config;
+}
+
+
 std::string ModelConfigManager::generateVlmGenieConfig(const json& metadata, const json& genie,
                                                         const json& pipeline_nodes,
                                                         const std::string& processed_config_dir) {

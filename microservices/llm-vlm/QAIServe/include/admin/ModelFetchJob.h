@@ -20,6 +20,7 @@
 #include <memory>
 #include <unordered_map>
 #include <shared_mutex>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 
 enum class FetchStatus {
@@ -41,6 +42,7 @@ struct ModelFetchJob {
     std::string precision;
     std::string version;
     std::string chipset;
+    std::string source;   // download source: "aihub" (default) or "geniex"
 
     // Progress (written by background thread, read by HTTP handler)
     std::atomic<FetchStatus> status{FetchStatus::PENDING};
@@ -78,6 +80,7 @@ struct ModelFetchJob {
             {"runtime",          runtime},
             {"precision",        precision},
             {"version",          version},
+            {"source",           source.empty() ? "aihub" : source},
             {"status",           statusString(s)},
             {"bytes_downloaded", bytes_downloaded.load()},
             {"total_bytes",      total_bytes.load()},
@@ -107,7 +110,8 @@ public:
         const std::string& runtime,
         const std::string& precision,
         const std::string& version,
-        const std::string& chipset);
+        const std::string& chipset,
+        const std::string& source = "aihub");
 
     /**
      * Look up a job by ID. Returns nullptr if not found.
