@@ -78,6 +78,11 @@ services:
     restart: always
     env_file:
       - /etc/docker/env/qimsdk.env
+    volumes:
+      - /etc/media:/etc/media
+      - /etc/models:/etc/models
+      - /etc/labels:/etc/labels
+      - /etc/configs:/etc/configs
     command: >
       microservices-restricted-zone
       --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/rz_video.mp4}
