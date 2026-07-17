@@ -31,8 +31,8 @@
 #   Stage 1 (builder):  Compile everything; strip our own ELF artifacts.
 #   Stage 2 (stager):   Cherry-pick only the required system .so files from
 #                       a full Debian environment; assemble /export tree.
-#   Stage 3 (runtime):  gcr.io/distroless/cc-debian12 — COPY /export in.
-#                       No shell, no package manager, no apt cache.
+#   Stage 3 (runtime):  debian:trixie-slim — COPY /export in.
+#                       Minimal runtime; no build tools, no apt cache.
 #
 #   Privilege drop: handled natively by the C++ server binary at startup.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -522,6 +522,26 @@ COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
 COPY --from=litert_lm_builder /mnt/work/deploy/usr/include /usr/include
 COPY --from=litert_lm_builder /mnt/work/deploy/usr/bin ${DEPLOY_DIR}/usr/bin
 
+# ── Build llama.cpp (provides llama-server + libllama.so + libggml*.so) ───────
+# Pinned to tag b5616. Shared libs (-DBUILD_SHARED_LIBS=ON) required so
+# qai-forge can link against libllama/libggml at runtime.
+ENV LLAMACPP_INSTALL_DIR=/build/llamacpp-install
+RUN git clone --depth 1 --branch b5616 https://github.com/ggml-org/llama.cpp /build/llama.cpp && \
+    cmake -S /build/llama.cpp -B /build/llama.cpp/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_CURL=OFF \
+        -DGGML_NATIVE=OFF \
+        -DCMAKE_INSTALL_PREFIX=${LLAMACPP_INSTALL_DIR} && \
+    cmake --build /build/llama.cpp/build -j$(nproc) && \
+    cmake --install /build/llama.cpp/build && \
+    cp ${LLAMACPP_INSTALL_DIR}/bin/llama-server ${DEPLOY_DIR}/usr/bin/ && \
+    find ${LLAMACPP_INSTALL_DIR}/lib -name "*.so*" -exec cp -P {} ${DEPLOY_DIR}/usr/lib/ \; && \
+    rm -rf /build/llama.cpp
+
 # ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
 WORKDIR /build
 COPY qai-forge /build/qai-forge
@@ -538,6 +558,9 @@ RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DLITERT_INCLUDE_PATH=/usr/include \
         -DQAI_FORGE_BUILD_LITERT_LM=ON \
         -DLITERT_LM_INCLUDE_PATH=/usr/include \
+        -DQAI_FORGE_BUILD_LLAMACPP=ON \
+        -DLLAMACPP_INCLUDE_PATH=${LLAMACPP_INSTALL_DIR}/include \
+        -DLLAMACPP_LIB_PATH=${LLAMACPP_INSTALL_DIR}/lib \
         -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
         -DCMAKE_PREFIX_PATH=${DEPLOY_DIR}/usr && \
     cmake --build /build/qai-forge/build -j$(nproc) && \
@@ -630,10 +653,11 @@ RUN apt-get update && \
         libgrpc++1.51t64 \
         libgrpc29t64 \
         libprotobuf32t64 \
+        libgomp1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Assemble the /export tree that will be COPY'd into the distroless runtime.
+# Assemble the /export tree that will be COPY'd into the trixie-slim runtime.
 RUN mkdir -p /export/usr/bin \
              /export/usr/lib/rfsa/adsp \
              /export/etc/fastrpc \
@@ -657,21 +681,23 @@ COPY --from=builder /build/deploy/usr/bin/litert-inference-worker /export/usr/bi
 COPY --from=builder /build/deploy/usr/bin/litert-lm-inference-worker /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/litert-lm /export/usr/bin/
 COPY --from=builder /build/deploy/usr/bin/litert-lm-advanced /export/usr/bin/
+COPY --from=builder /build/deploy/usr/bin/llama-server /export/usr/bin/
 COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 
 # Cherry-pick only the required system .so files (with symlinks preserved).
-# These are the libraries NOT present in gcr.io/distroless/cc-debian12:
+# These are libraries not already bundled via the builder deploy tree:
 #   fastrpc deps:  libyaml-0-2, libbsd, libmd
 #   Drogon deps:   libjsoncpp, libssl, libcrypto, libz, libuuid
 #   C++ atomics:   libatomic
 #   gRPC/protobuf: libgrpc++, libgrpc, libprotobuf, and their transitive deps
 #                  (abseil, re2, c-ares, gpr, upb, address_sorting)
-# distroless/cc already provides: libc, libstdc++, libgcc_s, libm
+#   llama.cpp:     libgomp (OpenMP runtime required by llama-server)
+# trixie-slim already ships: libc6, libstdc++6, libgcc-s1, libm
 #
 # Uses find to locate .so files regardless of whether Debian placed them under
 # /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 libnghttp3 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap*" "liblber*" libbrotlidec libbrotlicommon libzstd liblzma libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb; do \
-      find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 libnghttp3 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap*" "liblber*" libbrotlidec libbrotlicommon libzstd liblzma libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb libgomp; do \
+      find /usr/lib /usr/lib/aarch64-linux-gnu /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
     done && \
     find /usr/lib /lib -name "libabsl_*.so*" -exec cp -dp {} /export/usr/lib/ \;
 # Debian packages abseil as dozens of separately-named component libraries

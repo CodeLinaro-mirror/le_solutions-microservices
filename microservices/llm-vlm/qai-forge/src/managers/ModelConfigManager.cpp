@@ -431,6 +431,12 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         if (!text_gen.empty()) {
             config.config_file = processed_config_dir + "/" + fs::path(text_gen).filename().string();
         }
+        if (config.config_file.empty()) {
+            std::string fallback = processed_config_dir + "/genie_config.json";
+            if (fs::exists(fallback)) {
+                config.config_file = fallback;
+            }
+        }
     }
 
     config.memory_requirement_mb = calculateMemoryFromBinFiles(bundle_path, metadata.value("model_files", json::object()));
