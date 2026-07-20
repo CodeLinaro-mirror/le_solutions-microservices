@@ -384,15 +384,23 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     }
 
     // ── Model type ────────────────────────────────────────────────────────────
-    // Read from metadata.json "model_type" field. Defaults to "generative" for
-    // backward compatibility — all existing bundles are generative models.
-    // "predictive" is used for classification/detection/segmentation models.
-    config.model_type = metadata.value("model_type", "generative");
-
-    // ── Runtime identifier ────────────────────────────────────────────────────
-    // Read runtime FIRST so it can be used in the config_file resolution below.
-    // Defaults to "genie" for backward compatibility.
+    // Read from metadata.json "model_type" field. Older/AI-Hub-published
+    // bundles have no such field — infer it from "runtime" instead of
+    // defaulting to "generative", so predictive backends (QNN/SNPE/LiteRT)
+    // aren't misrouted to the GenerativeOrchestrator. Falls back to
+    // "generative" only when runtime itself doesn't match a known predictive
+    // spelling (covers "genie", "litert_lm", "onnxrt", etc).
     config.runtime = metadata.value("runtime", "genie");
+    if (metadata.contains("model_type")) {
+        config.model_type = metadata.value("model_type", "generative");
+    } else {
+        static const std::set<std::string> predictive_runtimes = {
+            "qnn", "qnn_context_binary",
+            "snpe", "qnn_dlc",
+            "litert", "tflite",
+        };
+        config.model_type = predictive_runtimes.count(config.runtime) ? "predictive" : "generative";
+    }
 
     auto pipeline_nodes = genie.value("pipeline", json::object()).value("nodes", json::object());
 
@@ -455,7 +463,18 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         // Normalize lowercase dtype strings (e.g. "uint8") to OIP uppercase ("UINT8")
         std::string upper;
         for (char c : dt) upper += static_cast<char>(std::toupper(c));
-        return upper;
+
+        // Some model bundles spell dtypes out in full (e.g. "FLOAT32") instead
+        // of the KFServing v2 abbreviated form ("FP32") — canonicalize known
+        // aliases so every consumer (OIP JSON, gRPC InferService, TensorDTOs)
+        // sees a single valid dtype string.
+        static const std::unordered_map<std::string, std::string> aliases = {
+            {"FLOAT32", "FP32"},
+            {"FLOAT16", "FP16"},
+            {"FLOAT",   "FP32"},
+        };
+        auto it = aliases.find(upper);
+        return it != aliases.end() ? it->second : upper;
     };
 
     if (metadata.contains("input_specs") && metadata["input_specs"].is_array()) {

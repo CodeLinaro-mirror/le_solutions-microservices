@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -397,7 +398,41 @@ std::vector<std::string> AiHubClient::fetchVersions() {
         versions.push_back(ver);
     }
 
-    // Sort newest-first (lexicographic descending works for semver X.Y.Z)
-    std::sort(versions.begin(), versions.end(), std::greater<std::string>());
+    // Sort newest-first by parsed semver, not lexicographically — lexicographic
+    // order is wrong as soon as component widths differ (e.g. "0.9.2" > "0.57.3"
+    // as strings, even though 0.57.3 is the newer release). Handles the ".postN"
+    // suffix qai-hub-models occasionally publishes (e.g. "0.33.0.post1") and
+    // irregular 2-component versions (e.g. "0.27") by treating missing trailing
+    // components as 0.
+    auto versionKey = [](const std::string& v) {
+        std::string base = v;
+        int post = 0;
+        auto post_pos = base.find(".post");
+        if (post_pos != std::string::npos) {
+            post = 1;
+            base = base.substr(0, post_pos);
+        }
+
+        std::vector<int> parts;
+        size_t start = 0;
+        while (start <= base.size()) {
+            size_t dot = base.find('.', start);
+            std::string part = base.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+            int n = 0;
+            for (char c : part) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) break;
+                n = n * 10 + (c - '0');
+            }
+            parts.push_back(n);
+            if (dot == std::string::npos) break;
+            start = dot + 1;
+        }
+        parts.push_back(post);
+        return parts;
+    };
+
+    std::sort(versions.begin(), versions.end(), [&versionKey](const std::string& a, const std::string& b) {
+        return versionKey(a) > versionKey(b);
+    });
     return versions;
 }
