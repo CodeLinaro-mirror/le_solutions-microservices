@@ -79,19 +79,12 @@ services:
       - ALERT_CHANNEL=${REDIS_ALERTS_CHANNEL:-fire-analytics.alerts}
     network_mode: host
   qimsdk:
-    image: qimsdk
+    image: qimsdk:latest
     platform: arm64
     container_name: qimsdk-fs
     hostname: qimsdk-fs
-    user: qimsdk
     restart: always
     environment:
-      - XDG_RUNTIME_DIR=/dev/socket/weston
-      - WAYLAND_DISPLAY=wayland-1
-      - GST_PLUGIN_SCANNER=/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
-      - GST_DEBUG_NO_COLOR=1
-      - ADSP_LIBRARY_PATH=\"/usr/lib/dsp/cdsp;/usr/lib/dsp/cdsp1;${ADSP_LIBRARY_PATH}\"
-      - GST_DEBUG=2
       - INPUT_TYPE=${INPUT_TYPE:-video}
       - INPUT_URL=${INPUT_URL:-/etc/media/fire.mp4}
       - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.fire}:0
@@ -99,18 +92,18 @@ services:
       - LABELS_PATH_FIRE_SMOKE=${LABELS_PATH_FIRE_SMOKE:-/etc/labels/fire_smoke.json}
       - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
       - OUT_PORT=${OUT_PORT:-8900}
+    env_file:
+      - /etc/docker/env/qimsdk.env
     command: bash qimsdk_fire_smoke_detect.sh
-    volumes:
-      - /etc/labels:/etc/labels
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
     deploy:
       resources:
         reservations:
           devices:
             - driver: cdi
               device_ids:
-                - qualcomm.com/device=cdi-hw-acc
+                - qualcomm.com/device=qimsdk
+              capabilities:
+                - hw-acc
     network_mode: host
 volumes:
   mariadbVolume: null

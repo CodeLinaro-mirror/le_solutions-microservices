@@ -74,40 +74,39 @@ services:
       - DEFAULT_HEATMAP_COLS=64
     network_mode: host
   qimsdk:
-    image: softwarecenter.qualcomm.com/download/depot/services/iot-microservices/linux/qimsdk:1.0.5
+    image: qimsdk:latest
     platform: arm64
     container_name: qimsdk-ppe
     hostname: qimsdk-ppe
-    user: qimsdk
     restart: always
-    environment:
-      - XDG_RUNTIME_DIR=/dev/socket/weston
-      - WAYLAND_DISPLAY=wayland-1
-      - GST_PLUGIN_SCANNER=/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
-      - GST_DEBUG_NO_COLOR=1
-      - GST_DEBUG=2
-      - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/opt/sample-videos/people_sample_video.ts}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.ppe}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/opt/labels/foot_track_net.json}
-      - SETTINGS_PATH_PERSON=${SETTINGS_PATH_PERSON:-/opt/labels/foot_track_net_settings.json}
-      - MODEL_PATH_PPE=${MODEL_PATH_PPE:-/etc/models/gear_guard_net_quantized.tflite}
-      - LABELS_PATH_PPE=${LABELS_PATH_PPE:-/opt/labels/ppe_labels.json}
-      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
-      - OUT_PORT=${OUT_PORT:-8900}
-    command: bash qimsdk_ppe.sh
-    volumes:
-      - /etc/labels:/etc/labels
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
+    env_file:
+      - /etc/docker/env/qimsdk.env
+    command: >
+      microservices-ppe-detection
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/ppe_video.mp4}
+      --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8554}
+      --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
+      --stage1-model-path=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
+      --stage1-labels-path=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.json}
+      --stage1-settings-path=${SETTINGS_PATH_PERSON:-/etc/labels/foot_track_net_settings.json}
+      --stage2-model-path=${MODEL_PATH_PPE:-/etc/models/gear_guard_net_quantized.tflite}
+      --stage2-labels-path=${LABELS_PATH_PPE:-/etc/labels/gear_guard_net.json}
+      --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
+      --redis-host=${REDIS_HOST:-127.0.0.1}
+      --redis-port=${REDIS_OUT_PORT:-6379}
+      --redis-channel=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.ppe}:0
+      --webrtc-id=${WEBRTC_ID:-1010}
+      --no-display=${NO_DISPLAY_ARG:-0}
+      --no-output-overlay=${NO_OUT_OVERLAY_ARG:-0}
     deploy:
       resources:
         reservations:
           devices:
             - driver: cdi
               device_ids:
-                - qualcomm.com/device=cdi-hw-acc
+                - qualcomm.com/device=qimsdk
+              capabilities:
+                - hw-acc
     network_mode: host
 volumes:
   mariadbVolume: null
