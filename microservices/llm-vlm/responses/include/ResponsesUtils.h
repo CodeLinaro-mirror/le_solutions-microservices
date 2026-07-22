@@ -21,6 +21,7 @@
 //   paginate_input_items()       — slice input_items into a list envelope
 //   generate_compaction_id()     — generate a unique "cmp_XXXX" ID
 //   inject_summary_into_instructions() — append branch summary to instructions
+//   build_text_runtime_messages() — build model-facing text-only messages
 //   build_vlm_runtime_messages() — build model-facing VLM messages
 //   current_unix_time()          — current time as Unix timestamp (seconds)
 //   generate_response_id()       — generate a unique "resp_XXXX" ID
@@ -86,6 +87,18 @@ std::string inject_summary_into_instructions(
 // @return               OpenAI-format messages array
 // ─────────────────────────────────────────────────────────────────────────────
 json input_to_messages(const json& input, const std::string& system_prompt = "");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages — build model-facing messages for text inference
+//
+// Stored Responses history may contain multimodal content arrays. Text-only
+// runtimes receive plain text content only; image parts are omitted from the
+// runtime copy without mutating stored responses.
+//
+// @param messages Stored or current messages
+// @return         Text-only runtime messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages(const json& messages);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_vlm_runtime_messages — build model-facing messages for VLM inference

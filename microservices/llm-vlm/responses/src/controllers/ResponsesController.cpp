@@ -1160,8 +1160,18 @@ void ResponsesController::createResponse(
         sdk_request.max_completion_tokens;
     std::optional<int> resolved_max_output_tokens =
         requested_max_output_tokens;
+    json budget_ancestor_messages = json::array();
+    json budget_current_messages = json::array();
+    auto refresh_text_budget_messages = [&]() {
+        budget_ancestor_messages =
+            ResponsesUtils::build_text_runtime_messages(walk.ancestor_messages);
+        budget_current_messages =
+            ResponsesUtils::build_text_runtime_messages(
+                walk.current_request_messages);
+    };
 
     if (!is_vlm) {
+        refresh_text_budget_messages();
         bool skip_summarization =
             previous_response_id.empty()
             || current_turn_has_tool_response(walk.current_request_messages)
@@ -1172,8 +1182,8 @@ void ResponsesController::createResponse(
         TokenBudgetUtils::SummarizationTriggerResult trigger =
             TokenBudgetUtils::evaluate_summarization_trigger(
                 model,
-                walk.ancestor_messages,
-                walk.current_request_messages,
+                budget_ancestor_messages,
+                budget_current_messages,
                 effective_system_prompt,
                 tools_for_budget,
                 projected_max_output_tokens);
@@ -1191,8 +1201,8 @@ void ResponsesController::createResponse(
                 TokenBudgetUtils::ContextBudgetResult fallback_budget =
                     TokenBudgetUtils::resolve_context_budget(
                         model,
-                        walk.ancestor_messages,
-                        walk.current_request_messages,
+                        budget_ancestor_messages,
+                        budget_current_messages,
                         effective_system_prompt,
                         tools_for_budget,
                         requested_max_output_tokens);
@@ -1233,6 +1243,7 @@ void ResponsesController::createResponse(
                         "input"));
                     return;
                 }
+                refresh_text_budget_messages();
                 effective_system_prompt =
                     ResponsesUtils::inject_summary_into_instructions(
                         base_system_prompt,
@@ -1250,8 +1261,8 @@ void ResponsesController::createResponse(
             TokenBudgetUtils::ContextBudgetResult budget =
                 TokenBudgetUtils::resolve_context_budget(
                     model,
-                    walk.ancestor_messages,
-                    walk.current_request_messages,
+                    budget_ancestor_messages,
+                    budget_current_messages,
                     effective_system_prompt,
                     tools_for_budget,
                     requested_max_output_tokens);
@@ -1285,11 +1296,15 @@ void ResponsesController::createResponse(
         return;
     }
 
+    json runtime_ancestor_messages = is_vlm
+        ? json::array()
+        : ResponsesUtils::build_text_runtime_messages(begin.ancestor_messages);
     json runtime_request_messages = is_vlm
         ? ResponsesUtils::build_vlm_runtime_messages(
             begin.current_request_messages,
             begin.ancestor_messages)
-        : begin.current_request_messages;
+        : ResponsesUtils::build_text_runtime_messages(
+            begin.current_request_messages);
 
     CreateChatCompletionRequest standard_request;
     try {
@@ -1320,9 +1335,7 @@ void ResponsesController::createResponse(
     invoke_options.response_id = response_id;
     invoke_options.session_id = response_id;
     invoke_options.use_response_history = true;
-    invoke_options.response_history = is_vlm
-        ? json::array()
-        : begin.ancestor_messages;
+    invoke_options.response_history = runtime_ancestor_messages;
     if (current_turn_has_tool_response(begin.current_request_messages)
         && !previous_response_id.empty()) {
         invoke_options.previous_response_id = previous_response_id;
