@@ -145,7 +145,8 @@ private:
 
     /**
      * Parse a geniex.json manifest (written by the GenieX SDK) into a ModelConfig.
-     * GenieX bundles use the "qairt" runtime and resolve entry files directly
+     * GenieX bundles may report plugin runtimes like "qairt"; these are
+     * normalized to scheduler runtimes while entry files still resolve directly
      * within the bundle directory (no /tmp/configs processing needed).
      * The config id follows the same "{model_id}-{runtime}" convention.
      */

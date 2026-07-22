@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -68,9 +69,7 @@ public:
     ModelRuntime(std::string model_id,
                  std::unique_ptr<IGenerativeBackend> backend,
                  std::unique_ptr<IOrchestrator> orchestrator,
-                 ModelRuntimeEvents events = {},
-                 RunningCancelMode running_cancel_mode =
-                     RunningCancelMode::SOFT);
+                 ModelRuntimeEvents events = {});
     ~ModelRuntime();
 
     ModelRuntime(const ModelRuntime&) = delete;
@@ -103,6 +102,11 @@ private:
     size_t promoteAgedJobs();
     void runJob(InferenceJob& job);
     void unloadBackend(bool force);
+    void armCancelWatchdog(const std::string& job_id);
+    void invalidateCancelWatchdog();
+    void stopCancelWatchdog();
+    void cancelWatchdogLoop(std::string job_id, std::uint64_t generation);
+    void handleCancelWatchdogTimeout(const std::string& job_id);
     void setStateLocked(ModelRuntimeState state,
                         std::vector<ModelRuntimeState>& state_events);
     void notifyStateChanged(ModelRuntimeState state);
@@ -129,11 +133,18 @@ private:
     DrainMode drain_mode_ = DrainMode::None;
     std::chrono::milliseconds new_request_aging_threshold_ =
         std::chrono::seconds(30);
-    RunningCancelMode running_cancel_mode_ = RunningCancelMode::SOFT;
+    std::chrono::milliseconds cancel_grace_period_ =
+        std::chrono::seconds(30);
 
     ModelRuntimeState state_ = ModelRuntimeState::NotResident;
     bool backend_healthy_ = false;
     InferenceJobPtr running_job_;
+
+    std::mutex cancel_watchdog_mutex_;
+    std::condition_variable cancel_watchdog_cv_;
+    std::thread cancel_watchdog_thread_;
+    std::uint64_t cancel_watchdog_generation_ = 0;
+    bool cancel_watchdog_shutdown_ = false;
 };
 
 } // namespace scheduler

@@ -13,11 +13,6 @@ enum class CancelStatus {
     NOT_FOUND
 };
 
-enum class RunningCancelMode {
-    SOFT,
-    HARD
-};
-
 struct CancelResult {
     CancelStatus status = CancelStatus::NOT_FOUND;
     std::string job_id;

@@ -694,7 +694,27 @@ void ResponsesController::createResponse(
     std::string model              = body.value("model", "");
     bool        streaming          = body.value("stream", false);
     std::string system_prompt      = body.value("instructions", "");
-    std::string previous_response_id = body.value("previous_response_id", "");
+    std::string previous_response_id;
+    if (body.contains("previous_response_id")) {
+        if (body["previous_response_id"].is_null()) {
+            callback(make_error_response(
+                400,
+                "'previous_response_id' must be a string. For the first request, omit "
+                "'previous_response_id'; null is not supported.",
+                "invalid_request_error",
+                "previous_response_id"));
+            return;
+        }
+        if (!body["previous_response_id"].is_string()) {
+            callback(make_error_response(
+                400,
+                "invalid value for 'previous_response_id'",
+                "invalid_request_error",
+                "previous_response_id"));
+            return;
+        }
+        previous_response_id = body["previous_response_id"].get<std::string>();
+    }
 
     // ── Parse reasoning parameters ────────────────────────────────────────────
     std::string reasoning_effort  = "medium";  // default

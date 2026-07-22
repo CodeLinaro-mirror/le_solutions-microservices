@@ -75,7 +75,7 @@ BackendCapabilities GenIEBackend::capabilities() const {
         // GenIE SDK can filter <think> tokens internally via bypass_think_filter
         .backend_filters_think_tokens = true,
         // LLM supports KV save/restore (GenieDialog_save/restore); VLM does not
-        .supports_kv_save_restore     = !current_is_vlm_,
+        .supports_kv_save_restore     = !current_is_vlm_.load(),
     };
 }
 
@@ -121,7 +121,7 @@ void GenIEBackend::unloadModel(bool force) {
     }
 
     current_model_id_.clear();
-    current_is_vlm_ = false;
+    current_is_vlm_.store(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,14 +132,14 @@ void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
                                        const std::string& config_file,
                                        const std::string& sampler_file) {
     const bool is_vlm = ModelConfigManager::getInstance().supportsVision(model_id);
-    if (!current_model_id_.empty() && current_is_vlm_ != is_vlm) {
+    if (!current_model_id_.empty() && current_is_vlm_.load() != is_vlm) {
         unloadModel(false);
     }
 
     current_model_id_ = model_id;
-    current_is_vlm_   = is_vlm;
+    current_is_vlm_.store(is_vlm);
 
-    if (current_is_vlm_) {
+    if (is_vlm) {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: VLM model=" << model_id);
         vlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
     } else {
@@ -249,11 +249,12 @@ void GenIEBackend::onContextCompacted() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::resetKvAsync() {
+    const bool is_vlm = current_is_vlm_.load();
     LOG_INFO("[GenIEBackend] Initiating background KV reset for model: "
              << current_model_id_
-             << (current_is_vlm_ ? " (VLM)" : " (LLM)"));
+             << (is_vlm ? " (VLM)" : " (LLM)"));
     try {
-        if (current_is_vlm_) {
+        if (is_vlm) {
             if (vlm_worker_) {
                 vlm_worker_->initiateBackgroundReset();
             }
@@ -301,7 +302,7 @@ void GenIEBackend::resetKv() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::terminateWorker(bool force) {
-    if (current_is_vlm_) {
+    if (current_is_vlm_.load()) {
         if (vlm_worker_) {
             vlm_worker_->terminateWorker(force);
         }
@@ -311,7 +312,14 @@ void GenIEBackend::terminateWorker(bool force) {
         }
     }
     current_model_id_.clear();
-    current_is_vlm_ = false;
+    current_is_vlm_.store(false);
+}
+
+bool GenIEBackend::forceKillActiveWorker() {
+    if (current_is_vlm_.load()) {
+        return vlm_worker_ && vlm_worker_->forceKillActiveWorker();
+    }
+    return llm_worker_ && llm_worker_->forceKillActiveWorker();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,7 +327,7 @@ void GenIEBackend::terminateWorker(bool force) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool GenIEBackend::isHealthy() const {
-    if (current_is_vlm_) {
+    if (current_is_vlm_.load()) {
         return vlm_worker_ && vlm_worker_->isWorkerRunning();
     }
     return llm_worker_ && llm_worker_->isWorkerRunning();

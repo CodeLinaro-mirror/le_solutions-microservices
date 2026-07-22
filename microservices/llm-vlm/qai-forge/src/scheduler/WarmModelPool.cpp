@@ -75,16 +75,6 @@ const char* actionToString(int type) {
     return "unknown";
 }
 
-const char* runningCancelModeToString(RunningCancelMode mode) {
-    switch (mode) {
-        case RunningCancelMode::SOFT:
-            return "soft";
-        case RunningCancelMode::HARD:
-            return "hard";
-    }
-    return "soft";
-}
-
 } // namespace
 
 WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
@@ -113,9 +103,7 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
              << " residency_ttl_ms=" << config_.model_residency_ttl.count()
              << " tool_response_timeout_ms="
              << config_.tool_response_timeout.count()
-             << " memory_headroom_mb=" << config_.memory_headroom_mb
-             << " running_cancel_mode="
-             << runningCancelModeToString(config_.running_cancel_mode));
+             << " memory_headroom_mb=" << config_.memory_headroom_mb);
 }
 
 WarmModelPool::~WarmModelPool() {
@@ -662,8 +650,7 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
         model_id,
         std::move(pair.backend),
         std::move(pair.orchestrator),
-        std::move(events),
-        config_.running_cancel_mode);
+        std::move(events));
     runtime->start();
 
     RuntimeRecord record;

@@ -149,6 +149,7 @@ public:
      *               false → graceful SHUTDOWN command
      */
     void terminateWorker(bool force = false) override;
+    bool forceKillActiveWorker() override;
 
     /**
      * Returns true if the worker subprocess is alive.
