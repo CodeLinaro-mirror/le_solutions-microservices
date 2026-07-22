@@ -119,7 +119,12 @@ struct McpResponse {
 
     static McpResponse from_json(const json& j) {
         McpResponse r;
-        r.id = j.value("id", 0);
+        // JSON-RPC 2.0: id can be null in error responses when the server
+        // could not determine the request id. nlohmann j.value("id", 0)
+        // throws type_error.302 when the key exists with a null value.
+        if (j.contains("id") && !j["id"].is_null())
+            r.id = j["id"].get<int>();
+        // else r.id stays 0 (default)
         if (j.contains("error") && !j["error"].is_null()) {
             r.error = McpError::from_json(j["error"]);
         } else if (j.contains("result")) {
