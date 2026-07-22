@@ -515,6 +515,18 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         return it != aliases.end() ? it->second : upper;
     };
 
+    // Reads quantization_parameters.{scale,zero_point} from a tensor-spec JSON
+    // object (if present) into the given ModelTensorSpec. Defaults (1.0/0) are
+    // left untouched for unquantized tensors.
+    auto applyQuantParams = [](ModelTensorSpec& spec, const json& spec_json) {
+        if (spec_json.contains("quantization_parameters") &&
+            spec_json["quantization_parameters"].is_object()) {
+            const auto& qp = spec_json["quantization_parameters"];
+            spec.quant_scale      = qp.value("scale", 1.0f);
+            spec.quant_zero_point = qp.value("zero_point", 0);
+        }
+    };
+	
     if (metadata.contains("input_specs") && metadata["input_specs"].is_array()) {
         for (const auto& spec_json : metadata["input_specs"]) {
             ModelTensorSpec spec;
@@ -524,6 +536,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
                 for (const auto& d : spec_json["shape"])
                     spec.shape.push_back(d.get<int64_t>());
             }
+            applyQuantParams(spec, spec_json);
             config.input_specs.push_back(spec);
         }
     } else if (metadata.contains("model_files") && metadata["model_files"].is_object()) {
@@ -538,6 +551,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
                     for (const auto& d : tensor_info["shape"])
                         spec.shape.push_back(d.get<int64_t>());
                 }
+                applyQuantParams(spec, tensor_info);
                 config.input_specs.push_back(spec);
             }
         }
@@ -552,6 +566,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
                 for (const auto& d : spec_json["shape"])
                     spec.shape.push_back(d.get<int64_t>());
             }
+            applyQuantParams(spec, spec_json);
             config.output_specs.push_back(spec);
         }
     } else if (metadata.contains("model_files") && metadata["model_files"].is_object()) {
@@ -565,6 +580,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
                     for (const auto& d : tensor_info["shape"])
                         spec.shape.push_back(d.get<int64_t>());
                 }
+                applyQuantParams(spec, tensor_info);
                 config.output_specs.push_back(spec);
             }
         }

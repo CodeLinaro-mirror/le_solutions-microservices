@@ -7,6 +7,7 @@
 
 #include "controllers/ModelsController.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "postproc/PostprocRegistry.h"
 
 #include <drogon/HttpResponse.h>
 #include <nlohmann/json.hpp>
@@ -25,7 +26,7 @@ HttpResponsePtr jsonResp(const json& body, HttpStatusCode code = k200OK) {
     auto resp = HttpResponse::newHttpResponse();
     resp->setStatusCode(code);
     resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(body.dump());
+    resp->setBody(body.dump(2));
     return resp;
 }
 
@@ -66,6 +67,40 @@ json buildGenerativeOutputs() {
     return json::array({
         {{"name", "text_output"}, {"datatype", "BYTES"}, {"shape", json::array({-1})}},
     });
+}
+
+// Serialize a postprocess's ParameterSchema list, keyed by parameter name,
+// for GET /v2/postprocesses and the per-model extensions[] entry.
+json buildParamsJson(const std::vector<ParameterSchema>& params) {
+    json obj = json::object();
+    for (const auto& p : params) {
+        obj[p.name] = {
+            {"type",        p.type},
+            {"default",     p.default_val},
+            {"description", p.description},
+        };
+    }
+    return obj;
+}
+
+// Serialize a postprocess's supported tensor layouts.
+// Each layout is a positional list of TensorExpectation.
+json buildExpectsJson(const std::vector<std::vector<TensorExpectation>>& layouts) {
+    json layouts_json = json::array();
+    for (const auto& layout : layouts) {
+        json tensors_json = json::array();
+        for (const auto& t : layout) {
+            json dtypes_json = json::array();
+            for (auto dt : t.accepted_dtypes) dtypes_json.push_back(tensorDataTypeToString(dt));
+
+            tensors_json.push_back({
+                {"shape",  t.shape},
+                {"dtypes", dtypes_json},
+            });
+        }
+        layouts_json.push_back(tensors_json);
+    }
+    return layouts_json;
 }
 
 } // namespace
@@ -161,7 +196,35 @@ void ModelsController::getModelV2(const HttpRequestPtr& /*req*/,
         resp["inputs"]  = buildTensorSpecs(m->input_specs);
         resp["outputs"] = buildTensorSpecs(m->output_specs);
         resp["memory_mb"] = m->memory_requirement_mb;
+
+        // Postprocessing plugins compatible with this model's output tensors
+        json extensions = json::array();
+        for (const auto* p : PostprocRegistry::getInstance().getCompatible(m->output_specs)) {
+            extensions.push_back({
+                {"name",        p->name},
+                {"description", p->description},
+                {"parameters",  buildParamsJson(p->parameters)},
+            });
+        }
+        resp["extensions"] = extensions;
     }
 
     callback(jsonResp(resp));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /v2/postprocesses — postprocessing plugins catalog
+// ─────────────────────────────────────────────────────────────────────────────
+void ModelsController::listPostprocesses(const HttpRequestPtr& /*req*/,
+                                           std::function<void(const HttpResponsePtr&)>&& callback) {
+    json arr = json::array();
+    for (const auto* p : PostprocRegistry::getInstance().list()) {
+        arr.push_back({
+            {"name",        p->name},
+            {"description", p->description},
+            {"expects",     buildExpectsJson(p->layouts)},
+            {"parameters",  buildParamsJson(p->parameters)},
+        });
+    }
+    callback(jsonResp(arr));
 }

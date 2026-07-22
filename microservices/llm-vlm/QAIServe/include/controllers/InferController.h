@@ -10,13 +10,14 @@
 // Predictive AI and Generative AI models.
 //
 // Routes:
-//   POST /v2/models/{model}/infer            — Predictive AI tensor inference
-//                                              (JSON or binary extension)
-//   POST /v2/models/{model}/generate         — Generative AI blocking inference
-//                                              (JSON or multipart for VLM)
-//   POST /v2/models/{model}/generate_stream  — Generative AI SSE streaming
-//   GET  /v2/health/ready                    — server ready check
-//   GET  /v2/health/live                     — server live check
+//   POST /v2/models/{model}/infer             — Predictive AI tensor inference
+//                                               (JSON or binary extension)
+//   POST /v2/models/{model}/infer_postprocess — Predictive AI inference + postprocess
+//   POST /v2/models/{model}/generate          — Generative AI blocking inference
+//                                               (JSON or multipart for VLM)
+//   POST /v2/models/{model}/generate_stream   — Generative AI SSE streaming
+//   GET  /v2/health/ready                     — server ready check
+//   GET  /v2/health/live                      — server live check
 //
 // Model discovery (GET /v2/models, GET /v2/models/{model}) is handled by
 // ModelsController to keep routing concerns separate.
@@ -48,6 +49,10 @@ public:
         ADD_METHOD_TO(InferController::infer,
                       "/v2/models/{1}/infer", Post, Options);
 
+        // POST /v2/models/{model}/infer_postprocess — Predictive AI inference + postprocess
+        ADD_METHOD_TO(InferController::inferPostprocess,
+                      "/v2/models/{1}/infer_postprocess", Post, Options);
+
         // POST /v2/models/{model}/generate — Generative AI blocking
         ADD_METHOD_TO(InferController::generate,
                       "/v2/models/{1}/generate", Post, Options);
@@ -75,6 +80,31 @@ public:
     void infer(const HttpRequestPtr& req,
                std::function<void(const HttpResponsePtr&)>&& callback,
                const std::string& model_name);
+
+    /**
+     * POST /v2/models/{model}/infer_postprocess
+     *
+     * Runs the same Predictive AI tensor inference as /infer, then decodes
+     * the raw output tensors via a registered postprocess (?postprocess=)
+     * into model-specific JSON .
+     *
+     * Query params: postprocess (required), image_width, image_height,
+     * include_raw, plus any postprocess-specific params (e.g.
+     * conf_threshold, iou_threshold).
+     *
+     * Success: HTTP 200 with the postprocess's decoded JSON result
+     * (e.g. detections, boxes, keypoints), plus an "outputs" field with
+     * the raw output tensors when include_raw=true.
+     *
+     * Failure: HTTP 400 — not a predictive model, malformed request body, 
+     * or unknown postprocess name.
+     * HTTP 404 — model not found.
+     * HTTP 422 — model/postprocess tensor layout mismatch.
+     * HTTP 500 — exception thrown during inference or postprocess decoding.
+     */
+    void inferPostprocess(const HttpRequestPtr& req,
+                          std::function<void(const HttpResponsePtr&)>&& callback,
+                          const std::string& model_name);
 
     /**
      * POST /v2/models/{model}/generate

@@ -19,11 +19,15 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
+#include "postproc/PostprocRegistry.h"
+#include "postproc/PostprocConfig.h"
 #include <drogon/HttpResponse.h>
 #include <trantor/net/EventLoop.h>
 #include <nlohmann/json.hpp>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <filesystem>
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -173,6 +177,76 @@ CreateChatCompletionRequest buildChatRequest(
     return req;
 }
 
+// Parse request body (JSON or binary extension) into a TensorInferenceRequest.
+// Throws OipBinaryParseError on malformed input (caller catches).
+TensorInferenceRequest buildInferRequest(const HttpRequestPtr& req, const std::string& model_name) {
+    OipInferRequest oip_req;
+    std::string infer_header = req->getHeader("Inference-Header-Content-Length");
+    if (OipBinaryParser::isBinaryRequest(infer_header)) {
+        size_t header_len = static_cast<size_t>(std::stoul(infer_header));
+        oip_req = OipBinaryParser::parse(std::string(req->getBody()), header_len);
+    } else {
+        oip_req = OipBinaryParser::parseJson(std::string(req->getBody()));
+    }
+
+    if (oip_req.inputs.empty()) {
+        throw OipBinaryParseError("Missing required field: 'inputs'");
+    }
+
+    TensorInferenceRequest request;
+    request.model      = model_name;
+    request.request_id = oip_req.id.empty() ? generateRequestId() : oip_req.id;
+
+    for (const auto& inp : oip_req.inputs) {
+        InputTensor tensor;
+        tensor.name  = inp.name;
+        tensor.dtype = tensorDataTypeFromString(inp.datatype);
+        tensor.shape = inp.shape;
+        tensor.data  = inp.data;
+        request.inputs.push_back(std::move(tensor));
+    }
+    request.output_names = oip_req.outputs;
+    return request;
+}
+
+// Build the OIP outputs[] JSON array from a TensorInferenceResponse.
+json buildRawOutputsJson(const TensorInferenceResponse& result) {
+    json outputs_json = json::array();
+    for (const auto& out : result.outputs) {
+        std::string dt = tensorDataTypeToString(out.dtype);
+        json shape_arr = json::array();
+        for (auto d : out.shape) shape_arr.push_back(d);
+        outputs_json.push_back({
+            {"name",     out.name},
+            {"datatype", dt},
+            {"shape",    shape_arr},
+            {"data",     encodeDataArray(out.data, dt)},
+        });
+    }
+    return outputs_json;
+}
+
+// Parse an integer query param, failing closed to default_val on missing or
+// malformed input (never throws).
+int parseIntParam(const HttpRequestPtr& req, const std::string& key, int default_val) {
+    std::string v = req->getParameter(key);
+    if (v.empty()) return default_val;
+    try {
+        return std::stoi(v);
+    } catch (const std::exception&) {
+        return default_val;
+    }
+}
+
+// Resolves the model's labels file path — expected to sit alongside the
+// model file itself, i.e. in the same directory as ModelConfig::config_file
+// (e.g. config_file=/mnt/work/models/abc/abc.tflite -> labels.txt at
+// /mnt/work/models/abc/labels.txt). Empty if config_file is empty.
+std::string resolveLabelsPath(const ModelConfig& model_cfg) {
+    if (model_cfg.config_file.empty()) return "";
+    return (std::filesystem::path(model_cfg.config_file).parent_path() / "labels.txt").string();
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,39 +271,13 @@ void InferController::infer(
     }
 
     // Parse request — JSON or binary extension
-    OipInferRequest oip_req;
+    TensorInferenceRequest request;
     try {
-        std::string infer_header = req->getHeader("Inference-Header-Content-Length");
-        if (OipBinaryParser::isBinaryRequest(infer_header)) {
-            size_t header_len = static_cast<size_t>(std::stoul(infer_header));
-            oip_req = OipBinaryParser::parse(std::string(req->getBody()), header_len);
-        } else {
-            oip_req = OipBinaryParser::parseJson(std::string(req->getBody()));
-        }
+        request = buildInferRequest(req, model_name);
     } catch (const OipBinaryParseError& e) {
         callback(makeError(400, std::string("Request parse error: ") + e.what()));
         return;
     }
-
-    if (oip_req.inputs.empty()) {
-        callback(makeError(400, "Missing required field: 'inputs'"));
-        return;
-    }
-
-    // Build TensorInferenceRequest
-    TensorInferenceRequest request;
-    request.model      = model_name;
-    request.request_id = oip_req.id.empty() ? generateRequestId() : oip_req.id;
-
-    for (const auto& inp : oip_req.inputs) {
-        InputTensor tensor;
-        tensor.name  = inp.name;
-        tensor.dtype = tensorDataTypeFromString(inp.datatype);
-        tensor.shape = inp.shape;
-        tensor.data  = inp.data;
-        request.inputs.push_back(std::move(tensor));
-    }
-    request.output_names = oip_req.outputs;
 
     // Route to QaiForge::infer (predictive AI) on a background thread.
     // infer() runs synchronously and can block for seconds on first-load
@@ -244,24 +292,115 @@ void InferController::infer(
             TensorInferenceResponse result =
                 qai_forge::QaiForge::getInstance().infer(request);
 
-            json outputs_json = json::array();
-            for (const auto& out : result.outputs) {
-                std::string dt = tensorDataTypeToString(out.dtype);
-                json shape_arr = json::array();
-                for (auto d : out.shape) shape_arr.push_back(d);
-                outputs_json.push_back({
-                    {"name",     out.name},
-                    {"datatype", dt},
-                    {"shape",    shape_arr},
-                    {"data",     encodeDataArray(out.data, dt)},
-                });
-            }
-
             response = makeJson({
                 {"id",         result.request_id},
                 {"model_name", result.model},
-                {"outputs",    outputs_json},
+                {"outputs",    buildRawOutputsJson(result)},
             });
+
+        } catch (const GenAIException& e) {
+            response = makeError(e.http_status, e.message);
+        } catch (const std::exception& e) {
+            response = makeError(500, std::string("Internal error: ") + e.what());
+        }
+
+        loop->queueInLoop([callback, response]() { callback(response); });
+    }).detach();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// POST /v2/models/{model}/infer_postprocess — Predictive AI inference + postprocess
+// ─────────────────────────────────────────────────────────────────────────────────
+void InferController::inferPostprocess(
+    const HttpRequestPtr& req,
+    std::function<void(const HttpResponsePtr&)>&& callback,
+    const std::string& model_name)
+{
+    // Model config (validates model exists)
+    const ModelConfig* model_cfg = ModelConfigManager::getInstance().getModelConfig(model_name);
+    if (!model_cfg) {
+        callback(makeError(404, "Model '" + model_name + "' not found."));
+        return;
+    }
+    if (model_cfg->model_type != "predictive") {
+        callback(makeError(400,
+            "Model '" + model_name + "' is a generative model. "
+            "Use POST /v2/models/" + model_name + "/generate instead."));
+        return;
+    }
+
+    // Parse request body -> TensorInferenceRequest (same helper as /infer)
+    TensorInferenceRequest infer_req;
+    try {
+        infer_req = buildInferRequest(req, model_name);
+    } catch (const OipBinaryParseError& e) {
+        callback(makeError(400, std::string("Request parse error: ") + e.what()));
+        return;
+    }
+
+    // Look up postprocess by name (done before the inference thread so
+    // an unknown postprocess fails fast without paying for inference first)
+    const std::string postprocess_name = req->getParameter("postprocess");
+    const auto* info = PostprocRegistry::getInstance().find(postprocess_name);
+    if (!info) {
+        callback(makeError(400, "unknown postprocess: " + postprocess_name));
+        return;
+    }
+
+    // Tensor Layout match check between model output and postprocess input
+    int layout_idx = PostprocRegistry::matchLayout(info->layouts, model_cfg->output_specs);
+    if (layout_idx < 0) {
+        callback(makeError(422, "model/postprocess layout mismatch"));
+        return;
+    }
+
+    // Build PostprocConfig from query params + model tensor specs
+    PostprocConfig pp_cfg;
+    pp_cfg.image_width  = parseIntParam(req, "image_width", 0);
+    pp_cfg.image_height = parseIntParam(req, "image_height", 0);
+    pp_cfg.include_raw  = req->getParameter("include_raw") == "true";
+    pp_cfg.layout_index = layout_idx;  // postprocess branches on this
+    pp_cfg.input_specs  = model_cfg->input_specs;
+    pp_cfg.output_specs = model_cfg->output_specs;  // carries quant_scale/quant_zero_point
+    // Resolved from ModelConfig::config_file's directory (labels.txt is
+    // expected alongside the model file) — postprocessors needing class
+    // names read this path via PostprocessUtils::loadLabelsFile(); empty
+    // if config_file is empty.
+    pp_cfg.labels_path = resolveLabelsPath(*model_cfg);
+    for (const auto& [k, v] : req->getParameters())
+        pp_cfg.extra[k] = v;  // all query params forwarded; postprocess reads what it needs
+
+    // Run inference — same call /infer uses today, and (like /infer) this
+    // whole handler body runs on a detached std::thread, not the Drogon IO
+    // loop, since inference can block for seconds. process() below
+    // therefore executes concurrently across threads for concurrent
+    // requests — instance is required to be stateless (see postproc/PostprocPlugin.h).
+    auto* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    std::thread([infer_req = std::move(infer_req), pp_cfg, info, loop, callback]() mutable {
+        HttpResponsePtr response;
+        try {
+            TensorInferenceResponse raw =
+                qai_forge::QaiForge::getInstance().infer(infer_req);
+
+            // Decode — stateless instance, no allocation. Wrapped in
+            // try/catch like every other handler (/infer, /generate) —
+            // there is no Drogon exception filter/global handler in this
+            // codebase, so each handler is responsible for its own try/catch.
+            nlohmann::json result;
+            try {
+                result = info->instance->process(raw, pp_cfg);
+            } catch (const std::exception& e) {
+                response = makeError(500, std::string("postprocess error: ") + e.what());
+                loop->queueInLoop([callback, response]() { callback(response); });
+                return;
+            }
+
+            // Optionally attach raw tensors
+            if (pp_cfg.include_raw) {
+                result["outputs"] = buildRawOutputsJson(raw);
+            }
+
+            response = makeJson(result);
 
         } catch (const GenAIException& e) {
             response = makeError(e.http_status, e.message);

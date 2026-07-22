@@ -72,6 +72,12 @@ if(NOT GENIEX_LIB)
     message(FATAL_ERROR "libgeniex.so not found (set GENIEX_LIB_PATH or stage it into /usr/lib)")
 endif()
 
+# Built-in Predictive AI postprocessing plugins (built as standalone .so
+# files, loaded at runtime by PostprocPlugin — see
+# postprocess-plugins/CMakeLists.txt for how to add a new one). Not linked
+# into qaiserve itself.
+add_subdirectory(postprocess-plugins)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Source files
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,6 +133,12 @@ set(SERVER_SOURCES
     src/grpc/GrpcErrorMapping.cpp
     ${PROTO_GEN_SRC}
     ${GRPC_GEN_SRC}
+    
+    # Postprocess extension interface, Runtime loading, Registry, ABI conversion
+    src/postproc/PostprocRegistry.cpp
+    src/postproc/PostprocPlugin.cpp
+    src/postproc/PostprocAbiConvert.cpp
+
 )
 
 add_executable(qaiserve ${SERVER_SOURCES})
@@ -158,6 +170,8 @@ target_link_libraries(qaiserve PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     ${GENIEX_LIB}
+    # dlopen/dlsym/dlclose for PostprocRegistry's runtime plugin loading.
+    ${CMAKE_DL_LIBS}
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

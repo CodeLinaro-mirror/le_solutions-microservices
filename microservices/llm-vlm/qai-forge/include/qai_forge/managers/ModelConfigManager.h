@@ -24,6 +24,13 @@ struct ModelTensorSpec {
     std::string           name;
     std::vector<int64_t>  shape;
     std::string           dtype;  // "FP32", "INT8", etc.
+
+    // Quantization parameters from metadata.json "quantization_parameters".
+    // Defaults are the identity transform (scale=1.0, zero_point=0) for
+    // unquantized (e.g. FP32) tensors, so callers can apply
+    // (raw - zero_point) * scale unconditionally.
+    float   quant_scale      = 1.0f;
+    int32_t quant_zero_point = 0;
 };
 
 struct ModelConfig {

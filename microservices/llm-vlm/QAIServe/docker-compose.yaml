@@ -71,6 +71,7 @@ services:
       - QAISERVE_PORT=${QAISERVE_PORT:-9002}
       - GRPC_SERVER_PORT=${GRPC_SERVER_PORT:-50051}
       - GENAI_MODELS_DIR=/mnt/work/models
+      - POSTPROC_PLUGINS_DIR=/mnt/work/plugins
       - ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
       - CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
       - QAISERVE_MAX_BODY_SIZE=${QAISERVE_MAX_BODY_SIZE:-16777216}
@@ -116,3 +117,5 @@ services:
       - /usr/share/qcom:/usr/share/qcom
       # Model bundles directory
       - ${GENAI_MODEL_DIR:-/etc/models/}:/mnt/work/models/
+      # Client-supplied postprocess plugins (.so) directory — mounted read-only;
+      - ${POSTPROC_PLUGINS_DIR:-/etc/postproc_plugins/}:/mnt/work/plugins/:ro

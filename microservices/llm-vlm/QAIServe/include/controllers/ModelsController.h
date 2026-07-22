@@ -10,6 +10,7 @@
 //   GET /v1/models              — OpenAI-compatible model list (generative only)
 //   GET /v2/models              — OIP model list (all models: predictive + generative)
 //   GET /v2/models/{model_id}   — OIP model metadata with tensor specs
+//   GET /v2/postprocesses       — Postprocessing plugins catalog
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <drogon/HttpController.h>
@@ -31,6 +32,10 @@ public:
         // GET /v2/models/{model_id} — OIP metadata
         ADD_METHOD_TO(ModelsController::getModelV2,
                       "/v2/models/{1}", Get, Options);
+
+        // GET /v2/postprocesses — postprocessing plugins catalog
+        ADD_METHOD_TO(ModelsController::listPostprocesses,
+                      "/v2/postprocesses", Get, Options);
     METHOD_LIST_END
 
     /**
@@ -63,4 +68,14 @@ public:
     void getModelV2(const HttpRequestPtr& req,
                     std::function<void(const HttpResponsePtr&)>&& callback,
                     const std::string& model_id);
+
+    /**
+     * GET /v2/postprocesses
+     *
+     * Returns the full postprocess plugin catalog: every registered
+     * postprocess's name, description, supported tensor layouts
+     * and accepted query parameters.
+     */
+    void listPostprocesses(const HttpRequestPtr& req,
+                            std::function<void(const HttpResponsePtr&)>&& callback);
 };
