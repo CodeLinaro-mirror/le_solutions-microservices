@@ -73,19 +73,6 @@ def main():
                 except OSError as e:
                     print(f"[entrypoint] WARNING: Could not chmod {dev_path}: {e}", flush=True)
 
-        # Deploy the baked fastrpc DSP config into /usr/share/qcom/conf.d/ now
-        # that the bind-mount is in place, while we still have root privileges.
-        fastrpc_src = "/etc/fastrpc/hexagon-dsp-binaries.yaml"
-        fastrpc_dst_dir = "/usr/share/qcom/conf.d"
-        if os.path.isfile(fastrpc_src) and os.path.isdir(qcom_share):
-            try:
-                os.makedirs(fastrpc_dst_dir, exist_ok=True)
-                shutil.copy2(fastrpc_src, fastrpc_dst_dir)
-                print(f"[entrypoint] Deployed {fastrpc_src} -> {fastrpc_dst_dir}/", flush=True)
-            except OSError as e:
-                print(f"[entrypoint] WARNING: Could not deploy fastrpc config: {e}", flush=True)
-
-        print(f"[entrypoint] Dropping privileges from root to UID {TARGET_UID} / GID {TARGET_GID}...", flush=True)
         try:
             os.setgroups(list(supplementary_gids))
             os.setresgid(TARGET_GID, TARGET_GID, TARGET_GID)
