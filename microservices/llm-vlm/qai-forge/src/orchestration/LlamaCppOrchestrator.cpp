@@ -79,10 +79,19 @@ StandardResponse LlamaCppOrchestrator::execute(
                     return;
                 }
 
-                // Parse SSE chunk and invoke callback
-                handleSseChunk(sse_chunk, callback, event_id, request.model,
-                             accumulated_content, accumulated_tool_calls,
-                             finish_reason, prompt_tokens, completion_tokens);
+                try {
+                    // Parse SSE chunk and invoke callback
+                    handleSseChunk(sse_chunk, callback, event_id, request.model,
+                                 accumulated_content, accumulated_tool_calls,
+                                 finish_reason, prompt_tokens, completion_tokens);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[LlamaCppOrchestrator] handleSseChunk threw: "
+                              + std::string(e.what())
+                              + " chunk=" + sse_chunk.substr(0, 128));
+                } catch (...) {
+                    LOG_ERROR("[LlamaCppOrchestrator] handleSseChunk threw unknown exception"
+                              " chunk=" + sse_chunk.substr(0, 128));
+                }
             });
     } else {
         // Blocking mode: use httpPostBlocking
@@ -213,7 +222,7 @@ void LlamaCppOrchestrator::handleSseChunk(
                     stream_chunk.id = event_id;
                     stream_chunk.model = model;
                     stream_chunk.content_delta = content_delta;
-                    stream_chunk.finish_reason = "";
+                    stream_chunk.finish_reason = std::nullopt;
                     callback(stream_chunk);
                 }
 

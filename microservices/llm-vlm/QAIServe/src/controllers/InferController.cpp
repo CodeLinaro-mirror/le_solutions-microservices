@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <iostream>
 #include <thread>
+#include <future>
 
 using json = nlohmann::ordered_json;
 
@@ -410,11 +411,18 @@ void InferController::generateStream(
     CreateChatCompletionRequest chat_req = buildChatRequest(oip_req, model_name);
     chat_req.stream = true;
 
-    // Set up SSE response
+    // Set up SSE response.
+    // newAsyncStreamResponse lambda must NOT return until all SSE data is sent.
+    // QaiForge::generateStream is async (returns immediately, pushes tokens via
+    // callbacks from the scheduler thread). We use a promise/future to block the
+    // lambda until onComplete/onError/onCancelled fires, keeping the stream open.
     auto sse_resp = HttpResponse::newAsyncStreamResponse(
         [model_name, chat_req, oip_req]
         (drogon::ResponseStreamPtr stream) mutable {
             int completion_tokens = 0;
+            auto shared_stream = std::shared_ptr<drogon::ResponseStream>(std::move(stream));
+            auto done_promise = std::make_shared<std::promise<void>>();
+            auto done_future  = done_promise->get_future();
 
             try {
                 qai_forge::GenerateOptions opts;
@@ -422,8 +430,8 @@ void InferController::generateStream(
                     "oip_stream_" + model_name);
 
                 qai_forge::StreamCallbacks callbacks;
-                callbacks.onToken = [&stream, &model_name, &completion_tokens]
-                    (const StreamChunk& chunk) {
+                callbacks.onToken = [shared_stream, model_name, &completion_tokens]
+                    (const StreamChunk& chunk) mutable {
                         OipStreamChunk oip_chunk;
                         oip_chunk.model_name = model_name;
 
@@ -440,19 +448,39 @@ void InferController::generateStream(
                             }
                         }
 
-                        std::string event = "data: " + oip_chunk.toJson().dump() + "\n\n";
-                        stream->send(event);
+                        std::string event;
+                        try {
+                            event = "data: " + oip_chunk.toJson().dump() + "\n\n";
+                        } catch (const std::exception& e) {
+                            LOG_WARN << "[InferController] toJson/dump failed: "
+                                     << e.what();
+                            return;
+                        }
+                        try {
+                            shared_stream->send(event);
+                        } catch (const std::exception& e) {
+                            LOG_WARN << "[InferController] shared_stream->send failed: "
+                                     << e.what();
+                        } catch (...) {
+                            LOG_WARN << "[InferController] shared_stream->send failed (unknown)";
+                        }
                     };
-                callbacks.onComplete = [&stream](const StandardResponse& resp) {
-                    // Completion handled by final token with finish_reason
+                callbacks.onComplete = [shared_stream, done_promise](const StandardResponse& resp) {
+                    shared_stream->send("data: [DONE]\n\n");
+                    shared_stream->close();
+                    done_promise->set_value();
                 };
-                callbacks.onError = [&stream](const GenAIException& e) {
+                callbacks.onError = [shared_stream, done_promise](const GenAIException& e) {
                     std::string err_event = "data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n";
-                    stream->send(err_event);
+                    shared_stream->send(err_event);
+                    shared_stream->close();
+                    done_promise->set_value();
                 };
-                callbacks.onCancelled = [&stream]() {
+                callbacks.onCancelled = [shared_stream, done_promise]() {
                     std::string cancel_event = "data: {\"error\":\"Request cancelled\"}\n\n";
-                    stream->send(cancel_event);
+                    shared_stream->send(cancel_event);
+                    shared_stream->close();
+                    done_promise->set_value();
                 };
 
                 qai_forge::QaiForge::getInstance().generateStream(
@@ -462,11 +490,13 @@ void InferController::generateStream(
 
             } catch (const std::exception& e) {
                 std::string err_event = "data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n";
-                stream->send(err_event);
+                shared_stream->send(err_event);
+                shared_stream->close();
+                done_promise->set_value();
             }
 
-            stream->send("data: [DONE]\n\n");
-            stream->close();
+            // Block until the scheduler finishes (calls onComplete/onError/onCancelled)
+            done_future.wait();
         });
 
     sse_resp->setStatusCode(k200OK);

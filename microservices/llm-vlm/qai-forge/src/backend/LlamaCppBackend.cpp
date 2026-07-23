@@ -234,8 +234,10 @@ std::string LlamaCppBackend::receiveHttpResponse(int sockfd) {
 void LlamaCppBackend::receiveHttpStreamingResponse(int sockfd,
                                                   std::function<void(const std::string&)> on_chunk) {
     std::string buffer;
-    char chunk[1024];
+    char chunk[4096];
     bool headers_done = false;
+    bool chunked_encoding = false;
+    std::string sse_buffer;
 
     while (true) {
         ssize_t bytes = recv(sockfd, chunk, sizeof(chunk), 0);
@@ -245,31 +247,126 @@ void LlamaCppBackend::receiveHttpStreamingResponse(int sockfd,
 
         buffer.append(chunk, bytes);
 
-        // Skip HTTP headers
+        // Parse HTTP headers once
         if (!headers_done) {
             size_t header_end = buffer.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                buffer = buffer.substr(header_end + 4);
-                headers_done = true;
-            } else {
+            if (header_end == std::string::npos) {
                 continue;
             }
+            std::string headers = buffer.substr(0, header_end);
+            std::string headers_lower = headers;
+            for (auto& c : headers_lower) c = tolower(c);
+            chunked_encoding = headers_lower.find("transfer-encoding: chunked")
+                               != std::string::npos;
+            // Log first 256 bytes after headers for debugging
+            std::string body_preview = buffer.substr(
+                header_end + 4,
+                std::min(buffer.size() - header_end - 4, size_t(256)));
+            LOG_DEBUG("[LlamaCppBackend] streaming headers:\n" + headers
+                      + "\nchunked=" + (chunked_encoding ? "true" : "false")
+                      + "\nbody_preview=" + body_preview);
+            buffer = buffer.substr(header_end + 4);
+            headers_done = true;
         }
 
-        // Process SSE events (data: {...}\n\n format)
-        size_t pos = 0;
-        while ((pos = buffer.find("\n\n")) != std::string::npos) {
-            std::string event = buffer.substr(0, pos);
-            buffer = buffer.substr(pos + 2);
-
-            // Pass raw SSE chunk to callback (orchestrator will parse)
-            if (!event.empty() && on_chunk) {
-                on_chunk(event + "\n\n");
+        if (chunked_encoding) {
+            // Log first recv after headers
+            if (!sse_buffer.empty() || buffer.size() > 0) {
+                std::string buf_hex;
+                for (size_t i = 0; i < std::min(buffer.size(), size_t(32)); i++) {
+                    char hex[4];
+                    snprintf(hex, sizeof(hex), "%02x ", (unsigned char)buffer[i]);
+                    buf_hex += hex;
+                }
+                LOG_DEBUG("[LlamaCppBackend] chunked buffer(" +
+                          std::to_string(buffer.size()) + "): " + buf_hex);
             }
+            while (true) {
+                size_t crlf = buffer.find("\r\n");
+                if (crlf == std::string::npos) break;
 
-            // Check for [DONE] marker
-            if (event.find("data: [DONE]") != std::string::npos) {
-                return;
+                std::string size_str = buffer.substr(0, crlf);
+                // Strip chunk extensions
+                size_t semi = size_str.find(';');
+                if (semi != std::string::npos) size_str = size_str.substr(0, semi);
+                // Trim whitespace/CR
+                while (!size_str.empty() &&
+                       (size_str.front() == ' ' || size_str.front() == '\r'))
+                    size_str.erase(size_str.begin());
+                while (!size_str.empty() &&
+                       (size_str.back() == ' ' || size_str.back() == '\r'))
+                    size_str.pop_back();
+
+                if (size_str.empty()) {
+                    LOG_DEBUG("[LlamaCppBackend] empty size_str, crlf="
+                              + std::to_string(crlf)
+                              + " buf_size=" + std::to_string(buffer.size()));
+                    break;
+                }
+
+                // Validate: must be pure hex digits
+                bool valid_hex = true;
+                for (char c : size_str) {
+                    if (!isxdigit(static_cast<unsigned char>(c))) {
+                        valid_hex = false;
+                        break;
+                    }
+                }
+                if (!valid_hex) {
+                    LOG_DEBUG("[LlamaCppBackend] non-hex chunk size: '"
+                              + size_str + "', skipping");
+                    break;
+                }
+
+                size_t chunk_size = 0;
+                try {
+                    chunk_size = std::stoul(size_str, nullptr, 16);
+                } catch (...) {
+                    LOG_DEBUG("[LlamaCppBackend] failed to parse chunk size: '"
+                              + size_str + "'");
+                    break;
+                }
+
+                LOG_DEBUG("[LlamaCppBackend] chunk: size_str='" + size_str
+                          + "' chunk_size=" + std::to_string(chunk_size)
+                          + " data_start=" + std::to_string(crlf + 2)
+                          + " data_end=" + std::to_string(crlf + 2 + chunk_size)
+                          + " buf_size=" + std::to_string(buffer.size()));
+
+                if (chunk_size > 512 * 1024) break;
+                if (chunk_size == 0) return;
+
+                size_t data_start = crlf + 2;
+                size_t data_end   = data_start + chunk_size;
+                if (data_end + 2 > buffer.size()) break;
+
+                sse_buffer += buffer.substr(data_start, chunk_size);
+                buffer = buffer.substr(data_end + 2);
+
+                size_t pos = 0;
+                while ((pos = sse_buffer.find("\n\n")) != std::string::npos) {
+                    std::string event = sse_buffer.substr(0, pos);
+                    sse_buffer = sse_buffer.substr(pos + 2);
+                    if (!event.empty() && on_chunk) {
+                        on_chunk(event + "\n\n");
+                    }
+                    if (event.find("data: [DONE]") != std::string::npos) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            // Non-chunked: process SSE events directly
+            size_t pos = 0;
+            while ((pos = buffer.find("\n\n")) != std::string::npos) {
+                std::string event = buffer.substr(0, pos);
+                buffer = buffer.substr(pos + 2);
+                if (!event.empty() && on_chunk) {
+                    on_chunk(event + "\n\n");
+                }
+                if (event.find("data: [DONE]") != std::string::npos) {
+                    return;
+                }
             }
         }
     }
