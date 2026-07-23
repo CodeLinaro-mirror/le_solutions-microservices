@@ -107,18 +107,10 @@ struct CreateChatCompletionRequest {
     std::optional<std::string> user;
 
     // ── Reasoning model parameters ────────────────────────────────────────────
-    // reasoning_effort: "none"/"minimal"/"low"/"medium"/"high"/"xhigh"
+    // reasoning_effort: "none"/"minimal"/"low"/"medium"/"high"/"xhigh"/"max"
     // Controls the thinking budget via ReasoningBudgetCalculator.
     // When absent, defaults to "medium" for models that support thinking.
     std::optional<std::string> reasoning_effort;
-
-    // reasoning_summary: "" / "auto" / "concise" / "detailed"
-    // When set, a "reasoning" output item is included in the Responses API output[].
-    std::optional<std::string> reasoning_summary;
-
-    // reasoning_max_tokens: explicit cap on thinking tokens (overrides effort-based budget)
-    // When set, limits the number of tokens the model can use for reasoning/thinking.
-    std::optional<int> reasoning_max_tokens;
 
     // ── OIP raw prompt mode ───────────────────────────────────────────────────
     // Set by InferController when the OIP /generate request uses "text_input"
@@ -150,10 +142,6 @@ struct CreateChatCompletionRequest {
             req.user = j["user"].get<std::string>();
         if (j.contains("reasoning_effort") && !j["reasoning_effort"].is_null())
             req.reasoning_effort = j["reasoning_effort"].get<std::string>();
-        if (j.contains("reasoning_summary") && !j["reasoning_summary"].is_null())
-            req.reasoning_summary = j["reasoning_summary"].get<std::string>();
-        if (j.contains("reasoning_max_tokens") && !j["reasoning_max_tokens"].is_null())
-            req.reasoning_max_tokens = j["reasoning_max_tokens"].get<int>();
         return req;
     }
 };

@@ -310,9 +310,11 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // ── Slot 1.5: Budget info (reasoning budget notification) ─────────────────
     if (thinking_budget > 0 && answer_budget > 0) {
         prompt << system_prefix
-               << "[Reasoning Budget]: You have " << thinking_budget
-               << " tokens for thinking and " << answer_budget
-               << " tokens for your answer. Use your thinking budget wisely to reason through the problem."
+               << "[Reasoning Budget]: Use at most " << thinking_budget
+               << " tokens for internal thinking and reserve " << answer_budget
+               << " tokens for the final answer. Stop thinking when the "
+               << "thinking budget is used. Do not mention this budget in "
+               << "the final answer."
                << system_suffix;
     }
 
@@ -496,8 +498,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
             prelim_prompt,
             config_mgr.getContextSize(request.model),
             effort,
-            request.max_completion_tokens,
-            request.reasoning_max_tokens);
+            request.max_completion_tokens);
         if (budget.context_too_small) {
             throw GenAIException(
                 GenAIErrorCode::CONTEXT_LENGTH_EXCEEDED,
@@ -624,7 +625,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
             request.model,
             start_tag,
             end_tag,
-            thinking_budget > 0 ? thinking_budget : -1);
+            thinking_budget);
         router.route(full_response);
         thinking_content = router.getThinkingContent();
         answer_content = router.getAnswerContent();
@@ -728,8 +729,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             prelim_prompt,
             config_mgr.getContextSize(request.model),
             effort,
-            request.max_completion_tokens,
-            request.reasoning_max_tokens);
+            request.max_completion_tokens);
         if (budget.context_too_small) {
             throw GenAIException(
                 GenAIErrorCode::CONTEXT_LENGTH_EXCEEDED,
@@ -780,7 +780,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
         request.model,
         start_tag,
         end_tag,
-        thinking_budget > 0 ? thinking_budget : -1);
+        thinking_budget);
 
     std::string event_id = generateEventId();
     std::string full_response;

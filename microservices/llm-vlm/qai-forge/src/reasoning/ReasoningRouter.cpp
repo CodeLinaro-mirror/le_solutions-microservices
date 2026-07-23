@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/reasoning/ReasoningRouter.h"
-#include <iostream>
+#include "qai_forge/utils/Logger.h"
+#include <algorithm>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReasoningBudgetTracker
@@ -28,11 +29,17 @@ void ReasoningBudgetTracker::deactivate() {
     state_ = BudgetState::DONE;
 }
 
+int ReasoningBudgetTracker::estimateTokens(const std::string& text_fragment) {
+    // Estimate tokens using the same heuristic as GenieOrchestrator
+    // (1 token ≈ 4 chars).
+    int fragment_tokens = static_cast<int>(text_fragment.size() / 4);
+    if (fragment_tokens < 1) fragment_tokens = 1;  // Minimum 1 token per fragment
+    return fragment_tokens;
+}
+
 BudgetState ReasoningBudgetTracker::accept(const std::string& text_fragment) {
     if (state_ == BudgetState::COUNTING) {
-        // Estimate tokens using the same heuristic as GenieOrchestrator (1 token ≈ 4 chars)
-        int fragment_tokens = static_cast<int>(text_fragment.size() / 4);
-        if (fragment_tokens < 1) fragment_tokens = 1;  // Minimum 1 token per fragment
+        int fragment_tokens = estimateTokens(text_fragment);
         counted_ += fragment_tokens;
         if (budget_ >= 0) {
             remaining_ -= fragment_tokens;
@@ -42,6 +49,36 @@ BudgetState ReasoningBudgetTracker::accept(const std::string& text_fragment) {
         }
     }
     return state_;
+}
+
+int ReasoningBudgetTracker::acceptWithinBudget(const std::string& text_fragment) {
+    if (text_fragment.empty()) {
+        return 0;
+    }
+
+    if (state_ == BudgetState::FORCING) {
+        return 0;
+    }
+
+    if (state_ != BudgetState::COUNTING || budget_ < 0) {
+        accept(text_fragment);
+        return static_cast<int>(text_fragment.size());
+    }
+
+    int fragment_tokens = estimateTokens(text_fragment);
+    if (fragment_tokens <= remaining_) {
+        accept(text_fragment);
+        return static_cast<int>(text_fragment.size());
+    }
+
+    int accepted_tokens = std::max(remaining_, 0);
+    int accepted_chars = std::min(
+        static_cast<int>(text_fragment.size()),
+        accepted_tokens * 4);
+    counted_ += accepted_tokens;
+    remaining_ = 0;
+    state_ = BudgetState::FORCING;
+    return accepted_chars;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +168,7 @@ std::vector<StreamChunk> ReasoningRouter::route(const std::string& token_fragmen
                 budget_tracker_.activate();
             }
 
-        } else {
+        } else if (state_ == ChannelState::INSIDE) {
             // ── Inside thinking block — looking for end_tag ────────────────
             size_t idx = carry_buffer_.find(end_tag_);
             if (idx == std::string::npos) {
@@ -160,6 +197,12 @@ std::vector<StreamChunk> ReasoningRouter::route(const std::string& token_fragmen
             carry_buffer_ = carry_buffer_.substr(idx + end_tag_.size());
             state_ = ChannelState::OUTSIDE;
             budget_tracker_.deactivate();
+        } else {
+            // ── Over-budget thinking — discard until end_tag ───────────────
+            discardThinkingUntilEndTag();
+            if (state_ != ChannelState::OUTSIDE) {
+                break;
+            }
         }
     }
 
@@ -170,53 +213,65 @@ void ReasoningRouter::emitThinkingChunk(const std::string& text,
                                          std::vector<StreamChunk>& results) {
     if (text.empty()) return;
 
-    // Check budget
-    BudgetState budget_state = budget_tracker_.accept(text);
+    int accepted_chars = budget_tracker_.acceptWithinBudget(text);
 
-    if (budget_state == BudgetState::FORCING && !budget_forced_) {
-        // Budget exhausted — inject truncation message and force exit
-        budget_forced_ = true;
-        std::string truncation_msg = "\n[Thinking truncated]\n";
-        full_thinking_ += truncation_msg;
-
-        StreamChunk truncation_chunk;
-        truncation_chunk.id = session_id_;
-        truncation_chunk.model = model_id_;
-        truncation_chunk.reasoning_content = truncation_msg;
-        results.push_back(truncation_chunk);
-
-        // Redirect the fragment that tripped the budget into the answer channel
-        // instead of discarding it. In blocking mode, route() is called once with
-        // the entire remaining response as a single fragment, so dropping it here
-        // would leave the answer empty.
+    if (accepted_chars > 0) {
+        std::string accepted_text = text.substr(0, accepted_chars);
+        full_thinking_ += accepted_text;
         StreamChunk chunk;
         chunk.id = session_id_;
         chunk.model = model_id_;
-        chunk.content_delta = text;
-        full_answer_ += text;
+        chunk.reasoning_content = accepted_text;
         results.push_back(chunk);
+    }
 
-        // Force router out of thinking channel
+    if (budget_tracker_.state() == BudgetState::FORCING) {
+        if (!budget_forced_) {
+            LOG_WARN("[ReasoningRouter] Thinking budget exhausted for model "
+                     << model_id_ << " session=" << session_id_
+                     << " counted=" << budget_tracker_.tokensCounted());
+            std::string truncation_msg = "\n[Thinking truncated]\n";
+            full_thinking_ += truncation_msg;
+
+            StreamChunk truncation_chunk;
+            truncation_chunk.id = session_id_;
+            truncation_chunk.model = model_id_;
+            truncation_chunk.reasoning_content = truncation_msg;
+            results.push_back(truncation_chunk);
+        }
+        budget_forced_ = true;
+
+        // Redirect the over-budget remainder into the answer channel instead of
+        // discarding it. In blocking mode, route() is called once with the full
+        // remaining response, so dropping the remainder can leave the answer empty.
+        std::string answer_text = text.substr(accepted_chars);
+        if (!answer_text.empty()) {
+            StreamChunk chunk;
+            chunk.id = session_id_;
+            chunk.model = model_id_;
+            chunk.content_delta = answer_text;
+            full_answer_ += answer_text;
+            results.push_back(chunk);
+        }
+
         state_ = ChannelState::OUTSIDE;
         return;
     }
+}
 
-    if (budget_forced_) {
-        // After budget forced, treat remaining thinking tokens as answer
-        StreamChunk chunk;
-        chunk.id = session_id_;
-        chunk.model = model_id_;
-        chunk.content_delta = text;
-        full_answer_ += text;
-        results.push_back(chunk);
+void ReasoningRouter::discardThinkingUntilEndTag() {
+    size_t idx = carry_buffer_.find(end_tag_);
+    if (idx == std::string::npos) {
+        auto partial = findPartialPrefix(carry_buffer_, end_tag_);
+        if (partial.has_value()) {
+            carry_buffer_ = partial.value();
+        } else {
+            carry_buffer_.clear();
+        }
         return;
     }
 
-    // Normal thinking token
-    full_thinking_ += text;
-    StreamChunk chunk;
-    chunk.id = session_id_;
-    chunk.model = model_id_;
-    chunk.reasoning_content = text;
-    results.push_back(chunk);
+    carry_buffer_ = carry_buffer_.substr(idx + end_tag_.size());
+    state_ = ChannelState::OUTSIDE;
+    budget_tracker_.deactivate();
 }

@@ -116,6 +116,44 @@ static bool get_optional_string_field(const json& body,
     return true;
 }
 
+static bool is_supported_reasoning_effort(const std::string& effort) {
+    static const std::unordered_set<std::string> supported = {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    };
+    return supported.count(effort) > 0;
+}
+
+static bool parse_reasoning_effort(
+    const json& body,
+    std::optional<std::string>& reasoning_effort) {
+    reasoning_effort.reset();
+    if (!body.contains("reasoning") || body["reasoning"].is_null()) {
+        return true;
+    }
+
+    const json& reasoning = body["reasoning"];
+    if (!reasoning.is_object()) {
+        return false;
+    }
+
+    for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
+        if (it.value().is_null()) {
+            continue;
+        }
+        if (it.key() != "effort" || !it.value().is_string()) {
+            return false;
+        }
+
+        std::string effort = it.value().get<std::string>();
+        if (!is_supported_reasoning_effort(effort)) {
+            return false;
+        }
+        reasoning_effort = std::move(effort);
+    }
+
+    return true;
+}
+
 static json make_assistant_messages(const StandardResponse& result) {
     std::string content = result.content.has_value()
         ? ResponsesUtils::strip_tool_call_protocol_text(result.content.value())
@@ -124,10 +162,6 @@ static json make_assistant_messages(const StandardResponse& result) {
         {"role", "assistant"},
         {"content", content}
     };
-    if (result.reasoning_content.has_value()
-        && !result.reasoning_content.value().empty()) {
-        message["_thinking_content"] = result.reasoning_content.value();
-    }
     if (result.tool_calls.has_value()
         && !result.tool_calls.value().empty()) {
         message["tool_calls"] = result.tool_calls.value();
@@ -565,9 +599,7 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     const std::string& model,
     const json& request_messages,
     const std::string& instructions,
-    const std::string& reasoning_effort,
-    const std::string& reasoning_summary,
-    std::optional<int> reasoning_max_tokens,
+    const std::optional<std::string>& reasoning_effort,
     const json& function_tools,
     bool has_function_tools,
     std::optional<int> max_completion_tokens) {
@@ -577,9 +609,11 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     json sdk_body = {
         {"model", model},
         {"messages", sdk_messages},
-        {"stream", false},
-        {"reasoning_effort", reasoning_effort}
+        {"stream", false}
     };
+    if (reasoning_effort.has_value()) {
+        sdk_body["reasoning_effort"] = reasoning_effort.value();
+    }
     if (max_completion_tokens.has_value()) {
         sdk_body["max_completion_tokens"] = max_completion_tokens.value();
     }
@@ -588,12 +622,6 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     }
     if (body.contains("top_p") && !body["top_p"].is_null()) {
         sdk_body["top_p"] = body["top_p"];
-    }
-    if (!reasoning_summary.empty()) {
-        sdk_body["reasoning_summary"] = reasoning_summary;
-    }
-    if (reasoning_max_tokens.has_value()) {
-        sdk_body["reasoning_max_tokens"] = reasoning_max_tokens.value();
     }
     if (has_function_tools) {
         sdk_body["tools"] = function_tools;
@@ -656,6 +684,23 @@ static HttpResponsePtr make_error_response(int status_code, const std::string& m
         static_cast<HttpStatusCode>(status_code));
 }
 
+static HttpResponsePtr make_invalid_previous_response_id_response() {
+    return make_error_response(
+        400,
+        "invalid previous_response_id",
+        "invalid_request_error",
+        "previous_response_id");
+}
+
+static HttpResponsePtr make_invalid_reasoning_response() {
+    return make_error_response(
+        400,
+        "invalid or unsupported reasoning parameter",
+        "invalid_request_error",
+        "reasoning",
+        "invalid_reasoning");
+}
+
 static std::optional<json> get_stored_cancelled_response_object(
     const std::string& response_id) {
     std::optional<StoredResponse> stored =
@@ -696,37 +741,19 @@ void ResponsesController::createResponse(
     std::string system_prompt      = body.value("instructions", "");
     std::string previous_response_id;
     if (body.contains("previous_response_id")) {
-        if (body["previous_response_id"].is_null()) {
-            callback(make_error_response(
-                400,
-                "'previous_response_id' must be a string. For the first request, omit "
-                "'previous_response_id'; null is not supported.",
-                "invalid_request_error",
-                "previous_response_id"));
-            return;
-        }
-        if (!body["previous_response_id"].is_string()) {
-            callback(make_error_response(
-                400,
-                "invalid value for 'previous_response_id'",
-                "invalid_request_error",
-                "previous_response_id"));
+        if (body["previous_response_id"].is_null()
+            || !body["previous_response_id"].is_string()) {
+            callback(make_invalid_previous_response_id_response());
             return;
         }
         previous_response_id = body["previous_response_id"].get<std::string>();
     }
 
     // ── Parse reasoning parameters ────────────────────────────────────────────
-    std::string reasoning_effort  = "medium";  // default
-    std::string reasoning_summary = "";         // "" = no summary output item
-    std::optional<int> reasoning_max_tokens = std::nullopt;
-    if (body.contains("reasoning") && body["reasoning"].is_object()) {
-        reasoning_effort  = body["reasoning"].value("effort",  "medium");
-        reasoning_summary = body["reasoning"].value("summary", "");
-        if (body["reasoning"].contains("max_reasoning_tokens")
-            && !body["reasoning"]["max_reasoning_tokens"].is_null()) {
-            reasoning_max_tokens = body["reasoning"]["max_reasoning_tokens"].get<int>();
-        }
+    std::optional<std::string> reasoning_effort;
+    if (!parse_reasoning_effort(body, reasoning_effort)) {
+        callback(make_invalid_reasoning_response());
+        return;
     }
 
     // ── Tool type analysis ────────────────────────────────────────────────────
@@ -871,10 +898,9 @@ void ResponsesController::createResponse(
             sdk_body["top_p"] = body["top_p"];
         if (!previous_response_id.empty())
             sdk_body["user"] = previous_response_id;
-        // Pass reasoning parameters to the SDK (used by ReasoningBudgetCalculator)
-        sdk_body["reasoning_effort"]  = reasoning_effort;
-        if (!reasoning_summary.empty())
-            sdk_body["reasoning_summary"] = reasoning_summary;
+        if (reasoning_effort.has_value()) {
+            sdk_body["reasoning_effort"] = reasoning_effort.value();
+        }
 
         sdk_request = CreateChatCompletionRequest::from_json(sdk_body);
     } catch (const std::exception& e) {
@@ -973,19 +999,6 @@ void ResponsesController::createResponse(
                             }}
                         });
 
-                        // response.output_item.added (placeholder for first item)
-                        emit_event("response.output_item.added", {
-                            {"type",         "response.output_item.added"},
-                            {"output_index", 0},
-                            {"item", {
-                                {"type",   "message"},
-                                {"id",     "msg_" + response_id},
-                                {"role",   "assistant"},
-                                {"content", json::array()},
-                                {"status", "in_progress"}
-                            }}
-                        });
-
                         McpLoopResult loop_result;
                         bool had_error = false;
                         std::string error_msg;
@@ -1011,28 +1024,24 @@ void ResponsesController::createResponse(
                         }
 
                         if (!had_error) {
-                            std::string final_text =
-                                loop_result.final_response.content.value_or("");
-                            int output_index =
-                                static_cast<int>(loop_result.call_records.size());
-
-                            // response.output_item.done
-                            emit_event("response.output_item.done", {
-                                {"type",         "response.output_item.done"},
-                                {"output_index", output_index},
-                                {"item", {
-                                    {"type",    "message"},
-                                    {"id",      "msg_" + response_id},
-                                    {"role",    "assistant"},
-                                    {"content", {{{"type", "output_text"},
-                                                  {"text", final_text}}}},
-                                    {"status",  "completed"}
-                                }}
-                            });
-
-                            // Build final output array
                             json output = ResponsesUtils::build_output_array(
-                                loop_result.final_response, loop_result.call_records);
+                                loop_result.final_response,
+                                loop_result.call_records);
+
+                            for (std::size_t i = loop_result.call_records.size();
+                                 i < output.size();
+                                 ++i) {
+                                emit_event("response.output_item.added", {
+                                    {"type",         "response.output_item.added"},
+                                    {"output_index", i},
+                                    {"item",         output[i]}
+                                });
+                                emit_event("response.output_item.done", {
+                                    {"type",         "response.output_item.done"},
+                                    {"output_index", i},
+                                    {"item",         output[i]}
+                                });
+                            }
 
                             // response.completed
                             emit_event("response.completed", {
@@ -1314,8 +1323,6 @@ void ResponsesController::createResponse(
             runtime_request_messages,
             effective_system_prompt,
             reasoning_effort,
-            reasoning_summary,
-            reasoning_max_tokens,
             function_tools_for_request,
             expose_function_tools,
             is_vlm ? requested_max_output_tokens : resolved_max_output_tokens);
@@ -1400,11 +1407,13 @@ void ResponsesController::createResponse(
                         }}
                     });
 
+                    const int message_output_index = 0;
+
                     if (!expose_function_tools) {
                         // response.output_item.added
                         emit_event("response.output_item.added", {
                             {"type",         "response.output_item.added"},
-                            {"output_index", 0},
+                            {"output_index", message_output_index},
                             {"item", {
                                 {"type",    "message"},
                                 {"id",      "msg_" + response_id},
@@ -1417,7 +1426,7 @@ void ResponsesController::createResponse(
                         // response.content_part.added
                         emit_event("response.content_part.added", {
                             {"type",          "response.content_part.added"},
-                            {"output_index",  0},
+                            {"output_index",  message_output_index},
                             {"content_index", 0},
                             {"part",          {{"type", "output_text"}, {"text", ""}}}
                         });
@@ -1439,8 +1448,10 @@ void ResponsesController::createResponse(
                             // Use new async API - callbacks will handle completion
                             qai_forge::StreamCallbacks callbacks;
 
-                            callbacks.onToken = [shared_stream, expose_function_tools, response_id,
-                                                shared_full_text, shared_callback_count](const StreamChunk& chunk) {
+                            callbacks.onToken = [shared_stream, expose_function_tools,
+                                                message_output_index,
+                                                shared_full_text,
+                                                shared_callback_count](const StreamChunk& chunk) {
                                 auto stream_ptr = shared_stream.get();
                             (*shared_callback_count)++;
 
@@ -1452,29 +1463,21 @@ void ResponsesController::createResponse(
                                     stream_ptr->send("event: response.output_text.delta\n");
                                     stream_ptr->send("data: " + json({
                                         {"type",          "response.output_text.delta"},
-                                        {"output_index",  0},
+                                        {"output_index",  message_output_index},
                                         {"content_index", 0},
                                         {"delta",         chunk.content_delta.value()}
                                     }).dump() + "\n\n");
                                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                                 }
                             }
-                            if (chunk.reasoning_content.has_value()
-                                && !chunk.reasoning_content.value().empty()) {
-                                stream_ptr->send("event: response.reasoning.delta\n");
-                                stream_ptr->send("data: " + json({
-                                    {"type",         "response.reasoning.delta"},
-                                    {"output_index", 0},
-                                    {"delta",        chunk.reasoning_content.value()}
-                                }).dump() + "\n\n");
-                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                            }
                         };
 
                         callbacks.onComplete = [shared_stream, response_id, model,
                                                previous_response_id, metadata, function_tool_policy,
                                                function_tools, has_function_tools, expose_function_tools,
-                                               begin_created_at, shared_full_text](const StandardResponse& response) {
+                                               begin_created_at,
+                                               message_output_index,
+                                               shared_full_text](const StandardResponse& response) {
                             LOG_INFO("[ResponsesController] generateStream completed: response=" << response_id);
 
                             auto stream_ptr = shared_stream.get();
@@ -1500,7 +1503,8 @@ void ResponsesController::createResponse(
                             if (!emit_cancelled_if_stored()) {
                                 StandardResponse result = response;
                                 apply_function_tool_policy(result, function_tool_policy);
-                                json output = ResponsesUtils::build_output_array(result);
+                                json output =
+                                    ResponsesUtils::build_output_array(result, {});
 
                                 if (expose_function_tools) {
                                     for (std::size_t i = 0; i < output.size(); ++i) {
@@ -1546,14 +1550,14 @@ void ResponsesController::createResponse(
                                         ResponsesUtils::strip_tool_call_protocol_text(*shared_full_text);
                                     emit_event("response.output_text.done", {
                                         {"type",          "response.output_text.done"},
-                                        {"output_index",  0},
+                                        {"output_index",  message_output_index},
                                         {"content_index", 0},
                                         {"text",          clean_full_text}
                                     });
 
                                     emit_event("response.output_item.done", {
                                         {"type",         "response.output_item.done"},
-                                        {"output_index", 0},
+                                        {"output_index", message_output_index},
                                         {"item", {
                                             {"type",    "message"},
                                             {"id",      "msg_" + response_id},
@@ -1710,11 +1714,8 @@ void ResponsesController::createResponse(
                     standard_request, invoke_options);
             apply_function_tool_policy(result, function_tool_policy);
 
-            // Build output array.
-            // build_output_array() automatically emits a separate top-level
-            // {"type":"reasoning"} item when reasoning_content is non-empty,
-            // per the OpenAI Responses API spec.
-            json output = ResponsesUtils::build_output_array(result);
+            json output = ResponsesUtils::build_output_array(
+                result, {});
 
             // Build response object
             json response_obj = ResponsesUtils::build_response_object(
@@ -1866,11 +1867,7 @@ void ResponsesController::countInputTokens(
     std::string previous_response_id;
     if (!get_optional_string_field(
             body, "previous_response_id", previous_response_id)) {
-        callback(make_error_response(
-            400,
-            "invalid value for 'previous_response_id'",
-            "invalid_request_error",
-            "previous_response_id"));
+        callback(make_invalid_previous_response_id_response());
         return;
     }
 

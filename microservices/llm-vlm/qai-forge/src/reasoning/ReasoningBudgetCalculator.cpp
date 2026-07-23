@@ -28,6 +28,7 @@ float ReasoningBudgetCalculator::effortToFraction(const std::string& effort) {
     if (effort == "medium")  return 0.35f;
     if (effort == "high")    return 0.50f;
     if (effort == "xhigh")   return 0.60f;
+    if (effort == "max")     return 0.70f;
     // Unknown effort → treat as medium (safe default)
     return 0.35f;
 }
@@ -51,8 +52,7 @@ ReasoningBudgetResult ReasoningBudgetCalculator::compute(
     const std::string&  assembled_prompt,
     int                 context_size,
     const std::string&  effort,
-    std::optional<int>  max_output_tokens,
-    std::optional<int>  max_reasoning_tokens) {
+    std::optional<int>  max_output_tokens) {
 
     ReasoningBudgetResult result;
     result.suppress_thinking      = false;
@@ -125,13 +125,6 @@ ReasoningBudgetResult ReasoningBudgetCalculator::compute(
                                        * static_cast<float>(effective_output_cap));
 
     int thinking_budget = std::min(raw_budget, max_allowed);
-
-    // Apply explicit max_reasoning_tokens cap if provided (takes precedence)
-    if (max_reasoning_tokens.has_value() && max_reasoning_tokens.value() > 0) {
-        thinking_budget = std::min(thinking_budget, max_reasoning_tokens.value());
-        LOG_DEBUG("[ReasoningBudgetCalculator] Applied max_reasoning_tokens cap: "
-                  << max_reasoning_tokens.value());
-    }
 
     // Ensure answer always gets at least MIN_ANSWER_RESERVE
     thinking_budget = std::min(thinking_budget,
