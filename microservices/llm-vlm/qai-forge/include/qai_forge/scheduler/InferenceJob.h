@@ -7,9 +7,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace scheduler {
 
@@ -27,6 +29,24 @@ enum class JobKind {
     WEBSOCKET,
     MCP_ROUND,
     INTERNAL_SUMMARIZATION,
+};
+
+struct SchedulerInvokeOptions {
+    std::string response_id;
+    std::string previous_response_id;
+    std::string session_id;
+    JobKind kind = JobKind::HTTP_NON_STREAMING;
+    JobPriority priority = JobPriority::NEW_REQUEST;
+    bool tool_output_submission = false;
+    bool allow_tool_chain_fallback = false;
+    bool skip_summarization_middleware = false;
+    bool use_response_history = false;
+    json response_history = json::array();
+
+    std::string summary_content;
+    int summary_token_count = 0;
+    std::unordered_map<std::string, std::string> facts;
+    std::size_t evicted_message_count = 0;
 };
 
 enum class SubmitStatus {
@@ -76,9 +96,7 @@ struct InferenceJob {
     bool is_tool_output_submission = false;
     bool is_tool_continuation = false;
     bool allow_tool_chain_fallback = false;
-    bool skip_summarization_middleware = false;
-    bool use_response_history = false;
-    json response_history = json::array();
+    std::shared_ptr<const SchedulerInvokeOptions> invoke_options;
 
     CreateChatCompletionRequest request;
 

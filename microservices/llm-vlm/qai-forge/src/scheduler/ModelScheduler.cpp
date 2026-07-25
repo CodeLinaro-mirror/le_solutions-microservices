@@ -258,12 +258,17 @@ GenAIException submitErrorToException(const SubmitResult& result) {
 }
 
 InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
-                         const SchedulerInvokeOptions& options) {
+                         SchedulerInvokeOptions options) {
+    if (!options.response_history.is_array()) {
+        options.response_history = json::array();
+    }
+
     auto job = std::make_shared<InferenceJob>();
-    job->job_id = options.response_id.empty() ? generatedJobId()
-                                              : options.response_id;
-    job->response_id = options.response_id.empty() ? job->job_id
-                                                   : options.response_id;
+    job->job_id = options.response_id.empty()
+        ? generatedJobId()
+        : options.response_id;
+    job->response_id = options.response_id.empty()
+        ? job->job_id : options.response_id;
     job->previous_response_id = options.previous_response_id;
     if (!options.session_id.empty()) {
         job->session_id = options.session_id;
@@ -278,12 +283,6 @@ InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
     job->kind = options.kind;
     job->priority = options.priority;
     job->allow_tool_chain_fallback = options.allow_tool_chain_fallback;
-    job->skip_summarization_middleware =
-        options.skip_summarization_middleware;
-    job->use_response_history = options.use_response_history;
-    job->response_history = options.response_history.is_array()
-        ? options.response_history
-        : json::array();
     job->request = request;
     if (!job->session_id.empty()) {
         job->request.user = job->session_id;
@@ -291,6 +290,8 @@ InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
 
     const bool tool_output =
         options.tool_output_submission || requestContainsToolOutput(request);
+    job->invoke_options = std::make_shared<const SchedulerInvokeOptions>(
+        std::move(options));
     if (tool_output && !job->previous_response_id.empty()) {
         job->is_tool_output_submission = true;
         job->priority = JobPriority::READY_TOOL_CONT;
@@ -372,10 +373,10 @@ void ModelScheduler::start() {
 
 StandardResponse ModelScheduler::runBlocking(
     const CreateChatCompletionRequest& request,
-    const SchedulerInvokeOptions& options) {
+    SchedulerInvokeOptions options) {
     validateSchedulableOrThrow(request, "Blocking");
 
-    InferenceJobPtr job = buildJob(request, options);
+    InferenceJobPtr job = buildJob(request, std::move(options));
     LOG_INFO("[ModelScheduler] Submitting blocking request: job="
              << job->job_id << " response=" << job->response_id
              << " model=" << job->model_id
@@ -446,15 +447,14 @@ StandardResponse ModelScheduler::runBlocking(
 StandardResponse ModelScheduler::runStreaming(
     const CreateChatCompletionRequest& request,
     std::function<void(const StreamChunk&)> callback,
-    const SchedulerInvokeOptions& options) {
+    SchedulerInvokeOptions options) {
     validateSchedulableOrThrow(request, "Streaming");
 
-    SchedulerInvokeOptions effective_options = options;
-    if (effective_options.kind == JobKind::HTTP_NON_STREAMING) {
-        effective_options.kind = JobKind::HTTP_STREAMING;
+    if (options.kind == JobKind::HTTP_NON_STREAMING) {
+        options.kind = JobKind::HTTP_STREAMING;
     }
 
-    InferenceJobPtr job = buildJob(request, effective_options);
+    InferenceJobPtr job = buildJob(request, std::move(options));
     job->request.stream = true;
     LOG_INFO("[ModelScheduler] Submitting streaming request: job="
              << job->job_id << " response=" << job->response_id
@@ -525,15 +525,14 @@ StandardResponse ModelScheduler::runStreaming(
 void ModelScheduler::runStreamingAsync(
     const CreateChatCompletionRequest& request,
     qai_forge::StreamCallbacks callbacks,
-    const SchedulerInvokeOptions& options) {
+    SchedulerInvokeOptions options) {
     validateSchedulableOrThrow(request, "StreamingAsync");
 
-    SchedulerInvokeOptions effective_options = options;
-    if (effective_options.kind == JobKind::HTTP_NON_STREAMING) {
-        effective_options.kind = JobKind::HTTP_STREAMING;
+    if (options.kind == JobKind::HTTP_NON_STREAMING) {
+        options.kind = JobKind::HTTP_STREAMING;
     }
 
-    InferenceJobPtr job = buildJob(request, effective_options);
+    InferenceJobPtr job = buildJob(request, std::move(options));
     job->request.stream = true;
     LOG_INFO("[ModelScheduler] Submitting async streaming request: job="
              << job->job_id << " response=" << job->response_id

@@ -24,7 +24,7 @@ namespace qai_forge {
  * Design:
  * - Stateless: No member variables for backend, session, or state
  * - Backend Injection: Backend passed to execute(), not stored
- * - Response History Merging: Merges response_history into request.messages
+ * - Response History Merging: Merges options response_history into request.messages
  * - Direct Message Passing: Passes messages to llama-server (no Jinja in C++)
  * - SSE Parsing: Parses Server-Sent Events from llama-server
  * - Callback Invocation: Calls OrchestratorStreamCallback with StreamChunk
@@ -45,7 +45,7 @@ public:
      * pattern where ModelRuntime owns the backend and passes it per call.
      *
      * @param request          Chat completion request (model, messages, params)
-     * @param response_history Ancestor messages from ResponseStore
+     * @param options          Scheduler invoke options
      * @param backend          Backend instance (injected, not stored)
      * @param callback         Stream callback (nullptr for blocking mode)
      * @param cancel           Cancellation predicate
@@ -53,7 +53,7 @@ public:
      */
     StandardResponse execute(
         const CreateChatCompletionRequest& request,
-        const json& response_history,
+        const scheduler::SchedulerInvokeOptions& options,
         IGenerativeBackend& backend,
         OrchestratorStreamCallback callback,
         std::function<bool()> cancel) override;

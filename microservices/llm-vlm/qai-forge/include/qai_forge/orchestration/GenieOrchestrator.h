@@ -54,12 +54,12 @@ public:
      * Execute one inference turn with an injected backend.
      *
      * This is the primary entry point for the scheduler path (ModelRuntime).
-     * Creates a transient ConversationSession seeded from response_history.
+     * Creates a transient ConversationSession seeded from scheduler options.
      * Blocking when callback is nullptr; streaming otherwise.
      */
     StandardResponse execute(
         const CreateChatCompletionRequest& request,
-        const json& response_history,
+        const scheduler::SchedulerInvokeOptions& options,
         IGenerativeBackend& backend,
         OrchestratorStreamCallback callback,
         std::function<bool()> cancel) override;

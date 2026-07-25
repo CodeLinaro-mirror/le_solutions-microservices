@@ -26,6 +26,7 @@
 #include "qai_forge/reasoning/ReasoningBudgetCalculator.h"
 #include "qai_forge/adapters/ModelAdapterFactory.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/scheduler/InferenceJob.h"
 #include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
 #include <algorithm>
@@ -79,6 +80,16 @@ void registerSessionHash(const CreateChatCompletionRequest& request,
     auto& session_mgr = SessionManager::getInstance();
     std::string hash = SessionManager::calculateMessagesHash(request.messages);
     session_mgr.registerHash(hash, session_id);
+}
+
+ConversationMemoryUpdate makeConversationMemoryUpdate(
+    const ConversationSession& session) {
+    ConversationMemoryUpdate update;
+    update.summary_content = session.summary_content;
+    update.summary_token_count = session.summary_token_count;
+    update.facts = session.facts;
+    update.evicted_message_count = session.evicted_message_count;
+    return update;
 }
 
 std::string renderToolCallsForPrompt(const json& tool_calls) {
@@ -426,7 +437,7 @@ StandardResponse GenieOrchestrator::executeStreaming(
 // ─────────────────────────────────────────────────────────────────────────────
 StandardResponse GenieOrchestrator::execute(
     const CreateChatCompletionRequest& request,
-    const json& response_history,
+    const scheduler::SchedulerInvokeOptions& options,
     IGenerativeBackend& backend,
     OrchestratorStreamCallback callback,
     std::function<bool()> cancel) {
@@ -434,6 +445,15 @@ StandardResponse GenieOrchestrator::execute(
     const std::string session_id = request.user.value_or("");
     auto session = std::make_shared<ConversationSession>(
         session_id.empty() ? request.model : session_id);
+    session->summary_content = options.summary_content;
+    session->summary_token_count = options.summary_token_count;
+    session->facts = options.facts;
+    session->evicted_message_count = options.evicted_message_count;
+
+    static const json kEmptyResponseHistory = json::array();
+    const json& response_history = options.use_response_history
+        ? options.response_history
+        : kEmptyResponseHistory;
     if (response_history.is_array()) {
         for (const auto& message : response_history) {
             if (message.is_object()) {
@@ -656,9 +676,11 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     // Runs synchronously before returning so the next turn's prompt is fully
     // prepared (summary + facts updated) before the response is returned.
     // Skipped for VLM (no KV save/restore) and tool-call turns (turn not done).
+    std::optional<ConversationMemoryUpdate> updated_conversation_memory;
     if (!is_vlm && tool_calls.empty()) {
         try {
             postTurnProcessing(*session, request.model, backend);
+            updated_conversation_memory = makeConversationMemoryUpdate(*session);
         } catch (const std::exception& e) {
             LOG_WARN("[GenieOrchestrator] Post-turn processing failed (non-fatal): "
                      << e.what());
@@ -691,6 +713,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
+    response.updated_conversation_memory = std::move(updated_conversation_memory);
     LOG_INFO("[GenieOrchestrator] Blocking inference completed: model="
              << request.model << " session=" << session->session_id
              << " finish_reason=" << response.finish_reason
@@ -911,9 +934,11 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     }
 
     // ── Post-turn memory management (LLM only, complete turns only) ───────────
+    std::optional<ConversationMemoryUpdate> updated_conversation_memory;
     if (!is_vlm && tool_calls.empty()) {
         try {
             postTurnProcessing(*session, request.model, backend);
+            updated_conversation_memory = makeConversationMemoryUpdate(*session);
         } catch (const std::exception& e) {
             LOG_WARN("[GenieOrchestrator] Post-turn processing failed (non-fatal): "
                      << e.what());
@@ -952,6 +977,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
+    response.updated_conversation_memory = std::move(updated_conversation_memory);
     LOG_INFO("[GenieOrchestrator] Streaming inference completed: model="
              << request.model << " session=" << session->session_id
              << " finish_reason=" << response.finish_reason

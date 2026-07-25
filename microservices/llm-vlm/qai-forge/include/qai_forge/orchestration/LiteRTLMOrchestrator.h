@@ -64,12 +64,12 @@ public:
      * Execute one inference turn with an injected backend.
      *
      * On the first call, initializes metadata from the backend (lazy init).
-     * Creates a transient ConversationSession seeded from response_history.
+     * Creates a transient ConversationSession seeded from scheduler options.
      * Blocking when callback is nullptr; streaming otherwise.
      */
     StandardResponse execute(
         const CreateChatCompletionRequest& request,
-        const json& response_history,
+        const scheduler::SchedulerInvokeOptions& options,
         IGenerativeBackend& backend,
         OrchestratorStreamCallback callback,
         std::function<bool()> cancel) override;

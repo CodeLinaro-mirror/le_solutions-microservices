@@ -9,9 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <sstream>
 #include <utility>
-#include <vector>
 
 namespace TokenBudgetUtils {
 namespace {
@@ -38,27 +36,6 @@ std::string formatTemplate(const std::string& templ,
     result = replaceAll(result, "{cap}", std::to_string(cap));
     result = replaceAll(result, "{requested}", std::to_string(requested));
     return result;
-}
-
-std::string contentText(const json& content) {
-    if (content.is_string()) {
-        return content.get<std::string>();
-    }
-    if (!content.is_array()) {
-        return content.is_null() ? std::string() : content.dump();
-    }
-
-    std::ostringstream oss;
-    for (const auto& part : content) {
-        if (!part.is_object()) {
-            continue;
-        }
-        std::string type = part.value("type", "");
-        if (type == "text" || type == "input_text" || type == "output_text") {
-            oss << part.value("text", "");
-        }
-    }
-    return oss.str();
 }
 
 json normalizeContentParts(const json& messages) {
@@ -106,69 +83,17 @@ json normalizeContentParts(const json& messages) {
     return normalized;
 }
 
-void appendMessages(std::vector<json>& destination, const json& messages) {
-    if (!messages.is_array()) {
-        return;
-    }
-    for (const auto& message : messages) {
-        if (message.is_object()) {
-            destination.push_back(message);
-        }
-    }
-}
-
-std::vector<json> cleanMessages(const std::vector<json>& messages) {
-    std::vector<json> clean;
-    clean.reserve(messages.size());
-    for (const auto& message : messages) {
-        json clean_message = json::object();
-        for (const auto& [key, value] : message.items()) {
-            if (key.empty() || key[0] != '_') {
-                clean_message[key] = value;
-            }
-        }
-        clean.push_back(std::move(clean_message));
-    }
-    return clean;
-}
-
-int estimate_image_tokens(const json& content) {
-    if (!content.is_array()) {
-        return 0;
-    }
-
-    int total = 0;
-    for (const auto& part : content) {
-        if (!part.is_object()) {
-            continue;
-        }
-        std::string type = part.value("type", "");
-        if (type == "image_url" || type == "input_image") {
-            total += ResponsesConstants::IMAGE_TOKEN_COST;
-        }
-    }
-    return total;
-}
-
-int estimate_image_tokens_for_messages(const json& messages) {
-    if (!messages.is_array()) {
-        return 0;
-    }
-
-    int total = 0;
-    for (const auto& message : messages) {
-        if (!message.is_object() || !message.contains("content")) {
-            continue;
-        }
-        total += estimate_image_tokens(message["content"]);
-    }
-    return total;
-}
-
 int combined_tool_response_tokens(const json& ancestor_messages,
                                   const json& current_messages) {
     return estimate_tool_response_tokens(ancestor_messages)
         + estimate_tool_response_tokens(current_messages);
+}
+
+int estimate_message_content_tokens(const json& message) {
+    if (!message.is_object() || !message.contains("content")) {
+        return 0;
+    }
+    return estimate_multimodal_content_tokens(message["content"]);
 }
 
 } // namespace
@@ -242,7 +167,7 @@ int estimate_tool_response_tokens(const json& messages) {
     return total;
 }
 
-std::string render_candidate_prompt(
+static int estimate_prompt_tokens(
     const std::string& model,
     const json& ancestor_messages,
     const json& current_messages,
@@ -256,38 +181,27 @@ std::string render_candidate_prompt(
     }
     const auto& adapter = ModelAdapterFactory::getAdapter(model);
 
-    std::string system_prefix =
-        chat_template.value("system_prefix", "<|system|>\n");
-    std::string system_suffix =
-        chat_template.value("system_suffix", "\n");
-    std::string user_prefix =
-        chat_template.value("user_prefix", "<|user|>\n");
-    std::string user_suffix =
-        chat_template.value("user_suffix", "\n");
-    std::string assistant_prefix =
-        chat_template.value("assistant_prefix", "<|assistant|>\n");
-    std::string assistant_suffix =
-        chat_template.value("assistant_suffix", "\n");
-
+    int total = ResponsesConstants::MESSAGE_OVERHEAD_TOKENS;
     std::string system_content =
         adapter.buildSystemPrompt(chat_template, instructions, tools);
-
-    std::ostringstream prompt;
     if (!system_content.empty()) {
-        prompt << system_prefix << system_content << system_suffix;
+        total += ResponsesConstants::MESSAGE_OVERHEAD_TOKENS
+            + estimate_tokens(system_content);
     }
 
-    std::vector<json> history;
-    appendMessages(history, normalizeContentParts(ancestor_messages));
-    for (const auto& message : cleanMessages(history)) {
-        std::string role = message.value("role", "");
-        std::string content = message.contains("content")
-            ? contentText(message["content"])
-            : std::string();
-        if (role == "user") {
-            prompt << user_prefix << content << user_suffix;
-        } else if (role == "assistant") {
-            prompt << assistant_prefix << content << assistant_suffix;
+    json normalized_ancestor_messages =
+        normalizeContentParts(ancestor_messages);
+    if (normalized_ancestor_messages.is_array()) {
+        for (const auto& message : normalized_ancestor_messages) {
+            if (!message.is_object()) {
+                continue;
+            }
+            std::string role = message.value("role", "");
+            if (role != "user" && role != "assistant") {
+                continue;
+            }
+            total += ResponsesConstants::MESSAGE_OVERHEAD_TOKENS
+                + estimate_message_content_tokens(message);
         }
     }
 
@@ -300,34 +214,28 @@ std::string render_candidate_prompt(
             }
 
             std::string role = message.value("role", "");
-            std::string content = message.contains("content")
-                ? contentText(message["content"])
-                : std::string();
             if (role == "user") {
-                prompt << user_prefix << content << user_suffix;
+                total += ResponsesConstants::MESSAGE_OVERHEAD_TOKENS
+                    + estimate_message_content_tokens(message);
             } else if (role == "tool") {
-                prompt << user_prefix
-                       << adapter.formatToolResponse(json::array({message}))
-                       << user_suffix;
+                total += ResponsesConstants::MESSAGE_OVERHEAD_TOKENS
+                    + estimate_tokens(
+                        adapter.formatToolResponse(json::array({message})));
             }
         }
     }
 
-    prompt << assistant_prefix;
-    return prompt.str();
+    return total;
 }
 
-int count_input_tokens(
+static int count_input_tokens(
     const std::string& model,
     const json& ancestor_messages,
     const json& current_messages,
     const std::string& instructions,
     const json& tools) {
-    std::string prompt = render_candidate_prompt(
+    return estimate_prompt_tokens(
         model, ancestor_messages, current_messages, instructions, tools);
-    return estimate_tokens(prompt)
-        + estimate_image_tokens_for_messages(ancestor_messages)
-        + estimate_image_tokens_for_messages(current_messages);
 }
 
 ContextBudgetResult resolve_context_budget(
@@ -394,37 +302,6 @@ ContextBudgetResult resolve_context_budget(
 
 int default_max_output_tokens(int context_size) {
     return static_cast<int>(context_size * 0.5);
-}
-
-int summary_max_output_tokens(int context_size) {
-    return static_cast<int>(
-        context_size * ResponsesConstants::SUMMARIZATION_SUMMARY_SIZE_RATIO);
-}
-
-SummarizationTriggerResult evaluate_summarization_trigger(
-    const std::string& model,
-    const json& ancestor_messages,
-    const json& current_messages,
-    const std::string& instructions,
-    const json& tools,
-    int max_output_tokens) {
-
-    SummarizationTriggerResult result;
-    result.context_size =
-        ModelConfigManager::getInstance().getContextSize(model);
-    result.input_tokens = count_input_tokens(
-        model, ancestor_messages, current_messages, instructions, tools);
-    result.output_reservation_tokens = static_cast<int>(
-        std::max(max_output_tokens, 0)
-        * ResponsesConstants::SUMMARIZATION_MAX_COMPLETION_MULTIPLIER);
-    result.projected_tokens =
-        result.input_tokens + result.output_reservation_tokens;
-    result.threshold_tokens = static_cast<int>(
-        result.context_size
-        * ResponsesConstants::SUMMARIZATION_CONTEXT_THRESHOLD);
-    result.should_summarize =
-        result.projected_tokens >= result.threshold_tokens;
-    return result;
 }
 
 } // namespace TokenBudgetUtils

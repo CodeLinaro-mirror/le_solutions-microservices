@@ -26,18 +26,13 @@ enum class StoredResponseStatus {
 };
 
 /**
- * @brief Reserved summary metadata for future branch-aware compaction.
+ * @brief Branch-local conversation memory captured after a completed turn.
  */
-struct CompactionSummary {
-    std::string compaction_id;
+struct StoredConversationMemory {
+    std::string summary_content;
+    int summary_token_count = 0;
+    std::unordered_map<std::string, std::string> facts;
     std::string summarized_until_response_id;
-    std::string branch_head_response_id;
-    std::string summary_text;
-    int summary_tokens = 0;
-    int input_tokens_before = 0;
-    int input_tokens_after = 0;
-    std::string model;
-    int created_at = 0;
 };
 
 /**
@@ -64,6 +59,7 @@ struct StoredResponse {
     ResponseStoreJson incomplete_details = nullptr;
     ResponseStoreJson metadata = ResponseStoreJson::object();
 
+    std::optional<StoredConversationMemory> conversation_memory;
     std::string active_job_id;
 
     int created_at = 0;
@@ -74,7 +70,8 @@ struct StoredResponse {
 
 /**
  * @brief Grouping container for a response tree.
- * @details The session tracks membership and future compaction records only.
+ * @details The session tracks membership only; memory is branch-local to
+ * individual responses.
  */
 struct StoredSession {
     std::string session_id;
@@ -82,7 +79,6 @@ struct StoredSession {
     std::unordered_set<std::string> response_ids;
     int created_at = 0;
     int last_activity_at = 0;
-    std::vector<CompactionSummary> compactions;
 };
 
 /**
@@ -94,10 +90,9 @@ struct BuildCandidateResult {
     std::string error_message;
     std::string session_id;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
+    std::vector<std::string> ancestor_message_response_ids;
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
-    std::string applied_compaction_id;
-    std::string applied_summary;
-    int summary_tokens = 0;
+    std::optional<StoredConversationMemory> conversation_memory;
 };
 
 /**
@@ -111,7 +106,9 @@ struct BeginResponseResult {
     std::string session_id;
     int created_at = 0;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
+    std::vector<std::string> ancestor_message_response_ids;
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
+    std::optional<StoredConversationMemory> conversation_memory;
 };
 
 /**
@@ -153,17 +150,6 @@ struct DeleteCascadeResult {
     std::string error_message;
 };
 
-/**
- * @brief Result of storing a branch compaction summary.
- */
-struct ApplyCompactionResult {
-    bool ok = false;
-    bool applied = false;
-    int http_status = 200;
-    std::string error_message;
-    std::string compaction_id;
-};
-
 class ResponseStoreTestAccess;
 
 /**
@@ -190,6 +176,21 @@ public:
         int ttl_seconds = 900);
 
     /**
+     * @brief Create an InProgress response using a prevalidated context walk.
+     * @details The store still validates response identity and parent state
+     * under lock before committing the new response.
+     */
+    BeginResponseResult beginResponseFromCandidate(
+        const std::string& response_id,
+        const std::string& model,
+        const std::string& previous_response_id,
+        const ResponseStoreJson& input_items,
+        const ResponseStoreJson& request_messages,
+        const ResponseStoreJson& metadata,
+        BuildCandidateResult candidate,
+        int ttl_seconds = 900);
+
+    /**
      * @brief Commit an InProgress response as Completed.
      */
     bool completeResponse(
@@ -197,7 +198,9 @@ public:
         const ResponseStoreJson& assistant_messages,
         const ResponseStoreJson& output_items,
         const ResponseStoreJson& response_object,
-        const ResponseStoreJson& usage);
+        const ResponseStoreJson& usage,
+        const std::optional<StoredConversationMemory>& memory_update =
+            std::nullopt);
 
     /**
      * @brief Mark an InProgress response as Failed.
@@ -220,13 +223,6 @@ public:
      * @brief Expire stale InProgress responses and return job ids to cancel.
      */
     std::vector<ExpiredResponse> expireStaleInProgress(int now_unix);
-
-    /**
-     * @brief Store or replace a fork-safe branch compaction summary.
-     */
-    ApplyCompactionResult applyCompaction(
-        const std::string& session_id,
-        const CompactionSummary& summary);
 
     /**
      * @brief Return a copy of a stored response, or nullopt if missing.
@@ -267,8 +263,11 @@ private:
 
     static int currentUnixTime();
 
-    static void appendMessages(ResponseStoreJson& destination,
-                               const ResponseStoreJson& messages);
+    static void appendMessagesWithSource(
+        ResponseStoreJson& destination,
+        std::vector<std::string>& destination_response_ids,
+        const ResponseStoreJson& messages,
+        const std::string& response_id);
 
     static ResponseStoreJson makeResponseObject(
         const StoredResponse& response,
@@ -290,6 +289,16 @@ private:
     BuildCandidateResult buildCandidateMessagesLocked(
         const std::string& previous_response_id,
         const ResponseStoreJson& request_messages) const;
+
+    BeginResponseResult beginResponseFromCandidateLocked(
+        const std::string& response_id,
+        const std::string& model,
+        const std::string& previous_response_id,
+        const ResponseStoreJson& input_items,
+        const ResponseStoreJson& request_messages,
+        const ResponseStoreJson& metadata,
+        BuildCandidateResult candidate,
+        int ttl_seconds);
 
     std::unordered_map<std::string, StoredResponse> responses_by_id_;
     std::unordered_map<std::string, StoredSession> sessions_by_id_;

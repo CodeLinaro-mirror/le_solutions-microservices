@@ -19,9 +19,8 @@
 //   synthesize_in_progress()     — assemble Retrieve JSON for active responses
 //   normalize_input_items()      — Responses API input → input_items list
 //   paginate_input_items()       — slice input_items into a list envelope
-//   generate_compaction_id()     — generate a unique "cmp_XXXX" ID
-//   inject_summary_into_instructions() — append branch summary to instructions
 //   build_text_runtime_messages() — build model-facing text-only messages
+//   build_text_runtime_messages_with_sources() — text runtime plus owner IDs
 //   build_vlm_runtime_messages() — build model-facing VLM messages
 //   current_unix_time()          — current time as Unix timestamp (seconds)
 //   generate_response_id()       — generate a unique "resp_XXXX" ID
@@ -57,22 +56,6 @@ int current_unix_time();
 std::string generate_response_id();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generate_compaction_id — generate a unique "cmp_XXXXXXXXXXXXXXXX" ID
-// ─────────────────────────────────────────────────────────────────────────────
-std::string generate_compaction_id();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// inject_summary_into_instructions — append applied branch summary
-//
-// @param instructions    Effective system instructions
-// @param applied_summary Summary text returned by ResponseStore
-// @return                Instructions with summary text appended
-// ─────────────────────────────────────────────────────────────────────────────
-std::string inject_summary_into_instructions(
-    const std::string& instructions,
-    const std::string& applied_summary);
-
-// ─────────────────────────────────────────────────────────────────────────────
 // input_to_messages — convert Responses API `input` to messages array
 //
 // Handles all Responses API input formats:
@@ -99,6 +82,23 @@ json input_to_messages(const json& input, const std::string& system_prompt = "")
 // @return         Text-only runtime messages
 // ─────────────────────────────────────────────────────────────────────────────
 json build_text_runtime_messages(const json& messages);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages_with_sources — build text runtime plus owners
+//
+// Applies the same filtering as build_text_runtime_messages(). For each emitted
+// runtime message, appends the corresponding input source id to
+// runtime_message_source_ids.
+//
+// @param messages Stored or current messages
+// @param message_source_ids Source id for each input message
+// @param runtime_message_source_ids Output source id for each emitted message
+// @return Text-only runtime messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages_with_sources(
+    const json& messages,
+    const std::vector<std::string>& message_source_ids,
+    std::vector<std::string>& runtime_message_source_ids);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_vlm_runtime_messages — build model-facing messages for VLM inference
