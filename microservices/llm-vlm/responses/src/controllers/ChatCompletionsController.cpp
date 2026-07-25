@@ -222,10 +222,29 @@ void ChatCompletionsController::handleStreamingRequest(
             auto accumulated_tool_calls = std::make_shared<json>();
             auto has_tool_calls = std::make_shared<bool>(false);
 
-            callbacks.onToken = [stream, session, accumulated_content](const StreamChunk& chunk) {
+            callbacks.onToken = [stream, session, accumulated_content, accumulated_tool_calls, has_tool_calls](const StreamChunk& chunk) {
                 // Accumulate content
                 if (chunk.content_delta) {
                     *accumulated_content += *chunk.content_delta;
+                }
+
+                // Build delta object
+                json delta_obj = json::object();
+                if (chunk.role.has_value()) {
+                    delta_obj["role"] = *chunk.role;
+                }
+                if (chunk.content_delta.has_value()) {
+                    delta_obj["content"] = *chunk.content_delta;
+                }
+                if (chunk.tool_calls.has_value() && chunk.tool_calls->is_array()
+                        && !chunk.tool_calls->empty()) {
+                    delta_obj["tool_calls"] = *chunk.tool_calls;
+                    *has_tool_calls = true;
+                }
+
+                // Skip empty deltas (nothing to send to client)
+                if (delta_obj.empty()) {
+                    return;
                 }
 
                 // Format as OpenAI chat completion chunk
@@ -237,9 +256,7 @@ void ChatCompletionsController::handleStreamingRequest(
                     {"choices", json::array({
                         {
                             {"index", 0},
-                            {"delta", {
-                                {"content", chunk.content_delta.value_or("")}
-                            }},
+                            {"delta", delta_obj},
                             {"finish_reason", nullptr}
                         }
                     })}

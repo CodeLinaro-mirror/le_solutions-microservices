@@ -34,6 +34,7 @@ struct StreamChunk : BaseResponseChunk {
     std::optional<std::string> role;
     std::optional<std::string> content_delta;
     std::optional<std::string> reasoning_content; // For reasoning models (e.g. DeepSeek-R1)
+    std::optional<json> tool_calls;               // For streaming tool call deltas (llama.cpp)
     std::optional<std::string> finish_reason;
 };
 

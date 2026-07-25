@@ -17,6 +17,7 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 namespace qai_forge {
 
@@ -84,15 +85,42 @@ int LlamaCppWorkerManager::startWorker(const std::string& model_id,
 
         // Execute llama-server with OpenAI-compatible API
         // Dynamically inject the path to the server binary instead of hardcoding /usr/bin/
-        execl(server_binary_path.c_str(),
-              "llama-server",
-              "-m", model_path.c_str(),
-              "--host", "127.0.0.1",
-              "--port", port_str.c_str(),
-              "--ctx-size", ctx_str.c_str(),
-              "--n-gpu-layers", "999",  // Offload all layers to NPU (Qualcomm Hexagon fallback)
-              "--parallel", "1",  // Single request at a time
-              nullptr);
+        std::vector<std::string> args = {
+            "llama-server",
+            "-m", model_path,
+            "--host", "127.0.0.1",
+            "--port", port_str,
+            "--ctx-size", ctx_str,
+            "--n-gpu-layers", "999",
+            "--parallel", "1"
+        };
+
+        // Map log levels to llama-server arguments and environment variables
+        qai::LogLevel log_level = qai::Logger::instance().getLevel();
+        if (log_level == qai::LogLevel::TRACE || log_level == qai::LogLevel::DEBUG) {
+            args.push_back("--log-verbosity"); args.push_back("5");
+            args.push_back("--verbose");
+            setenv("GGML_LOG_LEVEL", "2", 1); setenv("LLAMA_LOG_LEVEL", "2", 1);
+        } else if (log_level == qai::LogLevel::INFO) {
+            args.push_back("--log-verbosity"); args.push_back("3");
+            setenv("GGML_LOG_LEVEL", "1", 1); setenv("LLAMA_LOG_LEVEL", "1", 1);
+        } else if (log_level == qai::LogLevel::WARN) {
+            args.push_back("--log-verbosity"); args.push_back("2");
+            setenv("GGML_LOG_LEVEL", "0", 1); setenv("LLAMA_LOG_LEVEL", "0", 1);
+        } else if (log_level == qai::LogLevel::ERROR) {
+            args.push_back("--log-verbosity"); args.push_back("1");
+            setenv("GGML_LOG_LEVEL", "0", 1); setenv("LLAMA_LOG_LEVEL", "0", 1);
+        } else {
+            args.push_back("--log-disable");
+            setenv("GGML_LOG_LEVEL", "0", 1); setenv("LLAMA_LOG_LEVEL", "0", 1);
+        }
+
+        std::vector<char*> argv_list;
+        for (const auto& arg : args) {
+            argv_list.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv_list.push_back(nullptr);
+        execv(server_binary_path.c_str(), argv_list.data());
 
         // If exec fails, exit child
         _exit(1);

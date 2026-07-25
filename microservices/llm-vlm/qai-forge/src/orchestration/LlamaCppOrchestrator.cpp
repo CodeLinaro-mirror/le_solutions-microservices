@@ -226,7 +226,7 @@ void LlamaCppOrchestrator::handleSseChunk(
                     callback(stream_chunk);
                 }
 
-                // Accumulate tool calls
+                // Accumulate tool calls and stream them to the client
                 if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
                     for (const auto& tool_call_delta : delta["tool_calls"]) {
                         // Merge tool call deltas (simplified - assumes index-based merging)
@@ -264,6 +264,14 @@ void LlamaCppOrchestrator::handleSseChunk(
                             }
                         }
                     }
+
+                    // Stream the tool_calls delta to the client so Hermes/clients
+                    // receive the tool call payload in the streaming response
+                    StreamChunk tool_chunk;
+                    tool_chunk.id = event_id;
+                    tool_chunk.model = model;
+                    tool_chunk.tool_calls = delta["tool_calls"];
+                    callback(tool_chunk);
                 }
             }
 
