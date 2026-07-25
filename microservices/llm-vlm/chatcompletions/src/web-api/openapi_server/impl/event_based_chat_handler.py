@@ -562,7 +562,7 @@ class EventBasedChatHandler:
                 message = ChatCompletionResponseMessage(
                     role="assistant",
                     content=None,
-                    refusal=LLMServiceKeys.REFUSE,
+                    refusal=None,
                     tool_calls=tool_calls
                 )
 
@@ -603,7 +603,7 @@ class EventBasedChatHandler:
                 message = ChatCompletionResponseMessage(
                     role="assistant",
                     content=content,
-                    refusal=LLMServiceKeys.REFUSE,
+                    refusal=None,
                     tool_calls=None
                 )
 
