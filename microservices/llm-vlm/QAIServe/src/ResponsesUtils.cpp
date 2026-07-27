@@ -9,12 +9,162 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "ResponsesUtils.h"
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <regex>
 
 namespace ResponsesUtils {
+namespace {
+
+bool is_vlm_image_type(const std::string& type) {
+    return type == "image_url" || type == "input_image";
+}
+
+std::string image_url_from_part(const json& part) {
+    if (!part.is_object()) {
+        return "";
+    }
+    if (!is_vlm_image_type(part.value("type", ""))) {
+        return "";
+    }
+
+    json image_url = part.value("image_url", json(nullptr));
+    if (image_url.is_string()) {
+        return image_url.get<std::string>();
+    }
+    if (image_url.is_object()) {
+        return image_url.value("url", "");
+    }
+    return "";
+}
+
+std::string latest_image_url_from_messages(const json& messages) {
+    if (!messages.is_array()) {
+        return "";
+    }
+
+    for (auto msg_it = messages.rbegin(); msg_it != messages.rend(); ++msg_it) {
+        if (!msg_it->is_object() || !msg_it->contains("content")) {
+            continue;
+        }
+        const json& content = (*msg_it)["content"];
+        if (!content.is_array()) {
+            continue;
+        }
+
+        for (auto part_it = content.rbegin();
+             part_it != content.rend();
+             ++part_it) {
+            std::string url = image_url_from_part(*part_it);
+            if (!url.empty()) {
+                return url;
+            }
+        }
+    }
+    return "";
+}
+
+json convert_vlm_content_text_parts(const json& content) {
+    if (content.is_string()) {
+        return content;
+    }
+    if (!content.is_array()) {
+        return content.is_null() ? json("") : content;
+    }
+
+    json parts = json::array();
+    for (const auto& part : content) {
+        if (!part.is_object()) {
+            continue;
+        }
+
+        std::string type = part.value("type", "");
+        if (type == "input_text" || type == "text" || type == "output_text") {
+            parts.push_back({{"type", "text"},
+                             {"text", part.value("text", "")}});
+        } else if (!is_vlm_image_type(type)) {
+            parts.push_back(part);
+        }
+    }
+    return parts;
+}
+
+std::string text_runtime_content(const json& content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return content.is_null() ? std::string() : content.dump();
+    }
+
+    std::ostringstream text;
+    bool first = true;
+    for (const auto& part : content) {
+        std::string part_text;
+        if (part.is_string()) {
+            part_text = part.get<std::string>();
+        } else if (part.is_object()) {
+            std::string type = part.value("type", "");
+            if (is_vlm_image_type(type)) {
+                continue;
+            }
+            if (type == "input_text" || type == "text"
+                || type == "output_text" || part.contains("text")) {
+                part_text = part.value("text", "");
+            }
+        }
+
+        if (part_text.empty()) {
+            continue;
+        }
+        if (!first) {
+            text << "\n";
+        }
+        text << part_text;
+        first = false;
+    }
+    return text.str();
+}
+
+void attach_image_to_message(json& message, const std::string& image_url) {
+    if (image_url.empty() || !message.is_object()) {
+        return;
+    }
+
+    json image_part = {
+        {"type", "image_url"},
+        {"image_url", {{"url", image_url}}}
+    };
+
+    if (!message.contains("content")) {
+        message["content"] = json::array({image_part});
+        return;
+    }
+
+    json& content = message["content"];
+    if (content.is_string()) {
+        std::string text = content.get<std::string>();
+        content = json::array();
+        if (!text.empty()) {
+            content.push_back({{"type", "text"}, {"text", text}});
+        }
+        content.push_back(std::move(image_part));
+        return;
+    }
+
+    if (!content.is_array()) {
+        content = json::array({image_part});
+        return;
+    }
+
+    content.push_back(std::move(image_part));
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // current_unix_time
@@ -32,6 +182,35 @@ std::string generate_response_id() {
     std::ostringstream oss;
     oss << "resp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
     return oss.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generate_compaction_id
+// ─────────────────────────────────────────────────────────────────────────────
+std::string generate_compaction_id() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "cmp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
+    return oss.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// inject_summary_into_instructions
+// ─────────────────────────────────────────────────────────────────────────────
+std::string inject_summary_into_instructions(
+    const std::string& instructions,
+    const std::string& applied_summary) {
+    if (applied_summary.empty()) {
+        return instructions;
+    }
+
+    std::string result = instructions;
+    if (!result.empty()) {
+        result += "\n\n";
+    }
+    result += "Previous conversation summary:\n";
+    result += applied_summary;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,35 +270,98 @@ json input_to_messages(const json& input, const std::string& system_prompt) {
             continue;
         }
 
-        // message — standard message object
-        if (item_type == "message" || item_type.empty()) {
-            std::string role = item.value("role", "user");
-            const auto& content = item.value("content", json{});
-
-            if (content.is_string()) {
-                messages.push_back({{"role", role}, {"content", content}});
-            } else if (content.is_array()) {
-                // Content parts array — extract text parts
-                std::string text_content;
-                for (const auto& part : content) {
-                    std::string part_type = part.value("type", "");
-                    if (part_type == "input_text" || part_type == "text") {
-                        text_content += part.value("text", "");
-                    } else if (part_type == "output_text") {
-                        text_content += part.value("text", "");
-                    }
-                }
-                if (!text_content.empty()) {
-                    messages.push_back({{"role", role}, {"content", text_content}});
-                }
-            } else if (item.contains("text")) {
-                messages.push_back({{"role", role}, {"content", item["text"]}});
-            }
-            continue;
+        // Standard message or content part. Preserve content arrays as-is so
+        // VLM image_url parts survive the shared HTTP/WebSocket conversion.
+        std::string role = item.value("role", "user");
+        if (item.contains("content")) {
+            messages.push_back({{"role", role}, {"content", item["content"]}});
+        } else if (item.contains("text")) {
+            messages.push_back({{"role", role}, {"content", item["text"]}});
         }
     }
 
     return messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages(const json& messages) {
+    json runtime_messages = json::array();
+    if (!messages.is_array()) {
+        return runtime_messages;
+    }
+
+    for (const auto& message : messages) {
+        if (!message.is_object()) {
+            continue;
+        }
+
+        json runtime_message = message;
+        bool has_tool_calls =
+            runtime_message.contains("tool_calls")
+            && runtime_message["tool_calls"].is_array()
+            && !runtime_message["tool_calls"].empty();
+        bool is_tool_result =
+            runtime_message.value("role", "") == "tool"
+            && runtime_message.contains("tool_call_id");
+
+        if (runtime_message.contains("content")) {
+            runtime_message["content"] =
+                text_runtime_content(runtime_message["content"]);
+        }
+
+        std::string content = runtime_message.value("content", "");
+        // Image-only text-runtime messages drop out; tool exchanges must stay paired.
+        if (content.empty() && !has_tool_calls && !is_tool_result) {
+            continue;
+        }
+        runtime_messages.push_back(std::move(runtime_message));
+    }
+
+    return runtime_messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_vlm_runtime_messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_vlm_runtime_messages(const json& current_messages,
+                                const json& ancestor_messages) {
+    json runtime_messages = json::array();
+    if (!current_messages.is_array()) {
+        return runtime_messages;
+    }
+
+    std::string image_url = latest_image_url_from_messages(current_messages);
+    if (image_url.empty()) {
+        image_url = latest_image_url_from_messages(ancestor_messages);
+    }
+
+    int last_user_index = -1;
+    for (const auto& message : current_messages) {
+        if (!message.is_object()) {
+            continue;
+        }
+
+        json runtime_message = message;
+        if (runtime_message.contains("content")) {
+            runtime_message["content"] =
+                convert_vlm_content_text_parts(runtime_message["content"]);
+        }
+
+        if (runtime_message.value("role", "") == "user") {
+            last_user_index = static_cast<int>(runtime_messages.size());
+        }
+        runtime_messages.push_back(std::move(runtime_message));
+    }
+
+    if (last_user_index >= 0 && !image_url.empty()) {
+        attach_image_to_message(
+            runtime_messages[static_cast<std::size_t>(last_user_index)],
+            image_url);
+    }
+
+    return runtime_messages;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,6 +387,30 @@ std::vector<McpToolRequest> extract_mcp_tool_requests(const json& tools) {
         requests.push_back(req);
     }
     return requests;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// strip_tool_call_protocol_text
+// ─────────────────────────────────────────────────────────────────────────────
+std::string strip_tool_call_protocol_text(const std::string& text) {
+    static const std::regex tool_call_re(
+        R"(<tool_call>\s*[\s\S]*?\s*</tool_call>)",
+        std::regex::ECMAScript);
+
+    std::string cleaned = std::regex_replace(text, tool_call_re, "");
+    const auto begin = std::find_if_not(
+        cleaned.begin(), cleaned.end(), [](unsigned char c) {
+            return std::isspace(c);
+        });
+    const auto end = std::find_if_not(
+        cleaned.rbegin(), cleaned.rend(), [](unsigned char c) {
+            return std::isspace(c);
+        }).base();
+
+    if (begin >= end) {
+        return "";
+    }
+    return std::string(begin, end);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,31 +450,40 @@ json build_output_array(const StandardResponse& result,
     }
 
     // ── Message output item (answer text only — no reasoning here) ────────────
+    const bool has_tool_calls =
+        result.tool_calls.has_value() && !result.tool_calls.value().empty();
+    std::string cleaned_content = result.content.has_value()
+        ? strip_tool_call_protocol_text(result.content.value())
+        : "";
+
     json content_array = json::array();
-    if (result.content.has_value() && !result.content.value().empty()) {
+    if (!cleaned_content.empty()) {
         content_array.push_back({
             {"type", "output_text"},
-            {"text", result.content.value()}
+            {"text", cleaned_content}
         });
     }
 
-    output.push_back({
-        {"type",    "message"},
-        {"id",      "msg_" + result.id},
-        {"role",    "assistant"},
-        {"content", content_array},
-        {"status",  "completed"}
-    });
+    if (!content_array.empty() || !has_tool_calls) {
+        output.push_back({
+            {"type",    "message"},
+            {"id",      "msg_" + result.id},
+            {"role",    "assistant"},
+            {"content", content_array},
+            {"status",  "completed"}
+        });
+    }
 
     // Function call output items (non-MCP tool calls, if any)
-    if (result.tool_calls.has_value() && !result.tool_calls.value().empty()) {
+    if (has_tool_calls) {
         for (const auto& tc : result.tool_calls.value()) {
             output.push_back({
                 {"type",      "function_call"},
                 {"id",        tc.value("id", "")},
                 {"call_id",   tc.value("id", "")},
                 {"name",      tc.value("function", json::object()).value("name", "")},
-                {"arguments", tc.value("function", json::object()).value("arguments", "")}
+                {"arguments", tc.value("function", json::object()).value("arguments", "")},
+                {"status",    "completed"}
             });
         }
     }
@@ -225,11 +500,15 @@ json build_response_object(const std::string& response_id,
                             const std::string& status,
                             int prompt_tokens,
                             int completion_tokens,
-                            bool truncated) {
+                            int created_at,
+                            const json& error,
+                            const json& incomplete_details,
+                            const std::string& previous_response_id,
+                            const json& metadata) {
     return {
         {"id",               response_id},
         {"object",           "response"},
-        {"created_at",       current_unix_time()},
+        {"created_at",       created_at},
         {"model",            model},
         {"status",           status},
         {"output",           output},
@@ -238,11 +517,172 @@ json build_response_object(const std::string& response_id,
             {"output_tokens", completion_tokens},
             {"total_tokens",  prompt_tokens + completion_tokens}
         }},
-        {"error",            nullptr},
-        {"incomplete_details", truncated
-            ? json({{"reason", "max_tool_calls"}})
-            : json(nullptr)}
+        {"error",            error.is_null() ? json(nullptr) : error},
+        {"incomplete_details", incomplete_details.is_null()
+            ? json(nullptr)
+            : incomplete_details},
+        {"previous_response_id", previous_response_id.empty()
+            ? json(nullptr)
+            : json(previous_response_id)},
+        {"metadata", metadata.is_null() ? json::object() : metadata}
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// synthesize_in_progress
+// ─────────────────────────────────────────────────────────────────────────────
+json synthesize_in_progress(const std::string& response_id,
+                            const std::string& model,
+                            int created_at,
+                            const std::string& previous_response_id,
+                            const json& metadata) {
+    return {
+        {"id", response_id},
+        {"object", "response"},
+        {"created_at", created_at},
+        {"model", model},
+        {"status", "in_progress"},
+        {"output", json::array()},
+        {"usage", nullptr},
+        {"error", nullptr},
+        {"incomplete_details", nullptr},
+        {"previous_response_id", previous_response_id.empty()
+            ? json(nullptr)
+            : json(previous_response_id)},
+        {"metadata", metadata.is_null() ? json::object() : metadata}
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalize_input_items
+// ─────────────────────────────────────────────────────────────────────────────
+json normalize_input_items(const std::string& response_id,
+                           const json& raw_input) {
+    auto make_id = [&response_id](std::size_t index) {
+        std::ostringstream oss;
+        oss << "item_" << response_id << "_"
+            << std::setw(6) << std::setfill('0') << index;
+        return oss.str();
+    };
+
+    auto user_text_item = [&make_id](std::size_t index,
+                                     const std::string& text) {
+        return json{
+            {"id", make_id(index)},
+            {"type", "message"},
+            {"role", "user"},
+            {"content", json::array({{
+                {"type", "input_text"},
+                {"text", text}
+            }})}
+        };
+    };
+
+    json items = json::array();
+    if (raw_input.is_string()) {
+        items.push_back(user_text_item(0, raw_input.get<std::string>()));
+        return items;
+    }
+    if (!raw_input.is_array()) {
+        return items;
+    }
+
+    for (std::size_t i = 0; i < raw_input.size(); ++i) {
+        const auto& item = raw_input[i];
+        if (item.is_string()) {
+            items.push_back(user_text_item(i, item.get<std::string>()));
+            continue;
+        }
+        if (!item.is_object()) {
+            continue;
+        }
+
+        std::string type = item.value("type", "");
+        bool is_message = (type == "message")
+            || (type.empty() && item.contains("role"));
+
+        if (!type.empty() && !is_message) {
+            json normalized = item;
+            normalized["id"] = make_id(i);
+            items.push_back(std::move(normalized));
+            continue;
+        }
+
+        json normalized = item;
+        normalized["id"] = make_id(i);
+        normalized["type"] = "message";
+        std::string role = item.value("role", "user");
+        normalized["role"] = role;
+
+        json content = json::array();
+        if (item.contains("content")) {
+            const auto& raw_content = item["content"];
+            if (raw_content.is_string()) {
+                content = json::array({{
+                    {"type", "input_text"},
+                    {"text", raw_content.get<std::string>()}
+                }});
+            } else {
+                content = raw_content;
+            }
+        } else if (item.contains("text")) {
+            content = json::array({{
+                {"type", "input_text"},
+                {"text", item["text"]}
+            }});
+        }
+        normalized["content"] = content;
+        items.push_back(std::move(normalized));
+    }
+
+    return items;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// paginate_input_items
+// ─────────────────────────────────────────────────────────────────────────────
+PaginateResult paginate_input_items(const json& items,
+                                    int limit,
+                                    const std::string& order,
+                                    const std::string& after) {
+    PaginateResult result;
+    json view = items.is_array() ? items : json::array();
+    if (order == "desc") {
+        std::reverse(view.begin(), view.end());
+    }
+
+    std::size_t start = 0;
+    if (!after.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < view.size(); ++i) {
+            if (view[i].is_object() && view[i].value("id", "") == after) {
+                start = i + 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            result.error_message = "after cursor not found";
+            return result;
+        }
+    }
+
+    json page = json::array();
+    std::size_t count = static_cast<std::size_t>(limit);
+    std::size_t end = std::min(view.size(), start + count);
+    for (std::size_t i = start; i < end; ++i) {
+        page.push_back(view[i]);
+    }
+
+    result.ok = true;
+    result.envelope = {
+        {"object", "list"},
+        {"data", page},
+        {"first_id", page.empty() ? json(nullptr) : page.front()["id"]},
+        {"last_id", page.empty() ? json(nullptr) : page.back()["id"]},
+        {"has_more", end < view.size()}
+    };
+    return result;
 }
 
 } // namespace ResponsesUtils

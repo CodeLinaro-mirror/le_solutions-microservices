@@ -623,7 +623,8 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
             session->session_id,
             request.model,
             start_tag,
-            end_tag);
+            end_tag,
+            thinking_budget > 0 ? thinking_budget : -1);
         router.route(full_response);
         thinking_content = router.getThinkingContent();
         answer_content = router.getAnswerContent();
@@ -680,8 +681,12 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     }
     response.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
     response.prompt_tokens = static_cast<int>(prompt.size() / 4);
-    // completion_tokens includes both answer tokens AND reasoning tokens
-    response.completion_tokens = static_cast<int>(answer_content.size() / 4) + reasoning_token_count;
+    // completion_tokens includes both answer tokens AND reasoning tokens.
+    // Non-empty answers always report at least 1 token — otherwise short
+    // answers (e.g. "4") truncate to 0 via integer division.
+    int answer_token_estimate = answer_content.empty()
+        ? 0 : static_cast<int>(answer_content.size() / 4) + 1;
+    response.completion_tokens = answer_token_estimate + reasoning_token_count;
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
@@ -774,7 +779,8 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
         session->session_id,
         request.model,
         start_tag,
-        end_tag);
+        end_tag,
+        thinking_budget > 0 ? thinking_budget : -1);
 
     std::string event_id = generateEventId();
     std::string full_response;
@@ -937,8 +943,12 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     }
     response.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
     response.prompt_tokens = static_cast<int>(prompt.size() / 4);
-    // completion_tokens includes both answer tokens AND reasoning tokens
-    response.completion_tokens = static_cast<int>(answer_content.size() / 4) + reasoning_token_count;
+    // completion_tokens includes both answer tokens AND reasoning tokens.
+    // Non-empty answers always report at least 1 token — otherwise short
+    // answers (e.g. "4") truncate to 0 via integer division.
+    int answer_token_estimate = answer_content.empty()
+        ? 0 : static_cast<int>(answer_content.size() / 4) + 1;
+    response.completion_tokens = answer_token_estimate + reasoning_token_count;
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;

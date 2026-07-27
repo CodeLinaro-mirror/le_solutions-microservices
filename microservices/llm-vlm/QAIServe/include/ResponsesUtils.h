@@ -13,8 +13,16 @@
 // Functions:
 //   input_to_messages()          — Responses API input → messages array
 //   extract_mcp_tool_requests()  — parse MCP tool entries from tools[]
+//   strip_tool_call_protocol_text — remove model-internal tool call tags
 //   build_output_array()         — StandardResponse + McpCallRecords → output[]
 //   build_response_object()      — assemble final Responses API response JSON
+//   synthesize_in_progress()     — assemble Retrieve JSON for active responses
+//   normalize_input_items()      — Responses API input → input_items list
+//   paginate_input_items()       — slice input_items into a list envelope
+//   generate_compaction_id()     — generate a unique "cmp_XXXX" ID
+//   inject_summary_into_instructions() — append branch summary to instructions
+//   build_text_runtime_messages() — build model-facing text-only messages
+//   build_vlm_runtime_messages() — build model-facing VLM messages
 //   current_unix_time()          — current time as Unix timestamp (seconds)
 //   generate_response_id()       — generate a unique "resp_XXXX" ID
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,6 +57,22 @@ int current_unix_time();
 std::string generate_response_id();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// generate_compaction_id — generate a unique "cmp_XXXXXXXXXXXXXXXX" ID
+// ─────────────────────────────────────────────────────────────────────────────
+std::string generate_compaction_id();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// inject_summary_into_instructions — append applied branch summary
+//
+// @param instructions    Effective system instructions
+// @param applied_summary Summary text returned by ResponseStore
+// @return                Instructions with summary text appended
+// ─────────────────────────────────────────────────────────────────────────────
+std::string inject_summary_into_instructions(
+    const std::string& instructions,
+    const std::string& applied_summary);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // input_to_messages — convert Responses API `input` to messages array
 //
 // Handles all Responses API input formats:
@@ -65,6 +89,33 @@ std::string generate_response_id();
 json input_to_messages(const json& input, const std::string& system_prompt = "");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages — build model-facing messages for text inference
+//
+// Stored Responses history may contain multimodal content arrays. Text-only
+// runtimes receive plain text content only; image parts are omitted from the
+// runtime copy without mutating stored responses.
+//
+// @param messages Stored or current messages
+// @return         Text-only runtime messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages(const json& messages);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_vlm_runtime_messages — build model-facing messages for VLM inference
+//
+// Stored Responses input stays OpenAI-shaped (`input_text`, `input_image`).
+// VLM runtime receives chat-style parts (`text`, `image_url`) and only the
+// current request text plus the current/latest image from the lineage.
+//
+// @param current_messages  Messages for the current request
+// @param ancestor_messages Stored parent-lineage messages used for image fallback
+// @return                  Current-turn VLM runtime messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_vlm_runtime_messages(
+    const json& current_messages,
+    const json& ancestor_messages = json::array());
+
+// ─────────────────────────────────────────────────────────────────────────────
 // extract_mcp_tool_requests — parse MCP tool entries from tools[] array
 //
 // Extracts all {type:"mcp"} entries and returns them as McpToolRequest structs.
@@ -74,6 +125,14 @@ json input_to_messages(const json& input, const std::string& system_prompt = "")
 // @return       Vector of McpToolRequest (one per MCP server reference)
 // ─────────────────────────────────────────────────────────────────────────────
 std::vector<McpToolRequest> extract_mcp_tool_requests(const json& tools);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// strip_tool_call_protocol_text — remove raw model tool-call protocol blocks
+//
+// @param text Model answer text that may contain <tool_call>...</tool_call>
+// @return     Text with tool-call protocol blocks removed and whitespace trimmed
+// ─────────────────────────────────────────────────────────────────────────────
+std::string strip_tool_call_protocol_text(const std::string& text);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_output_array — build Responses API output[] from inference results
@@ -97,7 +156,11 @@ json build_output_array(const StandardResponse& result,
 // @param status             "completed" | "incomplete" | "cancelled"
 // @param prompt_tokens      Token count for the prompt
 // @param completion_tokens  Token count for the completion
-// @param truncated          true if max_tool_calls was reached
+// @param created_at         Unix timestamp captured by the caller
+// @param error              Response error object, or null
+// @param incomplete_details Incomplete details object, or null
+// @param previous_response_id Parent response ID, or empty for root responses
+// @param metadata           Request metadata object, or null
 // @return                   Complete Responses API response object
 // ─────────────────────────────────────────────────────────────────────────────
 json build_response_object(const std::string& response_id,
@@ -106,6 +169,59 @@ json build_response_object(const std::string& response_id,
                             const std::string& status,
                             int prompt_tokens,
                             int completion_tokens,
-                            bool truncated = false);
+                            int created_at,
+                            const json& error,
+                            const json& incomplete_details,
+                            const std::string& previous_response_id = "",
+                            const json& metadata = json::object());
+
+// ─────────────────────────────────────────────────────────────────────────────
+// synthesize_in_progress — assemble Retrieve JSON for an active response
+//
+// @param response_id          The response ID (resp_XXXX)
+// @param model                The model ID
+// @param created_at           Unix timestamp captured when the response began
+// @param previous_response_id Parent response ID, or empty for root responses
+// @param metadata             Stored metadata object, or null
+// @return                     Minimal in-progress Responses API object
+// ─────────────────────────────────────────────────────────────────────────────
+json synthesize_in_progress(const std::string& response_id,
+                            const std::string& model,
+                            int created_at,
+                            const std::string& previous_response_id,
+                            const json& metadata);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalize_input_items — convert raw Responses API input to input_items[]
+//
+// @param response_id The response ID used to stamp stable item ids
+// @param raw_input   The request `input` value
+// @return            Normalized input_items array
+// ─────────────────────────────────────────────────────────────────────────────
+json normalize_input_items(const std::string& response_id,
+                           const json& raw_input);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PaginateResult — result of input_items list pagination
+// ─────────────────────────────────────────────────────────────────────────────
+struct PaginateResult {
+    bool ok = false;
+    json envelope = json::object();
+    std::string error_message;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// paginate_input_items — slice input_items by order, cursor, and limit
+//
+// @param items Stored input_items array
+// @param limit Maximum number of items to return
+// @param order "asc" or "desc"
+// @param after Optional item id cursor
+// @return      List envelope or cursor error
+// ─────────────────────────────────────────────────────────────────────────────
+PaginateResult paginate_input_items(const json& items,
+                                    int limit,
+                                    const std::string& order,
+                                    const std::string& after);
 
 } // namespace ResponsesUtils
