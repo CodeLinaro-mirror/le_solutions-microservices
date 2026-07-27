@@ -82,7 +82,6 @@ public:
     bool activate();
     CancelResult cancel(const std::string& job_id);
     void requestDrain();
-    void requestProtectedDrain();
     void failQueued(const GenAIException& error);
     void stop(bool force = false);
 
@@ -95,7 +94,6 @@ private:
     enum class DrainMode {
         None,
         Normal,
-        Protected,
     };
 
     void executorLoop();

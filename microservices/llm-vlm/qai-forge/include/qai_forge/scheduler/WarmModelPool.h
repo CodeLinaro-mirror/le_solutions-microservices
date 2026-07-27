@@ -28,7 +28,8 @@ struct WarmModelPoolConfig {
     size_t max_active_models = 3;
     size_t max_concurrent_model_loads = 1;
     std::chrono::milliseconds idle_timeout = std::chrono::minutes(5);
-    std::chrono::milliseconds model_residency_ttl = std::chrono::seconds(60);
+    std::chrono::milliseconds blocked_admission_timeout =
+        std::chrono::seconds(30);
     std::chrono::milliseconds tool_response_timeout = std::chrono::seconds(30);
     size_t max_queue_depth_per_model = 0; // 0 = unlimited
     long memory_headroom_mb = 1024;
@@ -44,12 +45,9 @@ struct ModelPoolRuntimeSnapshot {
     bool healthy = false;
     bool active_reserved = false;
     bool eviction_requested = false;
-    bool expiry_pending = false;
     bool tool_lease_active = false;
     std::string tool_chain_id;
     std::optional<std::chrono::steady_clock::time_point> tool_lease_until;
-    std::optional<std::chrono::steady_clock::time_point> resident_since;
-    std::optional<std::chrono::steady_clock::time_point> residency_expires_at;
     std::chrono::steady_clock::time_point last_used_at;
     std::optional<std::chrono::steady_clock::time_point> idle_since;
 };
@@ -95,11 +93,8 @@ private:
         ModelRuntimeState state = ModelRuntimeState::NotResident;
         bool active_reserved = false;
         bool eviction_requested = false;
-        bool expiry_pending = false;
         std::string tool_chain_id;
         std::optional<std::chrono::steady_clock::time_point> tool_lease_until;
-        std::optional<std::chrono::steady_clock::time_point> resident_since;
-        std::optional<std::chrono::steady_clock::time_point> residency_expires_at;
         std::chrono::steady_clock::time_point last_used_at =
             std::chrono::steady_clock::now();
         std::optional<std::chrono::steady_clock::time_point> idle_since;
@@ -108,7 +103,6 @@ private:
     enum class PoolActionType {
         Activate,
         Drain,
-        ProtectedDrain,
         Reject
     };
 
@@ -135,10 +129,8 @@ private:
     long modelMemoryMb(const std::string& model_id) const;
     bool runtimeHasQueuedWorkLocked(const RuntimeRecord& record) const;
     void clearToolLeaseLocked(RuntimeRecord& record);
-    void markResidentLocked(RuntimeRecord& record,
-                            std::chrono::steady_clock::time_point now);
-    void clearResidencyLocked(RuntimeRecord& record);
-    std::chrono::steady_clock::time_point nextIdleDeadlineLocked() const;
+    std::chrono::steady_clock::time_point nextPolicyDeadlineLocked(
+        std::chrono::steady_clock::time_point now) const;
 
     static bool isActiveReservedState(ModelRuntimeState state);
 

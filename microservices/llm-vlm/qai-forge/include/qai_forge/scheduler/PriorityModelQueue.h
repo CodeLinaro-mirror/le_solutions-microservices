@@ -38,11 +38,9 @@ class PriorityModelQueue {
 public:
     void push(InferenceJobPtr job);
     InferenceJobPtr pop();
-    InferenceJobPtr popProtectedDrainJob();
     InferenceJobPtr cancel(const std::string& job_id);
 
     bool empty() const;
-    bool hasProtectedDrainWork() const;
     size_t size() const;
     size_t size(JobPriority priority) const;
     QueueSnapshot snapshot() const;
@@ -59,7 +57,6 @@ private:
     Lane& laneFor(JobPriority priority);
     const Lane& laneFor(JobPriority priority) const;
     InferenceJobPtr popFrom(Lane& lane);
-    bool hasReadyJobIn(const Lane& lane) const;
     QueueAdmissionCandidate peekFrom(const Lane& lane,
                                      JobPriority priority) const;
 

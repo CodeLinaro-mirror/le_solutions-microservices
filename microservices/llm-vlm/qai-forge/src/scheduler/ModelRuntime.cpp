@@ -160,6 +160,9 @@ void ModelRuntime::enqueue(InferenceJobPtr job) {
 }
 
 bool ModelRuntime::activate() {
+    std::vector<ModelRuntimeState> state_events;
+    bool should_notify = false;
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == ModelRuntimeState::Stopped || stop_requested_) {
@@ -173,20 +176,25 @@ bool ModelRuntime::activate() {
             state_ == ModelRuntimeState::Running ||
             state_ == ModelRuntimeState::Draining) {
             drain_mode_ = DrainMode::None;
-            return true;
-        }
-
-        if (state_ == ModelRuntimeState::Evicting) {
+            if (state_ == ModelRuntimeState::Draining && !running_job_) {
+                setStateLocked(ModelRuntimeState::Idle, state_events);
+                should_notify = true;
+            }
+        } else if (state_ == ModelRuntimeState::Evicting) {
             activation_requested_ = true;
             drain_mode_ = DrainMode::None;
-            return true;
+            should_notify = true;
+        } else {
+            activation_requested_ = true;
+            drain_mode_ = DrainMode::None;
+            should_notify = true;
         }
-
-        activation_requested_ = true;
-        drain_mode_ = DrainMode::None;
     }
 
-    cv_.notify_one();
+    notifyStateChanges(state_events);
+    if (should_notify) {
+        cv_.notify_one();
+    }
     return true;
 }
 
@@ -262,33 +270,6 @@ void ModelRuntime::requestDrain() {
 
         drain_mode_ = DrainMode::Normal;
         LOG_INFO("[ModelRuntime] Drain requested: model=" << model_id_
-                 << " state=" << stateToString(state_));
-        if (state_ == ModelRuntimeState::Running) {
-            setStateLocked(ModelRuntimeState::Draining, state_events);
-        }
-    }
-
-    notifyStateChanges(state_events);
-    cv_.notify_one();
-}
-
-void ModelRuntime::requestProtectedDrain() {
-    std::vector<ModelRuntimeState> state_events;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ == ModelRuntimeState::Stopped || stop_requested_) {
-            return;
-        }
-
-        activation_requested_ = false;
-        if (state_ == ModelRuntimeState::NotResident ||
-            state_ == ModelRuntimeState::Failed ||
-            state_ == ModelRuntimeState::Evicting) {
-            return;
-        }
-
-        drain_mode_ = DrainMode::Protected;
-        LOG_INFO("[ModelRuntime] Protected drain requested: model=" << model_id_
                  << " state=" << stateToString(state_));
         if (state_ == ModelRuntimeState::Running) {
             setStateLocked(ModelRuntimeState::Draining, state_events);
@@ -429,20 +410,6 @@ void ModelRuntime::executorLoop() {
                 drain_mode_ = DrainMode::None;
                 setStateLocked(ModelRuntimeState::Evicting, state_events);
                 should_unload = true;
-            } else if (drain_mode_ == DrainMode::Protected &&
-                       isResidentState(state_) &&
-                       (state_ == ModelRuntimeState::Idle ||
-                        state_ == ModelRuntimeState::Draining)) {
-                promoteAgedJobs();
-                job = queue_.popProtectedDrainJob();
-                if (job) {
-                    running_job_ = job;
-                    setStateLocked(ModelRuntimeState::Running, state_events);
-                } else {
-                    drain_mode_ = DrainMode::None;
-                    setStateLocked(ModelRuntimeState::Evicting, state_events);
-                    should_unload = true;
-                }
             } else if (state_ == ModelRuntimeState::Idle) {
                 promoteAgedJobs();
                 job = queue_.pop();

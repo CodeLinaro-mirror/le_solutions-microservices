@@ -28,22 +28,17 @@ EvictionPolicyPlan EvictionPolicy::plan(
         };
 
     for (const auto& runtime : input.snapshot.runtimes) {
-        if (isProtectedDrainReady(runtime)) {
-            add_action(EvictionPolicyActionType::ProtectedDrain, runtime.model_id);
-        }
-    }
-
-    for (const auto& runtime : input.snapshot.runtimes) {
         if (planned_model_ids.count(runtime.model_id) > 0) {
             continue;
         }
-        if (isIdleTtlExpired(runtime, input.config, input.now)) {
+        if (isIdleTimeoutExpired(runtime, input.config, input.now)) {
             add_action(EvictionPolicyActionType::Drain, runtime.model_id);
         }
     }
 
     std::vector<WaitingCandidate> waiting;
     std::vector<EvictionCandidate> evictable;
+    std::vector<EvictionCandidate> fairness_evictable;
     long eventual_reclaimable_mb = 0;
     size_t loading_count = 0;
 
@@ -72,11 +67,18 @@ EvictionPolicyPlan EvictionPolicy::plan(
         if (planned_model_ids.count(runtime.model_id) == 0 &&
             isEvictableIdleRuntime(runtime)) {
             evictable.push_back(EvictionCandidate{&runtime, model_memory_mb});
+        } else if (planned_model_ids.count(runtime.model_id) == 0 &&
+                   isFairnessDrainCandidate(runtime)) {
+            fairness_evictable.push_back(
+                EvictionCandidate{&runtime, model_memory_mb});
         }
     }
 
     std::sort(waiting.begin(), waiting.end(), waitingLess);
     std::sort(evictable.begin(), evictable.end(), victimLess);
+    std::sort(fairness_evictable.begin(),
+              fairness_evictable.end(),
+              victimLess);
 
     if (input.config.max_active_models == 0) {
         for (const WaitingCandidate& candidate : waiting) {
@@ -149,6 +151,29 @@ EvictionPolicyPlan EvictionPolicy::plan(
             }
         }
 
+        if ((planned_eviction_count < count_evictions_needed ||
+             planned_freed_mb < memory_needed_mb) &&
+            hasWaitedPastBlockedAdmissionTimeout(
+                candidate,
+                input.now,
+                input.config.blocked_admission_timeout)) {
+            for (const EvictionCandidate& victim : fairness_evictable) {
+                if (!victim.runtime ||
+                    planned_model_ids.count(victim.runtime->model_id) > 0) {
+                    continue;
+                }
+
+                victims_for_candidate.push_back(victim.runtime->model_id);
+                planned_freed_mb += victim.model_memory_mb;
+                ++planned_eviction_count;
+
+                if (planned_eviction_count >= count_evictions_needed &&
+                    planned_freed_mb >= memory_needed_mb) {
+                    break;
+                }
+            }
+        }
+
         if (planned_eviction_count >= count_evictions_needed &&
             planned_freed_mb >= memory_needed_mb) {
             for (const std::string& victim_model_id : victims_for_candidate) {
@@ -178,17 +203,7 @@ bool EvictionPolicy::isColdWaitingState(ModelRuntimeState state) {
            state == ModelRuntimeState::Failed;
 }
 
-bool EvictionPolicy::isProtectedDrainReady(
-    const ModelPoolRuntimeSnapshot& runtime) {
-    return runtime.expiry_pending &&
-           runtime.active_reserved &&
-           !runtime.eviction_requested &&
-           !runtime.tool_lease_active &&
-           (runtime.state == ModelRuntimeState::Idle ||
-            runtime.state == ModelRuntimeState::Draining);
-}
-
-bool EvictionPolicy::isIdleTtlExpired(
+bool EvictionPolicy::isIdleTimeoutExpired(
     const ModelPoolRuntimeSnapshot& runtime,
     const EvictionPolicyConfig& config,
     std::chrono::steady_clock::time_point now) {
@@ -197,7 +212,6 @@ bool EvictionPolicy::isIdleTtlExpired(
            runtime.active_reserved &&
            !runtime.eviction_requested &&
            !runtime.tool_lease_active &&
-           !runtime.expiry_pending &&
            runtime.queue.total() == 0 &&
            runtime.idle_since.has_value() &&
            now - runtime.idle_since.value() >= config.idle_timeout;
@@ -210,6 +224,25 @@ bool EvictionPolicy::isEvictableIdleRuntime(
            !runtime.eviction_requested &&
            !runtime.tool_lease_active &&
            runtime.queue.total() == 0;
+}
+
+bool EvictionPolicy::isFairnessDrainCandidate(
+    const ModelPoolRuntimeSnapshot& runtime) {
+    return runtime.active_reserved &&
+           !runtime.eviction_requested &&
+           !runtime.tool_lease_active &&
+           (runtime.state == ModelRuntimeState::Idle ||
+            runtime.state == ModelRuntimeState::Running);
+}
+
+bool EvictionPolicy::hasWaitedPastBlockedAdmissionTimeout(
+    const WaitingCandidate& candidate,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::milliseconds timeout) {
+    return candidate.runtime &&
+           candidate.runtime->candidate.has_work &&
+           timeout.count() > 0 &&
+           now - candidate.runtime->candidate.created_at >= timeout;
 }
 
 long EvictionPolicy::modelMemoryMb(
