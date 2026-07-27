@@ -45,20 +45,25 @@
 #                       (Stage 0) and for the QAIServe application build
 #                       (Stage 1). Defaults to the version validated for
 #                       this Dockerfile.
+#
+#   BUILD_LITERT_LM_CLI_TOOLS  Build the litert-lm / litert-lm-advanced
+#                       on-device debugging/benchmarking CLI binaries
+#                       (Stage 0b). QAIServe never calls these at runtime —
+#                       it drives LiteRT-LM inference via
+#                       liblitert_lm_c_api.so through litert-lm-inference-worker.
+#                       Left off by default to keep the image small; pass
+#                       --build-arg BUILD_LITERT_LM_CLI_TOOLS=true to build
+#                       and ship them again.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 ARG QAIRT_SDK_VERSION=2.45.40.260406
+ARG BUILD_LITERT_LM_CLI_TOOLS=false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: litert_builder
 #
 # Builds LiteRT v2.1.5 natively on AArch64 using Bazelisk.
-# Outputs staged artifacts to /mnt/work/deploy/usr:
-#   /mnt/work/deploy/usr/lib/     — liblitert_runtime_c_api.so, dispatch .so, plugin .so
-#   /mnt/work/deploy/usr/bin/     — run_model, run_model_simple, benchmark_model
-#   /mnt/work/deploy/usr/include/ — litert/ and tflite/ C API headers
-#
-# Runs natively on ARM64 — no cross-compilation required.
-# Artifacts are copied into the ARM64 builder stage below.
+# Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
 
@@ -95,8 +100,11 @@ RUN wget -t 3 -T 120 --no-verbose \
         "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" \
     && chmod +x /usr/local/bin/bazel
 
+# Build LiteRT using modular script
+ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
 ENV LITERT_SRC_DIR=/mnt/work/src/litert
 ENV LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
+ENV QAIRT_LITERT_DIR=/tmp/qairt-litert
 ENV HERMETIC_PYTHON_VERSION=3.10
 ENV PYTHON_BIN_PATH=/usr/bin/python3
 ENV PYTHON_LIB_PATH=/usr/lib/python3/dist-packages
@@ -113,253 +121,32 @@ ENV TF_SET_ANDROID_WORKSPACE=0
 ENV TF_DOWNLOAD_CLANG=0
 ENV TF_ENABLE_XLA=0
 
-# Clone LiteRT v2.1.5 with retry logic.
-RUN git config --global http.postBuffer 1048576000 \
-    && git config --global http.lowSpeedLimit 0 \
-    && git config --global http.lowSpeedTime 999999 \
-    && git config --global core.compression 0 \
-    && for i in {1..5}; do \
-           git clone --branch v2.1.5 --depth 1 https://github.com/google-ai-edge/LiteRT.git "${LITERT_SRC_DIR}" && break || { \
-               echo "Clone failed, retrying in 15 seconds..."; \
-               rm -rf "${LITERT_SRC_DIR}"; \
-               sleep 15; \
-           }; \
-       done \
-    && cd "${LITERT_SRC_DIR}" \
-    && for i in {1..5}; do \
-           git submodule update --init --recursive --depth 1 && break || { \
-               echo "Submodule update failed, retrying in 15 seconds..."; \
-               sleep 15; \
-           }; \
-       done \
-    && if [ -f configure ]; then yes n | ./configure; \
-       elif [ -f configure.py ]; then yes n | python3 configure.py; \
-       else echo "No configure script found; using env-based configuration"; fi
-
-# ── Download QAIRT ${QAIRT_SDK_VERSION} for LiteRT QNN dispatch + compiler plugin ──
-# LiteRT v2.1.5 defaults to QAIRT 2.44.0.260225 (third_party/qairt/workspace.bzl).
-# Setting LITERT_QAIRT_SDK overrides the default via configurable_repo's
-# local_path_env mechanism — Bazel uses the local directory instead of
-# downloading from softwarecenter.qualcomm.com.
-#
-# configurable_repo does string concatenation:
-#   ctx.path(LITERT_QAIRT_SDK + strip_prefix)
-# where strip_prefix = "qairt/2.44.0.260225"
-# So LITERT_QAIRT_SDK must end with "/" and the path
-#   ${LITERT_QAIRT_SDK}qairt/2.44.0.260225  must exist.
-# We create a compatibility symlink: qairt/2.44.0.260225 → qairt/${QAIRT_SDK_VERSION}
-ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
-ENV QAIRT_LITERT_DIR=/tmp/qairt-litert
-RUN mkdir -p ${QAIRT_LITERT_DIR} \
-    && wget -c -t 5 -T 120 --no-verbose \
-        -P ${QAIRT_LITERT_DIR} \
-        "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip" \
-    && cd ${QAIRT_LITERT_DIR} \
-    && unzip v${QAIRT_LITERT_VERSION}.zip \
-    && rm -f v${QAIRT_LITERT_VERSION}.zip \
-    && ln -sf ${QAIRT_LITERT_DIR}/qairt/${QAIRT_LITERT_VERSION} \
-              ${QAIRT_LITERT_DIR}/qairt/2.44.0.260225 \
-    && echo "QAIRT ${QAIRT_LITERT_VERSION} ready; symlink 2.44.0.260225 → ${QAIRT_LITERT_VERSION}"
-
-# LITERT_QAIRT_SDK must end with "/" so that:
-#   LITERT_QAIRT_SDK + "qairt/2.44.0.260225" = a valid directory path.
-ENV LITERT_QAIRT_SDK=${QAIRT_LITERT_DIR}/
-
-WORKDIR ${LITERT_SRC_DIR}
-
-# Prepare Bazel cache directory.
-RUN mkdir -p /bazel-cache
-
-# Native AArch64 build — no cross-compilation needed.
-# Note: --config=linux already sets --cxxopt=-std=c++17 for C++ files.
-# Do NOT pass --copt=-std=c++17 — it would be applied to C files too and fail.
-RUN bazel build --config=linux -c opt \
-    --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --copt=-DLITERT_ENABLE_NPU \
-    --linkopt=-Wl,--whole-archive \
-    --linkopt=-Wl,--no-whole-archive \
-    //litert/c:litert_runtime_c_api_so \
-    //litert/c:litert_tensor_buffer \
-    //litert/runtime:tensor_buffer \
-    //litert/vendors/qualcomm/dispatch:dispatch_api_so \
-    //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so \
-    //litert/tools:run_model \
-    //litert/tools:run_model_simple \
-    //litert/tools:benchmark_model
-
-# Stage LiteRT shared libraries, plugins, binaries, and public headers.
-RUN mkdir -p "${LITERT_DEPLOY_DIR}/lib" "${LITERT_DEPLOY_DIR}/bin" "${LITERT_DEPLOY_DIR}/include" \
-    && bazel cquery \
-        --config=linux -c opt \
-        --repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION} \
-        --output=files \
-        'set(//litert/c:litert_runtime_c_api_so //litert/c:litert_tensor_buffer //litert/runtime:tensor_buffer //litert/vendors/qualcomm/dispatch:dispatch_api_so //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so //litert/tools:run_model //litert/tools:run_model_simple //litert/tools:benchmark_model)' \
-        > /tmp/litert_bazel_outputs.txt \
-    && echo "Configured LiteRT Bazel outputs:" \
-    && cat /tmp/litert_bazel_outputs.txt \
-    && while IFS= read -r output; do \
-            if [ -e "$output" ] || [ -L "$output" ]; then \
-                case "$output" in \
-                    *.so|*.so.*|*.a) cp -avL "$output" "${LITERT_DEPLOY_DIR}/lib/" ;; \
-                    */run_model|*/run_model_simple|*/benchmark_model) cp -avL "$output" "${LITERT_DEPLOY_DIR}/bin/" ;; \
-                esac; \
-            fi; \
-       done < /tmp/litert_bazel_outputs.txt \
-    && find bazel-bin bazel-out \( -type f -o -type l \) \
-        | grep -E '(/run_model|/run_model_simple|/benchmark_model)$' \
-        | while IFS= read -r output; do cp -avL "$output" "${LITERT_DEPLOY_DIR}/bin/" || true; done \
-    && cp -a litert "${LITERT_DEPLOY_DIR}/include/" \
-    && cp -a tflite "${LITERT_DEPLOY_DIR}/include/" \
-    && echo "Generating build_config.h from build_config.h.in (NPU enabled, GPU disabled)..." \
-    && mkdir -p "${LITERT_DEPLOY_DIR}/include/litert/build_common" \
-    && sed \
-        -e 's/#cmakedefine01 LITERT_BUILD_CONFIG_DISABLE_GPU/#define LITERT_BUILD_CONFIG_DISABLE_GPU 1/' \
-        -e 's/#cmakedefine01 LITERT_BUILD_CONFIG_DISABLE_NPU/#define LITERT_BUILD_CONFIG_DISABLE_NPU 0/' \
-        litert/build_common/build_config.h.in \
-        > "${LITERT_DEPLOY_DIR}/include/litert/build_common/build_config.h" \
-    && echo "Staged LiteRT libraries and tools:" \
-    && ls -lah "${LITERT_DEPLOY_DIR}/lib" \
-    && ls -lah "${LITERT_DEPLOY_DIR}/bin" \
-    && test "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f | wc -l)" -gt 0 \
-    && test -n "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f \( -iname '*litert*.so' -o -iname '*litert*.so.*' -o -iname '*LiteRt*.so' -o -iname '*LiteRt*.so.*' -o -iname '*litert*.a' -o -iname '*LiteRt*.a' \) | head -1)" \
-    && test -n "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f \( -iname '*dispatch*.so' -o -iname '*dispatch*.so.*' -o -iname '*qnn*plugin*.so' -o -iname '*qnn*plugin*.so.*' -o -iname '*dispatch*.a' -o -iname '*qnn*plugin*.a' \) | head -1)" \
-    && test -f "${LITERT_DEPLOY_DIR}/bin/run_model" \
-    && test -f "${LITERT_DEPLOY_DIR}/bin/run_model_simple" \
-    && test -f "${LITERT_DEPLOY_DIR}/bin/benchmark_model"
+COPY qai-forge/scripts/deps/build-litert.sh /tmp/
+RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-litert.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0b: litert_lm_builder
 #
 # Builds LiteRT-LM incrementally on top of the already-built LiteRT.
-# Starts FROM litert_builder — Docker layer caching means LiteRT is NOT
-# rebuilt; only LiteRT-LM is compiled in this stage.
-#
-# Key: --override_repository=litert=${LITERT_SRC_DIR} tells LiteRT-LM's Bazel
-# to use our already-cloned LiteRT source instead of downloading from GitHub.
-# Bazel's action cache also reuses compiled LiteRT artifacts from Stage 0.
+# Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM litert_builder AS litert_lm_builder
 
+# Re-declare to bring the global ARG into this stage's scope, then export as
+# ENV so build-litert-lm-incremental.sh (a plain RUN, not a build-arg-aware
+# step) can read it.
+ARG BUILD_LITERT_LM_CLI_TOOLS
+ENV BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS}
+
+# Build LiteRT-LM using modular script
+# LITERT_SRC_DIR is already inherited from litert_builder (this stage is
+# FROM litert_builder); re-declared here so the stage's inputs are explicit.
+ENV LITERT_SRC_DIR=/mnt/work/src/litert
 ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
 
-# Clone LiteRT-LM at tag v0.13.0 for a stable, reproducible build.
-RUN git lfs install \
-    && for i in {1..5}; do \
-        git clone --branch v0.13.0 --depth 1 \
-            https://github.com/google-ai-edge/LiteRT-LM.git "${LITERT_LM_SRC_DIR}" && break || { \
-            echo "Clone failed, retrying in 15 seconds..."; \
-            rm -rf "${LITERT_LM_SRC_DIR}"; \
-            sleep 15; \
-        }; \
-    done
-
-WORKDIR ${LITERT_LM_SRC_DIR}
-
-# Ensure LFS artifacts are fully downloaded (so we don't get linker errors on pointer files)
-RUN git lfs pull
-
-# Copy patch files — placed here (after LiteRT build) so that patch changes
-# do not invalidate the expensive LiteRT build cache layers above.
-# COPY patches /mnt/work/src/patches
-
-# Add cc_shared_library target for the LiteRT-LM C API directly.
-# cc_shared_library statically links all transitive deps and exports the
-# symbols from targets listed in exports_filter, producing a self-contained
-# .so that CMake consumers can link against without needing companion .so files.
-RUN printf '\n# Shared library target for the LiteRT-LM C API.\n# Produces liblitert_lm_c_api.so that can be loaded at runtime.\n# Used by litert-lm-inference-worker in the QAIServe service.\ncc_shared_library(\n    name = "litert_lm_c_api",\n    exports_filter = ["//c:engine"],\n    deps = [":engine"],\n    visibility = ["//visibility:public"],\n)\n' >> c/BUILD \
-    && echo "Added cc_shared_library target to c/BUILD" \
-    && tail -20 c/BUILD
-
-# Build LiteRT-LM using Bazel, overriding the @litert repository to use our
-# already-built LiteRT source (avoids a second LiteRT download/compile).
-# LITERT_QAIRT_SDK is inherited from litert_builder so QAIRT 2.45.40.260406
-# is also reused for the LiteRT-LM QNN dispatch path.
-#
-# Key flags:
-#   --config=linux_arm64          ARM64 CPU optimization (-mtune=generic -march=armv8-a -O3)
-#   --define=litert_enable_qnn    Enable QNN/NPU backend in LiteRT
-#   --define=litert_link_capi_so  All LiteRT-LM targets use litert_api_with_dynamic_runtime
-#                                 (dynamically loads liblitert_runtime_c_api.so at runtime)
-#                                 instead of statically embedding LiteRT — required to avoid
-#                                 symbol conflicts when liblitert_lm_c_api.so is loaded
-#   --define=resolve_symbols_in_exec=false
-#                                 Required companion to litert_link_capi_so=true: allows .so
-#                                 files to have symbols resolved from other .so files
-#                                 (liblitert_runtime_c_api.so) rather than from the executable
-#   --linkopt=-fuse-ld=lld        Use LLD linker (already installed in Stage 0)
-#
-# //c:litert_lm_c_api produces liblitert_lm_c_api.so (added by patch above).
-# //runtime/engine:litert_lm_main and litert_lm_advanced_main are CLI tools
-# useful for on-device debugging and benchmarking.
-# Build liblitert_lm_c_api.so as a self-contained shared library using
-# cc_shared_library (the correct Bazel rule for this purpose).
-# cc_shared_library statically links all transitive deps and exports the
-# symbols from targets listed in exports_filter, producing a .so that
-# CMake consumers can link against without needing 200+ companion .so files.
-RUN bazel build \
-    --config=linux \
-    --config=linux_arm64 \
-    --compilation_mode=opt \
-    --override_repository=litert=${LITERT_SRC_DIR} \
-    --define=litert_enable_qnn=true \
-    --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --linkopt=-fuse-ld=lld \
-    --http_timeout_scaling=10 \
-    --experimental_repository_downloader_retries=10 \
-    //c:litert_lm_c_api
-
-# Build the CLI tools separately with litert_link_capi_so=true so they
-# dynamically load liblitert_runtime_c_api.so at runtime (avoids symbol conflicts).
-RUN bazel build \
-    --config=linux \
-    --config=linux_arm64 \
-    --compilation_mode=opt \
-    --override_repository=litert=${LITERT_SRC_DIR} \
-    --define=litert_enable_qnn=true \
-    --define=litert_link_capi_so=true \
-    --define=resolve_symbols_in_exec=false \
-    --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --linkopt=-fuse-ld=lld \
-    //runtime/engine:litert_lm_main \
-    //runtime/engine:litert_lm_advanced_main
-
-# Stage LiteRT-LM shared library, C API headers, and CLI tool binaries.
-RUN mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
-             "${LITERT_LM_DEPLOY_DIR}/bin" \
-             "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c" \
-    && echo "Searching for litert_lm_c_api .so in bazel outputs:" \
-    && find -L bazel-bin bazel-out \( -type f -o -type l \) \
-        \( -name "liblitert_lm_c_api.so" -o -name "liblitert_lm_c_api.so.*" \
-           -o -name "litert_lm_c_api.so" -o -name "litert_lm_c_api.so.*" \
-           -o -name "libGemmaModelConstraintProvider.so" \) \
-        2>/dev/null | tee /tmp/litert_lm_so_files.txt \
-    && echo "Copying found .so files:" \
-    && while IFS= read -r f; do \
-            base=$(basename "$f"); \
-            if echo "$base" | grep -q "^lib"; then \
-                cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/" || true; \
-            else \
-                cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/lib${base}" || true; \
-            fi; \
-       done < /tmp/litert_lm_so_files.txt \
-    && cp c/engine.h "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c/" \
-    && cp -avL bazel-bin/runtime/engine/litert_lm_main \
-               "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm" \
-    && cp -avL bazel-bin/runtime/engine/litert_lm_advanced_main \
-               "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm-advanced" \
-    && echo "Staged LiteRT-LM library:" \
-    && ls -lah "${LITERT_LM_DEPLOY_DIR}/lib/" \
-    && test -f "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so" \
-    && echo "✓ liblitert_lm_c_api.so staged successfully" \
-    && echo "Staged LiteRT-LM CLI tools:" \
-    && ls -lah "${LITERT_LM_DEPLOY_DIR}/bin/" \
-    && test -f "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm" \
-    && test -f "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm-advanced" \
-    && echo "✓ litert-lm CLI tools staged successfully"
+COPY qai-forge/scripts/deps/build-litert-lm-incremental.sh /tmp/
+RUN chmod +x /tmp/build-litert-lm-incremental.sh && /tmp/build-litert-lm-incremental.sh && rm /tmp/build-litert-lm-incremental.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: Builder
@@ -408,108 +195,47 @@ RUN apt-get update && \
 # Defined early so all subsequent build steps can install directly into it.
 ENV DEPLOY_DIR=/build/deploy
 
+# Re-declared here (same literal values as Stage 0/0b) so the COPY --from=
+# lines below can reference them — ENV does not cross stage boundaries, and
+# this stage is FROM debian:trixie-slim, not FROM litert_builder.
+ENV LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
+ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
+
 # ── Build fastrpc from source ─────────────────────────────────────────────────
-# Sets MACHINE_NAME_PATH to /run/device-model (required for Qualcomm Linux).
-# Provides libcdsprpc.so and libadsprpc.so used by libGenie.so at runtime.
-RUN git clone --depth 1 https://github.com/quic/fastrpc.git /tmp/fastrpc && \
-    cd /tmp/fastrpc && \
-    autoreconf -is && \
-    CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
-        ./configure --prefix=/usr --libdir=/usr/lib && \
-    make -j$(nproc) && \
-    make install && \
-    rm -rf /tmp/fastrpc
+# Uses modular script for maintainability and reusability
+COPY qai-forge/scripts/deps/build-fastrpc.sh /tmp/
+RUN chmod +x /tmp/build-fastrpc.sh && /tmp/build-fastrpc.sh && rm /tmp/build-fastrpc.sh
 
 # ── Build lightweight Drogon from source ──────────────────────────────────────
-# Installed directly into ${DEPLOY_DIR}/usr so its shared libraries
-# (libdrogon.so, libtrantor.so) land in the deploy tree.
-RUN git clone --depth 1 --branch v1.9.6 \
-        https://github.com/drogonframework/drogon.git /tmp/drogon && \
-    cd /tmp/drogon && \
-    git submodule update --init && \
-    cmake -S . -B build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
-        -DBUILD_EXAMPLES=OFF \
-        -DBUILD_CTL=OFF \
-        -DBUILD_TESTING=OFF \
-        -DUSE_MYSQL=OFF \
-        -DUSE_SQLITE3=OFF \
-        -DUSE_POSTGRESQL=OFF \
-        -DUSE_REDIS=OFF \
-        -DUSE_BROTLI=OFF \
-        -DUSE_SPDLOG=OFF \
-        -DUSE_YAML_CPP=OFF && \
-    cmake --build build -j$(nproc) && \
-    cmake --install build && \
-    rm -rf /tmp/drogon
+# Uses modular script for maintainability and reusability
+COPY QAIServe/scripts/build-drogon.sh /tmp/
+RUN chmod +x /tmp/build-drogon.sh && /tmp/build-drogon.sh && rm /tmp/build-drogon.sh
 
 # ── Fetch and install Qualcomm AI Runtime Community (QAIRT) SDK ───────────────
-# Downloads the SDK zip from softwarecenter.qualcomm.com, extracts:
-#   - Genie headers  → /usr/include/  (for build)
-#   - libGenie.so    → /usr/lib/      (for build)
-#   - All aarch64 runtime libs + libGenie.so → ${DEPLOY_DIR}/usr/lib/
-#   - Hexagon DSP blobs (v68/v73/v75) → ${DEPLOY_DIR}/usr/lib/rfsa/adsp/
-# Note: For QAIServe we KEEP the QNN and SNPE libraries, unlike the responses server.
+# Uses modular script for maintainability and reusability
+# Note: QAIServe keeps QNN and SNPE libraries (unlike responses server)
+# fetch-qairt-sdk.sh copies QNN/SNPE/Genie headers to /usr/include (needed to
+# compile qai-forge's qnn-engine/snpe-engine below) and stages the aarch64
+# .so files (dlopen'd at runtime) into ${DEPLOY_DIR}/usr/lib — all before it
+# deletes its own download scratch dir. Nothing further to copy here.
 ENV QAIRT_VERSION=${QAIRT_SDK_VERSION}
 ENV QAIRT_DOWNLOAD_DIR=/tmp/qairt-download
-ENV QAIRT_LIB_PATH=${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/lib
-
-RUN mkdir -p ${QAIRT_DOWNLOAD_DIR} \
-             ${DEPLOY_DIR}/usr/lib/rfsa/adsp \
-             ${DEPLOY_DIR}/usr/include && \
-    wget -c -t 5 -T 120 -P ${QAIRT_DOWNLOAD_DIR} \
-        https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip && \
-    cd ${QAIRT_DOWNLOAD_DIR} && \
-    unzip v${QAIRT_VERSION}.zip && \
-    rm -f v${QAIRT_VERSION}.zip && \
-    cp -r ${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/include/Genie/* /usr/include/ && \
-    cp -r ${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/include/QNN/* /usr/include/ && \
-    cp -r ${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/include/SNPE/* /usr/include/ && \
-    cp ${QAIRT_LIB_PATH}/aarch64-oe-linux-gcc11.2/libGenie.so /usr/lib/ && \
-    cp ${QAIRT_LIB_PATH}/aarch64-oe-linux-gcc11.2/libQnn*.so /usr/lib/ && \
-    cp ${QAIRT_LIB_PATH}/aarch64-oe-linux-gcc11.2/libSNPE*.so /usr/lib/ && \
-    cp ${QAIRT_LIB_PATH}/hexagon-v68/unsigned/* ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ && \
-    cp ${QAIRT_LIB_PATH}/hexagon-v73/unsigned/* ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ && \
-    cp ${QAIRT_LIB_PATH}/hexagon-v75/unsigned/* ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ && \
-    cp ${QAIRT_LIB_PATH}/aarch64-oe-linux-gcc11.2/* ${DEPLOY_DIR}/usr/lib/ && \
-    rm -rf ${QAIRT_DOWNLOAD_DIR}/qairt
+COPY qai-forge/scripts/deps/fetch-qairt-sdk.sh /tmp/
+RUN chmod +x /tmp/fetch-qairt-sdk.sh && /tmp/fetch-qairt-sdk.sh && rm /tmp/fetch-qairt-sdk.sh
 
 # ── Stage the GenieX SDK (libgeniex.so + headers) ────────────────────────────
-# GenieX model-manager C ABI, used by QAIServe's GenieXClient for multi-hub
-# model downloads (HuggingFace / AI Hub / …). The SDK zip lives on the SAME
-# Qualcomm public S3 mirror as QAIRT.
-#   - Headers (geniex.h, geniex_model.h) → /usr/include/  (for build)
-#   - libgeniex.so + libgeniex_* backends → /usr/lib/ (build) + ${DEPLOY_DIR}
-# We intentionally do NOT copy the SDK's bundled lib/qairt/htp-files/* (libQnn*,
-# libQnnSystem, …) — those overlap the QAIRT libs already staged above; reusing
-# a single QAIRT copy avoids duplicate/mismatched QNN runtimes.
+# Uses modular script for maintainability and reusability
 ENV GENIEX_SDK_VERSION=v0.3.14
-ENV GENIEX_DOWNLOAD_DIR=/tmp/geniex-download
-
-RUN mkdir -p ${GENIEX_DOWNLOAD_DIR} && \
-    wget -t 2 -T 60 -P ${GENIEX_DOWNLOAD_DIR} \
-        https://github.com/qualcomm/GenieX/releases/download/${GENIEX_SDK_VERSION}/geniex-sdk-linux-arm64-${GENIEX_SDK_VERSION}.zip  && \
-    cd ${GENIEX_DOWNLOAD_DIR} && \
-    unzip geniex-sdk-linux-arm64-${GENIEX_SDK_VERSION}.zip && \
-    cp sdk-linux-arm64/include/*.h /usr/include/ && \
-    cp sdk-linux-arm64/lib/libgeniex.so /usr/lib/ && \
-    cp sdk-linux-arm64/lib/libgeniex.so ${DEPLOY_DIR}/usr/lib/ && \
-    cp sdk-linux-arm64/lib/qairt/libgeniex*.so ${DEPLOY_DIR}/usr/lib/ && \
-    cp sdk-linux-arm64/lib/qairt/libgeniex-proc*.so ${DEPLOY_DIR}/usr/lib/ 2>/dev/null || true && \
-    rm -rf ${GENIEX_DOWNLOAD_DIR}/sdk-linux-arm64 ${GENIEX_DOWNLOAD_DIR}/*.zip
-
-# Copy fastrpc runtime libraries into deploy staging
-RUN cp /usr/lib/libcdsprpc.so* ${DEPLOY_DIR}/usr/lib/ && \
-    cp /usr/lib/libadsprpc.so* ${DEPLOY_DIR}/usr/lib/
+COPY QAIServe/scripts/fetch-geniex-sdk.sh /tmp/
+RUN chmod +x /tmp/fetch-geniex-sdk.sh && /tmp/fetch-geniex-sdk.sh && rm /tmp/fetch-geniex-sdk.sh
 
 # ── Copy LiteRT libraries built from source (AArch64, with QNN NPU dispatch) ──
 # Overlays on top of the QAIRT libraries so the source-built LiteRT runtime
 # (liblitert_runtime_c_api.so) and dispatch/compiler-plugin .so files are
 # available for both build-time linking and runtime loading.
 # Headers land in /usr/include/litert/ and /usr/include/tflite/.
-COPY --from=litert_builder /mnt/work/deploy/usr /usr
-COPY --from=litert_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
+COPY --from=litert_builder ${LITERT_DEPLOY_DIR} /usr
+COPY --from=litert_builder ${LITERT_DEPLOY_DIR}/lib ${DEPLOY_DIR}/usr/lib
 
 # ── Copy LiteRT-LM libraries and CLI tools (built on top of LiteRT) ──────────
 # LiteRT-LM was built with --override_repository=litert=${LITERT_SRC_DIR}
@@ -517,30 +243,20 @@ COPY --from=litert_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
 # The .so files land in /usr/lib/ alongside the LiteRT runtime libraries.
 # The CLI tools (litert-lm, litert-lm-advanced) land in ${DEPLOY_DIR}/usr/bin/
 # for inclusion in the final image as on-device debugging/benchmarking tools.
-COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib /usr/lib
-COPY --from=litert_lm_builder /mnt/work/deploy/usr/lib ${DEPLOY_DIR}/usr/lib
-COPY --from=litert_lm_builder /mnt/work/deploy/usr/include /usr/include
-COPY --from=litert_lm_builder /mnt/work/deploy/usr/bin ${DEPLOY_DIR}/usr/bin
+# By default (BUILD_LITERT_LM_CLI_TOOLS=false) these are stub scripts staged
+# by build-litert-lm-incremental.sh rather than the real multi-MB Bazel-built
+# binaries — QAIServe itself never calls them. Pass
+# --build-arg BUILD_LITERT_LM_CLI_TOOLS=true to build and ship the real tools.
+COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/lib /usr/lib
+COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/lib ${DEPLOY_DIR}/usr/lib
+COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/include /usr/include
+COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/bin ${DEPLOY_DIR}/usr/bin
 
 # ── Build llama.cpp (provides llama-server + libllama.so + libggml*.so) ───────
-# Pinned to tag b5616. Shared libs (-DBUILD_SHARED_LIBS=ON) required so
-# qai-forge can link against libllama/libggml at runtime.
+# Uses modular script for maintainability and reusability
 ENV LLAMACPP_INSTALL_DIR=/build/llamacpp-install
-RUN git clone --depth 1 --branch b5616 https://github.com/ggml-org/llama.cpp /build/llama.cpp && \
-    cmake -S /build/llama.cpp -B /build/llama.cpp/build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_SHARED_LIBS=ON \
-        -DLLAMA_BUILD_SERVER=ON \
-        -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        -DLLAMA_CURL=OFF \
-        -DGGML_NATIVE=OFF \
-        -DCMAKE_INSTALL_PREFIX=${LLAMACPP_INSTALL_DIR} && \
-    cmake --build /build/llama.cpp/build -j$(nproc) && \
-    cmake --install /build/llama.cpp/build && \
-    cp ${LLAMACPP_INSTALL_DIR}/bin/llama-server ${DEPLOY_DIR}/usr/bin/ && \
-    find ${LLAMACPP_INSTALL_DIR}/lib -name "*.so*" -exec cp -P {} ${DEPLOY_DIR}/usr/lib/ \; && \
-    rm -rf /build/llama.cpp
+COPY qai-forge/scripts/deps/build-llamacpp.sh /tmp/
+RUN chmod +x /tmp/build-llamacpp.sh && /tmp/build-llamacpp.sh && rm /tmp/build-llamacpp.sh
 
 # ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
 WORKDIR /build
@@ -612,6 +328,11 @@ RUN find ${DEPLOY_DIR}/usr/bin -type f \
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 debian:trixie-slim AS stager
 
+# Same value as the builder stage's DEPLOY_DIR — re-declared here since ENV
+# does not cross stage boundaries and this stage is FROM debian:trixie-slim,
+# not FROM builder.
+ENV DEPLOY_DIR=/build/deploy
+
 # Install runtime deps to make their .so files available for cherry-picking.
 # libgrpc++1.51/libgrpc29/libprotobuf32 pull in abseil + re2 + c-ares
 # transitively — apt resolves the exact versioned packages; we only
@@ -675,38 +396,23 @@ RUN cp -a /etc/ssl/certs/. /export/etc/ssl/certs/ && \
 
 # Copy stripped binaries from the builder deploy tree.
 # Deliberately excludes qai-forge-daemon — the HTTP server spawns workers directly.
-COPY --from=builder /build/deploy/usr/bin/qaiserve /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/genai-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/genai-vlm-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/qnn-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/snpe-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert-lm-inference-worker /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert-lm /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/litert-lm-advanced /export/usr/bin/
-COPY --from=builder /build/deploy/usr/bin/llama-server /export/usr/bin/
-COPY --from=builder /build/deploy/usr/lib /export/usr/lib
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/qaiserve /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/genai-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/genai-vlm-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/qnn-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/snpe-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm-inference-worker /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm-advanced /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/llama-server /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/lib /export/usr/lib
 
 # Cherry-pick only the required system .so files (with symlinks preserved).
-# These are libraries not already bundled via the builder deploy tree:
-#   fastrpc deps:  libyaml-0-2, libbsd, libmd
-#   Drogon deps:   libjsoncpp, libssl, libcrypto, libz, libuuid
-#   C++ atomics:   libatomic
-#   gRPC/protobuf: libgrpc++, libgrpc, libprotobuf, and their transitive deps
-#                  (abseil, re2, c-ares, gpr, upb, address_sorting)
-#   llama.cpp:     libgomp (OpenMP runtime required by llama-server)
-# trixie-slim already ships: libc6, libstdc++6, libgcc-s1, libm
-#
-# Uses find to locate .so files regardless of whether Debian placed them under
-# /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 libnghttp3 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap*" "liblber*" libbrotlidec libbrotlicommon libzstd liblzma libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb libgomp; do \
-      find /usr/lib /usr/lib/aarch64-linux-gnu /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
-    done && \
-    find /usr/lib /lib -name "libabsl_*.so*" -exec cp -dp {} /export/usr/lib/ \;
-# Debian packages abseil as dozens of separately-named component libraries
-# (libabsl_base.so.*, libabsl_strings.so.*, libabsl_synchronization.so.*, ...)
-# rather than a single libabsl.so — the plain "${lib}.so*" glob above never
-# matches any of them, so it is cherry-picked separately right above.
+# Uses modular script for maintainability and reusability
+ENV EXPORT_DIR=/export
+COPY QAIServe/scripts/cherry-pick-system-libs.sh /tmp/
+RUN chmod +x /tmp/cherry-pick-system-libs.sh && /tmp/cherry-pick-system-libs.sh && rm /tmp/cherry-pick-system-libs.sh
 
 # Bake fastrpc DSP path config for all supported Qualcomm devices.
 RUN { \
@@ -719,18 +425,22 @@ RUN { \
       echo '    DSP_LIBRARY_PATH: sa8775p/Qualcomm/SA8775P-RIDE/dsp'; \
       echo '  Qualcomm Technologies, Inc. IQ8 8275 Pro SKU EVK:'; \
       echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp'; \
-    } > /export/etc/fastrpc/hexagon-dsp-binaries.yaml
+    } > ${EXPORT_DIR}/etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3: Runtime (debian:trixie-slim)
+# Stage 3: Runtime (distroless/cc-debian13)
 #
-# Uses debian:trixie-slim (glibc 2.41, GCC 14 libstdc++) rather than
-# distroless/cc-debian12, because the prebuilt GenieX SDK (libgeniex.so)
-# requires GLIBC_2.39 + GLIBCXX_3.4.32 — newer than bookworm/distroless-12
-# (glibc 2.36) can provide. trixie-slim already ships libc6/libstdc++6/libgcc-s1
-# at the required versions; the stager's cherry-picked .so files overlay on top.
+# distroless/cc-debian13 is built on Debian Trixie, so it ships the same
+# glibc 2.41 + GCC 14 libstdc++ as the debian:trixie-slim builder/stager
+# stages above — the prebuilt GenieX SDK (libgeniex.so) requires
+# GLIBC_2.39 + GLIBCXX_3.4.32, which distroless-12 (bookworm, glibc 2.36)
+# could not provide, but distroless-13 now can. Using the Trixie-based
+# distroless image instead of debian:trixie-slim keeps glibc consistent
+# across every stage while trimming the shell/package-manager/apt-cache
+# that trixie-slim still carries; the stager's cherry-picked .so files
+# overlay on top exactly as before.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:trixie-slim AS qaiserve-runtime
+FROM --platform=linux/arm64 gcr.io/distroless/cc-debian13 AS qaiserve-runtime
 
 # Single COPY brings in:
 #   /usr/bin/   - qaiserve, genai-inference-worker, genai-vlm-inference-worker,
