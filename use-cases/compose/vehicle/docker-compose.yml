@@ -91,6 +91,11 @@ services:
       - OUT_PORT=${OUT_PORT:-8900}
     env_file:
       - /etc/docker/env/qimsdk.env
+    volumes:
+      - /etc/media:/etc/media
+      - /etc/models:/etc/models
+      - /etc/labels:/etc/labels
+      - /etc/configs:/etc/configs
     command: bash /etc/media/qimsdk_vehicle_detect.sh
     deploy:
       resources:
