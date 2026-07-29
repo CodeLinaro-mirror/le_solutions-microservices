@@ -9,6 +9,11 @@
       "model_file": "nomic_embed_text.tflite",
       "display_name": "Nomic-Embed-Text",
       "max_tokens": 128
+    },
+    "nomic_embed_text_dlc": {
+      "model_file": "nomic_embed_text.dlc",
+      "display_name": "Nomic-Embed-Text-DLC",
+      "max_tokens": 128
     }
   },
   "default_model": "nomic-embed-text"
