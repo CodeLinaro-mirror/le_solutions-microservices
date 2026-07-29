@@ -55,6 +55,7 @@ services:
     container_name: tripwire-analytics-server
     depends_on:
       - redis
+      - mariadb
     restart: always
     environment:
       - REDIS_HOST=172.17.0.1
@@ -78,16 +79,6 @@ services:
     container_name: qimsdk-restricted-zone
     hostname: qimsdk-restricted-zone
     restart: always
-    environment:
-      - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/etc/media/sample-videos/rtsp2_1_region_quarter_vertical_tripwire.ts}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
-      - MODEL_PATH_PERSON=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      - MODEL_OFFSETS_PERSON=${MODEL_OFFSETS_PERSON:-<0.0,95.0,114.0,0.0>}
-      - MODEL_SCALES_PERSON=${MODEL_SCALES_PERSON:-<0.0037073439452797174,0.4590655267238617,2.336696147918701,0.00390625>}
-      - LABELS_PATH_PERSON=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.labels}
-      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
-      - OUT_PORT=${OUT_PORT:-8900}
     env_file:
       - /etc/docker/env/qimsdk.env
     volumes:
@@ -95,7 +86,23 @@ services:
       - /etc/models:/etc/models
       - /etc/labels:/etc/labels
       - /etc/configs:/etc/configs
-    command: bash qimsdk_person_detect.sh
+    command: >
+      microservices-restricted-zone
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/sample-videos/rtsp2_1_region_quarter_vertical_tripwire.ts}
+      --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8900}
+      --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
+      --model-path=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
+      --labels-path=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.json}
+      --settings-path=${SETTINGS_PATH_PERSON:-/etc/labels/foot_track_net_settings.json}
+      --restricted-zone-boundaries=${ZONE_BOUNDARIES:-"Zones,Zone1=<<960,540>,<1920,540>,<1920,1080>,<960,1080>>;"}
+      --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
+      --redis-host=${REDIS_HOST:-127.0.0.1}
+      --redis-port=${REDIS_OUT_PORT:-6379}
+      --redis-channel=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.rz}:0
+      --webrtc-id=${WEBRTC_ID:-1010}
+      --no-display=${NO_DISPLAY_ARG:-0}
+      --no-output-overlay=${NO_OUT_OVERLAY_ARG:-0}
+      --no-debug=${NO_DEBUG_ARG:-0}
     deploy:
       resources:
         reservations:
