@@ -284,14 +284,122 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
         self.graph_handle = c_void_p()
         self._sys_ctx_handle = None
         self._binary_info_ptr = None
+        self.dlc_handle = c_void_p(None)
 
         # Initialize and prepare once
         self._init_logging()
         self._init_backend()
-        self._bi, self._binary_buf, self._binary_size = self._load_binary()
-        self._graph_name, self._in_meta, self._out_meta, self._resolved_input, self._resolved_output = \
-            self._find_graph_and_io(self._bi)
-        self._create_context(self._binary_buf, self._binary_size)
+        if self.binary_path.lower().endswith(".dlc"):
+            self._load_and_compose_dlc()
+        else:
+            self._bi, self._binary_buf, self._binary_size = self._load_binary()
+            self._graph_name, self._in_meta, self._out_meta, self._resolved_input, self._resolved_output = \
+                self._find_graph_and_io(self._bi)
+            self._create_context(self._binary_buf, self._binary_size)
+            self._retrieve_graph(self._graph_name)
+
+    # ------------------------------------------------------------------
+    def _load_and_compose_dlc(self):
+        if self.system_provider is None:
+            raise RuntimeError("System provider not available for QNN DLC loading.")
+
+        # 1. Create context
+        null_ctx_cfg = POINTER(POINTER(c_void_p))()
+        rc = self.provider.contextCreate(
+            self.backend_handle,
+            self.device_handle,
+            null_ctx_cfg,
+            ctypes.byref(self.context_handle)
+        )
+        if rc != 0:
+            raise RuntimeError(f"contextCreate failed rc={rc}")
+
+        # 2. Create DLC handle from file
+        dlc = c_void_p()
+        rc = self.system_provider.systemDlcCreateFromFile(
+            self.logger_handle,
+            self.binary_path.encode("utf-8"),
+            ctypes.byref(dlc)
+        )
+        if rc != 0:
+            raise RuntimeError(f"systemDlcCreateFromFile failed rc={rc}")
+        self.dlc_handle = dlc
+
+        # 3. Compose graphs
+        from openapi_server.impl.qnn_runtime.system_structs import QnnSystemContext_GraphInfo_t
+        graphs_pp = POINTER(POINTER(c_void_p))()
+        num_graphs = c_uint32(0)
+
+        interface_addr = self.provider._ptr_val
+
+        rc = self.system_provider.systemDlcComposeGraphs(
+            self.dlc_handle,
+            POINTER(POINTER(c_void_p))(),  # graphConfigs
+            0,                             # numGraphConfigs
+            self.backend_handle,
+            self.context_handle,
+            interface_addr,
+            1,                             # graphVersion (1 = QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1)
+            ctypes.byref(graphs_pp),
+            ctypes.byref(num_graphs)
+        )
+
+        n_graphs = int(num_graphs.value)
+        graphs_val = ctypes.cast(graphs_pp, c_void_p).value
+
+        if rc != 0 or n_graphs == 0 or not graphs_val:
+            raise RuntimeError(f"systemDlcComposeGraphs failed or no graphs composed. rc={rc}")
+
+        # Cast raw pointer output to QnnSystemContext_GraphInfo_t pointer array
+        graphs_pp_typed = ctypes.cast(graphs_pp, POINTER(QnnSystemContext_GraphInfo_t))
+
+        idx = 0
+        if self.graph_name:
+            wanted = self.graph_name.encode()
+            for i in range(n_graphs):
+                g_info = graphs_pp_typed[i]
+                gver = int(g_info.version)
+                if gver == 1:
+                    name = g_info.u.graphInfoV1.graphName
+                elif gver == 2:
+                    name = g_info.u.graphInfoV2.graphName
+                else:
+                    name = g_info.u.graphInfoV3.graphName
+                if name == wanted:
+                    idx = i
+                    break
+
+        g_info = graphs_pp_typed[idx]
+        gver = int(g_info.version)
+        gver = int(g_info.version)
+        if gver == 1:
+            g = g_info.u.graphInfoV1
+        elif gver == 2:
+            g = g_info.u.graphInfoV2
+        else:
+            g = g_info.u.graphInfoV3
+
+        self._graph_name = (g.graphName or b"").decode(errors="replace")
+
+        n_in, in_ptr = int(g.numGraphInputs), g.graphInputs
+        n_out, out_ptr = int(g.numGraphOutputs), g.graphOutputs
+
+        in_names = [_tensor_name(in_ptr[i]) for i in range(n_in)]
+        out_names = [_tensor_name(out_ptr[i]) for i in range(n_out)]
+
+        self._in_meta = (n_in, in_ptr, in_names)
+        self._out_meta = (n_out, out_ptr, out_names)
+
+        self._resolved_input = self.input_name or next(
+            (cand for cand in TOKEN_NAMES_FALLBACK if cand in in_names),
+            in_names[0] if in_names else None
+        )
+
+        self._resolved_output = self.output_name or (
+            "embeddings" if "embeddings" in out_names else (out_names[0] if out_names else None)
+        )
+
+        # 4. Retrieve graph handle
         self._retrieve_graph(self._graph_name)
 
     # ------------------------------------------------------------------
@@ -311,6 +419,10 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
     # ------------------------------------------------------------------
     @classmethod
     def from_model_path(cls, model_path: str):
+        # Automatically select the context binary file if it exists in the models directory
+        bin_path = model_path.replace(".dlc", ".bin")
+        if model_path.lower().endswith(".dlc") and os.path.exists(bin_path):
+            model_path = bin_path
 
         backend = os.getenv("QNN_BACKEND_LIB", "libQnnHtp.so")
         system = os.getenv("QNN_SYSTEM_LIB", "libQnnSystem.so")
@@ -337,6 +449,14 @@ class SimpleQnnEmbeddingApp(EmbeddingBackend):
 
     # ------------------------------------------------------------------
     def close(self):
+        # 0. Free DLC context
+        try:
+            if self.system_provider and self.dlc_handle and self.dlc_handle.value:
+                self.system_provider.systemDlcFree(self.dlc_handle)
+        except Exception:
+            pass
+        self.dlc_handle = c_void_p(None)
+
         # 1. Free system context (holds binary-info pointer; must go first)
         try:
             if self.system_provider and self._sys_ctx_handle:

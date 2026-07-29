@@ -53,20 +53,23 @@ _EXTENSION_TO_BACKEND: Dict[str, type] = {
 }
 
 
-def _backend_factory(model_path: str) -> EmbeddingBackend:
+def _backend_factory(model_path: str, model_id: str = "") -> EmbeddingBackend:
     """
     Instantiate the correct :class:`EmbeddingBackend` for *model_path*.
 
-    Selection is based solely on the file extension:
+    Selection is based on the requested model_id and file extension:
 
-    * ``.tflite`` → :class:`NomicEmbedBackend` (LiteRT / TFLite path)
-    * ``.bin``    → :class:`SimpleQnnEmbeddingApp` (QNN binary path)
-    * ``.dlc``    → :class:`SimpleSnpeEmbeddingApp` (SNPE binary path)
+    * ``.tflite``  → :class:`NomicEmbedBackend` (LiteRT / TFLite path)
+    * ``.bin``     → :class:`SimpleQnnEmbeddingApp` (QNN binary path)
+    * ``.dlc`` (SNPE) → :class:`SimpleSnpeEmbeddingApp` (SNPE binary path)
+    * ``.dlc`` (QNN) → :class:`SimpleQnnEmbeddingApp` (QNN context binary inside DLC)
 
     Parameters
     ----------
     model_path:
         Absolute or relative path to the model file.
+    model_id:
+        The requested model ID/key to guide backend selection.
 
     Returns
     -------
@@ -80,6 +83,17 @@ def _backend_factory(model_path: str) -> EmbeddingBackend:
     """
     _, ext = os.path.splitext(model_path)
     ext = ext.lower()
+
+    if ext == ".dlc":
+        # Force SNPE backend if explicitly requested
+        if "snpe" in model_id.lower():
+            logger.info(f"Explicit SNPE request for {model_path!r}. Selecting backend {SimpleSnpeEmbeddingApp.__name__!r}.")
+            return SimpleSnpeEmbeddingApp.from_model_path(model_path)
+
+        # Force QNN backend if explicitly requested
+        if "qnn" in model_id.lower():
+            logger.info(f"Explicit QNN request for {model_path!r}. Selecting backend {SimpleQnnEmbeddingApp.__name__!r}.")
+            return SimpleQnnEmbeddingApp.from_model_path(model_path)
 
     backend_cls = _EXTENSION_TO_BACKEND.get(ext)
     if backend_cls is None:
@@ -112,9 +126,9 @@ def _backend_factory(model_path: str) -> EmbeddingBackend:
 # Re-creating the backend on every request adds 200–800 ms of cold-start
 # latency and prevents the HTP hardware from staying warm.
 #
-# We keep one EmbeddingBackend instance per model path and serialise
-# concurrent inference calls with a per-model lock so that tensor buffers
-# are never accessed from two threads simultaneously.
+# We keep one EmbeddingBackend instance per model path/key and serialise
+# concurrent inference calls with a lock so that tensor buffers are never
+# accessed from two threads simultaneously.
 # ---------------------------------------------------------------------------
 
 _backend_cache: Dict[str, EmbeddingBackend] = {}
@@ -122,42 +136,44 @@ _backend_locks: Dict[str, threading.Lock] = {}
 _backend_meta_lock = threading.Lock()
 
 
-def _get_backend(model_path: str) -> Tuple[EmbeddingBackend, threading.Lock]:
+def _get_backend(model_path: str, model_id: str) -> Tuple[EmbeddingBackend, threading.Lock]:
     """
-    Return ``(backend, lock)`` for *model_path*, creating them on first call.
+    Return ``(backend, lock)`` for *model_path* and *model_id*, creating them on first call.
 
-    Thread-safe: concurrent callers for the same *model_path* will block
+    Thread-safe: concurrent callers for the same backend will block
     until the backend is ready, then all receive the same cached instance.
 
     Parameters
     ----------
     model_path:
-        Absolute path to the model file.  The file extension determines
-        which backend class is instantiated (see :func:`_backend_factory`).
+        Absolute path to the model file.
+    model_id:
+        The requested model ID/key to guide backend selection.
 
     Returns
     -------
     Tuple[EmbeddingBackend, threading.Lock]
         The cached backend instance and its associated inference lock.
     """
+    cache_key = f"{model_path}:{model_id}"
     # Phase 1: obtain (or create) the per-model lock without holding the
     # global meta-lock for longer than necessary.
     with _backend_meta_lock:
-        if model_path not in _backend_locks:
-            _backend_locks[model_path] = threading.Lock()
-        lock = _backend_locks[model_path]
+        if cache_key not in _backend_locks:
+            _backend_locks[cache_key] = threading.Lock()
+        lock = _backend_locks[cache_key]
 
     # Phase 2: create the backend if it does not exist yet.  The per-model
     # lock serialises concurrent first-time initialisations for the same path.
     with lock:
-        if model_path not in _backend_cache:
-            logger.info(f"Initialising backend for model: {model_path!r}")
-            _backend_cache[model_path] = _backend_factory(model_path)
+        if cache_key not in _backend_cache:
+            logger.info(f"Initialising backend for model: {model_path!r} (key: {model_id!r})")
+            _backend_cache[cache_key] = _backend_factory(model_path, model_id)
             logger.info(
-                f"Backend {_backend_cache[model_path].__class__.__name__!r} "
+                f"Backend {_backend_cache[cache_key].__class__.__name__!r} "
                 f"ready for model: {model_path!r}"
             )
-        return _backend_cache[model_path], lock
+        return _backend_cache[cache_key], lock
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +234,7 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             embeddings_data, token_counts = await self._get_embeddings_from_component(
                 inputs=inputs,
                 model=model_binary_path,
+                model_id=requested_model,
                 dimensions=create_embeddings_request.dimensions,
                 encoding_format=create_embeddings_request.encoding_format,
             )
@@ -268,6 +285,7 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         self,
         inputs: List[str],
         model: str,
+        model_id: str = "",
         dimensions: Optional[int] = None,
         encoding_format: Optional[str] = "float",
     ) -> Tuple[List[Union[List[float], str]], List[int]]:
@@ -286,6 +304,8 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             Absolute path to the model file.  Extension determines backend:
             ``.tflite`` → NomicEmbedBackend, ``.bin`` → SimpleQnnEmbeddingApp,
             ``.dlc`` → SimpleSnpeEmbeddingApp.
+        model_id:
+            The requested model ID/key to guide backend selection.
         dimensions:
             If set, truncate each embedding vector to this many dimensions.
         encoding_format:
@@ -303,9 +323,17 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         def _work() -> Tuple[List[Union[List[float], str]], List[int]]:
             # Retrieve (or create) the cached backend and its inference lock.
             # The lock ensures tensor buffers are never accessed concurrently.
-            backend, lock = _get_backend(model)
+            backend, lock = _get_backend(model, model_id)
 
             with lock:
+                # Log the active backend and its associated runtime library/context details
+                active_lib = getattr(backend, "backend_lib", "N/A")
+                logger.info(
+                    f"Executing inference on model_id: {model_id!r} "
+                    f"using backend class: {backend.__class__.__name__!r} "
+                    f"and runtime library: {active_lib!r}"
+                )
+
                 # Both NomicEmbedBackend and SimpleQnnEmbeddingApp implement
                 # EmbeddingBackend, so no branching is needed here.
                 vectors: List[List[float]] = backend.embed_texts(inputs)

@@ -1,20 +1,25 @@
 {
   "models": {
-    "nomic-embed-text": {
+    "nomic_embed_text_qnn": {
       "model_file": "nomic_embed_text.bin",
-      "display_name": "Nomic-Embed-Text",
+      "display_name": "Nomic-Embed-Text-QNN",
       "max_tokens": 128
     },
     "nomic_embed_text_tflite": {
       "model_file": "nomic_embed_text.tflite",
-      "display_name": "Nomic-Embed-Text",
+      "display_name": "Nomic-Embed-Text-TFLite",
       "max_tokens": 128
     },
-    "nomic_embed_text_dlc": {
+    "nomic_embed_text_qnn_dlc": {
       "model_file": "nomic_embed_text.dlc",
-      "display_name": "Nomic-Embed-Text-DLC",
+      "display_name": "Nomic-Embed-Text-QNN-DLC",
+      "max_tokens": 128
+    },
+    "nomic_embed_text_snpe": {
+      "model_file": "nomic_embed_text.dlc",
+      "display_name": "Nomic-Embed-Text-SNPE",
       "max_tokens": 128
     }
   },
-  "default_model": "nomic-embed-text"
+  "default_model": "nomic_embed_text_qnn"
 }
