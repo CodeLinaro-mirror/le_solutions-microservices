@@ -377,6 +377,7 @@ void ModelRuntime::executorLoop() {
     while (true) {
         bool should_load = false;
         bool should_unload = false;
+        bool should_reload_unhealthy = false;
         InferenceJobPtr job;
         std::vector<ModelRuntimeState> state_events;
 
@@ -411,16 +412,38 @@ void ModelRuntime::executorLoop() {
                 setStateLocked(ModelRuntimeState::Evicting, state_events);
                 should_unload = true;
             } else if (state_ == ModelRuntimeState::Idle) {
-                promoteAgedJobs();
-                job = queue_.pop();
-                if (job) {
-                    running_job_ = job;
-                    setStateLocked(ModelRuntimeState::Running, state_events);
+                if (!queue_.empty() &&
+                    (!backend_healthy_ || !backend_ || !backend_->isHealthy())) {
+                    // Backend died while sitting idle (e.g. drained/reloaded by
+                    // WarmModelPool for another model). Don't hand the queued
+                    // job a guaranteed 503 — fail over to Failed so the reload
+                    // path below picks it back up and the job gets served once
+                    // the backend is healthy again, instead of being popped and
+                    // rejected here.
+                    backend_healthy_ = false;
+                    should_reload_unhealthy = true;
+                    setStateLocked(ModelRuntimeState::Failed, state_events);
+                } else {
+                    promoteAgedJobs();
+                    job = queue_.pop();
+                    if (job) {
+                        running_job_ = job;
+                        setStateLocked(ModelRuntimeState::Running, state_events);
+                    }
                 }
             }
         }
 
         notifyStateChanges(state_events);
+
+        if (should_reload_unhealthy) {
+            LOG_WARN("[ModelRuntime] Backend unhealthy with queued work while idle;"
+                     " forcing reload: model=" << model_id_);
+            unloadBackend(/*force=*/true);
+            waitForDspMemoryReclaim(model_id_, stop_requested_);
+            activate();
+            continue;
+        }
 
         if (should_load) {
             try {

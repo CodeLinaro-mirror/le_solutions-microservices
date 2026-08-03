@@ -210,6 +210,7 @@ void PredictiveWorkerManager::cleanupWorker(bool force) {
         close(sock_fd_);
         sock_fd_ = -1;
     }
+    read_buf_.clear();
     current_model_id_.clear();
 }
 
@@ -221,17 +222,23 @@ void PredictiveWorkerManager::sendMessage(const json& msg) {
 }
 
 json PredictiveWorkerManager::readMessage(int timeout_seconds) {
-    std::string line;
-    char ch;
-
-    fd_set fds;
-    struct timeval tv;
+    // Drain a large chunk per recv() instead of one byte per syscall — a
+    // multi-MB base64 RESULT line can otherwise cost millions of
+    // select()+read() pairs and dominate the request's wall-clock time.
+    char chunk[65536];
 
     while (true) {
+        size_t newline_pos = read_buf_.find('\n');
+        if (newline_pos != std::string::npos) {
+            std::string line = read_buf_.substr(0, newline_pos);
+            read_buf_.erase(0, newline_pos + 1);
+            return json::parse(line);
+        }
+
+        fd_set fds;
         FD_ZERO(&fds);
         FD_SET(sock_fd_, &fds);
-        tv.tv_sec  = timeout_seconds;
-        tv.tv_usec = 0;
+        struct timeval tv{timeout_seconds, 0};
 
         int ret = select(sock_fd_ + 1, &fds, nullptr, nullptr, &tv);
         if (ret == 0)
@@ -239,15 +246,12 @@ json PredictiveWorkerManager::readMessage(int timeout_seconds) {
         if (ret < 0)
             throw std::runtime_error("[PredictiveWorkerManager] select error");
 
-        ssize_t n = read(sock_fd_, &ch, 1);
+        ssize_t n = read(sock_fd_, chunk, sizeof(chunk));
         if (n <= 0)
             throw std::runtime_error("[PredictiveWorkerManager] worker disconnected");
 
-        if (ch == '\n') break;
-        line += ch;
+        read_buf_.append(chunk, static_cast<size_t>(n));
     }
-
-    return json::parse(line);
 }
 
 void PredictiveWorkerManager::executeInfer(
@@ -301,9 +305,12 @@ void PredictiveWorkerManager::executeInfer(
         }
 
         // Decode output tensors
+        // request_id is Layer 1's client-facing ID (custom, or generated if the
+        // client left it empty) — event_id is only for worker IPC correlation
+        // and must not leak into the response in its place.
         TensorInferenceResponse result;
         result.model      = request.model;
-        result.request_id = event_id;
+        result.request_id = request.request_id;
 
         for (const auto& t : response.value("outputs", json::array())) {
             OutputTensor out;

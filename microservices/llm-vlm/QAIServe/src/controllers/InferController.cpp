@@ -639,7 +639,7 @@ void InferController::generateStream(
         });
 
     sse_resp->setStatusCode(k200OK);
-    sse_resp->addHeader("Content-Type", "text/event-stream");
+    sse_resp->setContentTypeString("text/event-stream");
     sse_resp->addHeader("Cache-Control", "no-cache");
     sse_resp->addHeader("X-Accel-Buffering", "no");
     callback(sse_resp);

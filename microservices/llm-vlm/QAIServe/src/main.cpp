@@ -171,6 +171,17 @@ int main() {
             builder.AddListeningPort(grpc_address, grpc::InsecureServerCredentials());
             builder.RegisterService(&chat_service);
             builder.RegisterService(&infer_service);
+
+            // gRPC's built-in default max message size is 4 MiB, both for
+            // messages this server sends and receives — predictive model
+            // outputs (e.g. detection/segmentation tensors) can exceed that.
+            // Raise both limits; a client-side receive-limit increase alone
+            // cannot help, since the server would refuse to send an
+            // oversized response before it ever reaches the client.
+            const char* grpc_max_msg_env = std::getenv("QAISERVE_GRPC_MAX_MESSAGE_SIZE");
+            int grpc_max_message_size = grpc_max_msg_env ? std::stoi(grpc_max_msg_env) : 64 * 1024 * 1024;
+            builder.SetMaxSendMessageSize(grpc_max_message_size);
+            builder.SetMaxReceiveMessageSize(grpc_max_message_size);
             grpc_server = builder.BuildAndStart();
             grpc_thread = std::thread([&grpc_server]() { grpc_server->Wait(); });
             std::cout << "[main] gRPC ChatService + InferService server listening on " << grpc_address << std::endl;

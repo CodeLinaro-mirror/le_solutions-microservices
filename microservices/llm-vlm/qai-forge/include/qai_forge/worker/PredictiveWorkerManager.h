@@ -98,6 +98,11 @@ private:
     int worker_pid_ = -1;
     int sock_fd_    = -1;
 
+    // Bytes already read from sock_fd_ but not yet consumed as a full line —
+    // carried across readMessage() calls so a single recv() can satisfy
+    // multiple/partial lines without re-reading one byte at a time.
+    std::string read_buf_;
+
     void startWorker(const std::string& model_id, const json& init_params);
     void cleanupWorker(bool force = false);
 

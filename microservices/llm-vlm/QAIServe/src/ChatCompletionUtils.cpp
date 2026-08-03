@@ -103,6 +103,13 @@ std::string hashConversationPairs(const json& messages, bool exclude_last_pair) 
         pairs.pop_back();
     }
 
+    // No complete pairs to hash - return empty string rather than hashing
+    // an empty array, which would produce the same constant hash for every
+    // such call and collide across unrelated sessions.
+    if (pairs.empty()) {
+        return "";
+    }
+
     // Flatten pairs into single array
     json flattened_messages = json::array();
     for (const auto& pair : pairs) {
