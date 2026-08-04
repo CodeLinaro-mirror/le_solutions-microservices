@@ -973,18 +973,11 @@ void ResponsesController::createResponse(
                             }}
                         });
 
-                        // response.output_item.added (placeholder for first item)
-                        emit_event("response.output_item.added", {
-                            {"type",         "response.output_item.added"},
-                            {"output_index", 0},
-                            {"item", {
-                                {"type",   "message"},
-                                {"id",     "msg_" + response_id},
-                                {"role",   "assistant"},
-                                {"content", json::array()},
-                                {"status", "in_progress"}
-                            }}
-                        });
+                        // The final message's output_item.added is emitted by
+                        // McpAgenticLoop::runStreaming (via emitFinalMessageEvents)
+                        // once its real output_index is known — it may be
+                        // preceded by one output_item.added/done pair per mcp_call,
+                        // so it cannot be assumed to sit at index 0 up front.
 
                         McpLoopResult loop_result;
                         bool had_error = false;
