@@ -135,11 +135,16 @@ json Qwen3Adapter::preprocessVision(const json& messages) const {
 
             for (const auto& part : content) {
                 std::string type = part.value("type", "");
-                if (type == "text") {
+                if (type == "text" || type == "input_text") {
                     text_content += part.value("text", "");
-                } else if (type == "image_url") {
+                } else if (type == "image_url" || type == "input_image") {
                     auto image_url = part.value("image_url", json::object());
-                    std::string url = image_url.value("url", "");
+                    std::string url;
+                    if (image_url.is_string()) {
+                        url = image_url.get<std::string>();
+                    } else if (image_url.is_object()) {
+                        url = image_url.value("url", "");
+                    }
                     if (!url.empty()) {
                         image_urls.push_back(url);
                         // Qwen 3-VL uses <|image|> token (different from Qwen 2.5)

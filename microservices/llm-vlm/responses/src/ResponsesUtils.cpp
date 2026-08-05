@@ -18,6 +18,116 @@
 #include <regex>
 
 namespace ResponsesUtils {
+namespace {
+
+bool is_vlm_image_type(const std::string& type) {
+    return type == "image_url" || type == "input_image";
+}
+
+std::string image_url_from_part(const json& part) {
+    if (!part.is_object()) {
+        return "";
+    }
+    if (!is_vlm_image_type(part.value("type", ""))) {
+        return "";
+    }
+
+    json image_url = part.value("image_url", json(nullptr));
+    if (image_url.is_string()) {
+        return image_url.get<std::string>();
+    }
+    if (image_url.is_object()) {
+        return image_url.value("url", "");
+    }
+    return "";
+}
+
+std::string latest_image_url_from_messages(const json& messages) {
+    if (!messages.is_array()) {
+        return "";
+    }
+
+    for (auto msg_it = messages.rbegin(); msg_it != messages.rend(); ++msg_it) {
+        if (!msg_it->is_object() || !msg_it->contains("content")) {
+            continue;
+        }
+        const json& content = (*msg_it)["content"];
+        if (!content.is_array()) {
+            continue;
+        }
+
+        for (auto part_it = content.rbegin();
+             part_it != content.rend();
+             ++part_it) {
+            std::string url = image_url_from_part(*part_it);
+            if (!url.empty()) {
+                return url;
+            }
+        }
+    }
+    return "";
+}
+
+json convert_vlm_content_text_parts(const json& content) {
+    if (content.is_string()) {
+        return content;
+    }
+    if (!content.is_array()) {
+        return content.is_null() ? json("") : content;
+    }
+
+    json parts = json::array();
+    for (const auto& part : content) {
+        if (!part.is_object()) {
+            continue;
+        }
+
+        std::string type = part.value("type", "");
+        if (type == "input_text" || type == "text" || type == "output_text") {
+            parts.push_back({{"type", "text"},
+                             {"text", part.value("text", "")}});
+        } else if (!is_vlm_image_type(type)) {
+            parts.push_back(part);
+        }
+    }
+    return parts;
+}
+
+void attach_image_to_message(json& message, const std::string& image_url) {
+    if (image_url.empty() || !message.is_object()) {
+        return;
+    }
+
+    json image_part = {
+        {"type", "image_url"},
+        {"image_url", {{"url", image_url}}}
+    };
+
+    if (!message.contains("content")) {
+        message["content"] = json::array({image_part});
+        return;
+    }
+
+    json& content = message["content"];
+    if (content.is_string()) {
+        std::string text = content.get<std::string>();
+        content = json::array();
+        if (!text.empty()) {
+            content.push_back({{"type", "text"}, {"text", text}});
+        }
+        content.push_back(std::move(image_part));
+        return;
+    }
+
+    if (!content.is_array()) {
+        content = json::array({image_part});
+        return;
+    }
+
+    content.push_back(std::move(image_part));
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // current_unix_time
@@ -134,6 +244,48 @@ json input_to_messages(const json& input, const std::string& system_prompt) {
     }
 
     return messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_vlm_runtime_messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_vlm_runtime_messages(const json& current_messages,
+                                const json& ancestor_messages) {
+    json runtime_messages = json::array();
+    if (!current_messages.is_array()) {
+        return runtime_messages;
+    }
+
+    std::string image_url = latest_image_url_from_messages(current_messages);
+    if (image_url.empty()) {
+        image_url = latest_image_url_from_messages(ancestor_messages);
+    }
+
+    int last_user_index = -1;
+    for (const auto& message : current_messages) {
+        if (!message.is_object()) {
+            continue;
+        }
+
+        json runtime_message = message;
+        if (runtime_message.contains("content")) {
+            runtime_message["content"] =
+                convert_vlm_content_text_parts(runtime_message["content"]);
+        }
+
+        if (runtime_message.value("role", "") == "user") {
+            last_user_index = static_cast<int>(runtime_messages.size());
+        }
+        runtime_messages.push_back(std::move(runtime_message));
+    }
+
+    if (last_user_index >= 0 && !image_url.empty()) {
+        attach_image_to_message(
+            runtime_messages[static_cast<std::size_t>(last_user_index)],
+            image_url);
+    }
+
+    return runtime_messages;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
