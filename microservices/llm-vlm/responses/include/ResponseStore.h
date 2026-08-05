@@ -115,12 +115,25 @@ struct BeginResponseResult {
 };
 
 /**
- * @brief Result status reserved for the future cancel mutation.
+ * @brief Result status for the cancel mutation.
  */
 enum class CancelOutcome {
     Cancelled,
+    AlreadyCancelled,
     NotFound,
     InvalidState
+};
+
+/**
+ * @brief Result of a client-initiated cancel transition.
+ */
+struct CancelResponseResult {
+    bool ok = false;
+    int http_status = 200;
+    std::string error_message;
+    std::string active_job_id;
+    ResponseStoreJson response_object = ResponseStoreJson::object();
+    CancelOutcome outcome = CancelOutcome::NotFound;
 };
 
 /**
@@ -195,7 +208,8 @@ public:
     /**
      * @brief Mark an InProgress response as Cancelled.
      */
-    CancelOutcome cancelResponse(const std::string& response_id);
+    CancelResponseResult cancelResponseDetailed(
+        const std::string& response_id);
 
     /**
      * @brief Hard-delete a response and descendants with two-pass validation.

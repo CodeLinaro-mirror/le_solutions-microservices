@@ -287,6 +287,18 @@ static HttpResponsePtr make_error_response(int status_code, const std::string& m
         static_cast<HttpStatusCode>(status_code));
 }
 
+static std::optional<json> get_stored_cancelled_response_object(
+    const std::string& response_id) {
+    std::optional<StoredResponse> stored =
+        ResponseStore::getInstance().getResponse(response_id);
+    if (!stored.has_value()
+        || stored->status != StoredResponseStatus::Cancelled
+        || !stored->response_object.is_object()) {
+        return std::nullopt;
+    }
+    return stored->response_object;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /v1/responses — Create a response
 // ─────────────────────────────────────────────────────────────────────────────
@@ -940,75 +952,101 @@ void ResponsesController::createResponse(
                         error_msg = e.what();
                     }
 
+                    auto emit_cancelled_if_stored = [&]() {
+                        std::optional<json> cancelled_response =
+                            get_stored_cancelled_response_object(response_id);
+                        if (!cancelled_response.has_value()) {
+                            return false;
+                        }
+                        emit_event("response.cancelled", {
+                            {"type", "response.cancelled"},
+                            {"response", cancelled_response.value()}
+                        });
+                        return true;
+                    };
+
                     if (!had_error) {
-                        emit_event("response.output_text.done", {
-                            {"type",          "response.output_text.done"},
-                            {"output_index",  0},
-                            {"content_index", 0},
-                            {"text",          full_text}
-                        });
+                        if (!emit_cancelled_if_stored()) {
+                            emit_event("response.output_text.done", {
+                                {"type",          "response.output_text.done"},
+                                {"output_index",  0},
+                                {"content_index", 0},
+                                {"text",          full_text}
+                            });
 
-                        emit_event("response.output_item.done", {
-                            {"type",         "response.output_item.done"},
-                            {"output_index", 0},
-                            {"item", {
-                                {"type",    "message"},
-                                {"id",      "msg_" + response_id},
-                                {"role",    "assistant"},
-                                {"content", {{{"type", "output_text"},
-                                              {"text", full_text}}}},
-                                {"status",  "completed"}
-                            }}
-                        });
+                            emit_event("response.output_item.done", {
+                                {"type",         "response.output_item.done"},
+                                {"output_index", 0},
+                                {"item", {
+                                    {"type",    "message"},
+                                    {"id",      "msg_" + response_id},
+                                    {"role",    "assistant"},
+                                    {"content", {{{"type", "output_text"},
+                                                  {"text", full_text}}}},
+                                    {"status",  "completed"}
+                                }}
+                            });
 
-                        json output = ResponsesUtils::build_output_array(result);
-                        json response_obj = ResponsesUtils::build_response_object(
-                            response_id,
-                            model,
-                            output,
-                            "completed",
-                            result.prompt_tokens,
-                            result.completion_tokens,
-                            begin_created_at,
-                            json(nullptr),
-                            json(nullptr),
-                            previous_response_id,
-                            metadata);
-                        add_reasoning_usage_details(response_obj, result);
-                        bool completed =
-                            ResponseStore::getInstance().completeResponse(
-                            response_id,
-                            make_assistant_messages(result),
-                            output,
-                            response_obj,
-                            response_obj["usage"]);
-                        if (!completed) {
-                            std::optional<StoredResponse> stored =
-                                ResponseStore::getInstance().getResponse(
-                                    response_id);
-                            if (stored.has_value()
-                                && stored->response_object.is_object()) {
-                                response_obj = stored->response_object;
+                            json output = ResponsesUtils::build_output_array(result);
+                            json response_obj = ResponsesUtils::build_response_object(
+                                response_id,
+                                model,
+                                output,
+                                "completed",
+                                result.prompt_tokens,
+                                result.completion_tokens,
+                                begin_created_at,
+                                json(nullptr),
+                                json(nullptr),
+                                previous_response_id,
+                                metadata);
+                            add_reasoning_usage_details(response_obj, result);
+                            bool completed =
+                                ResponseStore::getInstance().completeResponse(
+                                response_id,
+                                make_assistant_messages(result),
+                                output,
+                                response_obj,
+                                response_obj["usage"]);
+                            if (!completed) {
+                                if (!emit_cancelled_if_stored()) {
+                                    std::optional<StoredResponse> stored =
+                                        ResponseStore::getInstance().getResponse(
+                                            response_id);
+                                    if (stored.has_value()
+                                        && stored->response_object.is_object()) {
+                                        response_obj = stored->response_object;
+                                    }
+                                    emit_event("response.completed", {
+                                        {"type", "response.completed"},
+                                        {"response", response_obj}
+                                    });
+                                }
+                            } else {
+                                emit_event("response.completed", {
+                                    {"type", "response.completed"},
+                                    {"response", response_obj}
+                                });
                             }
                         }
-
-                        emit_event("response.completed", {
-                            {"type", "response.completed"},
-                            {"response", response_obj}
-                        });
                     } else {
-                        ResponseStore::getInstance().failResponse(
+                        bool failed = ResponseStore::getInstance().failResponse(
                             response_id,
                             make_store_error_object(
                                 http_status >= 500
                                     ? "server_error"
                                     : "invalid_request_error",
                                 error_msg));
-                        emit_event("error", {
-                            {"type",    "error"},
-                            {"code",    "server_error"},
-                            {"message", error_msg}
-                        });
+                        if (!failed && emit_cancelled_if_stored()) {
+                            // Public state is already cancelled; do not emit
+                            // a failure event for a user-initiated cancel.
+                        } else {
+                            emit_event("error", {
+                                {"type",    "error"},
+                                {"code",    "server_error"},
+                                {"message", error_msg}
+                            });
+                        }
                     }
 
                     stream->send("data: [DONE]\n\n");
@@ -1063,16 +1101,32 @@ void ResponsesController::createResponse(
     } catch (const GenAIException& e) {
         std::string error_type = (e.http_status >= 500) ? "server_error"
                                                          : "invalid_request_error";
-        store.failResponse(
+        bool failed = store.failResponse(
             response_id,
             make_store_error_object(error_type, e.message));
+        if (!failed) {
+            std::optional<json> cancelled_response =
+                get_stored_cancelled_response_object(response_id);
+            if (cancelled_response.has_value()) {
+                callback(make_json_response(cancelled_response.value(), k200OK));
+                return;
+            }
+        }
         callback(make_error_response(e.http_status, e.message, error_type));
     } catch (const std::exception& e) {
-        store.failResponse(
+        bool failed = store.failResponse(
             response_id,
             make_store_error_object(
                 "server_error",
                 std::string("Internal server error: ") + e.what()));
+        if (!failed) {
+            std::optional<json> cancelled_response =
+                get_stored_cancelled_response_object(response_id);
+            if (cancelled_response.has_value()) {
+                callback(make_json_response(cancelled_response.value(), k200OK));
+                return;
+            }
+        }
         callback(make_error_response(500,
             std::string("Internal server error: ") + e.what()));
     }
@@ -1388,21 +1442,27 @@ void ResponsesController::cancelResponse(
     const std::string& response_id) {
 
     LOG_INFO("[ResponsesController] Cancel response: response=" << response_id);
-    bool cancelled =
-        scheduler::ModelScheduler::getInstance().cancelResponse(response_id);
+    CancelResponseResult result =
+        ResponseStore::getInstance().cancelResponseDetailed(response_id);
 
-    if (!cancelled) {
-        callback(make_error_response(404,
-            "Response " + response_id + " not found or not active",
+    if (!result.ok) {
+        callback(make_error_response(
+            result.http_status,
+            result.error_message,
             "invalid_request_error"));
         return;
     }
 
-    json response = {
-        {"id",     response_id},
-        {"object", "response"},
-        {"status", "cancelled"}
-    };
-    auto resp = make_json_response(response, k200OK);
+    if (!result.active_job_id.empty()) {
+        scheduler::CancelResult scheduler_cancel =
+            scheduler::ModelScheduler::getInstance().cancel(
+                result.active_job_id);
+        LOG_INFO("[ResponsesController] Cancel scheduler cleanup: response="
+                 << response_id << " job=" << result.active_job_id
+                 << " status=" << static_cast<int>(scheduler_cancel.status)
+                 << " message=\"" << scheduler_cancel.message << "\"");
+    }
+
+    auto resp = make_json_response(result.response_object, k200OK);
     callback(resp);
 }
