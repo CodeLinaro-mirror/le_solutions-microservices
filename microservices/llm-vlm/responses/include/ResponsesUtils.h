@@ -13,6 +13,7 @@
 // Functions:
 //   input_to_messages()          — Responses API input → messages array
 //   extract_mcp_tool_requests()  — parse MCP tool entries from tools[]
+//   strip_tool_call_protocol_text — remove model-internal tool call tags
 //   build_output_array()         — StandardResponse + McpCallRecords → output[]
 //   build_response_object()      — assemble final Responses API response JSON
 //   synthesize_in_progress()     — assemble Retrieve JSON for active responses
@@ -95,6 +96,14 @@ json input_to_messages(const json& input, const std::string& system_prompt = "")
 // @return       Vector of McpToolRequest (one per MCP server reference)
 // ─────────────────────────────────────────────────────────────────────────────
 std::vector<McpToolRequest> extract_mcp_tool_requests(const json& tools);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// strip_tool_call_protocol_text — remove raw model tool-call protocol blocks
+//
+// @param text Model answer text that may contain <tool_call>...</tool_call>
+// @return     Text with tool-call protocol blocks removed and whitespace trimmed
+// ─────────────────────────────────────────────────────────────────────────────
+std::string strip_tool_call_protocol_text(const std::string& text);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_output_array — build Responses API output[] from inference results

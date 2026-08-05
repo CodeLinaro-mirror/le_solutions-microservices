@@ -301,6 +301,7 @@ InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
     job->model_id = request.model;
     job->kind = options.kind;
     job->priority = options.priority;
+    job->allow_tool_chain_fallback = options.allow_tool_chain_fallback;
     job->skip_summarization_middleware =
         options.skip_summarization_middleware;
     job->use_response_history = options.use_response_history;
@@ -585,10 +586,19 @@ SubmitResult ModelScheduler::submit(InferenceJobPtr job) {
                      << job->job_id << " previous="
                      << job->previous_response_id
                      << " message=\"" << resolved.message << "\"");
-            return reject(
-                SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
-                job->job_id,
-                resolved.message);
+            if (job->allow_tool_chain_fallback) {
+                job->is_tool_output_submission = false;
+                job->is_tool_continuation = false;
+                job->priority = JobPriority::SESSION_CONT;
+                LOG_INFO("[ModelScheduler] Falling back to store-backed continuation: job="
+                         << job->job_id << " previous="
+                         << job->previous_response_id);
+            } else {
+                return reject(
+                    SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
+                    job->job_id,
+                    resolved.message);
+            }
         }
 
         if (resolved.status == ToolChainResolveStatus::NotFound ||
@@ -597,34 +607,60 @@ SubmitResult ModelScheduler::submit(InferenceJobPtr job) {
                      << job->job_id << " previous="
                      << job->previous_response_id
                      << " message=\"" << resolved.message << "\"");
-            return reject(
-                SubmitStatus::REJECTED_PREVIOUS_RESPONSE_NOT_FOUND,
-                job->job_id,
-                resolved.message);
+            if (job->allow_tool_chain_fallback) {
+                job->is_tool_output_submission = false;
+                job->is_tool_continuation = false;
+                job->priority = JobPriority::SESSION_CONT;
+                LOG_INFO("[ModelScheduler] Falling back to store-backed continuation: job="
+                         << job->job_id << " previous="
+                         << job->previous_response_id);
+            } else {
+                return reject(
+                    SubmitStatus::REJECTED_PREVIOUS_RESPONSE_NOT_FOUND,
+                    job->job_id,
+                    resolved.message);
+            }
         }
 
-        prepareToolContinuation(*job, resolved.entry.value());
-        LOG_INFO("[ModelScheduler] Tool continuation resolved: job="
-                 << job->job_id << " chain=" << job->tool_chain_id
-                 << " model=" << job->model_id
-                 << " session=" << job->session_id);
-        if (!tool_chains_.markContinuationQueued(
-                job->tool_chain_id,
-                job->job_id,
-                config_.tool_response_timeout)) {
-            LOG_WARN("[ModelScheduler] Tool continuation lease expired while queueing: job="
-                     << job->job_id << " chain=" << job->tool_chain_id);
-            return reject(
-                SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
-                job->job_id,
-                "Tool response window expired for previous_response_id '" +
-                    job->previous_response_id + "'");
-        }
+        if (!job->is_tool_output_submission) {
+            // ResponseStore already supplied the history. Missing/expired
+            // ToolChainTable state only removes the warm-priority optimization.
+        } else {
+            prepareToolContinuation(*job, resolved.entry.value());
+            LOG_INFO("[ModelScheduler] Tool continuation resolved: job="
+                     << job->job_id << " chain=" << job->tool_chain_id
+                     << " model=" << job->model_id
+                     << " session=" << job->session_id);
+            if (!tool_chains_.markContinuationQueued(
+                    job->tool_chain_id,
+                    job->job_id,
+                    config_.tool_response_timeout)) {
+                LOG_WARN("[ModelScheduler] Tool continuation lease expired while queueing: job="
+                         << job->job_id << " chain=" << job->tool_chain_id);
+                if (job->allow_tool_chain_fallback) {
+                    job->is_tool_output_submission = false;
+                    job->is_tool_continuation = false;
+                    job->priority = JobPriority::SESSION_CONT;
+                    job->tool_chain_id.clear();
+                    LOG_INFO("[ModelScheduler] Falling back after lease expiry: job="
+                             << job->job_id << " previous="
+                             << job->previous_response_id);
+                } else {
+                    return reject(
+                        SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
+                        job->job_id,
+                        "Tool response window expired for previous_response_id '" +
+                            job->previous_response_id + "'");
+                }
+            }
 
-        pool_.renewToolLease(
-            job->model_id,
-            job->tool_chain_id,
-            config_.tool_response_timeout);
+            if (job->is_tool_output_submission) {
+                pool_.renewToolLease(
+                    job->model_id,
+                    job->tool_chain_id,
+                    config_.tool_response_timeout);
+            }
+        }
     }
 
     wrapCallbacks(*job);

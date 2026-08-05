@@ -75,6 +75,7 @@ struct InferenceJob {
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool is_tool_output_submission = false;
     bool is_tool_continuation = false;
+    bool allow_tool_chain_fallback = false;
     bool skip_summarization_middleware = false;
     bool use_response_history = false;
     json response_history = json::array();

@@ -11,9 +11,11 @@
 #include "ResponsesUtils.h"
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <regex>
 
 namespace ResponsesUtils {
 
@@ -160,6 +162,30 @@ std::vector<McpToolRequest> extract_mcp_tool_requests(const json& tools) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// strip_tool_call_protocol_text
+// ─────────────────────────────────────────────────────────────────────────────
+std::string strip_tool_call_protocol_text(const std::string& text) {
+    static const std::regex tool_call_re(
+        R"(<tool_call>\s*[\s\S]*?\s*</tool_call>)",
+        std::regex::ECMAScript);
+
+    std::string cleaned = std::regex_replace(text, tool_call_re, "");
+    const auto begin = std::find_if_not(
+        cleaned.begin(), cleaned.end(), [](unsigned char c) {
+            return std::isspace(c);
+        });
+    const auto end = std::find_if_not(
+        cleaned.rbegin(), cleaned.rend(), [](unsigned char c) {
+            return std::isspace(c);
+        }).base();
+
+    if (begin >= end) {
+        return "";
+    }
+    return std::string(begin, end);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // build_output_array
 //
 // Per the OpenAI Responses API spec, the reasoning output item is a SEPARATE
@@ -196,31 +222,40 @@ json build_output_array(const StandardResponse& result,
     }
 
     // ── Message output item (answer text only — no reasoning here) ────────────
+    const bool has_tool_calls =
+        result.tool_calls.has_value() && !result.tool_calls.value().empty();
+    std::string cleaned_content = result.content.has_value()
+        ? strip_tool_call_protocol_text(result.content.value())
+        : "";
+
     json content_array = json::array();
-    if (result.content.has_value() && !result.content.value().empty()) {
+    if (!cleaned_content.empty()) {
         content_array.push_back({
             {"type", "output_text"},
-            {"text", result.content.value()}
+            {"text", cleaned_content}
         });
     }
 
-    output.push_back({
-        {"type",    "message"},
-        {"id",      "msg_" + result.id},
-        {"role",    "assistant"},
-        {"content", content_array},
-        {"status",  "completed"}
-    });
+    if (!content_array.empty() || !has_tool_calls) {
+        output.push_back({
+            {"type",    "message"},
+            {"id",      "msg_" + result.id},
+            {"role",    "assistant"},
+            {"content", content_array},
+            {"status",  "completed"}
+        });
+    }
 
     // Function call output items (non-MCP tool calls, if any)
-    if (result.tool_calls.has_value() && !result.tool_calls.value().empty()) {
+    if (has_tool_calls) {
         for (const auto& tc : result.tool_calls.value()) {
             output.push_back({
                 {"type",      "function_call"},
                 {"id",        tc.value("id", "")},
                 {"call_id",   tc.value("id", "")},
                 {"name",      tc.value("function", json::object()).value("name", "")},
-                {"arguments", tc.value("function", json::object()).value("arguments", "")}
+                {"arguments", tc.value("function", json::object()).value("arguments", "")},
+                {"status",    "completed"}
             });
         }
     }

@@ -32,6 +32,7 @@ struct SchedulerInvokeOptions {
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool tool_output_submission = false;
+    bool allow_tool_chain_fallback = false;
     bool skip_summarization_middleware = false;
     bool use_response_history = false;
     json response_history = json::array();
