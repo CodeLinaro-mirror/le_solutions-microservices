@@ -314,7 +314,8 @@ std::string ChatOrchestratorImpl::buildContextPrompt(const ConversationSession& 
 StandardResponse ChatOrchestratorImpl::executeBlocking(
     const CreateChatCompletionRequest& request,
     IGenerativeBackend& backend,
-    CancellationPredicate cancel_requested) {
+    CancellationPredicate cancel_requested,
+    bool skip_summarization_middleware) {
     validateRequest(request);
     auto [session, draft] = resolveSessionAndDraft(request);
     LOG_INFO("[ChatOrchestratorImpl] Prepared blocking request: model="
@@ -327,14 +328,16 @@ StandardResponse ChatOrchestratorImpl::executeBlocking(
         std::move(session),
         std::move(draft),
         backend,
-        cancel_requested);
+        cancel_requested,
+        skip_summarization_middleware);
 }
 
 void ChatOrchestratorImpl::executeStreaming(
     const CreateChatCompletionRequest& request,
     IGenerativeBackend& backend,
     StreamCallback callback,
-    CancellationPredicate cancel_requested) {
+    CancellationPredicate cancel_requested,
+    bool skip_summarization_middleware) {
     validateRequest(request);
     auto [session, draft] = resolveSessionAndDraft(request);
     LOG_INFO("[ChatOrchestratorImpl] Prepared streaming request: model="
@@ -348,7 +351,8 @@ void ChatOrchestratorImpl::executeStreaming(
         std::move(draft),
         backend,
         std::move(callback),
-        cancel_requested);
+        cancel_requested,
+        skip_summarization_middleware);
 }
 
 StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
@@ -356,15 +360,18 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
     std::shared_ptr<ConversationSession> session,
     DraftTurn&& draft,
     IGenerativeBackend& backend,
-    const CancellationPredicate& cancel_requested) {
+    const CancellationPredicate& cancel_requested,
+    bool skip_summarization_middleware) {
     auto& config_mgr = ModelConfigManager::getInstance();
     const bool is_vlm = config_mgr.supportsVision(request.model);
     int context_size = config_mgr.getContextSize(request.model);
-    SummarizationMiddleware::checkAndSummarize(
-        *session,
-        request,
-        backend,
-        context_size);
+    if (!skip_summarization_middleware) {
+        SummarizationMiddleware::checkAndSummarize(
+            *session,
+            request,
+            backend,
+            context_size);
+    }
 
     std::string prompt = buildContextPrompt(*session, request);
     LOG_INFO("[ChatOrchestratorImpl] Blocking prompt built: model="
@@ -554,15 +561,18 @@ void ChatOrchestratorImpl::executeStreamingPrepared(
     DraftTurn&& draft,
     IGenerativeBackend& backend,
     StreamCallback callback,
-    const CancellationPredicate& cancel_requested) {
+    const CancellationPredicate& cancel_requested,
+    bool skip_summarization_middleware) {
     auto& config_mgr = ModelConfigManager::getInstance();
     const bool is_vlm = config_mgr.supportsVision(request.model);
     int context_size = config_mgr.getContextSize(request.model);
-    SummarizationMiddleware::checkAndSummarize(
-        *session,
-        request,
-        backend,
-        context_size);
+    if (!skip_summarization_middleware) {
+        SummarizationMiddleware::checkAndSummarize(
+            *session,
+            request,
+            backend,
+            context_size);
+    }
 
     std::string prompt = buildContextPrompt(*session, request);
     LOG_INFO("[ChatOrchestratorImpl] Streaming prompt built: model="
@@ -762,7 +772,8 @@ StandardResponse ChatOrchestratorImpl::handleBlocking(const CreateChatCompletion
         std::move(session),
         std::move(draft),
         backend_,
-        {});
+        {},
+        false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -785,7 +796,8 @@ void ChatOrchestratorImpl::handleStreaming(const CreateChatCompletionRequest& re
         std::move(draft),
         backend_,
         std::move(callback),
-        {});
+        {},
+        false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

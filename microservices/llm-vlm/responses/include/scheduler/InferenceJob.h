@@ -26,6 +26,7 @@ enum class JobKind {
     HTTP_STREAMING,
     WEBSOCKET,
     MCP_ROUND,
+    INTERNAL_SUMMARIZATION,
 };
 
 enum class SubmitStatus {
@@ -74,6 +75,7 @@ struct InferenceJob {
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool is_tool_output_submission = false;
     bool is_tool_continuation = false;
+    bool skip_summarization_middleware = false;
 
     CreateChatCompletionRequest request;
 

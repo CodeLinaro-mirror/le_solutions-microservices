@@ -34,6 +34,9 @@ public:
         // POST /v1/responses
         ADD_METHOD_TO(ResponsesController::createResponse, "/v1/responses", Post, Options);
 
+        // POST /v1/responses/input_tokens
+        ADD_METHOD_TO(ResponsesController::countInputTokens, "/v1/responses/input_tokens", Post, Options);
+
         // GET /v1/responses/{response_id}
         ADD_METHOD_TO(ResponsesController::getResponse, "/v1/responses/{1}", Get, Options);
 
@@ -49,6 +52,9 @@ public:
 
     void createResponse(const HttpRequestPtr& req,
                         std::function<void(const HttpResponsePtr&)>&& callback);
+
+    void countInputTokens(const HttpRequestPtr& req,
+                          std::function<void(const HttpResponsePtr&)>&& callback);
 
     void getResponse(const HttpRequestPtr& req,
                      std::function<void(const HttpResponsePtr&)>&& callback,

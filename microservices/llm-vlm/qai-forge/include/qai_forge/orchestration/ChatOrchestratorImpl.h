@@ -46,7 +46,8 @@ public:
     StandardResponse executeBlocking(
         const CreateChatCompletionRequest& request,
         IGenerativeBackend& backend,
-        CancellationPredicate cancel_requested = {});
+        CancellationPredicate cancel_requested = {},
+        bool skip_summarization_middleware = false);
 
     /**
      * @brief Execute a streaming chat request using the supplied backend.
@@ -57,7 +58,8 @@ public:
         const CreateChatCompletionRequest& request,
         IGenerativeBackend& backend,
         StreamCallback callback,
-        CancellationPredicate cancel_requested = {});
+        CancellationPredicate cancel_requested = {},
+        bool skip_summarization_middleware = false);
 
 private:
     // Constructor initializes the legacy fallback backend reference.
@@ -108,7 +110,8 @@ private:
         std::shared_ptr<ConversationSession> session,
         DraftTurn&& draft,
         IGenerativeBackend& backend,
-        const CancellationPredicate& cancel_requested);
+        const CancellationPredicate& cancel_requested,
+        bool skip_summarization_middleware);
 
     void executeStreamingPrepared(
         const CreateChatCompletionRequest& request,
@@ -116,5 +119,6 @@ private:
         DraftTurn&& draft,
         IGenerativeBackend& backend,
         StreamCallback callback,
-        const CancellationPredicate& cancel_requested);
+        const CancellationPredicate& cancel_requested,
+        bool skip_summarization_middleware);
 };
