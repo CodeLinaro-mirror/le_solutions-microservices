@@ -5,7 +5,7 @@
 // ResponsesController — Layer 1 (Drogon HTTP Adapter for Responses API)
 //
 // Implements the OpenAI Responses API (limited on-device subset).
-// Calls ChatOrchestrator (qai-forge SDK) and formats results into the
+// Calls the model scheduler and formats results into the
 // Responses API wire format.
 //
 // MCP support (Layer 1.5):
@@ -23,23 +23,78 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "controllers/ResponsesController.h"
+#include "ResponseStore.h"
 #include "ResponsesUtils.h"
 #include "mcp/McpAgenticLoop.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/utils/Logger.h"
 #include "scheduler/ModelScheduler.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 
 using json = nlohmann::ordered_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+enum class RetrieveStreamParam {
+    Disabled,
+    Enabled,
+    Invalid
+};
+
+static RetrieveStreamParam parse_retrieve_stream_param(const std::string& raw) {
+    if (raw.empty() || raw == "false" || raw == "False" || raw == "FALSE"
+        || raw == "0") {
+        return RetrieveStreamParam::Disabled;
+    }
+    if (raw == "true" || raw == "True" || raw == "TRUE" || raw == "1") {
+        return RetrieveStreamParam::Enabled;
+    }
+    return RetrieveStreamParam::Invalid;
+}
+
+static bool parse_input_items_limit(const std::string& raw, int& limit) {
+    if (raw.empty()) {
+        limit = 20;
+        return true;
+    }
+    if (!std::all_of(raw.begin(), raw.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        })) {
+        return false;
+    }
+
+    char* end = nullptr;
+    long parsed = std::strtol(raw.c_str(), &end, 10);
+    if (end != raw.c_str() + raw.size() || parsed < 1 || parsed > 100) {
+        return false;
+    }
+    limit = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parse_input_items_order(const std::string& raw,
+                                    std::string& order) {
+    if (raw.empty()) {
+        order = "desc";
+        return true;
+    }
+
+    order = raw;
+    std::transform(order.begin(), order.end(), order.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return order == "asc" || order == "desc";
+}
+
 static HttpResponsePtr make_error_response(int status_code, const std::string& message,
                                             const std::string& error_type = "server_error",
                                             const std::string& param = "") {
@@ -619,18 +674,114 @@ void ResponsesController::getResponse(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& response_id) {
 
-    // The session IS the response in our implementation.
-    // We look up the session by response_id and return the last assistant message.
-    json response_obj = {
-        {"id",     response_id},
-        {"object", "response"},
-        {"status", "completed"},
-        {"model",  "unknown"},
-        {"output", json::array()},
-        {"usage",  {{"input_tokens", 0}, {"output_tokens", 0}, {"total_tokens", 0}}}
-    };
+    RetrieveStreamParam stream =
+        parse_retrieve_stream_param(req->getParameter("stream"));
+    if (stream == RetrieveStreamParam::Enabled) {
+        callback(make_error_response(
+            400,
+            "streaming is not supported for the retrieve endpoint",
+            "invalid_request_error",
+            "stream"));
+        return;
+    }
+    if (stream == RetrieveStreamParam::Invalid) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'stream' - expected true/false/1/0",
+            "invalid_request_error",
+            "stream"));
+        return;
+    }
+
+    const auto& params = req->getParameters();
+    if (params.find("starting_after") != params.end()) {
+        callback(make_error_response(
+            400,
+            "starting_after requires streaming, which is not supported for retrieve",
+            "invalid_request_error",
+            "starting_after"));
+        return;
+    }
+
+    std::optional<StoredResponse> stored =
+        ResponseStore::getInstance().getResponse(response_id);
+    if (!stored.has_value()) {
+        callback(make_error_response(
+            404,
+            "Response " + response_id + " not found",
+            "invalid_request_error"));
+        return;
+    }
+
+    json response_obj;
+    if (stored->status == StoredResponseStatus::InProgress) {
+        response_obj = ResponsesUtils::synthesize_in_progress(
+            stored->response_id,
+            stored->model,
+            stored->created_at,
+            stored->previous_response_id,
+            stored->metadata);
+    } else {
+        response_obj = stored->response_object;
+    }
 
     auto resp = HttpResponse::newHttpJsonResponse(response_obj.dump());
+    resp->setStatusCode(k200OK);
+    callback(resp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /v1/responses/{response_id}/input_items
+// ─────────────────────────────────────────────────────────────────────────────
+void ResponsesController::listInputItems(
+    const HttpRequestPtr& req,
+    std::function<void(const HttpResponsePtr&)>&& callback,
+    const std::string& response_id) {
+
+    int limit = 20;
+    if (!parse_input_items_limit(req->getParameter("limit"), limit)) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'limit' - expected integer between 1 and 100",
+            "invalid_request_error",
+            "limit"));
+        return;
+    }
+
+    std::string order = "desc";
+    if (!parse_input_items_order(req->getParameter("order"), order)) {
+        callback(make_error_response(
+            400,
+            "invalid value for 'order' - expected 'asc' or 'desc'",
+            "invalid_request_error",
+            "order"));
+        return;
+    }
+
+    (void)req->getParameter("include");
+    std::optional<ResponseStoreJson> items =
+        ResponseStore::getInstance().getInputItems(response_id);
+    if (!items.has_value()) {
+        callback(make_error_response(
+            404,
+            "response not found",
+            "invalid_request_error"));
+        return;
+    }
+
+    ResponsesUtils::PaginateResult page =
+        ResponsesUtils::paginate_input_items(
+            items.value(), limit, order, req->getParameter("after"));
+    if (!page.ok) {
+        callback(make_error_response(
+            400,
+            page.error_message,
+            "invalid_request_error",
+            "after"));
+        return;
+    }
+
+    auto resp = HttpResponse::newHttpJsonResponse(page.envelope.dump());
     resp->setStatusCode(k200OK);
     callback(resp);
 }
@@ -643,19 +794,23 @@ void ResponsesController::deleteResponse(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& response_id) {
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
     LOG_INFO("[ResponsesController] Delete response: response=" << response_id);
-    bool deleted = orchestrator.deleteSession(response_id);
+    DeleteCascadeResult result =
+        ResponseStore::getInstance().deleteCascade(response_id);
 
-    if (!deleted) {
-        callback(make_error_response(404, "Response " + response_id + " not found",
-                                     "invalid_request_error"));
+    if (!result.ok) {
+        std::string param =
+            result.http_status == 409 ? "response_id" : "";
+        callback(make_error_response(result.http_status,
+                                     result.error_message,
+                                     "invalid_request_error",
+                                     param));
         return;
     }
 
     json response = {
         {"id",      response_id},
-        {"object",  "response.deleted"},
+        {"object",  "response"},
         {"deleted", true}
     };
     auto resp = HttpResponse::newHttpJsonResponse(response.dump());
