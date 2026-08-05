@@ -37,10 +37,12 @@ enum class ContextStrategy {
 };
 
 /**
- * How the backend handles concurrent inference requests.
+ * Legacy concurrency description for one backend execution context.
  *
- * EXCLUSIVE:  Only one inference at a time (DSP/NPU hardware lock).
- *             Used by: GenIE (Snapdragon DSP), LiteRT LM (GPU lock).
+ * EXCLUSIVE:  Only one inference at a time for the scope described by
+ *             BackendCapabilities below. For scheduler-owned backends this
+ *             usually means one model handle / worker subprocess, not
+ *             necessarily the entire process.
  *
  * BOUNDED:    Up to max_concurrent inferences simultaneously.
  *             Used by: ONNX Runtime on CPU/GPU.
@@ -67,6 +69,9 @@ struct BackendCapabilities {
     float           compaction_threshold = 0.70f;  // trigger summarization at 70%
 
     // ── Concurrency ───────────────────────────────────────────────────────────
+    // Scope is one backend execution context. For scheduler-owned GenIE
+    // backends, EXCLUSIVE + max_concurrent=1 means one request per loaded
+    // worker/model handle, not one request globally across all loaded models.
     ConcurrencyModel concurrency_model   = ConcurrencyModel::EXCLUSIVE;
     int              max_concurrent      = 1;
 

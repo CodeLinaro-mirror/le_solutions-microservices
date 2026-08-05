@@ -5,12 +5,13 @@
 // McpAgenticLoop.cpp — Autonomous MCP tool-call loop implementation
 //
 // Drives the inference → tool-call → result → re-infer cycle.
-// Calls ChatOrchestrator::handleBlocking() (Layer 2) for each inference round.
+// Submits each inference round through ModelScheduler.
 // Calls McpClientRegistry::callTool() for each tool invocation.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "mcp/McpAgenticLoop.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/utils/Logger.h"
+#include "scheduler/ModelScheduler.h"
 #include <iostream>
 #include <sstream>
 #include <chrono>
@@ -54,6 +55,9 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
         std::string func_name = tc.value("function", json::object()).value("name", "");
         std::string args_str  = tc.value("function", json::object()).value("arguments", "{}");
         int output_index      = output_index_start + static_cast<int>(i);
+        LOG_INFO("[McpAgenticLoop] Executing tool call: call_id="
+                 << call_id << " name=" << func_name
+                 << " output_index=" << output_index);
 
         // Parse arguments
         json arguments;
@@ -86,6 +90,9 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
 
         // Execute the tool call
         McpToolResult result = registry_.callTool(func_name, arguments, call_id, records);
+        LOG_INFO("[McpAgenticLoop] Tool call completed: call_id="
+                 << call_id << " name=" << func_name
+                 << " is_error=" << (result.is_error ? "true" : "false"));
 
         // Find the record we just added
         const McpCallRecord& record = records.back();
@@ -129,27 +136,52 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
 // run — blocking agentic loop
 // ─────────────────────────────────────────────────────────────────────────────
 McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_request,
-                                   const json& mcp_tools) {
+                                   const json& mcp_tools,
+                                   const std::string& response_id) {
     McpLoopResult loop_result;
-    auto& orchestrator = ChatOrchestrator::getInstance();
 
     // Build the working request (will be mutated each iteration)
     CreateChatCompletionRequest current_request = base_request;
     current_request.stream = false;
     current_request.tools  = mcp_tools;
+    std::string previous_round_response_id =
+        base_request.user.value_or("");
 
     for (int iter = 0; iter < max_iterations_; ++iter) {
         loop_result.iterations = iter + 1;
+        LOG_INFO("[McpAgenticLoop] Inference round started: response="
+                 << response_id << " iteration=" << loop_result.iterations
+                 << " previous=" << previous_round_response_id);
 
         // Run one inference round
-        StandardResponse response = orchestrator.handleBlocking(current_request);
+        scheduler::SchedulerInvokeOptions invoke_options;
+        invoke_options.response_id = response_id;
+        invoke_options.previous_response_id = previous_round_response_id;
+        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
+        if (iter > 0 && !previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
+            invoke_options.tool_output_submission = true;
+        } else if (!previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::SESSION_CONT;
+        }
+
+        StandardResponse response =
+            scheduler::ModelScheduler::getInstance().runBlocking(
+                current_request, invoke_options);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
             || response.tool_calls.value().empty()) {
             // No tool calls — we're done
+            LOG_INFO("[McpAgenticLoop] Inference round completed without tool calls: response="
+                     << response_id << " iteration=" << loop_result.iterations
+                     << " finish_reason=" << response.finish_reason);
             loop_result.final_response = response;
             return loop_result;
         }
+        previous_round_response_id = response_id.empty() ? response.id : response_id;
+        LOG_INFO("[McpAgenticLoop] Tool calls requested: response="
+                 << response_id << " iteration=" << loop_result.iterations
+                 << " tool_call_count=" << response.tool_calls.value().size());
 
         // Execute all tool calls
         const json& tool_calls = response.tool_calls.value();
@@ -178,10 +210,23 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
 
     // Max iterations reached
     loop_result.truncated = true;
+    LOG_WARN("[McpAgenticLoop] Max iterations reached: response="
+             << response_id << " max_iterations=" << max_iterations_);
     // Run one final inference without tools to get a text response
     current_request.tools = std::nullopt;
     try {
-        loop_result.final_response = orchestrator.handleBlocking(current_request);
+        scheduler::SchedulerInvokeOptions invoke_options;
+        invoke_options.response_id = response_id;
+        invoke_options.previous_response_id = previous_round_response_id;
+        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
+        if (!previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
+            invoke_options.tool_output_submission = true;
+        }
+
+        loop_result.final_response =
+            scheduler::ModelScheduler::getInstance().runBlocking(
+                current_request, invoke_options);
     } catch (...) {
         // If final inference fails, return a synthetic response
         loop_result.final_response.content = "(Response truncated: maximum tool call iterations reached)";
@@ -199,21 +244,41 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                                             McpSseEmitter emitter,
                                             const std::string& response_id) {
     McpLoopResult loop_result;
-    auto& orchestrator = ChatOrchestrator::getInstance();
 
     CreateChatCompletionRequest current_request = base_request;
     current_request.stream = false;  // Use blocking internally; we emit SSE manually
     current_request.tools  = mcp_tools;
+    std::string previous_round_response_id =
+        base_request.user.value_or("");
 
     for (int iter = 0; iter < max_iterations_; ++iter) {
         loop_result.iterations = iter + 1;
+        LOG_INFO("[McpAgenticLoop] Streaming inference round started: response="
+                 << response_id << " iteration=" << loop_result.iterations
+                 << " previous=" << previous_round_response_id);
 
         // Run one inference round (blocking)
-        StandardResponse response = orchestrator.handleBlocking(current_request);
+        scheduler::SchedulerInvokeOptions invoke_options;
+        invoke_options.response_id = response_id;
+        invoke_options.previous_response_id = previous_round_response_id;
+        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
+        if (iter > 0 && !previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
+            invoke_options.tool_output_submission = true;
+        } else if (!previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::SESSION_CONT;
+        }
+
+        StandardResponse response =
+            scheduler::ModelScheduler::getInstance().runBlocking(
+                current_request, invoke_options);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
             || response.tool_calls.value().empty()) {
             // Final answer — emit text delta events
+            LOG_INFO("[McpAgenticLoop] Streaming inference round completed without tool calls: response="
+                     << response_id << " iteration=" << loop_result.iterations
+                     << " finish_reason=" << response.finish_reason);
             loop_result.final_response = response;
 
             std::string final_text = response.content.value_or("");
@@ -247,6 +312,10 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
 
             return loop_result;
         }
+        previous_round_response_id = response_id.empty() ? response.id : response_id;
+        LOG_INFO("[McpAgenticLoop] Streaming tool calls requested: response="
+                 << response_id << " iteration=" << loop_result.iterations
+                 << " tool_call_count=" << response.tool_calls.value().size());
 
         // Execute tool calls with SSE emission
         const json& tool_calls = response.tool_calls.value();
@@ -272,9 +341,22 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
 
     // Max iterations reached
     loop_result.truncated = true;
+    LOG_WARN("[McpAgenticLoop] Streaming max iterations reached: response="
+             << response_id << " max_iterations=" << max_iterations_);
     current_request.tools = std::nullopt;
     try {
-        loop_result.final_response = orchestrator.handleBlocking(current_request);
+        scheduler::SchedulerInvokeOptions invoke_options;
+        invoke_options.response_id = response_id;
+        invoke_options.previous_response_id = previous_round_response_id;
+        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
+        if (!previous_round_response_id.empty()) {
+            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
+            invoke_options.tool_output_submission = true;
+        }
+
+        loop_result.final_response =
+            scheduler::ModelScheduler::getInstance().runBlocking(
+                current_request, invoke_options);
         std::string final_text = loop_result.final_response.content.value_or("");
         int output_index = static_cast<int>(loop_result.call_records.size());
 

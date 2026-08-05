@@ -8,6 +8,7 @@
 #include "mcp/NativeToolRegistry.h"
 #include "tools/DateTimeTool.h"
 #include "tools/CalculatorTool.h"
+#include "scheduler/ModelScheduler.h"
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -38,6 +39,9 @@ int main() {
             // returns false until scanModelBundles() is called at least once.
             ModelConfigManager::getInstance().scanModelBundles();
             std::cout << "[main] Model bundles scanned." << std::endl;
+
+            scheduler::ModelScheduler::getInstance().start();
+            std::cout << "[main] Model scheduler started." << std::endl;
 
             // ── Step 3b: Register built-in native tools ───────────────────────
             // Native tools run in-process (no subprocess, no network).
@@ -102,7 +106,8 @@ int main() {
         })
         .run();
 
-    // Cleanup: disconnect MCP servers on shutdown
+    // Cleanup: stop scheduler infrastructure and disconnect MCP servers on shutdown.
+    scheduler::ModelScheduler::getInstance().shutdown();
     McpClientRegistry::getInstance().disconnectAll();
 
     return 0;

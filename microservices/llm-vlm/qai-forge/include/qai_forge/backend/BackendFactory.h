@@ -4,23 +4,22 @@
 #pragma once
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BackendFactory — Selects the correct IGenerativeBackend based on runtime
 //
 // The "runtime" field in metadata.json is the routing key:
-//   "genie"     → GenIEBackend::getInstance()   (current — Qualcomm GenIE SDK)
-//   "litert_lm" → LiteRTLMBackend::getInstance() (future — MediaPipe Tasks)
-//   "onnxrt"    → OnnxRTBackend::getInstance()   (future — ONNX Runtime)
+//   "genie"     → GenIEBackend   (Qualcomm GenIE SDK)
+//   "litert_lm" → LiteRTLMBackend (future scheduler-owned support)
+//   "onnxrt"    → OnnxRTBackend   (future)
 //
-// All backends are singletons. BackendFactory returns a reference to the
-// appropriate singleton based on the runtime string.
+// Scheduler path creates backend instances so each ModelRuntime can own its
+// model handle and worker subprocess.
 //
-// Design invariant: ChatOrchestratorImpl uses BackendFactory to select the
-// backend at construction time. When a new backend is added, only
-// BackendFactory::getGenerativeBackend() needs to change — the orchestrator
-// is never modified.
+// Legacy path may still use singleton access until the scheduler-only cutover
+// removes ChatOrchestratorImpl::handleBlocking/handleStreaming fallback.
 //
 // See docs/genai-backend-decoupling.md §8 for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,12 +27,24 @@
 class BackendFactory {
 public:
     /**
-     * Returns the IGenerativeBackend singleton for the given runtime identifier.
+     * Create a scheduler-owned backend instance for the given runtime.
      *
      * @param runtime  Runtime identifier from ModelConfig.runtime
      *                 ("genie", "litert_lm", "onnxrt")
-     * @return         Reference to the appropriate backend singleton.
-     *                 Falls back to GenIEBackend for unknown runtime values.
+     */
+    static std::unique_ptr<IGenerativeBackend>
+    createGenerativeBackend(const std::string& runtime);
+
+    /**
+     * Resolve a model id to its runtime and create a scheduler-owned backend.
+     */
+    static std::unique_ptr<IGenerativeBackend>
+    createGenerativeBackendForModel(const std::string& model_id);
+
+    /**
+     * Legacy singleton access.
+     *
+     * Kept until the old ChatOrchestratorImpl fallback path is removed.
      */
     static IGenerativeBackend& getGenerativeBackend(const std::string& runtime);
 
