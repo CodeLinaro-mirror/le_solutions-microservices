@@ -485,6 +485,10 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
     }
 
     ensureWorkerRunning(request, backend);
+    LOG_INFO("[ChatOrchestratorImpl] Resetting backend context before "
+             "blocking inference: model="
+             << request.model << " session=" << session->session_id);
+    backend.onContextCompacted();
     LOG_INFO("[ChatOrchestratorImpl] Blocking backend ready: model="
              << request.model << " session=" << session->session_id
              << " max_tokens=" << effective_max_tokens
@@ -687,6 +691,10 @@ StandardResponse ChatOrchestratorImpl::executeStreamingPrepared(
     }
 
     ensureWorkerRunning(request, backend);
+    LOG_INFO("[ChatOrchestratorImpl] Resetting backend context before "
+             "streaming inference: model="
+             << request.model << " session=" << session->session_id);
+    backend.onContextCompacted();
     LOG_INFO("[ChatOrchestratorImpl] Streaming backend ready: model="
              << request.model << " session=" << session->session_id
              << " max_tokens=" << effective_max_tokens

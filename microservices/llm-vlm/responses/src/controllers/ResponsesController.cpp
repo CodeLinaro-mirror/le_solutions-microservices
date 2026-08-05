@@ -498,7 +498,8 @@ void ResponsesController::createResponse(
                 // ── MCP Streaming ─────────────────────────────────────────────
                 auto resp = HttpResponse::newAsyncStreamResponse(
                     [sdk_request, mcp_function_tools, response_id, model,
-                     max_iterations](ResponseStreamPtr stream) {
+                     max_iterations, previous_response_id,
+                     metadata](ResponseStreamPtr stream) {
 
                         auto emit_event = [&stream](const std::string& event_type,
                                                      const json& data) {
@@ -854,6 +855,7 @@ void ResponsesController::createResponse(
             // ── Streaming: emit Responses API SSE events ──────────────────────
             auto resp = HttpResponse::newAsyncStreamResponse(
                 [standard_request, invoke_options, response_id, model,
+                 previous_response_id, metadata,
                  begin_created_at = begin.created_at](ResponseStreamPtr stream) {
                     auto emit_event = [&stream](const std::string& event_type,
                                                  const json& data) {
