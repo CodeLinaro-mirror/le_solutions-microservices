@@ -97,7 +97,9 @@ json build_output_array(const StandardResponse& result,
 // @param status             "completed" | "incomplete" | "cancelled"
 // @param prompt_tokens      Token count for the prompt
 // @param completion_tokens  Token count for the completion
-// @param truncated          true if max_tool_calls was reached
+// @param created_at         Unix timestamp captured by the caller
+// @param error              Response error object, or null
+// @param incomplete_details Incomplete details object, or null
 // @return                   Complete Responses API response object
 // ─────────────────────────────────────────────────────────────────────────────
 json build_response_object(const std::string& response_id,
@@ -106,6 +108,8 @@ json build_response_object(const std::string& response_id,
                             const std::string& status,
                             int prompt_tokens,
                             int completion_tokens,
-                            bool truncated = false);
+                            int created_at,
+                            const json& error,
+                            const json& incomplete_details);
 
 } // namespace ResponsesUtils

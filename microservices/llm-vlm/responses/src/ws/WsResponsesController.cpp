@@ -388,7 +388,8 @@ void WsResponsesController::runWarmup(
     sendEvent(conn, {
         {"type", WsProtocol::SERVER_RESPONSE_COMPLETED},
         {"response", ResponsesUtils::build_response_object(
-            response_id, model, json::array(), "completed", 0, 0)}
+            response_id, model, json::array(), "completed", 0, 0,
+            created_time, json(nullptr), json(nullptr))}
     });
 
     // Update connection-local cache
@@ -577,7 +578,8 @@ void WsResponsesController::runResponse(
         {"response", ResponsesUtils::build_response_object(
             response_id, model, output, "completed",
             final_response.prompt_tokens,
-            final_response.completion_tokens)}
+            final_response.completion_tokens,
+            created_time, json(nullptr), json(nullptr))}
     });
 
     // ── Step 5: Update connection-local cache ─────────────────────────────────
