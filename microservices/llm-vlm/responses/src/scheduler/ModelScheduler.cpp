@@ -303,6 +303,10 @@ InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
     job->priority = options.priority;
     job->skip_summarization_middleware =
         options.skip_summarization_middleware;
+    job->use_response_history = options.use_response_history;
+    job->response_history = options.response_history.is_array()
+        ? options.response_history
+        : json::array();
     job->request = request;
     if (!job->session_id.empty()) {
         job->request.user = job->session_id;
@@ -461,7 +465,7 @@ StandardResponse ModelScheduler::runBlocking(
     return future.get();
 }
 
-void ModelScheduler::runStreaming(
+StandardResponse ModelScheduler::runStreaming(
     const CreateChatCompletionRequest& request,
     std::function<void(const StreamChunk&)> callback,
     const SchedulerInvokeOptions& options) {
@@ -484,7 +488,7 @@ void ModelScheduler::runStreaming(
              << " tool_output="
              << (job->is_tool_output_submission ? "true" : "false"));
 
-    auto promise = std::make_shared<std::promise<void>>();
+    auto promise = std::make_shared<std::promise<StandardResponse>>();
     auto future = promise->get_future();
     auto mutex = std::make_shared<std::mutex>();
     auto completed = std::make_shared<bool>(false);
@@ -499,8 +503,8 @@ void ModelScheduler::runStreaming(
                 promise,
                 mutex,
                 completed,
-                [](std::promise<void>& p) {
-                    p.set_value();
+                [&response](std::promise<StandardResponse>& p) {
+                    p.set_value(response);
                 });
         };
 
@@ -514,7 +518,7 @@ void ModelScheduler::runStreaming(
                 promise,
                 mutex,
                 completed,
-                [&error](std::promise<void>& p) {
+                [&error](std::promise<StandardResponse>& p) {
                     p.set_exception(std::make_exception_ptr(error));
                 });
         };
@@ -527,7 +531,7 @@ void ModelScheduler::runStreaming(
                 promise,
                 mutex,
                 completed,
-                [](std::promise<void>& p) {
+                [](std::promise<StandardResponse>& p) {
                     p.set_exception(std::make_exception_ptr(
                         GenAIException(
                             GenAIErrorCode::INTERNAL_ERROR,
@@ -537,7 +541,7 @@ void ModelScheduler::runStreaming(
         };
 
     submitOrThrow(*this, job);
-    future.get();
+    return future.get();
 }
 
 bool ModelScheduler::cancelResponse(const std::string& response_id) {

@@ -121,6 +121,8 @@ json build_output_array(const StandardResponse& result,
 // @param created_at         Unix timestamp captured by the caller
 // @param error              Response error object, or null
 // @param incomplete_details Incomplete details object, or null
+// @param previous_response_id Parent response ID, or empty for root responses
+// @param metadata           Request metadata object, or null
 // @return                   Complete Responses API response object
 // ─────────────────────────────────────────────────────────────────────────────
 json build_response_object(const std::string& response_id,
@@ -131,7 +133,9 @@ json build_response_object(const std::string& response_id,
                             int completion_tokens,
                             int created_at,
                             const json& error,
-                            const json& incomplete_details);
+                            const json& incomplete_details,
+                            const std::string& previous_response_id = "",
+                            const json& metadata = json::object());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // synthesize_in_progress — assemble Retrieve JSON for an active response

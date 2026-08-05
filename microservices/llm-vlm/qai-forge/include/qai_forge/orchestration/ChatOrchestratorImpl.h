@@ -54,8 +54,31 @@ public:
      * @detail Scheduler-safe entry point: no global concurrency guard is taken
      *         and no singleton backend is used.
      */
-    void executeStreaming(
+    StandardResponse executeStreaming(
         const CreateChatCompletionRequest& request,
+        IGenerativeBackend& backend,
+        StreamCallback callback,
+        CancellationPredicate cancel_requested = {},
+        bool skip_summarization_middleware = false);
+
+    /**
+     * @brief Execute with caller-supplied response history.
+     * @detail Scheduler-only Responses entry point. Seeds a transient session
+     *         from response_history and does not register it in SessionManager.
+     */
+    StandardResponse executeFromMessages(
+        const CreateChatCompletionRequest& request,
+        const json& response_history,
+        IGenerativeBackend& backend,
+        CancellationPredicate cancel_requested = {},
+        bool skip_summarization_middleware = false);
+
+    /**
+     * @brief Streaming variant of executeFromMessages.
+     */
+    StandardResponse executeFromMessages(
+        const CreateChatCompletionRequest& request,
+        const json& response_history,
         IGenerativeBackend& backend,
         StreamCallback callback,
         CancellationPredicate cancel_requested = {},
@@ -111,14 +134,16 @@ private:
         DraftTurn&& draft,
         IGenerativeBackend& backend,
         const CancellationPredicate& cancel_requested,
-        bool skip_summarization_middleware);
+        bool skip_summarization_middleware,
+        bool register_session_hash);
 
-    void executeStreamingPrepared(
+    StandardResponse executeStreamingPrepared(
         const CreateChatCompletionRequest& request,
         std::shared_ptr<ConversationSession> session,
         DraftTurn&& draft,
         IGenerativeBackend& backend,
         StreamCallback callback,
         const CancellationPredicate& cancel_requested,
-        bool skip_summarization_middleware);
+        bool skip_summarization_middleware,
+        bool register_session_hash);
 };

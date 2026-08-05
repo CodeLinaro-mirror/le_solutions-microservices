@@ -33,6 +33,8 @@ struct SchedulerInvokeOptions {
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool tool_output_submission = false;
     bool skip_summarization_middleware = false;
+    bool use_response_history = false;
+    json response_history = json::array();
 };
 
 // Public scheduler facade.
@@ -56,7 +58,7 @@ public:
     StandardResponse runBlocking(
         const CreateChatCompletionRequest& request,
         const SchedulerInvokeOptions& options = {});
-    void runStreaming(
+    StandardResponse runStreaming(
         const CreateChatCompletionRequest& request,
         std::function<void(const StreamChunk&)> callback,
         const SchedulerInvokeOptions& options = {});

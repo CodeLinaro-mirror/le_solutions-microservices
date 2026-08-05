@@ -329,10 +329,11 @@ StandardResponse ChatOrchestratorImpl::executeBlocking(
         std::move(draft),
         backend,
         cancel_requested,
-        skip_summarization_middleware);
+        skip_summarization_middleware,
+        true);
 }
 
-void ChatOrchestratorImpl::executeStreaming(
+StandardResponse ChatOrchestratorImpl::executeStreaming(
     const CreateChatCompletionRequest& request,
     IGenerativeBackend& backend,
     StreamCallback callback,
@@ -345,14 +346,87 @@ void ChatOrchestratorImpl::executeStreaming(
              << " stream=" << (request.stream ? "true" : "false")
              << " message_count=" << request.messages.size()
              << " has_tools=" << (request.tools.has_value() ? "true" : "false"));
-    executeStreamingPrepared(
+    return executeStreamingPrepared(
         request,
         std::move(session),
         std::move(draft),
         backend,
         std::move(callback),
         cancel_requested,
-        skip_summarization_middleware);
+        skip_summarization_middleware,
+        true);
+}
+
+StandardResponse ChatOrchestratorImpl::executeFromMessages(
+    const CreateChatCompletionRequest& request,
+    const json& response_history,
+    IGenerativeBackend& backend,
+    CancellationPredicate cancel_requested,
+    bool skip_summarization_middleware) {
+    validateRequest(request);
+    const std::string session_id = request.user.value_or("");
+    auto session = std::make_shared<ConversationSession>(
+        session_id.empty() ? request.model : session_id);
+    if (response_history.is_array()) {
+        for (const auto& message : response_history) {
+            if (message.is_object()) {
+                session->addMessage(message);
+            }
+        }
+    }
+
+    DraftTurn draft(session->session_id, request.model);
+    for (const auto& message : request.messages) {
+        if (message.is_object()) {
+            draft.addMessage(message);
+        }
+    }
+
+    return executeBlockingPrepared(
+        request,
+        std::move(session),
+        std::move(draft),
+        backend,
+        cancel_requested,
+        skip_summarization_middleware,
+        false);
+}
+
+StandardResponse ChatOrchestratorImpl::executeFromMessages(
+    const CreateChatCompletionRequest& request,
+    const json& response_history,
+    IGenerativeBackend& backend,
+    StreamCallback callback,
+    CancellationPredicate cancel_requested,
+    bool skip_summarization_middleware) {
+    validateRequest(request);
+    const std::string session_id = request.user.value_or("");
+    auto session = std::make_shared<ConversationSession>(
+        session_id.empty() ? request.model : session_id);
+    if (response_history.is_array()) {
+        for (const auto& message : response_history) {
+            if (message.is_object()) {
+                session->addMessage(message);
+            }
+        }
+    }
+
+    DraftTurn draft(session->session_id, request.model);
+    for (const auto& message : request.messages) {
+        if (message.is_object()) {
+            draft.addMessage(message);
+        }
+    }
+
+    return executeStreamingPrepared(
+        request,
+        std::move(session),
+        std::move(draft),
+        backend,
+        std::move(callback),
+        cancel_requested,
+        skip_summarization_middleware,
+        false);
 }
 
 StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
@@ -361,7 +435,8 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
     DraftTurn&& draft,
     IGenerativeBackend& backend,
     const CancellationPredicate& cancel_requested,
-    bool skip_summarization_middleware) {
+    bool skip_summarization_middleware,
+    bool register_session_hash) {
     auto& config_mgr = ModelConfigManager::getInstance();
     const bool is_vlm = config_mgr.supportsVision(request.model);
     int context_size = config_mgr.getContextSize(request.model);
@@ -525,7 +600,9 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
     }
     session->addMessage(assistant_msg);
 
-    registerSessionHash(request, session->session_id);
+    if (register_session_hash) {
+        registerSessionHash(request, session->session_id);
+    }
 
     StandardResponse response;
     response.id = session->session_id;
@@ -555,14 +632,15 @@ StandardResponse ChatOrchestratorImpl::executeBlockingPrepared(
     return response;
 }
 
-void ChatOrchestratorImpl::executeStreamingPrepared(
+StandardResponse ChatOrchestratorImpl::executeStreamingPrepared(
     const CreateChatCompletionRequest& request,
     std::shared_ptr<ConversationSession> session,
     DraftTurn&& draft,
     IGenerativeBackend& backend,
     StreamCallback callback,
     const CancellationPredicate& cancel_requested,
-    bool skip_summarization_middleware) {
+    bool skip_summarization_middleware,
+    bool register_session_hash) {
     auto& config_mgr = ModelConfigManager::getInstance();
     const bool is_vlm = config_mgr.supportsVision(request.model);
     int context_size = config_mgr.getContextSize(request.model);
@@ -725,33 +803,66 @@ void ChatOrchestratorImpl::executeStreamingPrepared(
         LOG_WARN("[ChatOrchestratorImpl] Streaming inference cancelled before commit: model="
                  << request.model
                  << " session=" << session->session_id);
-        return;
+        return StandardResponse{};
     }
+
+    std::string thinking_content;
+    std::string answer_content = full_response;
+    int reasoning_token_count = 0;
+    if (use_reasoning) {
+        thinking_content = router.getThinkingContent();
+        answer_content = router.getAnswerContent();
+        reasoning_token_count = router.getThinkingTokenCount();
+    }
+
+    const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
+    json tool_calls = adapter.parseToolCalls(answer_content);
 
     draft.commit(*session);
     if (use_reasoning) {
         json assistant_msg =
-            {{"role", "assistant"}, {"content", router.getAnswerContent()}};
-        if (!router.getThinkingContent().empty()) {
-            assistant_msg["_thinking_content"] = router.getThinkingContent();
+            {{"role", "assistant"}, {"content", answer_content}};
+        if (!thinking_content.empty()) {
+            assistant_msg["_thinking_content"] = thinking_content;
         }
         session->addMessage(assistant_msg);
     } else {
         session->addMessage(
-            {{"role", "assistant"}, {"content", full_response}});
+            {{"role", "assistant"}, {"content", answer_content}});
     }
 
     StreamChunk finish_chunk;
     finish_chunk.id = session->session_id;
     finish_chunk.model = request.model;
-    finish_chunk.finish_reason = finish_reason;
+    finish_chunk.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
     callback(finish_chunk);
 
-    registerSessionHash(request, session->session_id);
+    if (register_session_hash) {
+        registerSessionHash(request, session->session_id);
+    }
+    StandardResponse response;
+    response.id = session->session_id;
+    response.model = request.model;
+    response.role = "assistant";
+    response.content = answer_content;
+    if (!thinking_content.empty()) {
+        response.reasoning_content = thinking_content;
+    }
+    if (!tool_calls.empty()) {
+        response.tool_calls = tool_calls;
+    }
+    response.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
+    response.prompt_tokens = static_cast<int>(prompt.size() / 4);
+    response.completion_tokens = static_cast<int>(answer_content.size() / 4);
+    response.reasoning_tokens = reasoning_token_count;
+    response.total_tokens = response.prompt_tokens +
+                            response.completion_tokens +
+                            response.reasoning_tokens;
     LOG_INFO("[ChatOrchestratorImpl] Streaming inference completed: model="
              << request.model << " session=" << session->session_id
-             << " finish_reason=" << finish_reason
-             << " response_chars=" << full_response.size());
+             << " finish_reason=" << response.finish_reason
+             << " response_chars=" << answer_content.size());
+    return response;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,7 +884,8 @@ StandardResponse ChatOrchestratorImpl::handleBlocking(const CreateChatCompletion
         std::move(draft),
         backend_,
         {},
-        false);
+        false,
+        true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -797,7 +909,8 @@ void ChatOrchestratorImpl::handleStreaming(const CreateChatCompletionRequest& re
         backend_,
         std::move(callback),
         {},
-        false);
+        false,
+        true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
