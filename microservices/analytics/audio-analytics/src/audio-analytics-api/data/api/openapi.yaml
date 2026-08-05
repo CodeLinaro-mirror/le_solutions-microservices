@@ -79,12 +79,12 @@ tags:
 security: []
 
 paths:
-  /kpi:
+  /kpi_benchmark:
     get:
       tags: ["Health"]
       summary: "Get service KPIs"
       description: "Returns the KPIs"
-      operationId: "getKPIs"
+      operationId: "getKPIBenchmarks"
       x-swagger-router-controller: Health
       responses:
         "200":
@@ -111,6 +111,38 @@ paths:
                   param: null
                   code: null
     
+  /kpi_last:
+    get:
+      tags: ["Health"]
+      summary: "Get the last generated service KPIs"
+      description: "Returns the KPIs"
+      operationId: "getKPILast"
+      x-swagger-router-controller: Health
+      responses:
+        "200":
+          description: "KPIs"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KPIResponse"
+              example:
+                status: "ok"
+                uptime: 12345
+                active_sessions: 2
+                version: "1.0.0"
+        "503":
+          description: "Service is unavailable or unhealthy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: "Server is down or overloaded"
+                  type: "service_unavailable"
+                  param: null
+                  code: null
+
   /health:
     get:
       tags: ["Health"]
@@ -130,6 +162,7 @@ paths:
                 uptime: 12345
                 active_sessions: 2
                 version: "1.0.0"
+                timestamp: "2026-07-02T01:34:06.582Z"
         "503":
           description: "Service is unavailable or unhealthy"
           content:
@@ -287,7 +320,7 @@ paths:
               file_sync:
                 summary: "File upload (non-streaming)"
                 value:
-                  model: "whisper-small"
+                  model: "whisper-small-quantized"
                   file: "(binary audio data)"
                   stream: false
                   language: "en"
@@ -299,7 +332,7 @@ paths:
               file_stream:
                 summary: "File upload (streaming results)"
                 value:
-                  model: "whisper-small"
+                  model: "whisper-small-quantized"
                   file: "(binary audio data)"
                   stream: true
                   language: "en"
@@ -307,7 +340,7 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateTranscriptionRequest"
             example:
-              model: "whisper-small"
+              model: "whisper-small-quantized"
               stream: true
               language: "en"
       responses:
@@ -821,6 +854,10 @@ components:
           type: string
           description: "Service version identifier"
           example: "1.0.0"
+        timestamp:
+          type: string
+          description: "Timestamp of the Health Check call"
+          example: "2026-07-02T01:34:06.582Z"
       required:
         - status
     
@@ -850,19 +887,19 @@ components:
           items:
             type: string
           description: "Available ASR model names"
-          example: ["whisper-small-en", "whisper-base"]
+          example: ["whisper-small-quantized"]
         t2t_models:
           type: array
           items:
             type: string
           description: "Available translation model names"
-          example: ["opus-mt-en-fr"]
+          example: ["opus-mt-en-es"]
         tts_models:
           type: array
           items:
             type: string
           description: "Available TTS model names"
-          example: ["melo-tts-en"]
+          example: ["melo-tts-en", "melo-tts-es", "melo-tts-zh"]
       required:
         - uptime
 
@@ -904,11 +941,11 @@ components:
         name:
           type: string
           description: "Unique model identifier"
-          example: "whisper-small"
+          example: "whisper-small-quantized"
         display_name:
           type: string
           description: "Human-readable model name"
-          example: "Whisper Small"
+          example: "Whisper Small (Quantized)"
         version:
           type: string
           description: "Model version"
@@ -965,7 +1002,7 @@ components:
         model:
           type: string
           description: "ID of the ASR model to use"
-          example: "whisper-small"
+          example: "whisper-small-quantized"
         file:
           type: string
           format: binary

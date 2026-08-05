@@ -55,7 +55,7 @@ module.exports.createTranscription = async function createTranscription (req, re
                             session_id: data.session_id || "no_session_id",
                             text: "File Uploaded. Listen on WebSocket to get transcription output.",
                             language: "en",
-                            type: "transcript.text.delta"
+                            type: data.type || "transcript.event"
                         });
                     }
                 });
@@ -116,7 +116,7 @@ module.exports.createTranscription = async function createTranscription (req, re
                         state: data.state || undefined,
                         text: "Successfully started Transcription Engine. Please connect to the WebSocket to send audio data & receive transcription output.",
                         language: "en",
-                        type: "transcript.text.delta"
+                        type: data.type || "transcript.event"
                     });
                 }
             });
@@ -135,7 +135,7 @@ module.exports.createTranscription = async function createTranscription (req, re
                         state: data.state || undefined,
                         text: "Successfully started Transcription Engine. Please connect to the WebSocket to send audio data & receive transcription output.",
                         language: "en",
-                        type: "transcript.text.delta"
+                        type: data.type || "transcript.event"
                     });
                 }
             });

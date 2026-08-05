@@ -95,7 +95,8 @@ class ASRService(BaseService):
         # Service coordinator for managing resource conflicts with T2T
         self.coordinator = get_service_coordinator()
 
-        # Initialize ASR engine if not in dev mode
+        # KPI metrics from the most recent real transcription
+        self._last_kpi: dict = {}
         self.asr_engine = None
         if not self.dev_mode:
             self.logger.info("Running in production mode - initializing ASR engine")
@@ -844,6 +845,22 @@ class ASRService(BaseService):
                         detected_language = None       # ISO 639-1 code (e.g. "zh")
                         detected_language_name = None  # Full name from C++ (e.g. "Chinese")
 
+                        # For streaming file transcription, mirror the live-streaming path:
+                        # generate a session_id, register a session, and tag all results with
+                        # it so the client can correlate the WebSocket stream to this upload.
+                        # Non-streaming file transcription keeps its original sync_id-only
+                        # response and does not create a session.
+                        stream_session_id = None
+                        if request.stream:
+                            import uuid
+                            stream_session_id = str(uuid.uuid4())
+                            self.active_sessions[stream_session_id] = {
+                                'model': request.model,
+                                'language': request.language,
+                                'created_at': time.time(),
+                                'final_sent': False,
+                            }
+
                         # ISO 639-1 normalization map — C++ returns full English names
                         _LANG_NAME_TO_CODE = {
                             "english": "en", "chinese": "zh", "spanish": "es",
@@ -884,8 +901,9 @@ class ASRService(BaseService):
 
                                 # Send results immediately to avoid lag
                                 if request.stream:
-                                    # For streaming mode, send each chunk as it arrives
-                                    # Check isFinal to determine result type
+                                    # For streaming mode, send each chunk as it arrives.
+                                    # Tag with the session_id (like live streaming) so the
+                                    # client can correlate WebSocket messages to this upload.
                                     result_type = "transcript.text.done" if is_final else "transcript.text.delta"
 
                                     # Use call_soon_threadsafe since callback is from C thread
@@ -894,9 +912,10 @@ class ASRService(BaseService):
                                         self._send_streaming_chunk_with_type(
                                             transcription_text,
                                             detected_language or request.language or None,
-                                            request.sync_id,
+                                            None,
                                             result_type,
-                                            language_name=detected_language_name
+                                            language_name=detected_language_name,
+                                            session_id=stream_session_id
                                         )
                                     )
                                 else:
@@ -978,7 +997,7 @@ class ASRService(BaseService):
 
                                 # Set VAD length hangover (custom or environment value)
                                 self.whisper_wrapper.set_vad_len_hangover(vad_hangover)
-
+                                self.whisper_wrapper.set_metrics_enabled(True)
                                 self.logger.info("Singleton WhisperWrapper created and initialized")
                             else:
                                 self.logger.info("Reusing existing singleton WhisperWrapper instance")
@@ -1004,7 +1023,24 @@ class ASRService(BaseService):
                                     self.whisper_wrapper.set_vad_len_hangover(vad_value)
                             
                             wrapper = self.whisper_wrapper
-                        
+
+                        # For streaming file transcription, publish the ACK first so the
+                        # API's publishAndListenOnce resolves the HTTP response on it (with
+                        # the real session_id) before any transcript.text.delta arrives.
+                        # This mirrors the live-streaming asr_initialized handshake.
+                        if request.stream and stream_session_id:
+                            ack = TranscriptionsResult.create_result(
+                                text="File Uploaded. Listen on WebSocket to get transcription output.",
+                                language=request.language or "en",
+                                result_type="transcript.event",
+                                stream=True,
+                                session_id=stream_session_id,
+                                sync_id=request.sync_id,
+                                state="asr_initialized"
+                            )
+                            await self.publish(Config.ASR_TRANSCRIPTION_OUT, ack.to_json())
+                            self.logger.info(f'Sent asr_initialized ACK for file streaming session {stream_session_id}')
+
                                                 # Start processing
                         try:
                             await asyncio.to_thread(wrapper.start)
@@ -1027,6 +1063,12 @@ class ASRService(BaseService):
                             signalled = await asyncio.to_thread(processing_complete.wait, wait_timeout)
                             if signalled:
                                 self.logger.info("processing_complete event received")
+                                if self.whisper_wrapper:
+                                    self._last_kpi = {
+                                        'service': 'asr',
+                                        'ts': time.time(),
+                                        **self.whisper_wrapper.get_kpi_metrics()
+                                    }
                             else:
                                 self.logger.warning(f"Timed out waiting for processing_complete after {wait_timeout:.1f}s")
                         finally:
@@ -1040,6 +1082,14 @@ class ASRService(BaseService):
                                 self.logger.info('keep_alive=False: closing wrapper and releasing DSP resources')
                                 await asyncio.to_thread(wrapper.close)
                                 self.whisper_wrapper = None
+
+                        # Remove the streaming file session now that processing is
+                        # done — it was only registered so results could be tagged with
+                        # a session_id. Leaving it in active_sessions would make the
+                        # next /create hit the busy-check and get rejected.
+                        if stream_session_id:
+                            self.active_sessions.pop(stream_session_id, None)
+                            self.logger.info(f'Removed streaming file session {stream_session_id} from active_sessions')
 
                         # Use the results
                         if transcription_results:
@@ -1075,6 +1125,10 @@ class ASRService(BaseService):
 
                     except Exception as e:
                         self.logger.error(f"Error using ASR engine: {e}", exc_info=True)
+                        # Ensure the streaming file session is removed even on error so
+                        # the next /create is not rejected by the busy-check.
+                        if stream_session_id:
+                            self.active_sessions.pop(stream_session_id, None)
                         await self.send_error(
                             Config.ASR_TRANSCRIPTION_OUT,
                             f'ASR engine error: {e}',
@@ -1105,7 +1159,7 @@ class ASRService(BaseService):
         await self.publish(Config.ASR_TRANSCRIPTION_OUT, result.to_json())
         self.logger.debug(f'Sent immediate streaming chunk: "{text[:50]}..."')
     
-    async def _send_streaming_chunk_with_type(self, text: str, language: str, sync_id: str, result_type: str, language_name: str = None):
+    async def _send_streaming_chunk_with_type(self, text: str, language: str, sync_id: str, result_type: str, language_name: str = None, session_id: str = None):
         """Send a streaming chunk with specific result type (called from callback)."""
         result = TranscriptionsResult.create_result(
             text=text,
@@ -1114,6 +1168,7 @@ class ASRService(BaseService):
             result_type=result_type,
             stream=True,
             sync_id=sync_id,
+            session_id=session_id,
             state="transcription"
         )
 
@@ -1189,6 +1244,16 @@ class ASRService(BaseService):
         self.logger.info(f'Sent streaming result ({result_type}) for session {session_id}: {text[:50]}...')
         if is_final and session_id in self.active_sessions:
             self.active_sessions[session_id]['final_sent'] = True
+            # Capture KPI metrics from the wrapper after each final result
+            if self.whisper_wrapper:
+                try:
+                    self._last_kpi = {
+                        'service': 'asr',
+                        'ts': time.time(),
+                        **self.whisper_wrapper.get_kpi_metrics()
+                    }
+                except Exception:
+                    pass
     
     async def send_speech_event(self, session_id: str, event: str):
         """Send a speech detection event for a specific session."""
@@ -1507,7 +1572,7 @@ class ASRService(BaseService):
 
                         # Set VAD length hangover (custom or environment value)
                         self.whisper_wrapper.set_vad_len_hangover(vad_hangover)
-
+                        self.whisper_wrapper.set_metrics_enabled(True)
                         self.logger.info("Singleton WhisperWrapper created and initialized")
                     else:
                         self.logger.info("Reusing existing singleton WhisperWrapper instance")
@@ -2307,3 +2372,4 @@ class ASRService(BaseService):
 
         except Exception as e:
             self.logger.error(f'Error handling devices request: {e}', exc_info=True)
+ 

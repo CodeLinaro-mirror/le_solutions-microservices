@@ -18,6 +18,7 @@ import pathlib
 import base64
 import wave
 import socket
+import errno
 import os
 import sys
 import time
@@ -257,6 +258,29 @@ class TTS:
             self.TTSParams,   # tts_params
         ]
         c_lib.tts_benchmark.restype = ctypes.c_char_p
+        self._define_tts_set_metrics_enabled_ctype(c_lib)
+        self._define_tts_get_kpi_metrics_ctype(c_lib)
+
+    def _define_tts_set_metrics_enabled_ctype(self, c_lib):
+        """Define C types for the tts_set_metrics_enabled function.
+
+        C signature:
+            void tts_set_metrics_enabled(tts_handle_t handle, int enabled)
+        """
+        c_lib.tts_set_metrics_enabled.argtypes = [
+            ctypes.c_uint64,  # handle
+            ctypes.c_int,     # enabled (1 = on, 0 = off)
+        ]
+        c_lib.tts_set_metrics_enabled.restype = None
+
+    def _define_tts_get_kpi_metrics_ctype(self, c_lib):
+        """Define C types for the tts_get_kpi_metrics function.
+
+        C signature:
+            const char* tts_get_kpi_metrics(tts_handle_t handle)
+        """
+        c_lib.tts_get_kpi_metrics.argtypes = [ctypes.c_uint64]  # handle
+        c_lib.tts_get_kpi_metrics.restype = ctypes.c_char_p
 
     @staticmethod
     def _validate_model_params(model_params: dict) -> bool:
@@ -347,19 +371,50 @@ class TTS:
         if cancel_event.is_set():
             print(f"[cache_writer] Cancelled before cache write")
             return
+        # If the cache file already exists, skip the write — it's already good.
+        if os.path.exists(tmp_cache_location):
+            print(f"[cache_writer] Cache already exists, skipping write: {tmp_cache_location}")
+            return
+        tmp_write_path = tmp_cache_location + ".tmp"
         try:
             if not os.path.isdir(store_location_dir):
                 os.makedirs(store_location_dir)
             tmp_filename = os.path.basename(tmp_cache_location)
             _remove_stale(store_location_dir, tmp_filename)
-            if os.path.exists(tmp_cache_location):
-                os.remove(tmp_cache_location)
+            # Write to a .tmp file first — never touch the existing good cache
+            # until the new write succeeds.
+            if os.path.exists(tmp_write_path):
+                os.remove(tmp_write_path)
             t = time.time()
-            generate_packed_model_file(tmp_cache_location, model_buffer)
+            generate_packed_model_file(tmp_write_path, model_buffer)
+            os.replace(tmp_write_path, tmp_cache_location)
             print(f"[cache_writer] Wrote cache to {tmp_cache_location} "
                   f"in {time.time() - t:.2f}s")
         except OSError as e:
-            print(f"[cache_writer] Could not write cache to {tmp_cache_location}: {e}")
+            if e.errno == errno.ENOSPC:
+                print(f"[cache_writer] No space left on device — attempting LRU eviction")
+                if wu.evict_lru_cache(store_location_dir, len(model_buffer) if model_buffer else 0,
+                                      exclude_path=tmp_cache_location):
+                    try:
+                        generate_packed_model_file(tmp_write_path, model_buffer)
+                        os.replace(tmp_write_path, tmp_cache_location)
+                        print(f"[cache_writer] Wrote cache after eviction: {tmp_cache_location}")
+                    except Exception as retry_err:
+                        print(f"[cache_writer] Retry after eviction failed: {retry_err}")
+                        if os.path.exists(tmp_write_path):
+                            try:
+                                os.remove(tmp_write_path)
+                            except Exception:
+                                pass
+                else:
+                    print(f"[cache_writer] Eviction failed — skipping cache write for {tmp_cache_location}")
+            else:
+                print(f"[cache_writer] Could not write cache to {tmp_cache_location}: {e}")
+            if os.path.exists(tmp_write_path):
+                try:
+                    os.remove(tmp_write_path)
+                except Exception:
+                    pass
         finally:
             model_buffer = None
 
@@ -955,6 +1010,63 @@ class TTS:
         result = self._parse_benchmark_metrics(metrics_str)
         result["model_size"] = model_size
         return result
+
+    def set_metrics_enabled(self, enabled: bool) -> None:
+        """Enable or disable KPI metrics collection for this TTS instance.
+
+        When enabled, each call to process_with_callback() or process_to_file()
+        records timing metrics that can be retrieved with get_kpi_metrics().
+        Metrics collection is disabled by default.
+
+        Args:
+            enabled: True to enable metrics collection, False to disable.
+
+        Raises:
+            RuntimeError: If the TTS instance has not been initialized.
+        """
+        if self.handle is None:
+            raise RuntimeError("TTS not initialized. Call init_model() or init_dir() first.")
+
+        self.c_lib.tts_set_metrics_enabled(self.handle, int(enabled))
+        print(f"TTS metrics collection {'enabled' if enabled else 'disabled'}")
+
+    def get_kpi_metrics(self) -> dict:
+        """Return KPI metrics from the most recent process() call as a dict.
+
+        Metrics are only populated when metrics collection has been enabled via
+        set_metrics_enabled(True) before calling process_with_callback() or
+        process_to_file().
+
+        Returns:
+            dict with integer millisecond values for the keys:
+                - ``init``               — time spent in init_model_buffer()
+                - ``total_latency``      — end-to-end time for the process() call
+                - ``latency_first``      — time to receive the first audio chunk
+                - ``latency_subsequent`` — time between subsequent audio chunks
+
+            Returns an empty dict if the handle is invalid, metrics were never
+            collected, or the metrics string could not be parsed.
+
+        Example::
+
+            tts.set_metrics_enabled(True)
+            tts.process_with_callback(b"Hello world", callback)
+            metrics = tts.get_kpi_metrics()
+            # {'init': 622, 'total_latency': 1030, 'latency_first': 350,
+            #  'latency_subsequent': 75}
+
+        Raises:
+            RuntimeError: If the TTS instance has not been initialized.
+        """
+        if self.handle is None:
+            raise RuntimeError("TTS not initialized. Call init_model() or init_dir() first.")
+
+        raw = self.c_lib.tts_get_kpi_metrics(self.handle)
+        if raw is None:
+            return {}
+
+        metrics_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        return self._parse_benchmark_metrics(metrics_str)
 
     def close(self):
         """Alias for deinit() for consistency with other wrappers."""

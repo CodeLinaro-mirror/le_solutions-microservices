@@ -180,8 +180,11 @@ FROM base AS server-builder
 
 ARG INSTALL_NATIVE_LIBS
 ARG INSTALL_PULSE_AUDIO=false
-ARG VERSION_TAG=1.0.2
-ARG ARTIFACTORY_BASE_URL=https://artifacts.codelinaro.org/artifactory/iot-solutions-microservices-components/audio-analytics
+ARG VERSION_TAG=1.0.3
+ARG ARTIFACTORY_BASE_URL=https://artifacts.codelinaro.org/artifactory/clo-561-iot-solutions-microservices-test-generic/audio-analytics
+ARG JFROG_USERNAME
+ARG JFROG_PASSWORD
+
 
 # Install default Python 3 packages
 RUN apt-get update --fix-missing && \
@@ -224,9 +227,11 @@ COPY --chown=iot-user:iot-user audio-analytics-server/engine/python/*.py /usr/sr
 
 # Download melo & piper files from artifactory
 RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/server/melo" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/python/melo/"
 RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/server/piper" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/python/piper/"
 # Keep the COPY as these folders still exist and have .py source code files
@@ -250,9 +255,11 @@ RUN find /usr/src/server/melo -name '__pycache__' | while read cache_dir; do \
 
 # Download .so files & whisper speech float files from artifactory
 RUN wget -r -np -nH --cut-dirs=6 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/engine/native/" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/native/aarch64-oe-linux/"
 RUN wget -r -np -nH --cut-dirs=5 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/engine/models/whisper/" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/whisper/"
 # Comment out COPYs when pulling from Artifactory
@@ -264,9 +271,11 @@ RUN chown -R iot-user:iot-user /usr/src/engine/models/whisper/
 
 # Download Notice and License files from artifactory
 RUN wget -r -np -nH --cut-dirs=4 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/server/" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/NO.LOGIN.BINARY.LICENSE.QTI.pdf"
 RUN wget -r -np -nH --cut-dirs=4 --reject "index.html*" \
+   --user="${JFROG_USERNAME}" --password="${JFROG_PASSWORD}" \
    -P "/usr/src/server/" \
      "${ARTIFACTORY_BASE_URL}/${VERSION_TAG}/NOTICE.FOR.AUDIO.ANALAYTICS.BINARIES.txt"
 RUN chown -R iot-user:iot-user /usr/src/server/
@@ -361,6 +370,8 @@ RUN mkdir -p /etc/fastrpc && \
       echo 'machines:'; \
       echo '  Qualcomm Technologies, Inc. Monaco Monza addons:'; \
       echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp'; \
+      echo '  Qualcomm Technologies, Inc. Monaco EVK:'; \
+      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp'; \
       echo '  Qualcomm Technologies, Inc. Addons IQ 9075 EVK:'; \
       echo '    DSP_LIBRARY_PATH: sa8775p/Qualcomm/SA8775P-RIDE/dsp'; \
       echo '  Qualcomm Technologies, Inc. IQ8 8275 Pro SKU EVK:'; \
@@ -450,10 +461,10 @@ chmod 666 /dev/fastrpc* 2>/dev/null || true
 chmod -R 777 /var/log/supervisor 2>/dev/null || true
 chmod 666 /proc/1/fd/1 /proc/1/fd/2 2>/dev/null || true
 mkdir -p /usr/share/qcom/conf.d
-cp /etc/fastrpc/hexagon-dsp-binaries.yaml /usr/share/qcom/conf.d/
+cp /etc/fastrpc/hexagon-dsp-binaries.yaml /usr/share/qcom/conf.d/audio-analytics-hexagon-dsp-binaries.yaml
+export DSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 export ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 export CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
-export DSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
 EOF
 RUN chmod +x /entrypoint.sh

@@ -45,8 +45,8 @@ services:
     tmpfs:
       - /app/uploads:rw,size=500m,mode=777
       - /tmp/audio-cache:rw,size=2g,mode=777
-    # Override default command to fix device and audio permissions
-    # command: block removed — entrypoint.sh baked into the image handles this
+      - /usr/share/qcom/conf.d:rw,size=2m,mode=777
+
 
 # persistent volumes for cache and IPC socket across container restarts
 volumes:

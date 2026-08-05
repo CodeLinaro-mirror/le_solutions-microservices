@@ -83,6 +83,9 @@ class TTSService(BaseService):
         # Service coordinator for managing resource conflicts with ASR and T2T
         self.coordinator = get_service_coordinator()
 
+        # KPI metrics from the most recent real synthesis
+        self._last_kpi: dict = {}
+
         # Language code mapping
         self.TTS_LANGUAGE_CODE_MAPPING = {
             "melo": Config.MELO_LANGUAGE_CODE_MAP,
@@ -1035,6 +1038,7 @@ class TTSService(BaseService):
                 
                 # Use the singleton instance
                 tts_instance = self.tts_instance
+                tts_instance.set_metrics_enabled(True)
             
             # Each model has its own required sample rates
             model_sample_rate = {
@@ -1218,6 +1222,18 @@ class TTSService(BaseService):
 
                 await asyncio.to_thread(tts_thread.join, timeout=1.0)
                 self.logger.info(f"TTS processing complete, sent {chunk_count} chunks")
+
+            # Capture KPI metrics after synthesis (both on-device and stream paths)
+            try:
+                kpi_metrics = tts_instance.get_kpi_metrics()
+                if kpi_metrics:
+                    self._last_kpi = {
+                        'service': 'tts',
+                        'ts': time.time(),
+                        **kpi_metrics
+                    }
+            except Exception:
+                pass
 
             self.logger.info("TTS processing complete, keeping singleton instance alive for reuse")
             

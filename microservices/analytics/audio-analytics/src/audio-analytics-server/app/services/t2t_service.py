@@ -50,6 +50,9 @@ class T2TService(BaseService):
         # Service coordinator for managing resource conflicts with ASR/TTS
         self.coordinator = get_service_coordinator()
 
+        # KPI metrics from the most recent real translation
+        self._last_kpi: dict = {}
+
         if not self.dev_mode:
             self.logger.info("Running in production mode - loading translation wrapper")
             try:
@@ -472,6 +475,11 @@ class T2TService(BaseService):
 
             full_translation = ' '.join(result_parts).strip()
             self.logger.info(f"Translated: '{text[:60]}' -> '{full_translation[:60]}'")
+            self._last_kpi = {
+                'service': 't2t',
+                'ts': __import__('time').time(),
+                **wrapper.get_kpi_metrics()
+            }
             translations.append(TranslationResult(
                 translated_text=full_translation,
                 target_language=target_lang,

@@ -68,7 +68,6 @@ class TranslationCallbackManager:
         """Create global C callback functions that route to current handlers."""
         
         # Import PyGILState functions for thread safety
-        import ctypes
         pythonapi = ctypes.pythonapi
         PyGILState_Ensure = pythonapi.PyGILState_Ensure
         PyGILState_Ensure.restype = ctypes.c_int
@@ -78,7 +77,6 @@ class TranslationCallbackManager:
         @OnResultFn
         def _global_on_result(user_data, result_ptr):
             """Global C callback that routes to the current result handler."""
-            # Acquire GIL since this might be called from a C++ thread
             gil_state = PyGILState_Ensure()
             try:
                 with self._lock:
@@ -87,7 +85,6 @@ class TranslationCallbackManager:
                 if handler:
                     try:
                         if result_ptr:
-                            # Try to safely decode the result
                             try:
                                 result_bytes = ctypes.cast(result_ptr, ctypes.c_char_p).value
                                 if result_bytes is None:
@@ -112,13 +109,11 @@ class TranslationCallbackManager:
                 print(f"Critical error in global result callback: {e}")
                 traceback.print_exc()
             finally:
-                # Always release GIL
                 PyGILState_Release(gil_state)
         
         @OnDoneFn
         def _global_on_done(user_data):
             """Global C callback that routes to the current done handler."""
-            # Acquire GIL since this might be called from a C++ thread
             gil_state = PyGILState_Ensure()
             try:
                 with self._lock:
@@ -134,13 +129,11 @@ class TranslationCallbackManager:
                 print(f"Critical error in global done callback: {e}")
                 traceback.print_exc()
             finally:
-                # Always release GIL
                 PyGILState_Release(gil_state)
         
         @OnErrorFn
         def _global_on_error(user_data, error_code):
             """Global C callback that routes to the current error handler."""
-            # Acquire GIL since this might be called from a C++ thread
             gil_state = PyGILState_Ensure()
             try:
                 with self._lock:
@@ -156,7 +149,6 @@ class TranslationCallbackManager:
                 print(f"Critical error in global error callback: {e}")
                 traceback.print_exc()
             finally:
-                # Always release GIL
                 PyGILState_Release(gil_state)
         
         # Store strong references to prevent garbage collection
@@ -255,6 +247,9 @@ class TranslationWrapper:
         
         # Storage for translation results
         self.final_text = []
+
+        # KPI tracking for live translation calls
+        self._last_metrics: dict = {}
         
         # Set up instance-specific callback handlers
         def _on_result(result):
@@ -612,12 +607,10 @@ class TranslationWrapper:
                 except Exception as e:
                     print(f"[cache_writer] Error scanning stale T2T caches: {e}")
 
-            # Remove stale file for this language pair before writing
+            # If the cache file already exists, skip the write — it's already good.
             if os.path.exists(cache_file_path):
-                try:
-                    os.remove(cache_file_path)
-                except Exception as e:
-                    print(f"Could not remove old cache file {cache_file_path}: {e}")
+                print(f"[cache_writer] Cache already exists, skipping write: {cache_file_path}")
+                return
 
             # Write to temporary file first (atomic operation)
             temp_file_path = cache_file_path + ".tmp"
@@ -631,14 +624,39 @@ class TranslationWrapper:
             os.rename(temp_file_path, cache_file_path)
             print(f"Cache file created successfully: {cache_file_path}")
 
-        except Exception as e:
-            print(f"Failed to create cache file: {e}")
-            # Clean up temp file if it exists
-            temp_file_path = os.path.join(t2t_tmp_dir, f"translation_{input_code}_{output_code}.qnn.tmp")
+        except OSError as e:
+            import errno
+            if e.errno == errno.ENOSPC:
+                print(f"[cache_writer] No space left on device — attempting LRU eviction")
+                if wu.evict_lru_cache(t2t_tmp_dir, len(model_buffer), exclude_path=cache_file_path):
+                    try:
+                        with open(temp_file_path, 'wb') as f:
+                            f.write(model_buffer)
+                        os.rename(temp_file_path, cache_file_path)
+                        print(f"Cache file created successfully after eviction: {cache_file_path}")
+                    except Exception as retry_err:
+                        print(f"[cache_writer] Retry after eviction failed: {retry_err}")
+                        if os.path.exists(temp_file_path):
+                            try:
+                                os.remove(temp_file_path)
+                            except Exception:
+                                pass
+                else:
+                    print(f"[cache_writer] Eviction failed — skipping cache write for {cache_file_path}")
+            else:
+                print(f"Failed to create cache file: {e}")
+            # Clean up the .tmp file we may have partially written
             if os.path.exists(temp_file_path):
                 try:
                     os.remove(temp_file_path)
-                except:
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Failed to create cache file: {e}")
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except Exception:
                     pass
 
     def _cleanup_cache_dir(self, cache_dir: str):
@@ -800,6 +818,14 @@ class TranslationWrapper:
 
         wrapper.translation_engine_init_from_buffer.restype = ctypes.c_int
 
+        # void translation_engine_set_metrics_enabled(CTranslationEngine* engine, int enabled);
+        wrapper.translation_engine_set_metrics_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        wrapper.translation_engine_set_metrics_enabled.restype = None
+
+        # const char* translation_engine_get_kpi_metrics(CTranslationEngine* engine);
+        wrapper.translation_engine_get_kpi_metrics.argtypes = [ctypes.c_void_p]
+        wrapper.translation_engine_get_kpi_metrics.restype = ctypes.c_char_p
+
     def process(self, source_text: str) -> None:
         """Send a source text to the engine for translation.
 
@@ -935,6 +961,7 @@ class TranslationWrapper:
                 callback_state['done_received'] = True
                 if on_done_cb:
                     on_done_cb()
+                    print(f"[Instance {self.instance_id}] on_done_cb called")
             except Exception as e:
                 print(f"[Instance {self.instance_id}] Error in done callback: {e}")
                 traceback.print_exc()
@@ -994,6 +1021,19 @@ class TranslationWrapper:
             if ret != 0:
                 print(f"[Instance {self.instance_id}] Process failed with return code: {ret}")
                 return ret
+
+            # Capture KPI metrics for this process() call. The C++ wrapper
+            # populates time_to_first_token from the DSP-measured value that
+            # rides in the first result's output_text; this is a plain string
+            # read with no additional DSP round-trip.
+            try:
+                raw_metrics = self._wrapper.translation_engine_get_kpi_metrics(self._engine)
+                if raw_metrics:
+                    metrics_str = raw_metrics.decode('utf-8') if isinstance(raw_metrics, bytes) else raw_metrics
+                    self._last_metrics = self._parse_benchmark_metrics(metrics_str)
+                    print(f"[Instance {self.instance_id}] kpi_last: {metrics_str}")
+            except Exception as kpi_err:
+                print(f"[Instance {self.instance_id}] Error capturing KPI metrics: {kpi_err}")
             
             # If we get here with ret == 0, translation is complete!
             print(f"[Instance {self.instance_id}] Translation completed successfully (process returned 0)")
@@ -1039,11 +1079,44 @@ class TranslationWrapper:
                 on_error=self._instance_on_error
             )
 
+    def set_metrics_enabled(self, enabled: bool) -> None:
+        """Enable or disable KPI metrics collection for this translation instance.
+
+        When enabled (default), each call to process_with_cb() records timing
+        metrics retrievable via get_kpi_metrics().
+
+        Args:
+            enabled: True to enable metrics collection, False to disable.
+        """
+        if not hasattr(self, '_engine') or not self._engine:
+            raise RuntimeError("Translation engine not initialized.")
+        self._wrapper.translation_engine_set_metrics_enabled(self._engine, int(enabled))
+        print(f"[Instance {self.instance_id}] Translation metrics collection {'enabled' if enabled else 'disabled'}")
+
+    def get_kpi_metrics(self) -> dict:
+        """Return KPI metrics from the most recent process_with_cb() call.
+
+        Returns:
+            dict with integer millisecond values for:
+                - ``init``                 — time spent in engine init (stored once)
+                - ``total_latency``        — end-to-end time for the process() call
+                - ``time_to_first_token``  — DSP-measured time to first decoded token
+
+            Returns an empty dict if no translation has been run yet.
+
+        Example::
+
+            wrapper.process_with_cb("Hello", on_result_cb)
+            metrics = wrapper.get_kpi_metrics()
+            # {'init': 136, 'total_latency': 194, 'time_to_first_token': 58}
+        """
+        return dict(self._last_metrics)
+
     def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
         """Parse a translation benchmark metrics string into a dict.
 
-        Input: "init=200ms,proc=800ms,first_token=350ms"
-        Output: {"init": 200, "proc": 800, "first_token": 350}
+        Input: "init=200ms,total_latency=800ms,time_to_first_token=350ms"
+        Output: {"init": 200, "total_latency": 800, "time_to_first_token": 350}
         """
         result = {}
         if not metrics_str:
@@ -1158,18 +1231,26 @@ class TranslationWrapper:
             )
             model_size_bytes = len(model_buffer)
 
-            # Kick off background cache write so next run hits the fast path
+            # Kick off background cache write so next run hits the fast path.
+            # Skip if the disk is already full (check free space first).
             try:
-                cache_thread = threading.Thread(
-                    target=self._write_cache_file,
-                    args=(model_buffer, input_code,
-                          self.get_language_code(output_lang),
-                          _model_base, _qnn_ver),
-                    daemon=True
-                )
-                cache_thread.start()
-                TranslationWrapper._cache_writer_thread = cache_thread
-                TranslationWrapper._cache_writer_path = cache_file_path
+                import shutil
+                free_bytes = shutil.disk_usage(T2T_MODEL_STORE_DIR).free
+                if free_bytes < len(model_buffer):
+                    print(f"[benchmark] Skipping cache write — insufficient space "
+                          f"({free_bytes // 1024 // 1024} MB free, "
+                          f"{len(model_buffer) // 1024 // 1024} MB needed)")
+                else:
+                    cache_thread = threading.Thread(
+                        target=self._write_cache_file,
+                        args=(model_buffer, input_code,
+                              self.get_language_code(output_lang),
+                              _model_base, _qnn_ver),
+                        daemon=True
+                    )
+                    cache_thread.start()
+                    TranslationWrapper._cache_writer_thread = cache_thread
+                    TranslationWrapper._cache_writer_path = cache_file_path
             except Exception as e:
                 print(f"[benchmark] Could not start background cache write: {e}")
 

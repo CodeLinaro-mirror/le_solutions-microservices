@@ -78,6 +78,10 @@ class WhisperWrapper:
         self.partial_transcriptions = partial_transcriptions
         self.min_buffer_ms = min_buffer_ms
 
+        # KPI tracking for live transcription calls
+        self._last_metrics: dict = {}
+        self._init_ms: int = 0   # measured init latency (ms) for _init_whisper
+
         # Event / error constants
         self.KEY_TRANSCRIPTION = self.lib.whisper_response_listener_KEY_TRANSCRIPTION().decode()
         self.KEY_LANGUAGE      = self.lib.whisper_response_listener_KEY_LANGUAGE().decode()
@@ -217,6 +221,12 @@ class WhisperWrapper:
         lib.whisper_register_listener.argtypes = [c_void_p, c_void_p]
         lib.whisper_register_listener.restype = None
 
+        lib.whisper_set_metrics_enabled.argtypes = [c_void_p, c_int32]
+        lib.whisper_set_metrics_enabled.restype = None
+
+        lib.whisper_get_kpi_metrics.argtypes = [c_void_p]
+        lib.whisper_get_kpi_metrics.restype = c_char_p
+
         # Optional string / int getters already used above
         lib.whisper_response_listener_KEY_TRANSCRIPTION.restype = c_char_p
         lib.whisper_response_listener_KEY_LANGUAGE.restype      = c_char_p
@@ -231,6 +241,7 @@ class WhisperWrapper:
     # -------------------------------------------------------------------------
     def _init_whisper(self,encoder_path,decoder_path,vocab_path,speech_path,model_path):
         # Initialize Whisper
+        _t_init_start = time.time()
         self.handle = self.lib.whisper_create()
         if not self.handle:
             raise RuntimeError("Failed to create whisper handle")
@@ -253,7 +264,6 @@ class WhisperWrapper:
             #   2. Wait progressively longer between retries so the DSP has time to
             #      complete its hard-reset of reserved memory.
             #   3. Retry up to MAX_INIT_RETRIES times before giving up.
-            import time
             MAX_INIT_RETRIES = 3
             RETRY_DELAYS_S   = [2.0, 4.0, 6.0]   # cumulative: 2 s, 4 s, 6 s
             for attempt in range(MAX_INIT_RETRIES):
@@ -332,13 +342,58 @@ class WhisperWrapper:
 
         if self.data_listener:
             self.lib.input_stream_register_data_available_listener(self.stream, self.data_listener)
+
+        # Record the total init latency (create + whisper_init + retries + setup)
+        self._init_ms = int((time.time() - _t_init_start) * 1000)
         return self.handle
 
-    def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
-        """Parse a Whisper benchmark metrics string into a dict.
+    def set_metrics_enabled(self, enabled: bool) -> None:
+        """Enable or disable KPI metrics collection.
 
-        Input: "init=622ms,proc=1105ms,first_token=350ms,tokens=30"
-        Output: {"init": 622, "proc": 1105, "first_token": 350, "tokens": 30}
+        When enabled (default), each transcription call records timing
+        metrics retrievable via get_kpi_metrics().
+
+        Args:
+            enabled: True to enable metrics collection, False to disable.
+        """
+        if not self.handle:
+            raise RuntimeError("Whisper not initialized.")
+        self.lib.whisper_set_metrics_enabled(self.handle, int(enabled))
+        print(f"Whisper metrics collection {'enabled' if enabled else 'disabled'}")
+
+    def get_kpi_metrics(self) -> dict:
+        """Return KPI metrics from the most recent transcription.
+
+        Returns:
+            dict with integer millisecond values for:
+                - ``init``                — model init latency measured in Python
+                - ``total_latency``       — end-to-end time for the process() call
+                - ``time_to_first_token`` — time to first decoded token
+                - ``tokens``              — number of tokens decoded
+
+            Returns an empty dict if no transcription has been run yet.
+
+        Example::
+
+            metrics = wrapper.get_kpi_metrics()
+            # {'init': 556, 'total_latency': 1030, 'time_to_first_token': 350, 'tokens': 30}
+        """
+        if not self.handle:
+            return {}
+        raw = self.lib.whisper_get_kpi_metrics(self.handle)
+        if not raw:
+            return {}
+        metrics_str = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+        parsed = self._parse_benchmark_metrics(metrics_str)
+        # Prepend the Python-measured init latency so it leads the dict
+        self._last_metrics = {'init': self._init_ms, **parsed}
+        return dict(self._last_metrics)
+
+    def _parse_benchmark_metrics(self, metrics_str: str) -> dict:
+        """Parse a Whisper metrics string into a dict.
+
+        Input: "init=622ms,total_latency=1105ms,time_to_first_token=350ms,tokens=30"
+        Output: {"init": 622, "total_latency": 1105, "time_to_first_token": 350, "tokens": 30}
         """
         result = {}
         if not metrics_str:

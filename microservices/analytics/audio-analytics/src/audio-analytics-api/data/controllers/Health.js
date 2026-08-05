@@ -63,7 +63,7 @@ module.exports.healthCheck = async function healthCheck (req, res, next, body) {
     }
 };
 
-module.exports.getKPIs = async function getKPIs (req, res, next, body) {
+module.exports.getKPIBenchmarks = async function getKPIBenchmarks (req, res, next, body) {
     // Override default timeout for this request.
     req.setTimeout(300*1000);
     if (isDebug) console.log('=== Get KPIs called  ===');
@@ -72,7 +72,49 @@ module.exports.getKPIs = async function getKPIs (req, res, next, body) {
         if (isDebug) console.log('KPIs: Starting...');
 
         const requestBody = {
-            "message_type": 'get_kpis'
+            "message_type": 'get_kpi_benchmark'
+        };
+
+        // handle message
+        messages.publishAndListenOnce(config.audioKPI, config.audioKPI, requestBody, (err, data) => {
+            if (err) {
+                res.status(400).json({
+                    error: {
+                        message: data.message,
+                        type: "server_error",
+                        param: null,
+                        code: null
+                    }
+                });
+            } else {
+                console.log('Received kpis from server');
+                // Respond with the models (data.result contains the array)
+                res.status(200).json(data.result || data);
+            }
+        });
+    } catch (e) {
+        console.error('KPI error:', e);
+        res.status(500).json({
+            error: {
+                message: e.message,
+                type: "server_error",
+                param: null,
+                code: null
+            }
+        });
+    }
+};
+
+module.exports.getKPILast = async function getKPILast (req, res, next, body) {
+    // Override default timeout for this request.
+    req.setTimeout(300*1000);
+    if (isDebug) console.log('=== Get Last KPIs called  ===');
+
+    try {
+        if (isDebug) console.log('KPIs: Starting...');
+
+        const requestBody = {
+            "message_type": 'get_kpi_last'
         };
 
         // handle message

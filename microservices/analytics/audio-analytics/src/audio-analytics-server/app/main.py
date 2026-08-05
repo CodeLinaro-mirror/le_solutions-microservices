@@ -86,6 +86,27 @@ class AudioAnalyticsServer:
             "Whenever I find myself growing grim about the mouth, "
             "whenever it is a damp, drizzly November in my soul."
         )
+        # Language-specific short texts for TTS benchmarking
+        _TTS_SOURCE_TEXT = {
+            'en': _SHORT_TEXT,
+            'de': (
+                "\u201eImmer wenn ich merke, dass sich um meinen Mund eine d\u00fcstere Stimmung breitmacht, "
+                "immer wenn es in meiner Seele ein feuchter, nieseliger November ist.\u201c"
+            ),
+            'it': (
+                "\u00abOgni volta che mi accorgo di avere un\u2019espressione cupa sul volto, "
+                "ogni volta che nella mia anima \u00e8 un umido e piovigginoso novembre.\u00bb"
+            ),
+            'es': (
+                "\u00abSiempre que me descubro ensombrecido de semblante, "
+                "siempre que en mi alma reina un noviembre h\u00famedo y lluvioso.\u00bb"
+            ),
+            'zh': (
+                "\u201c\u6bcf\u5f53\u6211\u53d1\u73b0\u81ea\u5df1\u6101\u5bb9\u6ee1\u9762\uff0c"
+                "\u6bcf\u5f53\u6211\u7684\u7075\u9b42\u91cc\u6b63\u7ecf\u5386\u7740\u4e00\u4e2a"
+                "\u6f6e\u6e7f\u3001\u9634\u90c1\u7684\u5341\u4e00\u6708\u65f6\u3002\u201d"
+            ),
+        }
         _LONG_TEXT = (
             "Whenever I find myself growing grim about the mouth, whenever it is a damp, drizzly November in my soul, "
             "whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every "
@@ -111,6 +132,10 @@ class AudioAnalyticsServer:
             'de': (
                 "Immer wenn ich mich düster fühle, "
                 "wenn es ein feuchter, trüber November in meiner Seele ist."
+            ),
+            'it': (
+                "Ogni volta che mi accorgo di avere un'espressione cupa sul volto, "
+                "ogni volta che nella mia anima è un umido e piovigginoso novembre."
             ),
         }
 
@@ -170,7 +195,10 @@ class AudioAnalyticsServer:
 
                     print(f'[KPI] TTS {name}: benchmarking...')
                     try:
-                        m = _tts_inst.benchmark(_SHORT_TEXT, model_dir, {})
+                        # Pick language-appropriate text for this model
+                        _voice_lang = (mc.get("voices", [{}])[0].get("language", "en") or "en").lower()[:2]
+                        _bench_text = _TTS_SOURCE_TEXT.get(_voice_lang, _SHORT_TEXT)
+                        m = _tts_inst.benchmark(_bench_text, model_dir, {})
                         qnn_path = getattr(_tts_inst, '_resolved_qnn_path', None)
                         model_size_bytes = 0
                         if qnn_path and os.path.isfile(qnn_path):
@@ -268,10 +296,10 @@ class AudioAnalyticsServer:
                                 result["asr"][model_name][clip_key] = {
                                     "clip_bytes": len(audio),
                                     "token_count": m.get("tokens", 0),
-                                    "time_to_first_token_ms": m.get("first_token", 0),
-                                    "processing_latency_ms": m.get("proc", 0),
+                                    "time_to_first_token_ms": m.get("time_to_first_token", 0),
+                                    "processing_latency_ms": m.get("total_latency", 0),
                                 }
-                                print(f'[KPI] ASR {model_name} {clip_key}: init={m.get("init", 0)}ms  proc={m.get("proc", 0)}ms  first_token={m.get("first_token", 0)}ms  tokens={m.get("tokens", 0)}')
+                                print(f'[KPI] ASR {model_name} {clip_key}: init={m.get("init", 0)}ms  proc={m.get("total_latency", 0)}ms  first_token={m.get("time_to_first_token", 0)}ms  tokens={m.get("tokens", 0)}')
                             except Exception as e:
                                 logger.error(f'ASR benchmark ({model_name} {clip_key}): {e}', exc_info=True)
                                 result["asr"][model_name][clip_key] = {"note": str(e)}
@@ -330,10 +358,10 @@ class AudioAnalyticsServer:
                         result["t2t"][model_name] = {
                             "model_size_mb": m.get("model_size", 0) // (1024 * 1024),
                             "init_time_ms": m.get("init", 0),
-                            "end_to_end_latency_ms": m.get("proc", 0),
-                            "time_to_first_token_ms": m.get("first_token", 0),
+                            "end_to_end_latency_ms": m.get("total_latency", 0),
+                            "time_to_first_token_ms": m.get("time_to_first_token", 0),
                         }
-                        print(f'[KPI] T2T {model_name}: init={m.get("init", 0)}ms  proc={m.get("proc", 0)}ms  first_token={m.get("first_token", 0)}ms')
+                        print(f'[KPI] T2T {model_name}: init={m.get("init", 0)}ms  proc={m.get("total_latency", 0)}ms  first_token={m.get("time_to_first_token", 0)}ms')
                     except Exception as e:
                         logger.error(f'T2T benchmark ({model_name}): {e}', exc_info=True)
                         result["t2t"][model_name]["note"] = str(e)
@@ -429,11 +457,32 @@ class AudioAnalyticsServer:
             except Exception as e:
                 logger.error(f'KPI benchmark error: {e}', exc_info=True)
 
+        async def _run_kpi_last(sync_id):
+            try:
+                candidates = [
+                    k for k in [asr._last_kpi, t2t._last_kpi, tts._last_kpi]
+                    if k.get('ts') is not None
+                ]
+                result = max(candidates, key=lambda k: k['ts']) if candidates else {}
+                response = json.dumps({
+                    'sync_id': sync_id,
+                    'message_type': 'kpis_response',
+                    'result': result,
+                })
+                await CommunicationFactory.publish(self.comm_client, Config.KPI_CHANNEL, response)
+                logger.info('KPI last complete')
+            except Exception as e:
+                logger.error(f'KPI last error: {e}', exc_info=True)
+
         def handle_kpi(message: str):
             try:
                 msg = json.loads(message)
                 sync_id = msg.get('sync_id')
-                asyncio.create_task(_run_kpi_benchmark(sync_id))
+                msg_type = msg.get('message_type')
+                if msg_type == 'get_kpi_last':
+                    asyncio.create_task(_run_kpi_last(sync_id))
+                else:
+                    asyncio.create_task(_run_kpi_benchmark(sync_id))
             except Exception as e:
                 logger.error(f'KPI request error: {e}', exc_info=True)
 
@@ -448,7 +497,8 @@ class AudioAnalyticsServer:
         logger.info(f'  ASR: {Config.ASR_TRANSCRIPTION_IN}, {Config.ASR_MODELS}')
         logger.info(f'  T2T: {Config.T2T_TRANSLATION_IN}, {Config.T2T_MODELS}')
         logger.info(f'  TTS: {Config.TTS_TEXT_IN}, {Config.TTS_MODELS}')
-        logger.info(f'  KPI: {Config.KPI_CHANNEL}')
+        logger.info(f'  KPI benchmark: {Config.KPI_CHANNEL} (get_kpis)')
+        logger.info(f'  KPI last:      {Config.KPI_CHANNEL} (get_kpis_last)')
 
     async def stop(self):
         """Stop all services and cleanup."""

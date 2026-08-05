@@ -176,13 +176,24 @@ async function publishAndListenOnce(channelIn, channelOut, data, cb) {
                 // Check to see if message matches unique ID from earlier
                 let retData = JSON.parse(message);
 
-                // If message matches the unique ID run Callback
+                // Only act on the message that matches our sync_id. Otherwise a
+                // stray error/result belonging to a concurrent request could
+                // resolve the wrong caller and leak this subscriber. Messages
+                // without our sync_id (e.g. streaming transcript.text.delta
+                // chunks) are ignored here and delivered via listenToChannel.
+                if (retData.sync_id != sync_id) {
+                    return;
+                }
+
+                // Matched our request: resolve once, then tear down the
+                // subscriber so it does not leak across requests.
                 if (retData.error) {
                     cb(true, retData.result);
+                    redisClient.unsubscribe();
+                    redisClient.quit();
                 }
-                else if (retData.sync_id == sync_id && retData.result !== undefined) {
+                else if (retData.result !== undefined) {
                     cb(false, retData.result);
-
                     redisClient.unsubscribe();
                     redisClient.quit();
                 }

@@ -3,16 +3,65 @@
 
 import os
 import json
+import errno
+
+
+def evict_lru_cache(cache_dir: str, required_bytes: int, exclude_path: str = "") -> bool:
+    """Delete the least-recently-used .qnn file in cache_dir to free space.
+
+    Called when a cache write fails with ENOSPC.  Removes the single oldest
+    .qnn file (by mtime) that is not the file currently being written, then
+    returns True so the caller can retry the write.  Returns False if no
+    evictable file was found.
+
+    Args:
+        cache_dir:     Directory to scan for .qnn files.
+        required_bytes: How many bytes we need to free (logged only).
+        exclude_path:  Absolute path of the file currently being written
+                       (never evicted).
+
+    Returns:
+        True if a file was evicted, False otherwise.
+    """
+    try:
+        candidates = []
+        for fname in os.listdir(cache_dir):
+            if not fname.endswith('.qnn'):
+                continue
+            fpath = os.path.join(cache_dir, fname)
+            if os.path.abspath(fpath) == os.path.abspath(exclude_path):
+                continue
+            try:
+                candidates.append((os.path.getmtime(fpath), fpath))
+            except OSError:
+                pass
+
+        if not candidates:
+            print(f"[cache_evict] No evictable .qnn files in {cache_dir} "
+                  f"(need {required_bytes // 1024 // 1024} MB)")
+            return False
+
+        candidates.sort()  # oldest mtime first
+        oldest_path = candidates[0][1]
+        os.remove(oldest_path)
+        print(f"[cache_evict] Evicted LRU cache file: {oldest_path} "
+              f"(need {required_bytes // 1024 // 1024} MB)")
+        return True
+
+    except Exception as e:
+        print(f"[cache_evict] Error during eviction: {e}")
+        return False
 
 def search_file(target_file, search_path):
     if not os.path.isdir(search_path):
         print(f"Invalid directory: {search_path}")
 
     for entry in os.listdir(search_path):
-        full_path = os.path.join(search_path, target_file)
-        print(full_path)
-        if os.path.isfile(full_path) and entry == target_file:
-            return full_path
+        if entry == target_file:
+            full_path = os.path.join(search_path, target_file)
+            if os.path.isfile(full_path):
+                return full_path
+    return None
 
 def open_file(file_path):
     if not os.path.isfile(file_path):
