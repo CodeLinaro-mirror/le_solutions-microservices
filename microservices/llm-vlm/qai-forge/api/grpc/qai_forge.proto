@@ -1,0 +1,88 @@
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+
+// ─────────────────────────────────────────────────────────────────────────────
+// qai_forge.proto — gRPC Service Definition for qai-forge
+//
+// Generated C++ stubs are produced by CMake at build time:
+//   qai_forge.pb.h / qai_forge.pb.cc       — Protobuf message types
+//   qai_forge.grpc.pb.h / .cc            — gRPC service base class
+//
+// Client stubs can be generated for any language supported by protoc:
+//   Python:  python -m grpc_tools.protoc ...
+//   Swift:   protoc --swift_out ...
+//   Kotlin:  protoc --kotlin_out ...
+// ─────────────────────────────────────────────────────────────────────────────
+
+syntax = "proto3";
+
+package qai.forge.v1;
+
+option java_package = "com.qualcomm.qai.forge.v1";
+option java_outer_classname = "QaiForgeProto";
+option objc_class_prefix = "QAI";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ChatService — Main inference service
+// ─────────────────────────────────────────────────────────────────────────────
+service ChatService {
+    // Blocking (non-streaming) completion.
+    // Returns the full response when generation is complete.
+    rpc CreateChatCompletion(ChatCompletionRequest)
+        returns (ChatCompletionResponse);
+
+    // Server-streaming completion.
+    // Streams ChatCompletionChunk messages as tokens are generated.
+    // The final chunk has a non-empty finish_reason.
+    rpc CreateChatCompletionStream(ChatCompletionRequest)
+        returns (stream ChatCompletionChunk);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request / Response messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+message ChatMessage {
+    string role    = 1;  // "user", "assistant", "system", "tool"
+    string content = 2;
+}
+
+message ChatCompletionRequest {
+    string              model       = 1;
+    repeated ChatMessage messages   = 2;
+    bool                stream      = 3;
+    int32               max_tokens  = 4;
+    float               temperature = 5;
+    float               top_p       = 6;
+    int32               top_k       = 7;
+    // Session ID — maps to CreateChatCompletionRequest.user in Layer 2.
+    // Clients should pass the same user value across turns to maintain
+    // conversation history.
+    string              user        = 8;
+}
+
+// Full non-streaming response (returned by CreateChatCompletion)
+message ChatCompletionResponse {
+    string id                = 1;
+    string model             = 2;
+    string content           = 3;
+    // Populated for reasoning models (e.g. Qwen3, DeepSeek-R1)
+    string reasoning_content = 4;
+    string finish_reason     = 5;  // "stop", "length", "tool_calls"
+    int32  prompt_tokens     = 6;
+    int32  completion_tokens = 7;
+}
+
+// Single streaming token delta (returned by CreateChatCompletionStream)
+message ChatCompletionChunk {
+    string id              = 1;
+    string model           = 2;
+    // Content token delta — empty for role-only or finish chunks
+    string content_delta   = 3;
+    // Reasoning token delta — populated for thinking models
+    string reasoning_delta = 4;
+    // Non-empty only on the final chunk: "stop", "length", "tool_calls"
+    string finish_reason   = 5;
+    // Role — populated only on the first chunk
+    string role            = 6;
+}

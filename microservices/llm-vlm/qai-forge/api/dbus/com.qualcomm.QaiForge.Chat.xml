@@ -1,0 +1,110 @@
+<!DOCTYPE node PUBLIC
+  "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+
+<!--
+  Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  SPDX-License-Identifier: BSD-3-Clause-Clear
+
+  D-Bus Interface Definition for qai-forge Chat Service
+
+  Service name:  com.qualcomm.QaiForge
+  Object path:   /com/qualcomm/QaiForge/Chat
+  Interface:     com.qualcomm.QaiForge.Chat
+
+  Usage examples (busctl):
+
+    # Blocking completion
+    busctl call com.qualcomm.QaiForge /com/qualcomm/QaiForge/Chat \
+      com.qualcomm.QaiForge.Chat CreateChatCompletion s \
+      '{"model":"qwen3_4b_instruct_2507","messages":[{"role":"user","content":"Hello"}]}'
+
+    # Streaming completion (returns stream_id; subscribe to signals separately)
+    busctl call com.qualcomm.QaiForge /com/qualcomm/QaiForge/Chat \
+      com.qualcomm.QaiForge.Chat CreateChatCompletionStream s \
+      '{"model":"qwen3_4b_instruct_2507","messages":[{"role":"user","content":"Hello"}]}'
+
+    # Monitor signals
+    busctl monitor com.qualcomm.QaiForge
+-->
+
+<node name="/com/qualcomm/QaiForge/Chat">
+  <interface name="com.qualcomm.QaiForge.Chat">
+
+    <!-- ─────────────────────────────────────────────────────────────────────
+         CreateChatCompletion — Blocking inference
+
+         Input:  request_json  (s) — JSON string matching CreateChatCompletionRequest
+                 {
+                   "model": "qwen3_4b_instruct_2507",
+                   "messages": [{"role": "user", "content": "Hello"}],
+                   "max_completion_tokens": 1024,
+                   "temperature": 1.0,
+                   "user": "session-id-optional"
+                 }
+
+         Output: response_json (s) — JSON string with the full response
+                 {
+                   "id": "...",
+                   "model": "qwen3_4b_instruct_2507",
+                   "content": "Hello! How can I help you?",
+                   "reasoning_content": "...",  // only for thinking models
+                   "finish_reason": "stop",
+                   "prompt_tokens": 12,
+                   "completion_tokens": 8
+                 }
+         ───────────────────────────────────────────────────────────────────── -->
+    <method name="CreateChatCompletion">
+      <arg name="request_json"  type="s" direction="in"/>
+      <arg name="response_json" type="s" direction="out"/>
+    </method>
+
+    <!-- ─────────────────────────────────────────────────────────────────────
+         CreateChatCompletionStream — Non-blocking streaming inference
+
+         Input:  request_json (s) — same JSON format as CreateChatCompletion
+
+         Output: stream_id    (s) — unique ID for this stream
+                 Clients use this ID to correlate ChunkReceived / StreamFinished
+                 signals with their request.
+
+         After this method returns, the service emits:
+           - ChunkReceived(stream_id, chunk_json) for each token
+           - StreamFinished(stream_id, finish_reason) when done
+         ───────────────────────────────────────────────────────────────────── -->
+    <method name="CreateChatCompletionStream">
+      <arg name="request_json" type="s" direction="in"/>
+      <arg name="stream_id"    type="s" direction="out"/>
+    </method>
+
+    <!-- ─────────────────────────────────────────────────────────────────────
+         ChunkReceived — Emitted for each token during streaming
+
+         stream_id  (s) — matches the stream_id returned by CreateChatCompletionStream
+         chunk_json (s) — JSON string with the token delta
+                          {
+                            "id": "...",
+                            "model": "qwen3_4b_instruct_2507",
+                            "content_delta": "Hello",
+                            "reasoning_delta": "...",  // only for thinking models
+                            "role": "assistant"         // only on first chunk
+                          }
+         ───────────────────────────────────────────────────────────────────── -->
+    <signal name="ChunkReceived">
+      <arg name="stream_id"  type="s"/>
+      <arg name="chunk_json" type="s"/>
+    </signal>
+
+    <!-- ─────────────────────────────────────────────────────────────────────
+         StreamFinished — Emitted when streaming is complete
+
+         stream_id     (s) — matches the stream_id from CreateChatCompletionStream
+         finish_reason (s) — "stop", "length", "tool_calls", or "error"
+         ───────────────────────────────────────────────────────────────────── -->
+    <signal name="StreamFinished">
+      <arg name="stream_id"    type="s"/>
+      <arg name="finish_reason" type="s"/>
+    </signal>
+
+  </interface>
+</node>

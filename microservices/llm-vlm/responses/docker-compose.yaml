@@ -1,0 +1,84 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yaml — GenAI C++ Microservice (Responses API)
+#
+# Architecture:
+#   - Builder stage: debian:bookworm-slim (glibc 2.36, linux/arm64)
+#   - Runtime stage: responses-runtime (debian:bookworm-slim + fastrpc deps)
+#   - Privilege drop: handled natively by responses-server C++ binary
+#     at startup (before any threads or sockets are opened):
+#       1. glob /dev/fastrpc* and /dev/dma_heap/* → collect host GIDs + chmod 0666
+#       2. stat /usr/share/qcom → collect host GID
+#       3. copy /etc/fastrpc/hexagon-dsp-binaries.yaml → /usr/share/qcom/conf.d/
+#       4. stat /mnt/work/models → detect target UID/GID
+#       5. setgroups / setresgid / setresuid → drop to target user
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Runtime service ──────────────────────────────────────────────────────────
+  genai-responses-service:
+    platform: ${TARGET_ARCH:-linux/arm64}
+    image: genai-responses-server:latest
+    container_name: genai-responses-server
+    hostname: genai-responses
+    working_dir: /mnt/work/models
+    build:
+      context: ..
+      dockerfile: responses/Dockerfile
+      target: responses-runtime
+    ports:
+      - "${RESPONSES_PORT:-9002}:${RESPONSES_PORT:-9002}"
+
+    # DSP/DMA device access — GIDs are detected dynamically at startup
+    devices:
+      - /dev/dma_heap/system
+      - /dev/dma_heap/qcom,system
+      - /dev/fastrpc-cdsp
+      - /dev/fastrpc-cdsp1
+
+    # Required capabilities for DSP access and resource limit management
+    cap_add:
+      - SYS_RESOURCE
+
+    # Memory limits
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    oom_score_adj: -200
+
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 8G
+
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-ERROR}
+      - RESPONSES_PORT=${RESPONSES_PORT:-9002}
+      - GENAI_MODELS_DIR=/mnt/work/models
+      - GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
+      - GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
+      - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
+      - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
+
+    volumes:
+      # fastrpc reads the device model name from this file to select the
+      # correct DSP library path from hexagon-dsp-binaries.yaml
+      - /sys/firmware/devicetree/base/model:/run/device-model:ro
+      # Qualcomm platform config directory — the C++ binary copies
+      # /etc/fastrpc/hexagon-dsp-binaries.yaml into conf.d/ at startup
+      - /usr/share/qcom:/usr/share/qcom
+      # Model bundles directory
+      - ${GENAI_MODEL_DIR:-/etc/models/}:/mnt/work/models/
