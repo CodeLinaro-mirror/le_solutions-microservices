@@ -221,6 +221,7 @@ set(QAI_FORGE_SOURCES
     # Utils (Layer 2)
     src/utils/ImageUtils.cpp
     src/utils/PrivilegeDrop.cpp
+    src/utils/UseLock.cpp
 
     # Backend abstraction (Layer 3 — IGenerativeBackend implementations)
     src/backend/GenIEBackend.cpp
@@ -661,6 +662,9 @@ if(QAI_FORGE_BUILD_LITERT_LM)
     target_include_directories(litert-lm-inference-worker PRIVATE
         ${LITERT_LM_INCLUDE_PATH}
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(litert-lm-inference-worker PRIVATE
+        LITERT_LM_AVAILABLE
     )
     target_link_libraries(litert-lm-inference-worker PRIVATE
         ${LITERT_LM_LIB}

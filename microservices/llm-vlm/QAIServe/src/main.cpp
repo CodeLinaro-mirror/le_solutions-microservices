@@ -12,6 +12,7 @@
 #include "tools/CalculatorTool.h"
 #include "grpc/ChatServiceImpl.h"
 #include "grpc/InferServiceImpl.h"
+#include "admin/ModelAssetLock.h"
 #include <grpcpp/grpcpp.h>
 #include <cstdlib>
 #include <iostream>
@@ -77,6 +78,19 @@ int main() {
             // ── Step 3a: Scan model bundles ───────────────────────────────────
             // ModelConfigManager is a lazy singleton — validateModel() always
             // returns false until scanModelBundles() is called at least once.
+
+            // Clean up orphaned download locks and partial ZIPs from a previous
+            // crash before scanning, so stale locks don't block re-downloads.
+            {
+                const char* models_env = std::getenv("GENAI_MODELS_DIR");
+                const char* tmp_env    = std::getenv("QAISERVE_TMP_DIR");
+                std::string models_dir = (models_env && models_env[0] != '\0')
+                                             ? models_env : "/mnt/work/models";
+                std::string tmp_dir    = (tmp_env && tmp_env[0] != '\0')
+                                             ? tmp_env : "/tmp/qaiserve-downloads";
+                admin::cleanupOnStartup(models_dir, tmp_dir);
+            }
+
             ModelConfigManager::getInstance().scanModelBundles();
             std::cout << "[main] Model bundles scanned." << std::endl;
 

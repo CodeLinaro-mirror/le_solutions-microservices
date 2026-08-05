@@ -133,6 +133,7 @@ void ModelConfigManager::scanModelBundles() {
                              << " (already loaded from a previous bundle)");
                     continue;
                 }
+                config.bundle_path = bundle_path;
                 new_models[config.id] = std::move(config);
 
                 if (new_default.empty()) new_default = config.id;
@@ -173,6 +174,7 @@ void ModelConfigManager::scanModelBundles() {
                                  << " (already loaded from a previous bundle)");
                         continue;
                     }
+                    config.bundle_path = bundle_path;
                     new_models[model_id] = std::move(config);
                     if (new_default.empty()) new_default = model_id;
                     LOG_INFO("[ModelConfigManager] Loaded legacy model: " << model_id);
@@ -192,27 +194,64 @@ void ModelConfigManager::scanModelBundles() {
                 std::ifstream f(bundle_path + "/geniex.json");
                 json manifest = json::parse(f);
 
-                ModelConfig config = parseGenieXJson(manifest, bundle_path);
-                if (config.id.empty()) {
-                    LOG_WARN("[ModelConfigManager] Could not derive id from geniex.json: "
-                             << bundle_name);
-                    continue;
+                auto configs = parseGenieXJson(manifest, bundle_path);
+                for (auto& config : configs) {
+                    if (config.id.empty()) {
+                        LOG_WARN("[ModelConfigManager] Could not derive id from geniex.json: "
+                                 << bundle_name);
+                        continue;
+                    }
+                    std::string geniex_id = config.id;
+                    if (new_models.count(geniex_id)) {
+                        LOG_WARN("[ModelConfigManager] Duplicate model id '" << geniex_id
+                                 << "' — skipping GenieX bundle " << bundle_name
+                                 << " (already loaded from a previous bundle)");
+                        continue;
+                    }
+                    config.bundle_path = bundle_path;
+                    new_models[geniex_id] = std::move(config);
+                    if (new_default.empty()) new_default = geniex_id;
+                    LOG_INFO("[ModelConfigManager] Loaded GenieX model: "
+                             << geniex_id << " from " << bundle_name);
                 }
-                std::string geniex_id = config.id;
-                if (new_models.count(geniex_id)) {
-                    LOG_WARN("[ModelConfigManager] Duplicate model id '" << geniex_id
-                             << "' — skipping GenieX bundle " << bundle_name
-                             << " (already loaded from a previous bundle)");
-                    continue;
-                }
-                new_models[geniex_id] = std::move(config);
-
-                if (new_default.empty()) new_default = geniex_id;
-                LOG_INFO("[ModelConfigManager] Loaded GenieX model: "
-                         << geniex_id << " from " << bundle_name);
 
             } catch (const std::exception& e) {
                 LOG_ERROR("[ModelConfigManager] Error processing GenieX bundle "
+                          << bundle_name << ": " << e.what());
+            }
+        }
+        // ── HF direct download: hf_manifest.json (geniex.json-compatible) ────
+        // Written by HfDirectClient for repos with .task/.tflite/.litertlm files
+        // that GenieX SDK cannot handle. Schema is identical to geniex.json so
+        // parseGenieXJson can be reused directly.
+        else if (fs::exists(bundle_path + "/hf_manifest.json")) {
+            try {
+                std::ifstream f(bundle_path + "/hf_manifest.json");
+                json manifest = json::parse(f);
+
+                auto configs = parseGenieXJson(manifest, bundle_path);
+                for (auto& config : configs) {
+                    if (config.id.empty()) {
+                        LOG_WARN("[ModelConfigManager] Could not derive id from hf_manifest.json: "
+                                 << bundle_name);
+                        continue;
+                    }
+                    std::string hf_id = config.id;
+                    if (new_models.count(hf_id)) {
+                        LOG_WARN("[ModelConfigManager] Duplicate model id '" << hf_id
+                                 << "' — skipping HF bundle " << bundle_name
+                                 << " (already loaded from a previous bundle)");
+                        continue;
+                    }
+                    config.bundle_path = bundle_path;
+                    new_models[hf_id] = std::move(config);
+                    if (new_default.empty()) new_default = hf_id;
+                    LOG_INFO("[ModelConfigManager] Loaded HF direct model: "
+                             << hf_id << " from " << bundle_name);
+                }
+
+            } catch (const std::exception& e) {
+                LOG_ERROR("[ModelConfigManager] Error processing HF bundle "
                           << bundle_name << ": " << e.what());
             }
         }
@@ -266,6 +305,7 @@ void ModelConfigManager::scanModelBundles() {
                 ? static_cast<int>(static_cast<double>(file_bytes) / (1024.0 * 1024.0) * 1.25)
                 : 4096;
 
+            config.bundle_path = entry.path().parent_path().string();
             new_models[model_id] = std::move(config);
             if (new_default.empty()) new_default = model_id;
 
@@ -291,6 +331,18 @@ void ModelConfigManager::scanModelBundles() {
     for (const auto& entry : fs::recursive_directory_iterator(models_dir_)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".gguf") continue;
+
+        // Skip .gguf files whose parent directory already has a geniex.json or
+        // metadata.json manifest — those bundles are registered by a higher-priority
+        // branch and the individual .gguf files (including mmproj) must not be
+        // registered again as separate models.
+        const fs::path parent = entry.path().parent_path();
+        if (fs::exists(parent / "geniex.json") || fs::exists(parent / "metadata.json")) {
+            LOG_DEBUG("[ModelConfigManager] Skipping .gguf auto-discovery for '"
+                      << entry.path().filename().string()
+                      << "' — parent directory has a manifest (geniex.json/metadata.json)");
+            continue;
+        }
 
         const std::string file_path = entry.path().string();
         const std::string stem      = entry.path().stem().string();
@@ -343,6 +395,7 @@ void ModelConfigManager::scanModelBundles() {
                 ? static_cast<int>(static_cast<double>(file_bytes) / (1024.0 * 1024.0) * 1.25)
                 : 4096;
 
+            config.bundle_path = entry.path().parent_path().string();
             new_models[model_id] = std::move(config);
             if (new_default.empty()) new_default = model_id;
 
@@ -666,7 +719,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
 // earlier branch, which wins); this branch primarily serves HuggingFace/GGUF
 // pulls that ship only geniex.json.
 // ─────────────────────────────────────────────────────────────────────────────
-ModelConfig ModelConfigManager::parseGenieXJson(const json& manifest,
+std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifest,
                                                 const std::string& bundle_path) {
     ModelConfig config;
 
@@ -690,7 +743,37 @@ ModelConfig ModelConfigManager::parseGenieXJson(const json& manifest,
     }
 
     config.display_name = manifest.value("display_name", model_id);
-    config.id = model_id + "-" + runtime;
+
+    // Include precision in the id so different quantizations of the same model
+    // get distinct entries (e.g. "Qwen3-VL-4B-Instruct-Q4_K_M-llamacpp").
+    // Priority: geniex.json "Precision" field → ModelFile first key (quant name)
+    // → empty (fall back to plain model_id-runtime).
+    std::string precision = manifest.value("Precision",
+                            manifest.value("precision", std::string("")));
+    if (precision.empty()) {
+        // GenieX SDK does not write Precision into geniex.json; derive it from the
+        // ModelFile object whose key is the quantization name (e.g. "Q4_K_M").
+        // Only pick a key whose file is actually downloaded and present on disk.
+        auto model_file = manifest.value("ModelFile", json::object());
+        if (model_file.is_object() && !model_file.empty()) {
+            for (const auto& [k, v] : model_file.items()) {
+                if (!v.value("Downloaded", false)) continue;
+                std::string fname = v.value("Name", "");
+                if (fname.empty()) continue;
+                if (fs::exists(fs::path(bundle_path) / fname)) {
+                    precision = k;
+                    break;
+                }
+            }
+        }
+    }
+    // Normalise to lowercase for consistent id formatting.
+    for (auto& c : precision) c = static_cast<char>(std::tolower(c));
+    if (!precision.empty()) {
+        config.id = model_id + "-" + precision + "-" + runtime;
+    } else {
+        config.id = model_id + "-" + runtime;
+    }
 
     // ── Modality ──────────────────────────────────────────────────────────────
     // ModelType is "llm"/"vlm" (string). Also honor an int form (0=LLM,1=VLM)
@@ -726,7 +809,67 @@ ModelConfig ModelConfigManager::parseGenieXJson(const json& manifest,
         config.config_file = genie_cfg.string();
     }
 
-    return config;
+    // litert_lm bundles: use the first downloaded ModelFile (.task/.tflite/.litertlm)
+    // as config_file. Each variant gets its own ModelConfig.
+    if (config.config_file.empty() && config.runtime == "litert_lm") {
+        auto model_file = manifest.value("ModelFile", json::object());
+        if (model_file.is_object() && !model_file.empty()) {
+            std::vector<ModelConfig> results;
+            for (const auto& [quant_key, quant_val] : model_file.items()) {
+                if (!quant_val.value("Downloaded", false)) continue;
+                std::string fname = quant_val.value("Name", "");
+                if (fname.empty()) continue;
+                fs::path model_path = fs::path(bundle_path) / fname;
+                if (!fs::exists(model_path)) continue;
+
+                ModelConfig cfg = config;
+                std::string prec = quant_key;
+                for (auto& c : prec) c = static_cast<char>(std::tolower(c));
+                {
+                    std::string base_model_id = manifest.value("ModelName",
+                                               manifest.value("Name", std::string("")));
+                    if (auto slash = base_model_id.find_last_of('/'); slash != std::string::npos)
+                        base_model_id = base_model_id.substr(slash + 1);
+                    cfg.id = base_model_id + "-" + prec + "-" + config.runtime;
+                }
+                cfg.config_file = model_path.string();
+                results.push_back(std::move(cfg));
+            }
+            if (!results.empty()) return results;
+        }
+    }
+
+    // llama_cpp bundles: each downloaded quantization in ModelFile becomes a
+    // separate ModelConfig with its own id and config_file path.
+    if (config.config_file.empty() && config.runtime == "llamacpp") {
+        auto model_file = manifest.value("ModelFile", json::object());
+        if (model_file.is_object() && !model_file.empty()) {
+            std::vector<ModelConfig> results;
+            for (const auto& [quant_key, quant_val] : model_file.items()) {
+                if (!quant_val.value("Downloaded", false)) continue;
+                std::string fname = quant_val.value("Name", "");
+                if (fname.empty()) continue;
+                fs::path gguf_path = fs::path(bundle_path) / fname;
+                if (!fs::exists(gguf_path)) continue;
+
+                ModelConfig cfg = config;  // copy base config
+                std::string prec = quant_key;
+                for (auto& c : prec) c = static_cast<char>(std::tolower(c));
+                {
+                    std::string base_model_id = manifest.value("ModelName",
+                                               manifest.value("Name", std::string("")));
+                    if (auto slash = base_model_id.find_last_of('/'); slash != std::string::npos)
+                        base_model_id = base_model_id.substr(slash + 1);
+                    cfg.id = base_model_id + "-" + prec + "-" + config.runtime;
+                }
+                cfg.config_file = gguf_path.string();
+                results.push_back(std::move(cfg));
+            }
+            if (!results.empty()) return results;
+        }
+    }
+
+    return {config};
 }
 
 

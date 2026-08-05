@@ -56,18 +56,19 @@ git lfs pull
 # ─────────────────────────────────────────────────────────────────────────────
 # Add cc_shared_library target for the LiteRT-LM C API
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Adding cc_shared_library target to c/BUILD..."
-printf '\n# Shared library target for the LiteRT-LM C API.\n# Produces liblitert_lm_c_api.so that can be loaded at runtime.\n# Used by litert-lm-inference-worker in the QAIServe service.\ncc_shared_library(\n    name = "litert_lm_c_api",\n    exports_filter = ["//c:engine"],\n    deps = [":engine"],\n    visibility = ["//visibility:public"],\n)\n' >> c/BUILD
+echo "Adding cc_binary target to c/BUILD..."
+# Uses cc_binary+linkshared+linkstatic so all transitive deps (incl. Rust .a) are
+# statically linked into a single self-contained .so with no Bazel internal NEEDED entries.
+printf '\n# Self-contained shared library for the LiteRT-LM C API.\n# linkstatic=True pulls in all transitive Rust/C++ deps statically.\ncc_binary(\n    name = "liblitert_lm_c_api_full.so",\n    deps = [":engine"],\n    linkshared = True,\n    linkstatic = True,\n    visibility = ["//visibility:public"],\n)\n' >> c/BUILD
 
-echo "Added cc_shared_library target to c/BUILD"
-tail -20 c/BUILD
+echo "Added cc_binary target to c/BUILD"
+tail -10 c/BUILD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build LiteRT-LM with Bazel (using already-built LiteRT via --override_repository)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Building LiteRT-LM with Bazel..."
 
-# Build liblitert_lm_c_api.so as a self-contained shared library
 bazel build \
     --config=linux \
     --config=linux_arm64 \
@@ -79,7 +80,7 @@ bazel build \
     --linkopt=-fuse-ld=lld \
     --http_timeout_scaling=10 \
     --experimental_repository_downloader_retries=10 \
-    //c:litert_lm_c_api
+    //c:liblitert_lm_c_api_full.so
 
 # Build the CLI tools separately with litert_link_capi_so=true so they
 # dynamically load liblitert_runtime_c_api.so at runtime (avoids symbol conflicts)
@@ -110,22 +111,21 @@ mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
          "${LITERT_LM_DEPLOY_DIR}/bin" \
          "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c"
 
-echo "Searching for litert_lm_c_api .so in bazel outputs:"
-find -L bazel-bin bazel-out \( -type f -o -type l \) \
-    \( -name "liblitert_lm_c_api.so" -o -name "liblitert_lm_c_api.so.*" \
-       -o -name "litert_lm_c_api.so" -o -name "litert_lm_c_api.so.*" \
-       -o -name "libGemmaModelConstraintProvider.so" \) \
-    2>/dev/null | tee /tmp/litert_lm_so_files.txt
+# Copy the self-contained .so (linkstatic=True, all deps statically linked)
+CC_BINARY_SO=$(find -L bazel-bin/c -maxdepth 1 -name "liblitert_lm_c_api_full.so" -type f 2>/dev/null | head -1)
+if [ -z "$CC_BINARY_SO" ]; then
+    echo "ERROR: liblitert_lm_c_api_full.so not found in bazel-bin/c"
+    exit 1
+fi
+echo "Staging: $CC_BINARY_SO"
+cp -avL "$CC_BINARY_SO" "${LITERT_LM_DEPLOY_DIR}/lib/liblitert_lm_c_api.so"
 
-echo "Copying found .so files:"
-while IFS= read -r f; do
-    base=$(basename "$f")
-    if echo "$base" | grep -q "^lib"; then
-        cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/" || true
-    else
-        cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/lib${base}" || true
-    fi
-done < /tmp/litert_lm_so_files.txt
+# Copy additional runtime .so files that are dynamically loaded by LiteRT-LM
+# (not statically linked due to plugin architecture)
+find -L bazel-bin -name "libGemmaModelConstraintProvider.so" -type f 2>/dev/null | head -1 | while read f; do
+    echo "Staging runtime plugin: $f"
+    cp -avL "$f" "${LITERT_LM_DEPLOY_DIR}/lib/"
+done
 
 # Copy headers
 cp c/engine.h "${LITERT_LM_DEPLOY_DIR}/include/litert_lm/c/"
@@ -143,6 +143,21 @@ else
             "$tool" > "${LITERT_LM_DEPLOY_DIR}/bin/${tool}"
         chmod +x "${LITERT_LM_DEPLOY_DIR}/bin/${tool}"
     done
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build Rust cdylib wrappers (libllguidance.so) required by liblitert_lm_c_api.so
+# Must run after Bazel so the Bazel cache contains the llguidance Rust source.
+# ─────────────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR}/build-rust-wrappers.sh" ]; then
+    echo "Building Rust wrappers (libllguidance.so)..."
+    chmod +x "${SCRIPT_DIR}/build-rust-wrappers.sh"
+    LITERT_LM_DEPLOY_DIR="${LITERT_LM_DEPLOY_DIR}" \
+        sh "${SCRIPT_DIR}/build-rust-wrappers.sh" || \
+        echo "WARNING: build-rust-wrappers.sh failed or skipped — llg_new_tokenizer may be missing"
+else
+    echo "WARNING: build-rust-wrappers.sh not found, skipping Rust wrappers"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

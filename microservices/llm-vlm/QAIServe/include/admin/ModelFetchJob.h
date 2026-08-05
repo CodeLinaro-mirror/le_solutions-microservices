@@ -18,9 +18,11 @@
 #include <string>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <shared_mutex>
 #include <cstdint>
+#include <cstddef>
 #include <nlohmann/json.hpp>
 
 enum class FetchStatus {
@@ -49,10 +51,14 @@ struct ModelFetchJob {
     std::atomic<int64_t>     bytes_downloaded{0};
     std::atomic<int64_t>     total_bytes{0};
 
-    // Set on completion or failure (written once, then read-only)
+    // Set on completion or failure. Protected because background download
+    // threads update these while GET /admin/models/fetch/{job_id} reads them.
+    mutable std::mutex state_mutex;
     std::string error;
     std::string installed_id;   // e.g. "nomic_embed_text-qnn_dlc" on success
     std::string installed_path; // absolute path to extracted directory
+    bool        cached{false};  // true when file already existed locally (no download)
+    std::string message;        // human-readable note (e.g. "loaded from local cache")
 
     // Convenience
     double progress() const {
@@ -72,6 +78,23 @@ struct ModelFetchJob {
         return "unknown";
     }
 
+    void setError(const std::string& value) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        error = value;
+    }
+
+    void setInstalled(const std::string& id, const std::string& path) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        installed_id = id;
+        installed_path = path;
+    }
+
+    void setCachedMessage(const std::string& value) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        cached = true;
+        message = value;
+    }
+
     nlohmann::json toJson() const {
         FetchStatus s = status.load();
         nlohmann::json j = {
@@ -86,10 +109,14 @@ struct ModelFetchJob {
             {"total_bytes",      total_bytes.load()},
             {"progress",         progress()},
         };
-        if (!chipset.empty())        j["chipset"]        = chipset;
+        if (!chipset.empty()) j["chipset"] = chipset;
+
+        std::lock_guard<std::mutex> lock(state_mutex);
         if (!error.empty())          j["error"]          = error;
         if (!installed_id.empty())   j["installed_id"]   = installed_id;
         if (!installed_path.empty()) j["installed_path"] = installed_path;
+        if (cached)                  j["cached"]         = true;
+        if (!message.empty())        j["message"]        = message;
         return j;
     }
 };
@@ -112,6 +139,21 @@ public:
         const std::string& version,
         const std::string& chipset,
         const std::string& source = "aihub");
+
+    /**
+     * Create a new job only if the current number of active jobs is below
+     * max_active. active_count is set to the count observed under the registry
+     * lock before creation. Returns nullptr when the limit has been reached.
+     */
+    std::shared_ptr<ModelFetchJob> createIfBelowLimit(
+        const std::string& model,
+        const std::string& runtime,
+        const std::string& precision,
+        const std::string& version,
+        const std::string& chipset,
+        const std::string& source,
+        size_t max_active,
+        size_t& active_count);
 
     /**
      * Look up a job by ID. Returns nullptr if not found.

@@ -38,6 +38,7 @@ struct ModelConfig {
     std::string display_name;               // Human-readable name from metadata.json
     std::string config_file;                // Absolute path to the processed genie_config.json in /tmp/configs
     std::string sampler_config_file;        // Absolute path to the processed sampler config (if present)
+    std::string bundle_path;                // Absolute path to the on-disk model bundle directory (source of truth for DELETE/lock lookup)
     int context_size = 4096;                // Max context window in tokens (after capping)
     int memory_requirement_mb = 4096;       // Estimated memory footprint in MB
     bool supports_vision = false;           // True for VLM models
@@ -157,7 +158,7 @@ private:
      * within the bundle directory (no /tmp/configs processing needed).
      * The config id follows the same "{model_id}-{runtime}" convention.
      */
-    ModelConfig parseGenieXJson(const json& manifest, const std::string& bundle_path);
+    std::vector<ModelConfig> parseGenieXJson(const json& manifest, const std::string& bundle_path);
 
     /**
      * Generate a synthetic genie_config.json for VLM models.

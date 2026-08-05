@@ -2,44 +2,31 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// litert-lm-inference-worker — Phase 1: LiteRT-LM Inference Subprocess
+// litert-lm-inference-worker — LiteRT-LM Inference Subprocess
 //
 // This binary is spawned by LiteRTLMWorkerManager (via InferenceWorkerManager
 // with process_type "litert-lm"). It communicates with the parent process via
 // JSON Lines over a Unix Domain Socket (socketpair).
 //
-// Extended IPC Protocol (superset of the GenIE worker protocol):
+// IPC Protocol:
 //
 //   Startup sequence:
 //     1. Worker sends READY (socket connected, binary loaded)
 //     2. Parent sends INIT  { model_id, config_file, sampler_config }
-//     3. Worker loads .litertlm model, extracts metadata
-//     4. Worker sends METADATA { jinja_template, model_type, max_context_length,
-//                                tool_call_delimiter, tool_response_delimiter }
-//     5. Worker sends READY (model loaded, ready for inference)
+//     3. Worker loads .litertlm model via LiteRT-LM engine
+//     4. Worker sends READY (model loaded, ready for inference)
+//     5. Worker sends METADATA { model_type, max_context_length, ... }
 //
 //   Inference sequence (per request):
-//     1. Parent sends EXECUTE { event_id, prompt, streaming, max_tokens,
-//                               temperature, top_p, top_k, inputs[] }
-//     2. Worker runs prefill + decode_async
-//     3. Worker sends TOKEN { event_id, token, finish_reason? } per token
+//     1. Parent sends EXECUTE { event_id, prompt, max_tokens, temperature, ... }
+//     2. Worker creates conversation + calls send_message_stream
+//     3. Worker sends TOKEN { event_id, content } per token
 //     4. Worker sends DONE  { event_id, finish_reason }
 //     5. Worker sends READY (ready for next request)
 //
-//   Reset sequence:
-//     1. Parent sends RESET { command_id }
-//     2. Worker resets KV cache
-//     3. Worker sends READY { command_id }
+//   Reset / Shutdown handled via RESET / SHUTDOWN commands.
 //
-//   Shutdown:
-//     1. Parent sends SHUTDOWN or closes socket
-//     2. Worker exits cleanly
-//
-// The worker is intentionally dumb — no chat templating, no tool call parsing,
-// no context management. All intelligence lives in LiteRTLMOrchestrator.
-//
-// Socket FD is passed via LLM_SOCKET_FD environment variable (same convention
-// as genai-inference-worker, set by InferenceWorkerManager::startWorker).
+// Socket FD is passed via LLM_SOCKET_FD environment variable.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/utils/Logger.h"
@@ -123,8 +110,11 @@ struct LiteRTLMSession {
     std::string tool_response_delimiter;
 
 #ifdef LITERT_LM_AVAILABLE
-    LiteRtLmSession* session = nullptr;
-    LiteRtLmSettings* settings = nullptr;
+    LiteRtLmEngine*             engine              = nullptr;
+    LiteRtLmEngineSettings*     settings            = nullptr;
+    LiteRtLmConversation*       conversation        = nullptr;
+    LiteRtLmConversationConfig* conversation_config = nullptr;
+    LiteRtLmSessionConfig*      session_config      = nullptr;
 #endif
 
     bool loaded = false;
@@ -138,56 +128,90 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
     sess.model_path = model_path;
 
 #ifdef LITERT_LM_AVAILABLE
-    // Create settings
-    if (litert_lm_settings_create(&sess.settings) != kLiteRtLmStatusOk) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create LiteRT-LM settings");
+    // Determine backend from environment (default: npu)
+    const char* backend_env = std::getenv("LITERT_LM_BACKEND");
+    const char* backend_str = backend_env ? backend_env : "npu";
+
+    // Create engine settings with model path and backend
+    sess.settings = litert_lm_engine_settings_create(
+        model_path.c_str(), backend_str, nullptr, nullptr);
+    if (!sess.settings) {
+        LOG_ERROR("[LiteRTLMWorker] Failed to create engine settings for: " << model_path);
         return false;
     }
 
-    // Configure from environment
-    const char* num_threads_env = std::getenv("LITERT_LM_NUM_THREADS");
-    int num_threads = num_threads_env ? std::atoi(num_threads_env) : 4;
-    litert_lm_settings_set_num_threads(sess.settings, num_threads);
+    // Configure max tokens
+    const char* max_tokens_env = std::getenv("LITERT_LM_MAX_TOKENS");
+    int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 4096;
+    litert_lm_engine_settings_set_max_num_tokens(sess.settings, max_tokens);
 
-    // Create session
-    if (litert_lm_session_create(&sess.session, model_path.c_str(), sess.settings)
-            != kLiteRtLmStatusOk) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create LiteRT-LM session for: " << model_path);
-        litert_lm_settings_destroy(sess.settings);
+    // Set dispatch lib dir for QNN NPU support
+    const char* dispatch_lib_dir = std::getenv("LITERT_LM_DISPATCH_LIB_DIR");
+    if (dispatch_lib_dir) {
+        litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+            sess.settings, dispatch_lib_dir);
+    }
+
+    // Create engine (loads model)
+    sess.engine = litert_lm_engine_create(sess.settings);
+    if (!sess.engine) {
+        LOG_ERROR("[LiteRTLMWorker] Failed to create engine for: " << model_path);
+        litert_lm_engine_settings_delete(sess.settings);
         sess.settings = nullptr;
         return false;
     }
 
-    // Extract metadata from session
-    const char* jinja_template_cstr = nullptr;
-    if (litert_lm_session_get_jinja_template(sess.session, &jinja_template_cstr)
-            == kLiteRtLmStatusOk && jinja_template_cstr) {
-        sess.jinja_template = jinja_template_cstr;
+    // Create session config (used by conversation)
+    sess.session_config = litert_lm_session_config_create();
+    if (!sess.session_config) {
+        LOG_ERROR("[LiteRTLMWorker] Failed to create session config");
+        litert_lm_engine_delete(sess.engine);
+        sess.engine = nullptr;
+        litert_lm_engine_settings_delete(sess.settings);
+        sess.settings = nullptr;
+        return false;
+    }
+    litert_lm_session_config_set_apply_prompt_template(sess.session_config, true);
+
+    // Create conversation config
+    sess.conversation_config = litert_lm_conversation_config_create();
+    if (!sess.conversation_config) {
+        LOG_ERROR("[LiteRTLMWorker] Failed to create conversation config");
+        litert_lm_session_config_delete(sess.session_config);
+        sess.session_config = nullptr;
+        litert_lm_engine_delete(sess.engine);
+        sess.engine = nullptr;
+        litert_lm_engine_settings_delete(sess.settings);
+        sess.settings = nullptr;
+        return false;
+    }
+    litert_lm_conversation_config_set_session_config(
+        sess.conversation_config, sess.session_config);
+
+    // Create conversation (manages KV cache across turns)
+    sess.conversation = litert_lm_conversation_create(
+        sess.engine, sess.conversation_config);
+    if (!sess.conversation) {
+        LOG_ERROR("[LiteRTLMWorker] Failed to create conversation for: " << model_path);
+        litert_lm_conversation_config_delete(sess.conversation_config);
+        sess.conversation_config = nullptr;
+        litert_lm_session_config_delete(sess.session_config);
+        sess.session_config = nullptr;
+        litert_lm_engine_delete(sess.engine);
+        sess.engine = nullptr;
+        litert_lm_engine_settings_delete(sess.settings);
+        sess.settings = nullptr;
+        return false;
     }
 
-    const char* model_type_cstr = nullptr;
-    if (litert_lm_session_get_model_type(sess.session, &model_type_cstr)
-            == kLiteRtLmStatusOk && model_type_cstr) {
-        sess.model_type = model_type_cstr;
-    }
-
-    int max_context = 0;
-    if (litert_lm_session_get_max_context_length(sess.session, &max_context)
-            == kLiteRtLmStatusOk) {
-        sess.max_context_length = max_context;
-    }
-
-    const char* tool_call_delim = nullptr;
-    if (litert_lm_session_get_tool_call_delimiter(sess.session, &tool_call_delim)
-            == kLiteRtLmStatusOk && tool_call_delim) {
-        sess.tool_call_delimiter = tool_call_delim;
-    }
-
-    const char* tool_resp_delim = nullptr;
-    if (litert_lm_session_get_tool_response_delimiter(sess.session, &tool_resp_delim)
-            == kLiteRtLmStatusOk && tool_resp_delim) {
-        sess.tool_response_delimiter = tool_resp_delim;
-    }
+    // Set metadata — read from env vars for model-specific overrides,
+    // fall back to generic defaults.
+    sess.model_type = std::string(
+        std::getenv("LITERT_LM_MODEL_TYPE") ? std::getenv("LITERT_LM_MODEL_TYPE") : "unknown");
+    sess.tool_call_delimiter = std::string(
+        std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") ? std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") : "<|tool_call|>");
+    sess.tool_response_delimiter = std::string(
+        std::getenv("LITERT_LM_TOOL_RESPONSE_DELIMITER") ? std::getenv("LITERT_LM_TOOL_RESPONSE_DELIMITER") : "<|tool_response|>");
 
 #else
     // ── Stub mode (no LiteRT-LM SDK at build time) ─────────────────────────
@@ -213,8 +237,10 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
 
 static void resetKvCache(LiteRTLMSession& sess) {
 #ifdef LITERT_LM_AVAILABLE
-    if (sess.session) {
-        litert_lm_session_reset(sess.session);
+    // Conversation is recreated per-request, so KV cache is always clean.
+    if (sess.conversation) {
+        litert_lm_conversation_delete(sess.conversation);
+        sess.conversation = nullptr;
     }
 #else
     (void)sess;
@@ -254,7 +280,7 @@ static void handleGetMetadata(const LiteRTLMSession& sess, const std::string& ev
     json token_msg = {
         {"type", "TOKEN"},
         {"event_id", event_id},
-        {"token", "__METADATA__:" + meta.dump()},
+        {"content", "__METADATA__:" + meta.dump()},
         {"is_final", false}
     };
     sendMessage(token_msg);
@@ -280,121 +306,170 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     // Extended: multimodal inputs array (text + base64 images)
     // If "inputs" is present, use it; otherwise fall back to "prompt"
     std::string text_input = prompt;
-    std::vector<std::string> image_inputs;
 
     if (cmd.contains("inputs") && cmd["inputs"].is_array()) {
         text_input.clear();
         for (const auto& input : cmd["inputs"]) {
-            std::string type = input.value("type", "text");
-            if (type == "text") {
+            if (input.value("type", "text") == "text") {
                 text_input = input.value("content", "");
-            } else if (type == "image") {
-                image_inputs.push_back(input.value("content", ""));
             }
         }
     }
-
-    LOG_DEBUG("[LiteRTLMWorker] handleExecute event_id=" << event_id
-              << " max_tokens=" << max_tokens
-              << " images=" << image_inputs.size());
 
 #ifdef LITERT_LM_AVAILABLE
-    if (!sess.session) {
-        sendError(event_id, "Session not initialized");
+    if (!sess.engine) {
+        sendError(event_id, "Engine not initialized");
         sendReady();
         return;
     }
 
-    // Build input data
-    LiteRtLmInputData* input_data = nullptr;
-    if (litert_lm_input_data_create(&input_data) != kLiteRtLmStatusOk) {
-        sendError(event_id, "Failed to create input data");
+    // Recreate conversation per request to apply per-request max_tokens/sampler.
+    if (sess.conversation) {
+        litert_lm_conversation_delete(sess.conversation);
+        sess.conversation = nullptr;
+    }
+    if (sess.conversation_config) {
+        litert_lm_conversation_config_delete(sess.conversation_config);
+        sess.conversation_config = nullptr;
+    }
+    if (sess.session_config) {
+        litert_lm_session_config_delete(sess.session_config);
+        sess.session_config = nullptr;
+    }
+
+    sess.session_config = litert_lm_session_config_create();
+    LiteRtLmSamplerParams sampler_params;
+    sampler_params.type        = kLiteRtLmSamplerTypeTopP;
+    sampler_params.top_k       = top_k > 0 ? top_k : 40;
+    sampler_params.top_p       = top_p > 0.0f ? top_p : 0.9f;
+    sampler_params.temperature = temperature > 0.0f ? temperature : 0.7f;
+    sampler_params.seed        = 0;
+    litert_lm_session_config_set_sampler_params(sess.session_config, &sampler_params);
+    litert_lm_session_config_set_max_output_tokens(
+        sess.session_config, max_tokens > 0 ? max_tokens : 512);
+    litert_lm_session_config_set_apply_prompt_template(sess.session_config, true);
+
+    sess.conversation_config = litert_lm_conversation_config_create();
+    litert_lm_conversation_config_set_session_config(
+        sess.conversation_config, sess.session_config);
+
+    sess.conversation = litert_lm_conversation_create(
+        sess.engine, sess.conversation_config);
+    if (!sess.conversation) {
+        sendError(event_id, "Failed to create conversation");
         sendReady();
         return;
     }
 
-    // Add text input
-    if (!text_input.empty()) {
-        litert_lm_input_data_add_text(input_data, text_input.c_str());
-    }
+    // Build user message JSON: {"role":"user","content":"<text>"}
+    json user_msg = {{"role", "user"}, {"content", text_input}};
+    std::string message_json = user_msg.dump();
 
-    // Add image inputs (base64-decoded)
-    for (const auto& b64_image : image_inputs) {
-        // Base64 decode
-        static const std::string base64_chars =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::vector<uint8_t> decoded;
-        int val = 0, valb = -8;
-        for (unsigned char c : b64_image) {
-            if (c == '=') break;
-            size_t pos = base64_chars.find(c);
-            if (pos == std::string::npos) continue;
-            val = (val << 6) + static_cast<int>(pos);
-            valb += 6;
-            if (valb >= 0) {
-                decoded.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
-                valb -= 8;
+    auto stream_callback = [](void* user_data, const char* chunk, bool is_final, const char* error_msg) {
+        auto* data = static_cast<StreamCallbackData*>(user_data);
+
+        if (error_msg && error_msg[0] != '\0') {
+            std::string err_str(error_msg);
+            if (err_str.find("Max number of tokens") != std::string::npos ||
+                err_str.find("max_tokens") != std::string::npos) {
+                json done_tok = {
+                    {"type", "TOKEN"},
+                    {"event_id", data->event_id},
+                    {"content", chunk ? std::string(chunk) : ""},
+                    {"is_final", true},
+                    {"finish_reason", "length"}
+                };
+                sendMessage(done_tok);
+                data->done = true;
+                return;
+            }
+            json err_msg = {
+                {"type", "ERROR"},
+                {"event_id", data->event_id},
+                {"message", err_str}
+            };
+            sendMessage(err_msg);
+            data->done = true;
+            return;
+        }
+
+        // chunk may be a JSON response — extract text content, skip thought channels
+        std::string text_chunk;
+        if (chunk) {
+            std::string chunk_str(chunk);
+            if (!chunk_str.empty() && chunk_str[0] == '{') {
+                try {
+                    auto j = json::parse(chunk_str);
+                    // Skip thought/reasoning channels
+                    if (j.contains("channels")) {
+                        // thought channel — skip silently
+                    } else if (j.contains("content") && j["content"].is_array()) {
+                        for (const auto& part : j["content"]) {
+                            if (part.value("type", "") == "text") {
+                                text_chunk += part.value("text", "");
+                            }
+                        }
+                    } else if (j.contains("content") && j["content"].is_string()) {
+                        text_chunk = j.value("content", "");
+                    } else if (j.contains("text")) {
+                        text_chunk = j.value("text", "");
+                    } else {
+                        text_chunk = chunk_str;
+                    }
+                } catch (...) {
+                    text_chunk = chunk_str;
+                }
+            } else {
+                text_chunk = chunk_str;
             }
         }
-        if (!decoded.empty()) {
-            litert_lm_input_data_add_image(input_data, decoded.data(), decoded.size());
-        }
-    }
-
-    // Configure generation parameters
-    LiteRtLmGenerationParams* gen_params = nullptr;
-    litert_lm_generation_params_create(&gen_params);
-    litert_lm_generation_params_set_max_tokens(gen_params, max_tokens);
-    litert_lm_generation_params_set_temperature(gen_params, temperature);
-    litert_lm_generation_params_set_top_p(gen_params, top_p);
-    litert_lm_generation_params_set_top_k(gen_params, top_k);
-
-    // Run prefill
-    LiteRtLmOutput* prefill_output = nullptr;
-    LiteRtLmStatus prefill_status =
-        litert_lm_session_run_prefill(sess.session, input_data, gen_params, &prefill_output);
-
-    litert_lm_input_data_destroy(input_data);
-    litert_lm_generation_params_destroy(gen_params);
-
-    if (prefill_status != kLiteRtLmStatusOk) {
-        sendError(event_id, "Prefill failed");
-        sendReady();
-        return;
-    }
-    if (prefill_output) litert_lm_output_destroy(prefill_output);
-
-    // Run decode async with streaming callback
-    StreamCallbackData cb_data;
-    cb_data.event_id = event_id;
-
-    auto stream_callback = [](void* user_data, const LiteRtLmStreamChunk* chunk) {
-        auto* data = static_cast<StreamCallbackData*>(user_data);
-        if (!chunk) return;
 
         json token_msg = {
             {"type", "TOKEN"},
             {"event_id", data->event_id},
-            {"token", chunk->text ? std::string(chunk->text) : ""},
-            {"is_final", chunk->is_final}
+            {"content", text_chunk},
+            {"is_final", is_final}
         };
-        if (chunk->is_final) {
+        if (is_final) {
             token_msg["finish_reason"] = "stop";
         }
         sendMessage(token_msg);
 
-        if (chunk->is_final) {
+        if (is_final) {
             data->done = true;
         }
     };
 
-    LiteRtLmStatus decode_status =
-        litert_lm_session_run_decode_async(sess.session, stream_callback, &cb_data);
+    StreamCallbackData cb_data;
+    cb_data.event_id = event_id;
 
-    if (decode_status != kLiteRtLmStatusOk) {
-        sendError(event_id, "Decode failed");
+    int gen_status = litert_lm_conversation_send_message_stream(
+        sess.conversation,
+        message_json.c_str(),
+        nullptr,  // extra_context
+        nullptr,  // optional_args
+        stream_callback, &cb_data);
+
+    LOG_INFO("[LiteRTLMWorker] send_message_stream returned status=" << gen_status
+             << " cb_done=" << cb_data.done);
+
+    if (gen_status != 0 && !cb_data.done) {
+        sendError(event_id, "Generate failed with status: " + std::to_string(gen_status));
         sendReady();
         return;
+    }
+
+    // Wait for all callbacks to complete (non-blocking call)
+    {
+        int wait_ms = 0;
+        const int max_wait_ms = 300000; // 5 min
+        while (!cb_data.done && wait_ms < max_wait_ms) {
+            ::usleep(10000); // 10ms
+            wait_ms += 10;
+        }
+        if (!cb_data.done) {
+            LOG_WARN("[LiteRTLMWorker] send_message_stream timed out");
+        }
     }
 
     // Send DONE
@@ -417,7 +492,7 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
         json token_msg = {
             {"type", "TOKEN"},
             {"event_id", event_id},
-            {"token", token},
+            {"content", token},
             {"is_final", false}
         };
         sendMessage(token_msg);
@@ -491,7 +566,13 @@ int main() {
         return 1;
     }
 
-    // Step 4: Send METADATA (model-specific info for orchestrator)
+    // Step 4: Send READY (model loaded, ready for inference)
+    // Must be sent BEFORE METADATA so InferenceWorkerManager::startWorker()
+    // receives READY as expected and returns cleanly.
+    sendReady();
+
+    // Step 5: Send METADATA after READY (LiteRTLMWorkerManager reads it
+    // after base class ensureWorkerRunning() returns).
     json metadata_msg = {
         {"type", "METADATA"},
         {"jinja_template", sess.jinja_template},
@@ -501,9 +582,6 @@ int main() {
         {"tool_response_delimiter", sess.tool_response_delimiter}
     };
     sendMessage(metadata_msg);
-
-    // Step 5: Send READY (model loaded, ready for inference)
-    sendReady();
 
     LOG_INFO("[LiteRTLMWorker] Ready for inference: model=" << model_id);
 
@@ -548,12 +626,24 @@ int main() {
 
     // Cleanup
 #ifdef LITERT_LM_AVAILABLE
-    if (sess.session) {
-        litert_lm_session_destroy(sess.session);
-        sess.session = nullptr;
+    if (sess.conversation) {
+        litert_lm_conversation_delete(sess.conversation);
+        sess.conversation = nullptr;
+    }
+    if (sess.conversation_config) {
+        litert_lm_conversation_config_delete(sess.conversation_config);
+        sess.conversation_config = nullptr;
+    }
+    if (sess.session_config) {
+        litert_lm_session_config_delete(sess.session_config);
+        sess.session_config = nullptr;
+    }
+    if (sess.engine) {
+        litert_lm_engine_delete(sess.engine);
+        sess.engine = nullptr;
     }
     if (sess.settings) {
-        litert_lm_settings_destroy(sess.settings);
+        litert_lm_engine_settings_delete(sess.settings);
         sess.settings = nullptr;
     }
 #endif

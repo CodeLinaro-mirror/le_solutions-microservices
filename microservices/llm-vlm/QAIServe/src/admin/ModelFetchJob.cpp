@@ -9,6 +9,16 @@
 #include <sstream>
 #include <iomanip>
 
+namespace {
+
+bool isActive(FetchStatus status) {
+    return status == FetchStatus::PENDING ||
+           status == FetchStatus::DOWNLOADING ||
+           status == FetchStatus::EXTRACTING;
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ModelFetchJobRegistry — Singleton
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +55,6 @@ std::shared_ptr<ModelFetchJob> ModelFetchJobRegistry::create(
     const std::string& source)
 {
     auto job = std::make_shared<ModelFetchJob>();
-    job->job_id    = generateJobId();
     job->model     = model;
     job->runtime   = runtime;
     job->precision = precision;
@@ -54,6 +63,44 @@ std::shared_ptr<ModelFetchJob> ModelFetchJobRegistry::create(
     job->source    = source;
 
     std::unique_lock lock(mutex_);
+    do {
+        job->job_id = generateJobId();
+    } while (jobs_.count(job->job_id) > 0);
+    jobs_[job->job_id] = job;
+    return job;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// createIfBelowLimit — atomically enforce active download limit
+// ─────────────────────────────────────────────────────────────────────────────
+std::shared_ptr<ModelFetchJob> ModelFetchJobRegistry::createIfBelowLimit(
+    const std::string& model,
+    const std::string& runtime,
+    const std::string& precision,
+    const std::string& version,
+    const std::string& chipset,
+    const std::string& source,
+    size_t max_active,
+    size_t& active_count)
+{
+    auto job = std::make_shared<ModelFetchJob>();
+    job->model     = model;
+    job->runtime   = runtime;
+    job->precision = precision;
+    job->version   = version;
+    job->chipset   = chipset;
+    job->source    = source;
+
+    std::unique_lock lock(mutex_);
+    do {
+        job->job_id = generateJobId();
+    } while (jobs_.count(job->job_id) > 0);
+    active_count = 0;
+    for (const auto& entry : jobs_) {
+        if (isActive(entry.second->status.load())) ++active_count;
+    }
+    if (active_count >= max_active) return nullptr;
+
     jobs_[job->job_id] = job;
     return job;
 }

@@ -6,6 +6,7 @@
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/orchestration/IOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
+#include "qai_forge/utils/UseLock.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -416,7 +417,7 @@ void ModelRuntime::executorLoop() {
                     (!backend_healthy_ || !backend_ || !backend_->isHealthy())) {
                     // Backend died while sitting idle (e.g. drained/reloaded by
                     // WarmModelPool for another model). Don't hand the queued
-                    // job a guaranteed 503 — fail over to Failed so the reload
+                    // job a guaranteed 503 ï¿½ fail over to Failed so the reload
                     // path below picks it back up and the job gets served once
                     // the backend is healthy again, instead of being popped and
                     // rejected here.
@@ -450,6 +451,8 @@ void ModelRuntime::executorLoop() {
                 LOG_INFO("[ModelRuntime] Loading backend: model=" << model_id_);
                 backend_->loadModel(model_id_);
                 LOG_INFO("[ModelRuntime] Backend loaded: model=" << model_id_);
+                // Write use lock so DELETE is blocked while model is in memory
+                qai_forge::writeUseLock(model_id_);
                 std::vector<ModelRuntimeState> load_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -875,10 +878,11 @@ void ModelRuntime::handleCancelWatchdogTimeout(const std::string& job_id) {
 void ModelRuntime::unloadBackend(bool force) {
     try {
         backend_->unloadModel(force);
+        qai_forge::removeUseLock(model_id_);
         LOG_INFO("[ModelRuntime] Backend unloaded: model=" << model_id_
                  << " force=" << (force ? "true" : "false"));
     } catch (...) {
-        LOG_WARN("[ModelRuntime] Backend unload threw and was suppressed: model="
+        LOG_WARN("[ModelRuntime] Backend unload threw and was suppressed; retaining use lock: model="
                  << model_id_);
     }
 }

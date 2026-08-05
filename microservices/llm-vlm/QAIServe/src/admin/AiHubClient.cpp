@@ -21,7 +21,6 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
-#include <cstring>
 #include <stdexcept>
 #include <iostream>
 
@@ -87,6 +86,17 @@ long curlPerform(CURL* h) {
     return http_code;
 }
 
+bool isPathAtOrUnder(const fs::path& candidate, const fs::path& root) {
+    fs::path c = candidate.lexically_normal();
+    fs::path r = root.lexically_normal();
+    if (c == r) return true;
+
+    fs::path rel = c.lexically_relative(r);
+    if (rel.empty()) return false;
+    auto first = rel.begin();
+    return first != rel.end() && *first != "..";
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +153,37 @@ bool AiHubClient::exists(const std::string& url) {
 
     throw AiHubDownloadError(
         "Unexpected HTTP " + std::to_string(code) + " checking " + url);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// contentLength — HTTP HEAD request to read asset size
+// ─────────────────────────────────────────────────────────────────────────────
+int64_t AiHubClient::contentLength(const std::string& url) {
+    try {
+        CurlHandle ch;
+        CURL* h = ch.h;
+
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 1L);
+
+        long code = curlPerform(h);
+        if (code != 200) {
+            std::cerr << "[AiHubClient] Could not read Content-Length for "
+                      << url << ": HTTP " << code << "\n";
+            return 0;
+        }
+
+        curl_off_t content_length = 0;
+        curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
+        return content_length > 0 ? static_cast<int64_t>(content_length) : 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[AiHubClient] Could not read Content-Length for "
+                  << url << ": " << e.what() << "\n";
+        return 0;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +290,26 @@ void AiHubClient::download(const std::string& url,
                 "HTTP " + std::to_string(code) + " downloading " + url);
         }
 
+        if (bytes_so_far > 0 && code == 200) {
+            // Server ignored the Range request. The response was appended to the
+            // partial file, so discard it and restart from byte 0.
+            std::error_code ec;
+            fs::remove(dest, ec);
+            if (ec) {
+                throw AiHubDownloadError(
+                    "Failed to discard partial download " + dest.string() +
+                    ": " + ec.message());
+            }
+            if (attempt < num_retries) {
+                std::cerr << "[AiHubClient] Server ignored resume Range for "
+                          << url << ", restarting download (" << attempt + 1
+                          << "/" << num_retries << ")...\n";
+                continue;
+            }
+            throw AiHubDownloadError(
+                "Server ignored resume Range while downloading " + url);
+        }
+
         // Verify download completeness using Content-Length
         curl_off_t content_length = 0;
         curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
@@ -298,30 +359,32 @@ std::string AiHubClient::extractZip(const std::string& zip_path,
         throw AiHubDownloadError(msg);
     }
 
-    // Extract to a temporary directory first
+    // Extract to a temporary directory first. Remove a stale tmp dir left by a
+    // previous failed extraction so it cannot contaminate this run.
     fs::path tmp_dir = fs::path(dest_dir).parent_path()
                      / (fs::path(dest_dir).filename().string() + ".tmp");
+    fs::remove_all(tmp_dir);
     fs::create_directories(tmp_dir);
 
     zip_int64_t num_entries = zip_get_num_entries(za, 0);
     for (zip_int64_t i = 0; i < num_entries; ++i) {
-        const char* name = zip_get_name(za, i, 0);
-        if (!name) continue;
+        const char* raw_name = zip_get_name(za, i, 0);
+        if (!raw_name) continue;
+
+        std::string name(raw_name);
+        if (name.empty()) continue;
 
         fs::path entry_path = tmp_dir / name;
 
-        // Security: ensure no path traversal
-        auto canonical_tmp = fs::weakly_canonical(tmp_dir);
-        auto canonical_entry = fs::weakly_canonical(entry_path);
-        if (canonical_entry.string().find(canonical_tmp.string()) != 0) {
+        // Security: ensure no path traversal or absolute ZIP entry escapes tmp_dir.
+        if (!isPathAtOrUnder(entry_path, tmp_dir)) {
             zip_close(za);
             fs::remove_all(tmp_dir);
-            throw AiHubDownloadError(
-                "Unsafe ZIP entry detected: " + std::string(name));
+            throw AiHubDownloadError("Unsafe ZIP entry detected: " + name);
         }
 
         // Directory entry
-        if (name[strlen(name) - 1] == '/') {
+        if (name.back() == '/') {
             fs::create_directories(entry_path);
             continue;
         }
@@ -333,17 +396,28 @@ std::string AiHubClient::extractZip(const std::string& zip_path,
         if (!zf) {
             zip_close(za);
             fs::remove_all(tmp_dir);
-            throw AiHubDownloadError(
-                "Cannot open ZIP entry: " + std::string(name));
+            throw AiHubDownloadError("Cannot open ZIP entry: " + name);
         }
 
         std::ofstream out(entry_path, std::ios::binary);
+        if (!out) {
+            zip_fclose(zf);
+            zip_close(za);
+            fs::remove_all(tmp_dir);
+            throw AiHubDownloadError("Cannot write ZIP entry: " + name);
+        }
+
         char buf[65536];
-        zip_int64_t n;
+        zip_int64_t n = 0;
         while ((n = zip_fread(zf, buf, sizeof(buf))) > 0) {
             out.write(buf, n);
         }
         zip_fclose(zf);
+        if (n < 0 || !out) {
+            zip_close(za);
+            fs::remove_all(tmp_dir);
+            throw AiHubDownloadError("Failed while extracting ZIP entry: " + name);
+        }
     }
     zip_close(za);
 
