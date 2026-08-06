@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/backend/QNNBackend.h"
-#include "qai_forge/worker/ConventionalWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <stdexcept>
@@ -13,7 +13,7 @@ static const char* DEFAULT_QNN_WORKER = "/usr/local/bin/qnn-inference-worker";
 QNNBackend::QNNBackend() {
     const char* binary = std::getenv("QNN_WORKER_BINARY");
     if (!binary) binary = DEFAULT_QNN_WORKER;
-    worker_ = std::make_unique<ConventionalWorkerManager>(binary, "qnn");
+    worker_ = std::make_unique<PredictiveWorkerManager>(binary, "qnn");
 }
 
 QNNBackend& QNNBackend::getInstance() {

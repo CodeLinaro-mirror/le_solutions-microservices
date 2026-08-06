@@ -7,14 +7,14 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IInferenceBackend — Layer 3 interface for conventional AI inference
+// IInferenceBackend — Layer 3 interface for Predictive AI inference
 //
 // Implemented by:
 //   LiteRTBackend — wraps TFLite C++ API (TfLiteInterpreter)
 //   QNNBackend    — wraps QNN SDK C++ API
 //
 // Design invariants:
-//   - ConventionalAIOrchestrator ONLY calls methods on this interface.
+//   - PredictiveAIOrchestrator ONLY calls methods on this interface.
 //   - Tensor data is always raw bytes — no base64, no JSON arrays.
 //   - The backend runs in a subprocess (same fault isolation as GenIEBackend).
 //   - infer() is blocking — returns when all outputs are ready.

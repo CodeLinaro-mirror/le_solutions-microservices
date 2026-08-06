@@ -19,18 +19,18 @@
 services:
 
   # ── Runtime service ──────────────────────────────────────────────────────────
-  QAIServe-service:
+  qaiserve-service:
     platform: ${TARGET_ARCH:-linux/arm64}
-    image: QAIServe-server:latest
-    container_name: QAIServe-server
-    hostname: QAIServe
+    image: qaiserve-server:latest
+    container_name: qaiserve-server
+    hostname: qaiserve
     working_dir: /mnt/work/models
     build:
       context: ..
       dockerfile: QAIServe/Dockerfile
-      target: QAIServe-runtime
+      target: qaiserve-runtime
     ports:
-      - "${QAIServe_PORT:-9002}:${QAIServe_PORT:-9002}"
+      - "${QAISERVE_PORT:-9002}:${QAISERVE_PORT:-9002}"
 
     # DSP/DMA device access — GIDs are detected dynamically at startup
     devices:
@@ -66,7 +66,7 @@ services:
 
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-ERROR}
-      - QAIServe_PORT=${QAIServe_PORT:-9002}
+      - QAISERVE_PORT=${QAISERVE_PORT:-9002}
       - GENAI_MODELS_DIR=/mnt/work/models
 
       # Generative AI workers (GenIE — LLM + VLM)
@@ -75,16 +75,16 @@ services:
       - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
       - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
 
-      # QNN conventional AI worker
+      # QNN Predictive AI worker
       - QNN_WORKER_BINARY=/usr/bin/qnn-inference-worker
       - QNN_BACKEND_LIB=/usr/lib/libQnnHtp.so
       - QNN_SYS_LIB=/usr/lib/libQnnSystem.so
 
-      # SNPE conventional AI worker
+      # SNPE Predictive AI worker
       - SNPE_WORKER_BINARY=/usr/bin/snpe-inference-worker
       - SNPE_DELEGATE=${SNPE_DELEGATE:-dsp}
 
-      # LiteRT conventional AI worker
+      # LiteRT Predictive AI worker
       - LITERT_WORKER_BINARY=/usr/bin/litert-inference-worker
       - LITERT_DISPATCH_DIR=/usr/lib
       - LITERT_COMPILER_PLUGIN_DIR=/usr/lib

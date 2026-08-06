@@ -37,6 +37,7 @@ public:
     void handleStreaming(const CreateChatCompletionRequest& request, StreamCallback callback) override;
     bool deleteSession(const std::string& completion_id) override;
     bool cancelSession(const std::string& completion_id) override;
+    void resetKvCache(const std::string& model_id) override;
 
     /**
      * @brief Execute a blocking chat request using the supplied backend.

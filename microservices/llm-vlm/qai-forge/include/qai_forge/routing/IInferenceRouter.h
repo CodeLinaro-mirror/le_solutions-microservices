@@ -12,11 +12,11 @@
 //
 // Routes incoming requests to the correct orchestrator based on model_type:
 //   "generative"   → ChatOrchestrator (LLM/VLM — existing pipeline)
-//   "conventional" → ConventionalAIOrchestrator (classification/detection)
+//   "predictive" → PredictiveAIOrchestrator (classification/detection)
 //
 // The transport layer (Layer 1) calls this interface instead of calling
 // ChatOrchestrator directly. This allows the same transport to serve both
-// generative and conventional AI models.
+// generative and Predictive AI models.
 //
 // Design invariant: Layer 1 controllers NEVER branch on model type.
 // They call IInferenceRouter and let it dispatch to the correct orchestrator.
@@ -33,7 +33,7 @@ public:
     /**
      * Handle a non-streaming generative AI request.
      * Routes to ChatOrchestrator::handleBlocking() for "generative" models.
-     * Throws GenAIException for "conventional" models (wrong endpoint).
+     * Throws GenAIException for "predictive" models (wrong endpoint).
      */
     virtual StandardResponse handleBlocking(
         const CreateChatCompletionRequest& request) = 0;
@@ -41,7 +41,7 @@ public:
     /**
      * Handle a streaming generative AI request.
      * Routes to ChatOrchestrator::handleStreaming() for "generative" models.
-     * Throws GenAIException for "conventional" models (wrong endpoint).
+     * Throws GenAIException for "predictive" models (wrong endpoint).
      */
     virtual void handleStreaming(
         const CreateChatCompletionRequest& request,
@@ -57,11 +57,11 @@ public:
      */
     virtual bool cancelSession(const std::string& completion_id) = 0;
 
-    // ── Conventional AI path (new) ────────────────────────────────────────────
+    // ── Predictive AI path (new) ────────────────────────────────────────────
 
     /**
-     * Handle a conventional AI tensor inference request.
-     * Routes to ConventionalAIOrchestrator for "conventional" models.
+     * Handle a Predictive AI tensor inference request.
+     * Routes to PredictiveAIOrchestrator for "predictive" models.
      * Returns a 501 Not Implemented response for "generative" models
      * (wrong endpoint — use /v1/chat/completions instead).
      */

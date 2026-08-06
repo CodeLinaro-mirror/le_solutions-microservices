@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTBackend — IInferenceBackend implementation for LiteRT conventional AI
+// LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
 //
-// Manages the litert-inference-worker subprocess via ConventionalWorkerManager.
+// Manages the litert-inference-worker subprocess via PredictiveWorkerManager.
 // The worker binary path is resolved from the LITERT_WORKER_BINARY environment
 // variable (default: /usr/local/bin/litert-inference-worker).
 //
@@ -16,7 +16,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/LiteRTBackend.h"
-#include "qai_forge/worker/ConventionalWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <stdexcept>
@@ -31,7 +31,7 @@ static const char* DEFAULT_COMPILER_PLUGIN_DIR = "/usr/lib";
 LiteRTBackend::LiteRTBackend() {
     const char* binary = std::getenv("LITERT_WORKER_BINARY");
     if (!binary) binary = DEFAULT_LITERT_WORKER;
-    worker_ = std::make_unique<ConventionalWorkerManager>(binary, "litert");
+    worker_ = std::make_unique<PredictiveWorkerManager>(binary, "litert");
 }
 
 LiteRTBackend& LiteRTBackend::getInstance() {

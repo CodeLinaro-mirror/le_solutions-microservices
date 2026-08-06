@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConventionalAIOrchestrator — Layer 2 orchestrator for conventional AI
+// PredictiveAIOrchestrator — Layer 2 orchestrator for Predictive AI
 //
 // Routes tensor inference requests to QNNBackend or SNPEBackend based on
 // the model's "runtime" field in metadata.json.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "qai_forge/orchestration/ConventionalAIOrchestrator.h"
+#include "qai_forge/orchestration/PredictiveAIOrchestrator.h"
 #include "qai_forge/backend/LiteRTBackend.h"
 #include "qai_forge/backend/QNNBackend.h"
 #include "qai_forge/backend/SNPEBackend.h"
@@ -18,12 +18,12 @@
 #include "qai_forge/utils/Logger.h"
 #include <stdexcept>
 
-ConventionalAIOrchestrator& ConventionalAIOrchestrator::getInstance() {
-    static ConventionalAIOrchestrator instance;
+PredictiveAIOrchestrator& PredictiveAIOrchestrator::getInstance() {
+    static PredictiveAIOrchestrator instance;
     return instance;
 }
 
-TensorInferenceResponse ConventionalAIOrchestrator::handleInfer(
+TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
     const TensorInferenceRequest& request)
 {
     auto& cfg = ModelConfigManager::getInstance();
@@ -38,7 +38,7 @@ TensorInferenceResponse ConventionalAIOrchestrator::handleInfer(
 
     // Validate model type
     std::string model_type = cfg.getModelType(request.model);
-    if (model_type != "conventional") {
+    if (model_type != "predictive") {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
             "Model '" + request.model + "' is a generative model. "
@@ -59,7 +59,7 @@ TensorInferenceResponse ConventionalAIOrchestrator::handleInfer(
     } else {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
-            "Unknown conventional AI runtime '" + runtime + "' for model '" + request.model + "'.",
+            "Unknown Predictive AI runtime '" + runtime + "' for model '" + request.model + "'.",
             400);
     }
 
@@ -72,7 +72,7 @@ TensorInferenceResponse ConventionalAIOrchestrator::handleInfer(
         backend->initialize(request.model, "");
     }
 
-    LOG_DEBUG("[ConventionalAIOrchestrator] Routing model='" << request.model
+    LOG_DEBUG("[PredictiveAIOrchestrator] Routing model='" << request.model
               << "' runtime='" << runtime << "' to " << backend->name());
 
     // Run inference

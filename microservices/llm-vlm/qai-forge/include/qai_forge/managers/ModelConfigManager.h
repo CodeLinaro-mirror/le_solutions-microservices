@@ -51,11 +51,11 @@ struct ModelConfig {
 
     // Model type from metadata.json "model_type" field.
     // "generative"   — LLM/VLM models (routed to GenerativeOrchestrator)
-    // "conventional" — classification/detection/segmentation (routed to ConventionalAIOrchestrator)
+    // "predictive" — classification/detection/segmentation (routed to PredictiveAIOrchestrator)
     // Defaults to "generative" for backward compatibility with existing bundles.
     std::string model_type = "generative";
 
-    // Tensor specs for conventional AI models (from metadata.json)
+    // Tensor specs for Predictive AI models (from metadata.json)
     std::vector<ModelTensorSpec> input_specs;
     std::vector<ModelTensorSpec> output_specs;
 };
@@ -108,7 +108,7 @@ public:
     // Used by BackendFactory to select the correct IGenerativeBackend implementation.
     std::string getRuntime(const std::string& model_id) const;
 
-    // Returns the model type ("generative" or "conventional").
+    // Returns the model type ("generative" or "predictive").
     // Returns "generative" if the model is not found (safe default).
     // Used by InferenceRouter to select the correct orchestrator.
     std::string getModelType(const std::string& model_id) const;

@@ -3,48 +3,58 @@
 
 #pragma once
 
+// ─────────────────────────────────────────────────────────────────────────────
+// InferController — OIP v2 Inference Endpoints
+//
+// Implements the Open Inference Protocol v2 inference endpoints for both
+// Predictive AI and Generative AI models.
+//
+// Routes:
+//   POST /v2/models/{model}/infer            — Predictive AI tensor inference
+//                                              (JSON or binary extension)
+//   POST /v2/models/{model}/generate         — Generative AI blocking inference
+//                                              (JSON or multipart for VLM)
+//   POST /v2/models/{model}/generate_stream  — Generative AI SSE streaming
+//   GET  /v2/health/ready                    — server ready check
+//   GET  /v2/health/live                     — server live check
+//
+// Model discovery (GET /v2/models, GET /v2/models/{model}) is handled by
+// ModelsController to keep routing concerns separate.
+//
+// Statelessness for generative models:
+//   /generate and /generate_stream call ChatOrchestrator::resetKvCache()
+//   before and after each inference to ensure clean Genie KV cache state.
+//   This is the OIP stateless contract — each request is independent.
+//
+// Binary extension for /infer:
+//   Content-Type: application/octet-stream
+//   Inference-Header-Content-Length: <N>
+//   Body: <N bytes JSON header><raw tensor bytes>
+//
+// Multipart for /generate (VLM images):
+//   Content-Type: multipart/form-data
+//   Parts: "request" (JSON) + "image_0", "image_1", ... (raw image bytes)
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include <drogon/HttpController.h>
 #include <string>
 
 using namespace drogon;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// InferController — Layer 1 (KFServing v2 Inference Protocol)
-//
-// Implements the KFServing v2 / Open Inference Protocol for conventional AI
-// models (classification, detection, segmentation).
-//
-// Routes:
-//   POST /v2/models/{model}/infer   — run tensor inference
-//   GET  /v2/models/{model}         — get model metadata (input/output specs)
-//   GET  /v2/health/ready           — server ready check
-//   GET  /v2/health/live            — server live check
-//
-// Responsibilities (Layer 1 only):
-//   1. Parse KFServing v2 JSON request → TensorInferenceRequest (raw bytes)
-//   2. Call IInferenceRouter::handleInfer() → TensorInferenceResponse
-//   3. Format TensorInferenceResponse → KFServing v2 JSON response
-//
-// This layer MUST NOT contain any inference logic.
-// All routing and inference is handled by qai-forge (Layers 2-4).
-//
-// KFServing v2 data encoding:
-//   "data" field is a flat JSON array of numbers.
-//   FP32 → each float stored as 4 bytes (little-endian).
-//   INT8/UINT8 → each value stored as 1 byte.
-//   INT32/UINT32 → each value stored as 4 bytes.
-// ─────────────────────────────────────────────────────────────────────────────
-
 class InferController : public drogon::HttpController<InferController> {
 public:
     METHOD_LIST_BEGIN
-        // POST /v2/models/{model}/infer — KFServing v2 inference
+        // POST /v2/models/{model}/infer — Predictive AI (JSON or binary extension)
         ADD_METHOD_TO(InferController::infer,
                       "/v2/models/{1}/infer", Post, Options);
 
-        // GET /v2/models/{model} — model metadata (input/output specs)
-        ADD_METHOD_TO(InferController::getModelInfo,
-                      "/v2/models/{1}", Get, Options);
+        // POST /v2/models/{model}/generate — Generative AI blocking
+        ADD_METHOD_TO(InferController::generate,
+                      "/v2/models/{1}/generate", Post, Options);
+
+        // POST /v2/models/{model}/generate_stream — Generative AI SSE streaming
+        ADD_METHOD_TO(InferController::generateStream,
+                      "/v2/models/{1}/generate_stream", Post, Options);
 
         // GET /v2/health/ready — server ready (models loaded)
         ADD_METHOD_TO(InferController::healthReady,
@@ -58,28 +68,47 @@ public:
     /**
      * POST /v2/models/{model}/infer
      *
-     * Parses KFServing v2 inference request, runs inference via
-     * ConventionalAIOrchestrator, returns KFServing v2 response.
+     * Runs Predictive AI tensor inference via PredictiveAIOrchestrator.
+     * Supports both JSON and binary extension (Inference-Header-Content-Length).
+     * Returns OIP v2 inference response.
      */
     void infer(const HttpRequestPtr& req,
                std::function<void(const HttpResponsePtr&)>&& callback,
                const std::string& model_name);
 
     /**
-     * GET /v2/models/{model}
+     * POST /v2/models/{model}/generate
      *
-     * Returns model metadata: name, platform, input/output tensor specs.
-     * Only available for conventional AI models (model_type == "conventional").
+     * Runs Generative AI inference (blocking) via ChatOrchestrator.
+     * Accepts:
+     *   - JSON: { "text_input": "...", "parameters": {...} }
+     *   - JSON: { "messages": [...], "parameters": {...} }  (server applies template)
+     *   - Multipart: "request" part (JSON) + "image_N" parts (raw bytes, VLM only)
+     *
+     * Stateless: resets Genie KV cache before and after inference.
      */
-    void getModelInfo(const HttpRequestPtr& req,
-                      std::function<void(const HttpResponsePtr&)>&& callback,
-                      const std::string& model_name);
+    void generate(const HttpRequestPtr& req,
+                  std::function<void(const HttpResponsePtr&)>&& callback,
+                  const std::string& model_name);
+
+    /**
+     * POST /v2/models/{model}/generate_stream
+     *
+     * Runs Generative AI inference with SSE streaming via ChatOrchestrator.
+     * Same request format as /generate.
+     * Response: text/event-stream with OipStreamChunk JSON per token.
+     *
+     * Stateless: resets Genie KV cache before and after inference.
+     */
+    void generateStream(const HttpRequestPtr& req,
+                        std::function<void(const HttpResponsePtr&)>&& callback,
+                        const std::string& model_name);
 
     /**
      * GET /v2/health/ready
      *
-     * Returns 200 if the server has scanned model bundles and is ready
-     * to serve requests. Returns 503 if not ready.
+     * Returns 200 if the server has scanned model bundles and is ready.
+     * Returns 503 if not ready.
      */
     void healthReady(const HttpRequestPtr& req,
                      std::function<void(const HttpResponsePtr&)>&& callback);

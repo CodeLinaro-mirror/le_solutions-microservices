@@ -80,11 +80,14 @@ void ModelConfigManager::scanModelBundles() {
                 }
 
                 ModelConfig config = parseMetadataJson(metadata, bundle_path, processed_dir);
-                config.id = model_id;
-                new_models[model_id] = std::move(config);
+                // Model ID convention: "{model_id}-{runtime}"
+                // e.g. "qwen3_4b_instruct_2507-genie", "nomic_embed_text-qnn_dlc"
+                std::string runtime_str = metadata.value("runtime", "genie");
+                config.id = model_id + "-" + runtime_str;
+                new_models[config.id] = std::move(config);
 
-                if (new_default.empty()) new_default = model_id;
-                LOG_INFO("[ModelConfigManager] Loaded model: " << model_id
+                if (new_default.empty()) new_default = model_id + "-" + runtime_str;
+                LOG_INFO("[ModelConfigManager] Loaded model: " << model_id + "-" + runtime_str
                          << " from " << bundle_name);
 
             } catch (const std::exception& e) {
@@ -251,10 +254,10 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     // ── Model type ────────────────────────────────────────────────────────────
     // Read from metadata.json "model_type" field. Defaults to "generative" for
     // backward compatibility — all existing bundles are generative models.
-    // "conventional" is used for classification/detection/segmentation models.
+    // "predictive" is used for classification/detection/segmentation models.
     config.model_type = metadata.value("model_type", "generative");
 
-    // ── Tensor Specs (for conventional AI) ────────────────────────────────────
+    // ── Tensor Specs (for Predictive AI) ────────────────────────────────────
     if (metadata.contains("input_specs") && metadata["input_specs"].is_array()) {
         for (const auto& spec_json : metadata["input_specs"]) {
             ModelTensorSpec spec;

@@ -47,7 +47,224 @@ bool requestHasTools(const CreateChatCompletionRequest& request) {
     return !request.tools.value().empty();
 }
 
-std::string generateEventId() {
+ChatOrchestratorImpl& ChatOrchestratorImpl::getInstance() {
+    static ChatOrchestratorImpl instance;
+    return instance;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor — initialize backend_ and build middleware pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+ChatOrchestratorImpl::ChatOrchestratorImpl()
+    : backend_(GenIEBackend::getInstance())
+{
+    buildMiddlewarePipeline();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildMiddlewarePipeline — construct pipeline from BackendCapabilities
+//
+// This is the key Phase 2 change: the middleware pipeline is built dynamically
+// from backend capabilities instead of being hardcoded in handleBlocking() and
+// handleStreaming(). Adding a new backend with different capabilities requires
+// zero changes to this method — only BackendCapabilities changes.
+// ─────────────────────────────────────────────────────────────────────────────
+void ChatOrchestratorImpl::buildMiddlewarePipeline() {
+    const BackendCapabilities caps = backend_.capabilities();
+
+    middleware_pipeline_.clear();
+
+    // Step 1: Concurrency middleware — shape depends on backend
+    switch (caps.concurrency_model) {
+        case ConcurrencyModel::EXCLUSIVE:
+            // GenIE, LiteRT LM: one inference at a time (DSP/GPU hardware lock)
+            middleware_pipeline_.push_back(
+                std::make_unique<ExclusiveLockMiddleware>(300000));
+            LOG_INFO("[ChatOrchestratorImpl] Middleware: ExclusiveLockMiddleware (timeout=300s)");
+            break;
+        case ConcurrencyModel::BOUNDED:
+            // OnnxRT (future): up to N concurrent inferences
+            // BoundedConcurrencyMiddleware will be added in Phase 6
+            LOG_INFO("[ChatOrchestratorImpl] Middleware: BoundedConcurrency (max="
+                     << caps.max_concurrent << ") — not yet implemented, no lock");
+            break;
+        case ConcurrencyModel::UNLIMITED:
+            // CPU-only: no concurrency limit
+            LOG_INFO("[ChatOrchestratorImpl] Middleware: no concurrency limit");
+            break;
+    }
+
+    // Step 2: Context compaction middleware — always added
+    // ContextCompactionMiddleware calls backend.onContextCompacted() after
+    // summarization — GenIE: sendReset(); OnnxRT: no-op.
+    middleware_pipeline_.push_back(
+        std::make_unique<ContextCompactionMiddleware>(
+            caps.context_window,
+            caps.compaction_threshold,
+            caps.context_strategy));
+    LOG_INFO("[ChatOrchestratorImpl] Middleware: ContextCompactionMiddleware"
+             << " (window=" << caps.context_window
+             << " threshold=" << caps.compaction_threshold
+             << " strategy=" << (caps.context_strategy == ContextStrategy::RESET_KV
+                                 ? "RESET_KV" : "FULL_RECOMPUTE") << ")");
+
+    LOG_INFO("[ChatOrchestratorImpl] Middleware pipeline built: "
+             << middleware_pipeline_.size() << " stage(s) for backend '"
+             << backend_.name() << "'");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 1: validateRequest
+// ─────────────────────────────────────────────────────────────────────────────
+void ChatOrchestratorImpl::validateRequest(const CreateChatCompletionRequest& request) {
+    auto& config_mgr = ModelConfigManager::getInstance();
+    if (!config_mgr.validateModel(request.model)) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + request.model + "' not found. Check /v1/models for available models.",
+            404
+        );
+    }
+    if (request.messages.empty() || !request.messages.is_array()) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "messages array is required and must not be empty.",
+            400
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 2: resolveSessionAndDraft
+// ─────────────────────────────────────────────────────────────────────────────
+std::pair<std::shared_ptr<ConversationSession>, DraftTurn>
+ChatOrchestratorImpl::resolveSessionAndDraft(const CreateChatCompletionRequest& request) {
+    auto& session_mgr = SessionManager::getInstance();
+
+    std::string session_id;
+    if (request.user.has_value() && !request.user.value().empty()) {
+        session_id = request.user.value();
+    } else {
+        std::string hash = SessionManager::calculateMessagesHash(request.messages);
+        auto existing = session_mgr.findByHash(hash);
+        if (existing) {
+            session_id = existing->session_id;
+        } else {
+            session_id = SessionManager::generateSessionId();
+        }
+    }
+
+    auto [session, is_new] = session_mgr.findOrCreate(session_id, request.user.value_or("default_user"));
+
+    DraftTurn draft(session_id, request.model);
+
+    if (is_new) {
+        for (const auto& msg : request.messages) {
+            draft.addMessage(msg);
+        }
+    } else {
+        size_t existing_count = session->messages.size();
+        size_t incoming_count = request.messages.size();
+        if (incoming_count > existing_count) {
+            for (size_t i = existing_count; i < incoming_count; ++i) {
+                draft.addMessage(request.messages[i]);
+            }
+        }
+    }
+
+    return {session, std::move(draft)};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 3a: isToolContinuation (ToolMiddleware)
+// ─────────────────────────────────────────────────────────────────────────────
+bool ChatOrchestratorImpl::isToolContinuation(const ConversationSession& session,
+                                               const CreateChatCompletionRequest& request) const {
+    if (request.messages.empty()) return false;
+    const auto& last_msg = request.messages.back();
+    if (!last_msg.is_object()) return false;
+    return last_msg.value("role", "") == "tool";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildContextPrompt — Context Compaction (Section 6)
+// ─────────────────────────────────────────────────────────────────────────────
+std::string ChatOrchestratorImpl::buildContextPrompt(const ConversationSession& session,
+                                                      const CreateChatCompletionRequest& request) const {
+    // OIP raw prompt mode: client pre-formatted the prompt, use it directly.
+    // Bypasses chat template application — used by /v2/models/{m}/generate
+    // when "text_input" is provided instead of "messages".
+    if (request.raw_prompt.has_value() && !request.raw_prompt->empty()) {
+        return request.raw_prompt.value();
+    }
+
+    auto& config_mgr = ModelConfigManager::getInstance();
+    json chat_template = config_mgr.getChatTemplate(request.model);
+    const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
+
+    std::string system_prefix = chat_template.value("system_prefix", "<|system|>\n");
+    std::string system_suffix = chat_template.value("system_suffix", "\n");
+    std::string user_prefix = chat_template.value("user_prefix", "<|user|>\n");
+    std::string user_suffix = chat_template.value("user_suffix", "\n");
+    std::string assistant_prefix = chat_template.value("assistant_prefix", "<|assistant|>\n");
+    std::string assistant_suffix = chat_template.value("assistant_suffix", "\n");
+
+    std::ostringstream prompt;
+
+    // 1. System prompt (with tool instructions injected by adapter)
+    std::string user_system;
+    for (const auto& msg : request.messages) {
+        if (msg.value("role", "") == "system") {
+            user_system = msg.value("content", "");
+            break;
+        }
+    }
+    json tools = request.tools.value_or(json::array());
+    std::string system_content = adapter.buildSystemPrompt(chat_template, user_system, tools);
+    if (!system_content.empty()) {
+        prompt << system_prefix << system_content << system_suffix;
+    }
+
+    // 2. Summary (if available)
+    if (!session.summary_content.empty()) {
+        prompt << system_prefix << "[Summary of previous conversation]: "
+               << session.summary_content << system_suffix;
+    }
+
+    // 3. Clean message history (strips private "_*" keys like "_thinking_content")
+    auto clean_messages = session.getCleanMessages();
+    for (const auto& msg : clean_messages) {
+        std::string role = msg.value("role", "");
+        std::string content = msg.value("content", "");
+        if (role == "user") {
+            prompt << user_prefix << content << user_suffix;
+        } else if (role == "assistant") {
+            prompt << assistant_prefix << content << assistant_suffix;
+        }
+    }
+
+    // 4. New messages from the draft (preprocessed by model adapter for vision)
+    json processed_messages = adapter.preprocessVision(request.messages);
+    for (const auto& msg : processed_messages) {
+        std::string role = msg.value("role", "");
+        std::string content = msg.value("content", "");
+        if (role == "user") {
+            prompt << user_prefix << content << user_suffix;
+        } else if (role == "tool") {
+            prompt << user_prefix << adapter.formatToolResponse(json::array({msg})) << user_suffix;
+        }
+    }
+
+    // 5. Assistant turn start
+    prompt << assistant_prefix;
+
+    return prompt.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generateEventId — unique ID for each inference event
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string generateEventId() {
     static std::mt19937_64 rng(std::random_device{}());
     std::ostringstream oss;
     oss << "evt-" << std::hex << rng();
@@ -1000,4 +1217,18 @@ bool ChatOrchestratorImpl::cancelSession(const std::string& completion_id) {
     // (LLM or VLM) based on current_is_vlm_ and sends SIGKILL.
     backend_.terminateWorker(/*force=*/true);
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resetKvCache — OIP stateless inference support
+//
+// Called by QAIServe's OIP /generate endpoint before and after each stateless
+// inference request to ensure clean KV cache state.
+//
+// Maps to IGenerativeBackend::resetKv() which calls the Genie cache reset API
+// (or is a no-op for backends that are inherently stateless).
+// ─────────────────────────────────────────────────────────────────────────────
+void ChatOrchestratorImpl::resetKvCache(const std::string& model_id) {
+    LOG_DEBUG("[ChatOrchestratorImpl] resetKvCache for model: " << model_id);
+    backend_.resetKv();
 }

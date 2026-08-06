@@ -39,9 +39,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ── Build options ─────────────────────────────────────────────────────────────
 option(QAI_FORGE_BUILD_WORKERS  "Build genai-inference-worker binaries" ON)
 option(QAI_FORGE_BUILD_GENAILIB "Build genai-lib (Layer 4)" ON)
-option(QAI_FORGE_BUILD_QNN       "Build QNN conventional AI engine + worker" OFF)
-option(QAI_FORGE_BUILD_SNPE      "Build SNPE conventional AI engine + worker" OFF)
-option(QAI_FORGE_BUILD_LITERT    "Build LiteRT conventional AI engine + worker" OFF)
+option(QAI_FORGE_BUILD_QNN       "Build QNN Predictive AI engine + worker" OFF)
+option(QAI_FORGE_BUILD_SNPE      "Build SNPE Predictive AI engine + worker" OFF)
+option(QAI_FORGE_BUILD_LITERT    "Build LiteRT Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_LITERT_LM "Build LiteRT-LM generative worker" OFF)
 option(QAI_FORGE_INSTALL         "Install targets and CMake package config" ON)
 
@@ -203,7 +203,7 @@ set(QAI_FORGE_SOURCES
     src/backend/GenIEBackend.cpp
     src/backend/BackendFactory.cpp
 
-    # Conventional AI backends (Layer 3 — IInferenceBackend implementations)
+    # Predictive AI backends (Layer 3 — IInferenceBackend implementations)
     src/backend/QNNBackend.cpp
     src/backend/SNPEBackend.cpp
     src/backend/LiteRTBackend.cpp
@@ -218,13 +218,13 @@ set(QAI_FORGE_SOURCES
     src/orchestration/ExclusiveLockMiddleware.cpp
     src/orchestration/ContextCompactionMiddleware.cpp
 
-    # Conventional AI orchestration (Layer 2)
-    src/orchestration/ConventionalAIOrchestrator.cpp
+    # Predictive AI orchestration (Layer 2)
+    src/orchestration/PredictiveAIOrchestrator.cpp
 
     # Worker management (Layer 3)
     src/worker/InferenceWorkerManager.cpp
     src/worker/VlmInferenceWorkerManager.cpp
-    src/worker/ConventionalWorkerManager.cpp
+    src/worker/PredictiveWorkerManager.cpp
 )
 
 add_library(qai_forge SHARED ${QAI_FORGE_SOURCES})
@@ -301,7 +301,7 @@ if(QAI_FORGE_BUILD_WORKERS AND QAI_FORGE_BUILD_GENAILIB)
 endif() # QAI_FORGE_BUILD_WORKERS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QNN engine + worker (conventional AI — QNN context binary)
+# QNN engine + worker (Predictive AI — QNN context binary)
 # ─────────────────────────────────────────────────────────────────────────────
 if(QAI_FORGE_BUILD_QNN AND QAI_FORGE_BUILD_WORKERS)
 
@@ -352,7 +352,7 @@ if(QAI_FORGE_BUILD_QNN AND QAI_FORGE_BUILD_WORKERS)
 endif() # QAI_FORGE_BUILD_QNN
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SNPE engine + worker (conventional AI — SNPE DLC container)
+# SNPE engine + worker (Predictive AI — SNPE DLC container)
 # ─────────────────────────────────────────────────────────────────────────────
 if(QAI_FORGE_BUILD_SNPE AND QAI_FORGE_BUILD_WORKERS)
 
@@ -403,7 +403,7 @@ if(QAI_FORGE_BUILD_SNPE AND QAI_FORGE_BUILD_WORKERS)
 endif() # QAI_FORGE_BUILD_SNPE
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LiteRT engine + worker (conventional AI — .tflite with NPU dispatch)
+# LiteRT engine + worker (Predictive AI — .tflite with NPU dispatch)
 # ─────────────────────────────────────────────────────────────────────────────
 if(QAI_FORGE_BUILD_LITERT AND QAI_FORGE_BUILD_WORKERS)
 

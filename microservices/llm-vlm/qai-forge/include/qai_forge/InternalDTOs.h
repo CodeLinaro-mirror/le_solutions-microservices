@@ -115,6 +115,13 @@ struct CreateChatCompletionRequest {
     // When set, a "reasoning" output item is included in the Responses API output[].
     std::optional<std::string> reasoning_summary;
 
+    // ── OIP raw prompt mode ───────────────────────────────────────────────────
+    // Set by InferController when the OIP /generate request uses "text_input"
+    // (raw pre-formatted prompt) instead of "messages" (server applies template).
+    // When set, ChatOrchestratorImpl::buildContextPrompt() returns this string
+    // directly without applying the chat template.
+    std::optional<std::string> raw_prompt;
+
     static CreateChatCompletionRequest from_json(const json& j) {
         CreateChatCompletionRequest req;
         req.model = j.at("model").get<std::string>();
