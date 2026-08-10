@@ -30,7 +30,7 @@ services:
       dockerfile: QAIServe/Dockerfile
       target: qaiserve-runtime
       args:
-        - QAIRT_SDK_VERSION=${QAIRT_SDK_VERSION:-2.45.40.260406}
+        - QAIRT_SDK_VERSION=${QAIRT_SDK_VERSION:-2.48.0.260626}
         - BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS:-false}
     ports:
       - "${QAISERVE_PORT:-9002}:${QAISERVE_PORT:-9002}"

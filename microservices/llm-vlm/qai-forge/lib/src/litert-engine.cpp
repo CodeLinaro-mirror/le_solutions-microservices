@@ -150,7 +150,7 @@ LiteRTEngine::LiteRTEngine(const std::string& model_file,
                 "LiteRtCreateEnvironment");
 
     // ── 2. Load model ─────────────────────────────────────────────────────────
-    checkStatus(LiteRtCreateModelFromFile(model_file.c_str(), &m.model),
+    checkStatus(LiteRtCreateModelFromFile(m.env, model_file.c_str(), &m.model),
                 "LiteRtCreateModelFromFile");
 
     // ── 3. Compilation options ────────────────────────────────────────────────
