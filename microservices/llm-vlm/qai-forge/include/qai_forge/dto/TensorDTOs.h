@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include <cctype>
 #include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,16 +59,27 @@ inline std::string tensorDataTypeToString(TensorDataType dt) {
 
 /**
  * Parse KFServing v2 datatype string to TensorDataType.
+ *
+ * Case-insensitive, and also accepts each backend engine's native spelling
+ * (e.g. SNPEEngine's "float32"/"uint8" from snpeEncodingToString(), not just
+ * the KFServing v2 "FP32"/"UINT8" abbreviations) — without this, any
+ * non-canonical spelling silently fell through to the FLOAT32 default below,
+ * mislabeling every quantized SNPE-backend output tensor as 4-byte float and
+ * corrupting downstream byte-width math (e.g. PostprocessUtils::readFloat).
  */
 inline TensorDataType tensorDataTypeFromString(const std::string& s) {
-    if (s == "FP32")  return TensorDataType::FLOAT32;
-    if (s == "FP16")  return TensorDataType::FLOAT16;
-    if (s == "INT32") return TensorDataType::INT32;
-    if (s == "INT16") return TensorDataType::INT16;
-    if (s == "INT8")  return TensorDataType::INT8;
-    if (s == "UINT8") return TensorDataType::UINT8;
-    if (s == "BOOL")  return TensorDataType::BOOL;
-    if (s == "BYTES") return TensorDataType::BYTES;
+    std::string upper;
+    upper.reserve(s.size());
+    for (char c : s) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    if (upper == "FP32"  || upper == "FLOAT32" || upper == "FLOAT")  return TensorDataType::FLOAT32;
+    if (upper == "FP16"  || upper == "FLOAT16")                      return TensorDataType::FLOAT16;
+    if (upper == "INT32" || upper == "UINT32")                       return TensorDataType::INT32;
+    if (upper == "INT16" || upper == "UINT16")                       return TensorDataType::INT16;
+    if (upper == "INT8")                                             return TensorDataType::INT8;
+    if (upper == "UINT8")                                            return TensorDataType::UINT8;
+    if (upper == "BOOL")                                             return TensorDataType::BOOL;
+    if (upper == "BYTES")                                            return TensorDataType::BYTES;
     return TensorDataType::FLOAT32;  // safe default
 }
 

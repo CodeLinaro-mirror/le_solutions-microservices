@@ -47,7 +47,32 @@ float fp16ToFloat(uint16_t h) {
 
 namespace PostprocessUtils {
 
+// Byte width of one element for a given dtype — mirrors the memcpy/index
+// widths used below, so the bounds check always matches the actual access.
+static size_t dtypeElemBytes(postproc_abi::DataType dtype) {
+    switch (dtype) {
+        case postproc_abi::DataType::UINT8:
+        case postproc_abi::DataType::INT8:    return 1;
+        case postproc_abi::DataType::FLOAT16: return 2;
+        case postproc_abi::DataType::FLOAT32:
+        default:                              return 4;
+    }
+}
+
 float readFloat(const postproc_abi::OutputTensor& t, size_t idx, float quant_scale, int32_t quant_zero_point) {
+    // Every caller derives `idx` from a runtime tensor shape (e.g. a grid
+    // size read from a *different* tensor's declared dimensions) — a
+    // mismatch between that assumption and this tensor's actual data_len
+    // must not turn into an out-of-bounds heap read, since a segfault here
+    // kills the whole server process, not just the current request.
+    const size_t elem_bytes = dtypeElemBytes(t.dtype);
+    if ((idx + 1) * elem_bytes > t.data_len) {
+        throw std::out_of_range(
+            "PostprocessUtils::readFloat: index " + std::to_string(idx) +
+            " (" + std::to_string((idx + 1) * elem_bytes) + " bytes) exceeds "
+            "tensor '" + t.name + "' data_len=" + std::to_string(t.data_len));
+    }
+
     switch (t.dtype) {
         case postproc_abi::DataType::UINT8: {
             uint8_t raw = t.data[idx];

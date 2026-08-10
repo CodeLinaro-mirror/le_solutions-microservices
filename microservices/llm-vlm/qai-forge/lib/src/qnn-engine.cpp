@@ -221,6 +221,33 @@ static size_t tensorByteSize(const Qnn_Tensor_t* t) {
     return n;
 }
 
+// KFServing v2 datatype string for a given Qnn_DataType_t — mirrors
+// snpeEncodingToString()/elementTypeToDtype() in the SNPE/LiteRT workers so
+// tensorDataTypeFromString() (qai_forge/dto/TensorDTOs.h) resolves the real
+// dtype instead of silently defaulting to FLOAT32 for quantized tensors.
+static std::string qnnDtypeToString(Qnn_DataType_t dt) {
+    switch (dt) {
+        case QNN_DATATYPE_FLOAT_32:         return "FP32";
+        case QNN_DATATYPE_FLOAT_16:         return "FP16";
+        case QNN_DATATYPE_INT_32:           return "INT32";
+        case QNN_DATATYPE_UINT_32:          return "UINT32";
+        case QNN_DATATYPE_UFIXED_POINT_32:  return "UINT32";
+        case QNN_DATATYPE_SFIXED_POINT_32:  return "INT32";
+        case QNN_DATATYPE_INT_16:           return "INT16";
+        case QNN_DATATYPE_UINT_16:          return "UINT16";
+        case QNN_DATATYPE_UFIXED_POINT_16:  return "UINT16";
+        case QNN_DATATYPE_SFIXED_POINT_16:  return "INT16";
+        case QNN_DATATYPE_INT_8:            return "INT8";
+        case QNN_DATATYPE_UINT_8:           return "UINT8";
+        case QNN_DATATYPE_UFIXED_POINT_8:   return "UINT8";
+        case QNN_DATATYPE_SFIXED_POINT_8:   return "INT8";
+        case QNN_DATATYPE_BOOL_8:           return "BOOL";
+        case QNN_DATATYPE_INT_64:           return "INT32"; // no 64-bit OIP type
+        case QNN_DATATYPE_UINT_64:          return "UINT32";
+        default:                            return "FP32";
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // QNNEngine constructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,8 +387,10 @@ QNNEngine::QNNEngine(const std::string& model_file,
         QNNTensorSpec spec;
         spec.name  = QNN_TENSOR_NAME(t);
         spec.dtype = static_cast<int>(QNN_TENSOR_DTYPE(t));
+        spec.dtype_str = qnnDtypeToString(QNN_TENSOR_DTYPE(t));
         for (uint32_t d = 0; d < QNN_TENSOR_RANK(t); ++d)
             spec.shape.push_back(QNN_TENSOR_DIMS(t)[d]);
+        spec.bytes = tensorByteSize(t);
 
         // Quantization params (if applicable)
         auto& qp = QNN_TENSOR_QPARAMS(t);
@@ -381,8 +410,10 @@ QNNEngine::QNNEngine(const std::string& model_file,
         QNNTensorSpec spec;
         spec.name  = QNN_TENSOR_NAME(t);
         spec.dtype = static_cast<int>(QNN_TENSOR_DTYPE(t));
+        spec.dtype_str = qnnDtypeToString(QNN_TENSOR_DTYPE(t));
         for (uint32_t d = 0; d < QNN_TENSOR_RANK(t); ++d)
             spec.shape.push_back(QNN_TENSOR_DIMS(t)[d]);
+        spec.bytes = tensorByteSize(t);
 
         auto& qp = QNN_TENSOR_QPARAMS(t);
         if (qp.encodingDefinition == QNN_DEFINITION_DEFINED &&

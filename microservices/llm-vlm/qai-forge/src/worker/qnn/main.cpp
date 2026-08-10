@@ -220,8 +220,7 @@ int main() {
                 std::vector<size_t>               output_sizes;
 
                 for (size_t i = 0; i < out_specs.size(); ++i) {
-                    size_t bytes = 4; // default float32
-                    for (auto d : out_specs[i].shape) bytes *= d;
+                    size_t bytes = out_specs[i].bytes;
                     output_bufs[i].resize(bytes);
                     output_ptrs.push_back(output_bufs[i].data());
                     output_sizes.push_back(bytes);
@@ -235,7 +234,7 @@ int main() {
                 for (size_t i = 0; i < out_specs.size(); ++i) {
                     json t;
                     t["name"]     = out_specs[i].name;
-                    t["dtype"]    = "FP32";
+                    t["dtype"]    = out_specs[i].dtype_str;
                     json shape_arr = json::array();
                     for (auto d : out_specs[i].shape) shape_arr.push_back(d);
                     t["shape"]    = shape_arr;
