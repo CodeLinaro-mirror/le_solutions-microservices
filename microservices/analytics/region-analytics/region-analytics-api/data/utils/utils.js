@@ -64,9 +64,21 @@ function convertToms(time) {
     else return time*1000;
 }
 
+async function checkTriggerConditionParams(data) {
+    let tc = data.trigger_condition;
+    // Check if params match people counting
+    if (config.peopleCountTriggerConditions.includes(tc)) {
+        if (tc === "occupancy_changed") return;
+        else if (!data.params.some((obj => obj.name === "threshold"))) {
+            throw new Error("Mismatch between Params and Trigger Condition. Threshold was not provided")
+        }
+    }
+}
+
 module.exports = {
     populateRedis,
     cameraUpdates,
     initializeDB,
-    convertToms
+    convertToms,
+    checkTriggerConditionParams
 };

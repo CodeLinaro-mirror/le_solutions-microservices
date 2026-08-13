@@ -1,7 +1,8 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 import signal
-from typing import Dict, Deque, Optional, Any, Tuple, List
+#from tkinter import CURRENT
+from typing import Dict,Deque, Optional, Any, Tuple, List
 from mysql.connector.constants import _obsolete_option
 import redis.asyncio as redis
 import asyncio
@@ -19,6 +20,15 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 import sys
 
+# For Debug
+#REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+#MARIADB_PASSWORD = os.environ.get('MARIADB_PASSWORD', 'secretpw')
+#MARIADB_HOST = os.environ.get('MARIADB_HOST', 'localhost')
+#MARIADB_USER = os.environ.get('MARIADB_USER', 'root')
+#logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+#logger = logging.getLogger()
+
+# for production
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 MARIADB_PASSWORD = os.environ.get('MARIADB_PASSWORD')
 MARIADB_HOST = os.environ.get('MARIADB_HOST')
@@ -231,6 +241,7 @@ async def get_triggers(r):
     # Convert to list of triggers
     triggers = [json.loads(trigger) for trigger in raw_triggers.values()]
 
+    # TODO: add occupancy_over, occupancy_under
     supported_trigger_conditions = ['occupancy_changed', 'occupancy_over', 'occupancy_under', 'loitering_over']
     triggers = [t for t in triggers if t['trigger_condition'] in supported_trigger_conditions]
 
@@ -366,6 +377,7 @@ async def run_count_query(r : redis.Redis, token, region_id, start_time, end_tim
             avg_of_avg_counts = float(0 if not result[2] else result[2])
 
         cursor.close()
+
 
         # Post results
         #{
@@ -910,40 +922,51 @@ def handle_no_db_error():
        #sys.exit()
 
 async def async_main():
+    global db_connection
+
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     channel_listener_task = None
     statistics_process_task = None
+    pubsub = None
 
     try:
         await connect_to_redis(r)
         await connect_to_db()
 
-        def quit_handler ():
-            if channel_listener_task == None:
-                raise RuntimeError('Got SIGTERM but no task to cancel!')
-            logging.info('Got SIGTERM, cancelling listener task..')
-            channel_listener_task.cancel()
-
-            if statistics_process_task:
+        def quit_handler():
+            logging.info('Got shutdown signal, cancelling tasks..')
+            if channel_listener_task and not channel_listener_task.done():
+                channel_listener_task.cancel()
+            if statistics_process_task and not statistics_process_task.done():
                 statistics_process_task.cancel()
 
-            if db_connection:
-                db_connection.close()
-                db_connection = None
-
         pubsub = await register_pubsub_listeners(r)
-        loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGTERM, quit_handler)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, quit_handler)
         channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
         statistics_process_task = asyncio.create_task(statistics_task())
-        await channel_listener_task
-        await statistics_process_task
+
+        await asyncio.gather(
+            channel_listener_task,
+            statistics_process_task,
+            return_exceptions=True
+        )
 
     except asyncio.CancelledError:
         logger.info('Got cancelled exception, shutting down..')
     finally:
-        logger.info('Closing redis client..')
+        logger.info('Cleaning up resources..')
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except Exception as e:
+                logger.debug(f'pubsub close: {e}')
         await r.aclose()
+        if db_connection:
+            db_connection.close()
+            db_connection = None
+        logger.info('Shutdown complete.')
 
 if __name__ == "__main__":
 

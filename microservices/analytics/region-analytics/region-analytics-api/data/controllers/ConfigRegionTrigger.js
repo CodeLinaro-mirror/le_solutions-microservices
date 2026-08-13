@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 'use strict';
@@ -14,6 +14,9 @@ module.exports.configTriggerRegionCreate = async function configTriggerRegionCre
     // Creates new trigger attached to specified region. 
 
     try {
+        // Make sure that the params match the trigger_condition
+        await utils.checkTriggerConditionParams(body);
+
         await db.insertRATrigger(body);
         await redis.insertRATrigger(body);
         res.status(200).send("New trigger was successfully configured");

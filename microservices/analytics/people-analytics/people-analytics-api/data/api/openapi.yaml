@@ -496,6 +496,12 @@ components:
           example:
             - name: "accessories"
               value: "helmet, goggles, glove"
+      required:
+        - monitor_id
+        - trigger_id
+        - trigger_name
+        - trigger_condition
+
     TriggerOccupancy:
       description: Monitor and conditions on which to trigger an alert.
       type: object
@@ -532,6 +538,11 @@ components:
           example:
             - name: "threshold"
               value: "3"
+      required:
+        - monitor_id
+        - trigger_id
+        - trigger_name
+        - trigger_condition
 
     Triggers:
       description: List of Trigger objects

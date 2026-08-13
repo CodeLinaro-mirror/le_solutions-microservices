@@ -516,6 +516,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Coord"
+      required:
+        - monitor_id
+        - region_id
+        - region_name
+        - coordinates
 
     Regions:
       description: List of Region objects

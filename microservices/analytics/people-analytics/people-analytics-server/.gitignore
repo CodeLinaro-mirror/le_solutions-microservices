@@ -1,2 +1,4 @@
 __pycache__/
+venv
 openapi.yaml
+people-analytics-server.tar

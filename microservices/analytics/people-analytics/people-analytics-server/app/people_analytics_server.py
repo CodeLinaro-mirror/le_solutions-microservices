@@ -1,4 +1,4 @@
-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+﻿# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 from ast import Try
@@ -24,7 +24,15 @@ import sys
 
 from dataclasses import dataclass, field
 
+# For Debug
+#REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+#MARIADB_PASSWORD = os.environ.get('MARIADB_PASSWORD', 'secretpw')
+#MARIADB_HOST = os.environ.get('MARIADB_HOST', 'localhost')
+#MARIADB_USER = os.environ.get('MARIADB_USER', 'root')
+#logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+#logger = logging.getLogger()
 
+# for production
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis')
 MARIADB_PASSWORD = os.environ.get('MARIADB_PASSWORD')
 MARIADB_HOST = os.environ.get('MARIADB_HOST')
@@ -57,6 +65,8 @@ message_list = [] # list of (loop.time(), message)
 evt_stop = asyncio.Event()
 
 frame_history_by_channel : Dict[str, deque] = {}
+
+trigger_entries = []
 
 # Class to store count stats
 @dataclass
@@ -170,7 +180,7 @@ def get_foot_coordinates(person):
     elif bb:
          #logger.info('using bb')
          foot_coords['x'] = (bb.x + bb.width) / 2.0
-         foot_coords['y'] = bb.y + bb.height
+         foot_coords['y'] = min(1, bb.y + bb.height) # ensure we do not go out of bounds
     else:
          logger.error(f'Person detected without landmarks or bounding box!')
          foot_coords = None
@@ -437,7 +447,15 @@ async def connect_to_db():
 
 
 async def get_triggers(r):
-    #logger.debug("get_triggers")
+    if not trigger_entries:
+        await update_triggers(r)
+    return trigger_entries
+
+
+async def update_triggers(r):
+    global trigger_entries
+
+    logger.debug("get_triggers")
     # Get triggers from Redis
     raw_triggers = await r.hgetall(TRIGGER_KEY)
     logger.debug(f'Raw triggers from redis: {raw_triggers}')
@@ -462,6 +480,7 @@ async def get_triggers(r):
         triggers.append(trigger)
 
     if triggers == []:
+        # todo back to info pton
         logger.debug(f'No triggers found at {TRIGGER_KEY}; adding default')
         triggers = [
              {
@@ -474,6 +493,8 @@ async def get_triggers(r):
         ]
 
     logger.debug(f'Parsed & validated triggers: {triggers}')
+
+    trigger_entries = triggers
     return triggers
 
 def convert_msg_timestamp_to_epoch_time(msg_ts, sys_time, channel=None):
@@ -728,7 +749,7 @@ async def update_heatmap_statistics(recent_history):
             foot_coords = get_foot_coordinates(person)
 
             if not foot_coords:
-                continue;
+                continue
 
             # Convert to heatmap array indices
             #logger.debug(f'{foot_coords}')
@@ -1513,6 +1534,12 @@ async def register_pubsub_listeners(r: redis.Redis):
         else:
             logger.debug('No message for analytics')
 
+    async def trigger_update_handler(message):
+        logger.info(f'Subscribed to region updates on key: {TRIGGER_KEY}')
+        if message['type'] == 'pmessage':
+            logger.info(f'Tripwires update detected: {message}')
+            asyncio.create_task(update_triggers(r))
+
     # register subscribe pattern handler, return pubsub to be used in caller for .run()
     pubsub = r.pubsub()
     await pubsub.psubscribe(**{DETECTION_CHANNEL_PREFIX + '*': detection_message_handler})
@@ -1520,6 +1547,8 @@ async def register_pubsub_listeners(r: redis.Redis):
 
     await pubsub.subscribe(**{ANALYTICS_CHANNEL: analytics_request_handler})
     logger.debug(f'subscribed to {ANALYTICS_CHANNEL} channel')
+
+    await pubsub.psubscribe(**{'__keyspace@0__:' + TRIGGER_KEY: trigger_update_handler})
 
     return pubsub
 
@@ -1529,41 +1558,53 @@ def handle_no_db_error():
        sys.exit()
 
 async def async_main():
+    global db_connection
+
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    await r.config_set('notify-keyspace-events', 'KEA')
+    logger.info(f'{await r.config_get("notify-keyspace-events")}')
     channel_listener_task = None
     statistics_process_task = None
+    pubsub = None
 
     try:
         await connect_to_redis(r)
         await connect_to_db()
 
-        def quit_handler ():
-            if channel_listener_task == None:
-                raise RuntimeError('Got SIGTERM but no task to cancel!')
-            logging.info('Got SIGTERM, cancelling listener task..')
-            channel_listener_task.cancel()
-
-            if statistics_task:
-                statistics_task.cancel()
-
-            if db_connection:
-                db_connection.close()
-                db_connection = None
+        def quit_handler():
+            logging.info('Got shutdown signal, cancelling tasks..')
+            if channel_listener_task and not channel_listener_task.done():
+                channel_listener_task.cancel()
+            if statistics_process_task and not statistics_process_task.done():
+                statistics_process_task.cancel()
 
         pubsub = await register_pubsub_listeners(r)
-        loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGTERM, quit_handler)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, quit_handler)
         channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
         statistics_process_task = asyncio.create_task(statistics_task())
 
-        await channel_listener_task
-        await statistics_process_task
+        await asyncio.gather(
+            channel_listener_task,
+            statistics_process_task,
+            return_exceptions=True
+        )
 
     except asyncio.CancelledError:
         logger.info('Got cancelled exception, shutting down..')
     finally:
-        logger.info('Closing redis client..')
+        logger.info('Cleaning up resources..')
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except Exception as e:
+                logger.debug(f'pubsub close: {e}')
         await r.aclose()
+        if db_connection:
+            db_connection.close()
+            db_connection = None
+        logger.info('Shutdown complete.')
 
 if __name__ == "__main__":
 
