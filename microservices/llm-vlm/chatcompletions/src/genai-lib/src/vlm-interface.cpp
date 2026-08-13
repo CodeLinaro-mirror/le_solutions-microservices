@@ -70,63 +70,48 @@ void vlm_destroy_object(VLMHandle handle) {
 }
 
 void vlm_chat_completion_create(VLMHandle handle,
-                                const Query* query,
-                                bool streaming,
-                                LLMResponseCallback cb) {
+                                 const Query* query,
+                                 bool streaming,
+                                 LLMTokenCallback token_cb) {
     if (!handle) return;
     try {
         VLMObject* obj = static_cast<VLMObject*>(handle);
 
-        // IMPORTANT: The same VLM handle may be reused for multiple requests
-        // (singleton/handle cache). The streaming mode is a per-request
-        // behavior that influences the text callback logic.
-        // Make sure to update the object's streaming flag for each call.
         obj->stream = streaming;
+        obj->tokenCallback = token_cb;
 
-        // Set the response callback for this request. The callback reads the
-        // 'stream' flag above.
-        obj->responseCallback = cb;
-
-        // Copy the request payload. VLMObject owns this memory.
         *(obj->query) = *query;
 
-        // Execute synchronously. All per-call lifetimes are scoped within this
-        // function.
         obj->vlm_chat_completion_create();
     } catch (const std::exception& e) {
         std::string err_msg = e.what();
-        std::cerr << "ERROR: Exception caught in vlm_chat_completion_create: "
+        std::cerr << "ERROR: Exception caught in vlm_chat_completion_create_with_token_callback: "
                   << err_msg << std::endl;
-        if (cb) {
+        // Send error via token callback with finish_reason="error"
+        if (token_cb) {
             std::string layman_msg = vlm_get_error_message(err_msg);
-            Response errorResponse;
-            Message errorMessage;
-            snprintf(errorMessage.role, sizeof(errorMessage.role),
-                     "assistant");
-            snprintf(errorMessage.content, sizeof(errorMessage.content),
+            TokenResponse errorToken;
+            snprintf(errorToken.id, sizeof(errorToken.id), "error");
+            snprintf(errorToken.model, sizeof(errorToken.model), "vlm");
+            snprintf(errorToken.content, sizeof(errorToken.content),
                      "%s", layman_msg.c_str());
-            errorResponse.choices[0].message = errorMessage;
-            snprintf(errorResponse.choices[0].finish_reason,
-                     sizeof(errorResponse.choices[0].finish_reason),
+            snprintf(errorToken.finish_reason, sizeof(errorToken.finish_reason),
                      "error");
-            cb(&errorResponse);
+            token_cb(&errorToken);
         }
     } catch (...) {
         std::cerr << "ERROR: Unknown exception caught in "
-                  << "vlm_chat_completion_create" << std::endl;
-        if (cb) {
+                  << "vlm_chat_completion_create_with_token_callback" << std::endl;
+        if (token_cb) {
             std::string layman_msg = vlm_get_error_message("");
-            Response errorResponse;
-            Message errorMessage;
-            snprintf(errorMessage.role, sizeof(errorMessage.role),
-                     "assistant");
-            snprintf(errorMessage.content, sizeof(errorMessage.content),
+            TokenResponse errorToken;
+            snprintf(errorToken.id, sizeof(errorToken.id), "error");
+            snprintf(errorToken.model, sizeof(errorToken.model), "vlm");
+            snprintf(errorToken.content, sizeof(errorToken.content),
                      "%s", layman_msg.c_str());
-            errorResponse.choices[0].message = errorMessage;
-            snprintf(errorResponse.choices[0].finish_reason,
-                     sizeof(errorResponse.choices[0].finish_reason),
+            snprintf(errorToken.finish_reason, sizeof(errorToken.finish_reason),
                      "error");
-            cb(&errorResponse);
+            token_cb(&errorToken);
         }
     }
 }

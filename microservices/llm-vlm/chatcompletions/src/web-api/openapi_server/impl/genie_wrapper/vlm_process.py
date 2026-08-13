@@ -218,6 +218,10 @@ class VLMProcess:
 bool vlm_is_initialized(VLMHandle handle);
 const char* vlm_get_last_error(VLMHandle handle);
 """
+            # Ensure single token callback API is present
+            if 'void vlm_chat_completion_create(VLMHandle handle, const Query* query, bool streaming' not in updated_interface:
+                # API should already be in header, but add if missing
+                pass
             self.ffi.cdef(updated_interface)
 
             # Load library
@@ -344,18 +348,16 @@ const char* vlm_get_last_error(VLMHandle handle);
             execution_error = None
             import json
 
-            # Define callback
-            @self.ffi.callback("void(const Response *)")
-            def callback(response_ptr):
+            # Define token callback (called for each token AND final token with finish_reason)
+            @self.ffi.callback("void(const TokenResponse *)")
+            def token_callback(token_ptr):
                 nonlocal execution_error
                 try:
-                    resp = response_ptr[0]
-                    choice = resp.choices[0]
-                    msg = choice.message
+                    token = token_ptr[0]
+                    content = self.ffi.string(token.content).decode("utf-8") if token.content else ""
+                    finish_reason = self.ffi.string(token.finish_reason).decode("utf-8") if token.finish_reason else ""
 
-                    content = self.ffi.string(msg.content).decode("utf-8")
-                    finish_reason = self.ffi.string(choice.finish_reason).decode("utf-8")
-
+                    # Handle error finish_reason
                     if finish_reason == "error":
                         if pipe_handle:
                             pipe_handle.write(json.dumps({
@@ -370,35 +372,47 @@ const char* vlm_get_last_error(VLMHandle handle);
                         completion_event.set()
                         return
 
-                    if pipe_handle:
-                        # Write token to pipe
-                        if content:
+                    # Send intermediate tokens (no finish_reason)
+                    if not finish_reason and content:
+                        if pipe_handle:
                             pipe_handle.write(json.dumps({
                                 "type": "token",
                                 "content": content
                             }) + '\n')
                             pipe_handle.flush()
+                        else:
+                            token_response = InferenceProtocol.create_token_response(event_id, content)
+                            self._send_response(token_response)
 
-                        if finish_reason == "stop":
+                    # Handle final token with finish_reason="stop"
+                    if finish_reason == "stop":
+                        # Send final token content if any
+                        if content:
+                            if pipe_handle:
+                                pipe_handle.write(json.dumps({
+                                    "type": "token",
+                                    "content": content
+                                }) + '\n')
+                                pipe_handle.flush()
+                            else:
+                                token_response = InferenceProtocol.create_token_response(event_id, content)
+                                self._send_response(token_response)
+
+                        # Send done message
+                        if pipe_handle:
                             pipe_handle.write(json.dumps({
                                 "type": "done",
                                 "finish_reason": finish_reason
                             }) + '\n')
                             pipe_handle.flush()
-                            completion_event.set()
-                    else:
-                        # Fallback to socket if no pipe (for backward compatibility if needed)
-                        if content:
-                            token_response = InferenceProtocol.create_token_response(event_id, content)
-                            self._send_response(token_response)
-
-                        if finish_reason == "stop":
+                        else:
                             done_response = InferenceProtocol.create_done_response(event_id, finish_reason)
                             self._send_response(done_response)
-                            completion_event.set()
+
+                        completion_event.set()
 
                 except Exception as e:
-                    logger.error(f"[{event_id}] Error in callback: {e}", exc_info=True)
+                    logger.error(f"[{event_id}] Error in token_callback: {e}", exc_info=True)
                     execution_error = e
                     if pipe_handle:
                         try:
@@ -411,11 +425,13 @@ const char* vlm_get_last_error(VLMHandle handle);
                             pass
                     completion_event.set()
 
-            # Execute VLM completion
+            # Execute VLM completion with single token callback
             # vlm_chat_completion_create executes asynchronously in the C++ layer.
             # We MUST wait here to prevent Python's garbage collector from destroying
             # the query and image_buffer objects while the C++ thread is still reading them!
-            self.lib.vlm_chat_completion_create(self.vlm_handle, query, streaming, callback)
+            self.lib.vlm_chat_completion_create(
+                self.vlm_handle, query, streaming, token_callback
+            )
 
             # Wait for execution to finish (or timeout after 5 minutes)
             if not completion_event.wait(timeout=300.0):

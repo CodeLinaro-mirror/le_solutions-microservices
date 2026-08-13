@@ -6,6 +6,7 @@
 //=============================================================================
 
 #include "llm-service.hpp"
+#include "llm-interface.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
@@ -340,70 +341,43 @@ void Dialog::queryCallback(const char* responseStr,
     const void* userData) {
 
     QueryStruct* qmtx = static_cast<QueryStruct*>(const_cast<void*>(userData));
-    if (*qmtx->stream == false) { // Non Streaming
-        if (responseStr && qmtx->responseStr) {
-          std::string filtered = filterThinkBlocks(responseStr, qmtx);
-          if (!filtered.empty()) {
-            *(qmtx->responseStr) += filtered;
-          }
-        }
 
-        if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
-          qmtx->in_think = false;
-          qmtx->think_carry.clear();
-          qmtx->active_think_end.clear();
-
-          std::unique_ptr<Response> response = std::make_unique<Response>();
-          strlcpy(response->model, qmtx->llmObj->modelSelected, sizeof(response->model));
-          Message message;
-
-          strlcpy(message.role, "assistant", sizeof(message.role));
-          strlcpy(message.content, qmtx->responseStr->c_str(), sizeof(message.content));
-
-          response->choices[0].message = message;
-          strlcpy(response->choices[0].finish_reason, "stop", sizeof(response->choices[0].finish_reason));
-
-          if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
-            qmtx->llmObj->responseCallback(response.get());
-          } else {
-            std::cout << "Callback NOT Registered" << std::endl;
-          }
-        }
-    } else { // Streaming
-      std::unique_ptr<Response> response = std::make_unique<Response>();
-      strlcpy(response->model, qmtx->llmObj->modelSelected, sizeof(response->model));
-      Message message;
-      strlcpy(message.role, "assistant", sizeof(message.role));
-
-      if (responseStr) {
+    // Per-token callback: use lightweight TokenResponse if tokenCallback is set
+    if (responseStr) {
         std::string filtered = filterThinkBlocks(responseStr, qmtx);
         if (!filtered.empty()) {
-          //Token by Token
-          strlcpy(message.content, filtered.c_str(), sizeof(message.content));
-          response->choices[0].message = message;
+            // Use TokenResponse for per-token streaming
+            if (qmtx->llmObj && qmtx->llmObj->tokenCallback) {
+                std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
+                strlcpy(token->id, qmtx->llmObj->id, sizeof(token->id));
+                strlcpy(token->model, qmtx->llmObj->modelSelected, sizeof(token->model));
+                strlcpy(token->content, filtered.c_str(), sizeof(token->content));
+                token->finish_reason[0] = '\0';  // Empty for intermediate tokens
 
-          if (qmtx->llmObj && qmtx->llmObj->responseCallback) {
-            qmtx->llmObj->responseCallback(response.get());
-          } else {
-            std::cout << "Callback NOT Registered" << std::endl;
-          }
+                qmtx->llmObj->tokenCallback(token.get());
+            } else {
+                std::cout << "WARNING: tokenCallback NOT registered, token lost!" << std::endl;
+            }
         }
-      }
+    }
 
-      if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
+    if (sentenceCode == GENIE_DIALOG_SENTENCE_END) {
         qmtx->in_think = false;
         qmtx->think_carry.clear();
         qmtx->active_think_end.clear();
 
-        std::unique_ptr<Response> endResponse = std::make_unique<Response>();
-        Message message;
+        // Send final token with finish_reason using TokenResponse
+        if (qmtx->llmObj && qmtx->llmObj->tokenCallback) {
+            std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
+            strlcpy(token->id, qmtx->llmObj->id, sizeof(token->id));
+            strlcpy(token->model, qmtx->llmObj->modelSelected, sizeof(token->model));
+            token->content[0] = '\0';  // Empty content for final marker
+            strlcpy(token->finish_reason, "stop", sizeof(token->finish_reason));
 
-        strlcpy(message.content, "", sizeof(message.content));
-        endResponse->choices[0].message = message;
-        strlcpy(endResponse->choices[0].finish_reason, "stop",
-            sizeof(endResponse->choices[0].finish_reason));
-        qmtx->llmObj->responseCallback(endResponse.get());
-      }
+            qmtx->llmObj->tokenCallback(token.get());
+        } else {
+            std::cout << "WARNING: tokenCallback NOT registered, final token lost!" << std::endl;
+        }
     }
 }
 
@@ -479,10 +453,7 @@ void LLMObject::chat_completion_create () {
     // Add Query to History
     conversation.push_back(query->message);
 
-    std::string responseText;
     QueryStruct qmtx;
-
-    qmtx.responseStr = &responseText;
     qmtx.stream = &stream;
     qmtx.llmObj = this;
     qmtx.in_think = false;
@@ -491,7 +462,6 @@ void LLMObject::chat_completion_create () {
 
     diag->query(prompt, GenieDialog_SentenceCode_t::GENIE_DIALOG_SENTENCE_COMPLETE, &qmtx);
 
-    qmtx.responseStr = nullptr;
     qmtx.stream = nullptr;
     qmtx.llmObj = nullptr;
 }

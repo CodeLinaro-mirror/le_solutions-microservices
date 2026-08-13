@@ -11,8 +11,17 @@
 #include <llm-interface.h>
 
 
-void my_response_callback(const Response* response) {
-    printf("%s\n", response->choices[0].message.content);
+void my_token_callback(const TokenResponse* token) {
+    // Print the token content if not empty
+    if (strlen(token->content) > 0) {
+        printf("%s", token->content);
+        fflush(stdout);  // Ensure immediate output
+    }
+
+    // Check if generation is complete
+    if (strcmp(token->finish_reason, "stop") == 0) {
+        printf("\n");  // Add newline at end
+    }
 }
 
 int main() {
@@ -95,7 +104,7 @@ int main() {
         query.message = message;
         strlcpy(query.model, model, sizeof(query.model));
 
-        llm_chat_completion_create(llm, &query,stream, my_response_callback);
+        llm_chat_completion_create(llm, &query, stream, my_token_callback);
     }
 
     llm_destroy_object(llm);

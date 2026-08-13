@@ -5,8 +5,6 @@
 //
 //=============================================================================
 
-typedef _Bool bool;
-
 #define MAX_STRING_LENGTH 256
 #define MAX_CONTENT_LENGTH 12300
 #define MAX_MESSAGES 100
@@ -89,11 +87,19 @@ typedef struct {
     Usage usage;
 } Response;
 
+// Lightweight structure for per-token streaming callbacks
+typedef struct {
+    char id[MAX_STRING_LENGTH];              // request ID
+    char model[MAX_STRING_LENGTH];           // model name
+    char content[MAX_STRING_LENGTH];         // token content
+    char finish_reason[MAX_STRING_LENGTH];   // "stop", "length", etc.
+} TokenResponse;
+
 // Handle to the LLMObject C++
 typedef void* LLMHandle;
 
-// Callback for Token
-typedef void (*LLMResponseCallback)(const Response* response);
+// Callback for individual tokens (streaming)
+typedef void (*LLMTokenCallback)(const TokenResponse* token);
 
 //invokes the Constructor of LLM Object
 LLMHandle llm_create_object(
@@ -107,12 +113,12 @@ void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
 //invokes the Destructor of LLM Object
 void llm_destroy_object(LLMHandle handle);
 
-// Chat completion function
+// Chat completion function with token callback only
 void llm_chat_completion_create(
     LLMHandle handle,
     const Query* query,
     bool streaming,
-    LLMResponseCallback cb);
+    LLMTokenCallback token_cb);
 
 // Opaque handle to the C++ VLMObject
 typedef void* VLMHandle;
@@ -136,14 +142,16 @@ VLMHandle vlm_create_object(const char* model, const char* config_path, const ch
 void vlm_destroy_object(VLMHandle handle);
 
 /**
- * @brief Perform a VLM completion request.
+ * @brief Perform a VLM completion request with token callback only.
  *
  * @param handle   VLMObject handle.
  * @param query    Pointer to a fully populated Query structure.
  * @param streaming Whether to stream partial results (must match the mode used at creation).
- * @param cb       Callback invoked when a response (or partial token) is ready.
+ * @param token_cb Callback for individual tokens during generation. Receives TokenResponse for each token
+ *                 with finish_reason set on the final token.
  */
-void vlm_chat_completion_create(VLMHandle handle,
-                                const Query* query,
-                                bool streaming,
-                                LLMResponseCallback cb);
+void vlm_chat_completion_create(
+    VLMHandle handle,
+    const Query* query,
+    bool streaming,
+    LLMTokenCallback token_cb);

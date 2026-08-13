@@ -141,7 +141,7 @@ class LLMObject
 
         char modelSelected[256];
 
-        LLMResponseCallback responseCallback = nullptr;
+        LLMTokenCallback tokenCallback = nullptr;
 
         void chat_completion_create ();
 
@@ -160,7 +160,6 @@ class LLMObject
 };
 
 typedef struct {
-    std::string* responseStr;
     bool* stream;
     LLMObject* llmObj;
     bool in_think = false;

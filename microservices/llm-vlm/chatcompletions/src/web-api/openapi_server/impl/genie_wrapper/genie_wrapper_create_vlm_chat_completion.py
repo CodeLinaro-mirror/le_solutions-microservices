@@ -649,7 +649,17 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 try:
                     if stream_outcome == "success" and completion_tokens > 0:
                         total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
+
+                        # TTFT: time from stream start to first token
                         ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
+
+                        # Token generation time: first token to last token (pure generation)
+                        if completion_tokens > 1 and ttft_timestamp and last_token_timestamp:
+                            token_generation_time_ms = (last_token_timestamp - ttft_timestamp) * 1000
+                        else:
+                            token_generation_time_ms = None
+
+                        # Average inter-token latency
                         avg_stream_latency_ms = (
                             sum(inter_token_latencies) / len(inter_token_latencies)
                             if inter_token_latencies else None
@@ -658,8 +668,9 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                         MetricsManager.get_instance().record_inference_metrics(
                             model_id=model,
                             total_pipeline_latency_ms=total_pipeline_latency_ms,
-                            tokens_generated=TokenCounter.estimate_tokens("".join(full_response_content)),
+                            tokens_generated=completion_tokens,
                             ttft_ms=ttft_ms,
+                            token_generation_time_ms=token_generation_time_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                             preprocessing_time_ms=preprocessing_time_ms if preprocessing_time_ms > 0 else None,
                         )

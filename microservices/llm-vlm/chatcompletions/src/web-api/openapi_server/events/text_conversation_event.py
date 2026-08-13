@@ -538,11 +538,12 @@ class TextConversationEvent(ConversationEvent):
                     started_from_clean_kv,
                 )
 
-            # Accumulate non-streaming response
+            # Accumulate non-streaming response with accurate timing
             accumulated_content = []
-            non_stream_start = time.time()
-            ttft_timestamp = None
-            last_token_timestamp = None
+            request_start = time.time()
+            inference_start_time = time.time()  # Set BEFORE execute_request() call
+            first_token_time = None
+            last_token_time = None
             inter_token_latencies = []
 
             async for token in llm_manager.execute_request(
@@ -550,7 +551,7 @@ class TextConversationEvent(ConversationEvent):
                 session_id=self.session.session_id,
                 model=self.model_id,
                 prompt=prompt_content,
-                streaming=False,
+                streaming=True,  # Always request streaming from C++ layer
                 max_tokens=max_completion,
                 temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
                 top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
@@ -559,11 +560,16 @@ class TextConversationEvent(ConversationEvent):
                 frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY
             ):
                 now = time.time()
-                if ttft_timestamp is None:
-                    ttft_timestamp = now
-                if last_token_timestamp is not None:
-                    inter_token_latencies.append((now - last_token_timestamp) * 1000)
-                last_token_timestamp = now
+
+                # First token arrival
+                if first_token_time is None:
+                    first_token_time = now
+
+                # Track inter-token latency
+                if last_token_time is not None:
+                    inter_token_latencies.append((now - last_token_time) * 1000)
+                last_token_time = now
+
                 accumulated_content.append(token)
 
             response_content = "".join(accumulated_content)
@@ -575,19 +581,30 @@ class TextConversationEvent(ConversationEvent):
             self._cap_prompt_tokens_total += prompt_tokens
             self._cap_completion_tokens_total += TokenCounter.estimate_tokens(response_content or "")
 
-            # Record non-streaming metrics only for successful completions.
+            # Record non-streaming metrics only for successful completions
             try:
-                if accumulated_content:
-                    ttft_ms = (ttft_timestamp - non_stream_start) * 1000 if ttft_timestamp else None
+                if accumulated_content and inference_start_time:
+                    # TTFT: time from inference start to first token
+                    ttft_ms = (first_token_time - inference_start_time) * 1000 if first_token_time else None
+
+                    # Token generation time: first token to last token (pure generation)
+                    if len(accumulated_content) > 1 and first_token_time and last_token_time:
+                        token_generation_time_ms = (last_token_time - first_token_time) * 1000
+                    else:
+                        token_generation_time_ms = None
+
+                    # Average inter-token latency
                     avg_stream_latency_ms = (
                         sum(inter_token_latencies) / len(inter_token_latencies)
                         if inter_token_latencies else None
                     )
+
                     MetricsManager.get_instance().record_inference_metrics(
                         model_id=self.model_id,
-                        total_pipeline_latency_ms=(time.time() - non_stream_start) * 1000,
-                        tokens_generated=TokenCounter.estimate_tokens(response_content),
+                        total_pipeline_latency_ms=(time.time() - request_start) * 1000,
+                        tokens_generated=len(accumulated_content),
                         ttft_ms=ttft_ms,
+                        token_generation_time_ms=token_generation_time_ms,
                         avg_stream_latency_ms=avg_stream_latency_ms,
                     )
             except Exception as metrics_err:
@@ -920,16 +937,28 @@ class TextConversationEvent(ConversationEvent):
                 try:
                     if stream_outcome == "success" and completion_tokens > 0:
                         total_pipeline_latency_ms = (time.time() - stream_start_time) * 1000
+
+                        # TTFT: time from stream start to first token
                         ttft_ms = (ttft_timestamp - stream_start_time) * 1000 if ttft_timestamp else None
+
+                        # Token generation time: first token to last token (pure generation)
+                        if completion_tokens > 1 and ttft_timestamp and last_token_timestamp:
+                            token_generation_time_ms = (last_token_timestamp - ttft_timestamp) * 1000
+                        else:
+                            token_generation_time_ms = None
+
+                        # Average inter-token latency
                         avg_stream_latency_ms = (
                             sum(inter_token_latencies) / len(inter_token_latencies)
                             if inter_token_latencies else None
                         )
+
                         MetricsManager.get_instance().record_inference_metrics(
                             model_id=self.model_id,
                             total_pipeline_latency_ms=total_pipeline_latency_ms,
-                            tokens_generated=TokenCounter.estimate_tokens("".join(full_response_content)),
+                            tokens_generated=completion_tokens,
                             ttft_ms=ttft_ms,
+                            token_generation_time_ms=token_generation_time_ms,
                             avg_stream_latency_ms=avg_stream_latency_ms,
                         )
                     elif stream_outcome == "failure":

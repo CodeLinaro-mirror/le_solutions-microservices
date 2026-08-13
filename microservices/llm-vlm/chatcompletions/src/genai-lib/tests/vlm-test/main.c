@@ -10,9 +10,17 @@
 #include <stdlib.h>
 #include "vlm-interface.h"
 
-void my_response_callback(const Response* response) {
-    // Print the assistant's response content
-    printf("%s\n", response->choices[0].message.content);
+void my_token_callback(const TokenResponse* token) {
+    // Print the token content if not empty
+    if (strlen(token->content) > 0) {
+        printf("%s", token->content);
+        fflush(stdout);  // Ensure immediate output
+    }
+
+    // Check if generation is complete
+    if (strcmp(token->finish_reason, "stop") == 0) {
+        printf("\n");  // Add newline at end
+    }
 }
 
 int main() {
@@ -162,7 +170,7 @@ int main() {
         query.top_p = 0.5;
         strlcpy(query.model, model, sizeof(query.model));
 
-        vlm_chat_completion_create(vlm, &query, stream, my_response_callback);
+        vlm_chat_completion_create(vlm, &query, stream, my_token_callback);
 
         // Free the image buffer after completion
         if (imageBuffer) {
