@@ -36,6 +36,7 @@
  * Boolean options must be given an explicit value:
  *   --no-display=true|false          (default: false)
  *   --no-output-overlay=true|false   (default: false)
+ *   --no-zone-overlay=true|false     (default: true)
  *   --no-debug=true|false            (default: false)
  *   --enable-redis-meta=true|false   (default: true)
  *
@@ -123,6 +124,7 @@ typedef struct GstAppConfig
   gchar *zone_boundaries;
   gboolean no_display;
   gboolean no_output_overlay;
+  gboolean no_zone_overlay;
   gboolean no_debug;
   gint width;
   gint height;
@@ -1505,6 +1507,30 @@ gst_app_zone_boundaries_to_overlay_masks (const gchar * zone_boundaries)
 }
 
 /*
+ * Apply the zone polygons to a qtivoverlay element.
+ *
+ * The zone outline is a monitoring aid drawn on top of the detection boxes, so
+ * it is independently controllable. When no_zone_overlay is set the "masks"
+ * property is left at its default and qtivoverlay draws only the detection
+ * boxes and labels; zone evaluation itself is unaffected and violations are
+ * still reported through the metadata branch.
+ */
+static void
+gst_app_overlay_apply_zone_masks (GstElement * overlay,
+    const GstAppConfig * config)
+{
+  gchar *overlay_masks = NULL;
+
+  if (config->no_zone_overlay)
+    return;
+
+  overlay_masks =
+      gst_app_zone_boundaries_to_overlay_masks (config->zone_boundaries);
+  g_object_set (G_OBJECT (overlay), "masks", overlay_masks, NULL);
+  g_free (overlay_masks);
+}
+
+/*
  * Create the selected output branch.
  *
  * user_tail is the last element of the user pipe. This function links from
@@ -1531,17 +1557,13 @@ gst_app_create_output_pipe (GstAppContext * appctx, GstElement * user_tail)
   pre_q = gst_app_make_element ("queue", "output_pre_queue");
 
   if (!appctx->config.no_output_overlay) {
-    gchar *overlay_masks = gst_app_zone_boundaries_to_overlay_masks (
-        appctx->config.zone_boundaries);
-
     overlay = gst_app_make_element ("qtivoverlay", "qtivoverlay");
     tee = gst_app_make_element ("tee", "output_tee");
 
     if (!pre_q || !overlay || !tee)
       goto error;
 
-    g_object_set (G_OBJECT (overlay), "masks", overlay_masks, NULL);
-    g_free (overlay_masks);
+    gst_app_overlay_apply_zone_masks (overlay, &appctx->config);
 
     gst_bin_add_many (GST_BIN (appctx->pipeline), pre_q, overlay, tee, NULL);
 
@@ -1586,13 +1608,10 @@ gst_app_create_output_pipe (GstAppContext * appctx, GstElement * user_tail)
       goto error;
 
     if (appctx->config.no_output_overlay) {
-      gchar *overlay_masks = gst_app_zone_boundaries_to_overlay_masks (
-          appctx->config.zone_boundaries);
       display_overlay = gst_app_make_element ("qtivoverlay", "display_overlay");
       if (!display_overlay)
         goto error;
-      g_object_set (G_OBJECT (display_overlay), "masks", overlay_masks, NULL);
-      g_free (overlay_masks);
+      gst_app_overlay_apply_zone_masks (display_overlay, &appctx->config);
     }
 
     // Enable sync in case of offline input
@@ -2402,6 +2421,7 @@ main (int argc, char * argv[])
   appctx.config.framerate = DEFAULT_FRAMERATE;
   appctx.config.webrtc_id = DEFAULT_WEBRTC_ID;
   appctx.config.enable_redis_meta = TRUE;
+  appctx.config.no_zone_overlay = TRUE;
 
   GOptionEntry entries[] = {
     { "input-type", 0, 0, G_OPTION_ARG_STRING, &appctx.config.input_type,
@@ -2417,6 +2437,9 @@ main (int argc, char * argv[])
     { "no-output-overlay", 0, 0, G_OPTION_ARG_INT, &appctx.config.no_output_overlay,
       "Disable overlay on encoded/output stream (display still shows overlay): "
       "1 or 0 (default: 0)", "1|0" },
+    { "no-zone-overlay", 0, 0, G_OPTION_ARG_INT, &appctx.config.no_zone_overlay,
+      "Disable drawing the restricted-zone polygons (detection boxes and zone "
+      "evaluation are unaffected): 1 or 0 (default: 1)", "1|0" },
     { "no-debug", 0, 0, G_OPTION_ARG_INT, &appctx.config.no_debug,
       "Disable qtirestrictedzonedbg zone evaluation (overlay still drawn): "
       "1 or 0 (default: 0)", "1|0" },
