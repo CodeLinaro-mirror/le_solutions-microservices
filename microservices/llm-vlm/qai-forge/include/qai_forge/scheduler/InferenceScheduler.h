@@ -28,9 +28,15 @@ struct PredictiveScheduleMetadata {
     std::string model_id;
 };
 
+inline WarmModelPoolConfig defaultPredictivePoolConfig() {
+    WarmModelPoolConfig config;
+    config.max_queue_depth_per_model = 12;
+    return config;
+}
+
 struct InferenceSchedulerConfig {
     WarmModelPoolConfig generative_pool_config;
-    WarmModelPoolConfig predictive_pool_config;
+    WarmModelPoolConfig predictive_pool_config = defaultPredictivePoolConfig();
     size_t max_concurrent_model_loads = 1;
 };
 
@@ -71,7 +77,7 @@ public:
     PredictiveRuntimeHandle(PredictiveRuntimeHandle&& other) noexcept;
     PredictiveRuntimeHandle& operator=(PredictiveRuntimeHandle&& other) noexcept;
 
-    TensorInferenceResponse submit(const TensorInferenceRequest& request);
+    SubmitResult submit(PredictiveJobPtr job);
     bool valid() const;
 
 private:

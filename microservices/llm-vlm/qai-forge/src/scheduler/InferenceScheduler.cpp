@@ -77,7 +77,9 @@ InferenceSchedulerConfig configFromEnvironment() {
         "TOOL_RESPONSE_TIMEOUT_SECONDS",
         config.generative_pool_config.tool_response_timeout);
     config.generative_pool_config.tool_response_timeout = tool_timeout;
-    config.predictive_pool_config.max_queue_depth_per_model = 0;
+    config.predictive_pool_config.max_queue_depth_per_model = parseSizeEnv(
+        "MAX_QUEUE_DEPTH_PER_MODEL",
+        config.predictive_pool_config.max_queue_depth_per_model);
     config.max_concurrent_model_loads = parseSizeEnv(
         "MAX_CONCURRENT_MODEL_LOADS",
         config.max_concurrent_model_loads);
@@ -217,24 +219,23 @@ PredictiveRuntimeHandle& PredictiveRuntimeHandle::operator=(
     return *this;
 }
 
-TensorInferenceResponse PredictiveRuntimeHandle::submit(
-    const TensorInferenceRequest& request) {
+SubmitResult PredictiveRuntimeHandle::submit(PredictiveJobPtr job) {
     if (!valid()) {
         throw std::logic_error("Predictive runtime reservation is inactive");
     }
-    if (request.model != metadata_.model_id) {
+    if (!job || job->model_id != metadata_.model_id) {
         release();
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
-            "Predictive request model does not match reserved runtime model '" +
+            "Predictive job model does not match reserved runtime model '" +
                 metadata_.model_id + "'",
             400);
     }
 
     try {
-        TensorInferenceResponse response = pool_->submit(runtime_, request);
+        SubmitResult result = pool_->submit(runtime_, std::move(job));
         release();
-        return response;
+        return result;
     } catch (...) {
         release();
         throw;

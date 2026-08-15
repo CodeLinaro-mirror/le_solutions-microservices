@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+class PredictiveOrchestrator;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BackendFactory — Selects the correct IGenerativeBackend based on runtime
 //
@@ -127,6 +129,10 @@ public:
      */
     static std::unique_ptr<IInferenceBackend>
     createPredictiveBackendForModel(const std::string& model_id);
+
+    /** @brief Create the shared predictive job preparation pipeline. */
+    static std::shared_ptr<PredictiveOrchestrator>
+    createPredictiveOrchestrator();
 
     // BackendFactory is a pure static utility — no instances.
     BackendFactory() = delete;

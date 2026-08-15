@@ -25,6 +25,7 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/GenieOrchestrator.h"
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
+#include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
@@ -192,4 +193,11 @@ BackendFactory::createPredictiveBackendForModel(const std::string& model_id) {
     }
 
     return createPredictiveBackend(model_config->runtime);
+}
+
+std::shared_ptr<PredictiveOrchestrator>
+BackendFactory::createPredictiveOrchestrator() {
+    static const auto orchestrator =
+        std::make_shared<PredictiveOrchestrator>();
+    return orchestrator;
 }

@@ -77,7 +77,6 @@ TensorInferenceResponse SNPEBackend::infer(const TensorInferenceRequest& request
     if (had_error)
         throw std::runtime_error("SNPEBackend::infer failed: " + error_msg);
 
-    result.stats.backend_name = "SNPE";
     return result;
 }
 
