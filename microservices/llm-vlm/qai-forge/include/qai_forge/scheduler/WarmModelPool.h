@@ -5,6 +5,7 @@
 
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
+#include "qai_forge/scheduler/SubmitResult.h"
 #include "qai_forge/backend/BackendFactory.h"
 
 #include <chrono>
@@ -26,7 +27,6 @@ class EvictionPolicy;
 
 struct WarmModelPoolConfig {
     size_t max_active_models = 3;
-    size_t max_concurrent_model_loads = 1;
     std::chrono::milliseconds idle_timeout = std::chrono::minutes(5);
     std::chrono::milliseconds blocked_admission_timeout =
         std::chrono::seconds(30);
@@ -44,6 +44,7 @@ struct ModelPoolRuntimeSnapshot {
     std::string running_job_id;
     bool healthy = false;
     bool active_reserved = false;
+    size_t reservation_count = 0;
     bool eviction_requested = false;
     bool tool_lease_active = false;
     std::string tool_chain_id;
@@ -64,7 +65,8 @@ struct ModelPoolSnapshot {
 class WarmModelPool {
 public:
     explicit WarmModelPool(WarmModelPoolConfig config,
-                           ModelRuntimePairFactory runtime_factory = {});
+                           ModelRuntimePairFactory runtime_factory = {},
+                           ModelRuntimeEvents runtime_events = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -73,7 +75,9 @@ public:
     WarmModelPool& operator=(WarmModelPool&&) = delete;
 
     void start();
-    SubmitResult submit(InferenceJobPtr job);
+    ModelRuntime* reserve(const std::string& model_id);
+    SubmitResult submit(ModelRuntime* runtime, GenerativeJobPtr job);
+    void releaseReservation(ModelRuntime* runtime) noexcept;
     CancelResult cancel(const std::string& job_id);
     bool openToolLease(const std::string& model_id,
                        const std::string& chain_id,
@@ -92,6 +96,7 @@ private:
         std::unique_ptr<ModelRuntime> runtime;
         ModelRuntimeState state = ModelRuntimeState::NotResident;
         bool active_reserved = false;
+        size_t reservation_count = 0;
         bool eviction_requested = false;
         std::string tool_chain_id;
         std::optional<std::chrono::steady_clock::time_point> tool_lease_until;
@@ -136,6 +141,7 @@ private:
 
     WarmModelPoolConfig config_;
     ModelRuntimePairFactory runtime_factory_;
+    ModelRuntimeEvents runtime_events_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

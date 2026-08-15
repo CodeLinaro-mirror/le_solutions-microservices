@@ -106,6 +106,41 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
     }
 }
 
+class ScopedLoadPermit {
+public:
+    explicit ScopedLoadPermit(const ModelRuntimeEvents& events)
+        : release_(events.release_load_permit) {
+        if (events.acquire_load_permit) {
+            events.acquire_load_permit();
+            acquired_ = true;
+        }
+    }
+
+    ~ScopedLoadPermit() {
+        release();
+    }
+
+    ScopedLoadPermit(const ScopedLoadPermit&) = delete;
+    ScopedLoadPermit& operator=(const ScopedLoadPermit&) = delete;
+
+    void release() noexcept {
+        if (!acquired_) {
+            return;
+        }
+        acquired_ = false;
+        if (release_) {
+            try {
+                release_();
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    std::function<void()> release_;
+    bool acquired_ = false;
+};
+
 } // namespace
 
 ModelRuntime::ModelRuntime(std::string model_id,
@@ -152,7 +187,7 @@ void ModelRuntime::start() {
              << " cancel_grace_ms=" << cancel_grace_period_.count());
 }
 
-void ModelRuntime::enqueue(InferenceJobPtr job) {
+void ModelRuntime::enqueue(GenerativeJobPtr job) {
     const std::string job_id = job ? job->job_id : std::string("<null>");
     queue_.push(std::move(job));
     LOG_INFO("[ModelRuntime] Enqueued job: model=" << model_id_
@@ -207,7 +242,7 @@ CancelResult ModelRuntime::cancel(const std::string& job_id) {
             "Cancel request is missing job_id"};
     }
 
-    if (InferenceJobPtr queued = queue_.cancel(job_id)) {
+    if (GenerativeJobPtr queued = queue_.cancel(job_id)) {
         LOG_INFO("[ModelRuntime] Cancelled queued job: model=" << model_id_
                  << " job=" << job_id);
         notifyCancelled(queued);
@@ -217,7 +252,7 @@ CancelResult ModelRuntime::cancel(const std::string& job_id) {
             "Queued scheduler job cancelled"};
     }
 
-    InferenceJobPtr running;
+    GenerativeJobPtr running;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (running_job_ && running_job_->job_id == job_id) {
@@ -282,7 +317,7 @@ void ModelRuntime::requestDrain() {
 }
 
 void ModelRuntime::failQueued(const GenAIException& error) {
-    while (InferenceJobPtr job = queue_.pop()) {
+    while (GenerativeJobPtr job = queue_.pop()) {
         notifyError(job, error);
     }
 }
@@ -379,7 +414,7 @@ void ModelRuntime::executorLoop() {
         bool should_load = false;
         bool should_unload = false;
         bool should_reload_unhealthy = false;
-        InferenceJobPtr job;
+        GenerativeJobPtr job;
         std::vector<ModelRuntimeState> state_events;
 
         {
@@ -449,7 +484,9 @@ void ModelRuntime::executorLoop() {
         if (should_load) {
             try {
                 LOG_INFO("[ModelRuntime] Loading backend: model=" << model_id_);
+                ScopedLoadPermit load_permit(events_);
                 backend_->loadModel(model_id_);
+                load_permit.release();
                 LOG_INFO("[ModelRuntime] Backend loaded: model=" << model_id_);
                 // Write use lock so DELETE is blocked while model is in memory
                 qai_forge::writeUseLock(model_id_);
@@ -653,7 +690,7 @@ size_t ModelRuntime::promoteAgedJobs() {
     return promoted;
 }
 
-void ModelRuntime::runJob(InferenceJob& job) {
+void ModelRuntime::runJob(GenerativeJob& job) {
     if (!backend_healthy_ || !backend_ || !backend_->isHealthy()) {
         throw GenAIException(
             GenAIErrorCode::HARDWARE_UNAVAILABLE,
@@ -913,7 +950,7 @@ bool ModelRuntime::isResidentState(ModelRuntimeState state) {
            state == ModelRuntimeState::Evicting;
 }
 
-void ModelRuntime::notifyCancelled(const InferenceJobPtr& job) {
+void ModelRuntime::notifyCancelled(const GenerativeJobPtr& job) {
     if (!job || !job->markCancellationNotified() ||
         !job->callbacks.on_cancelled) {
         return;
@@ -925,8 +962,8 @@ void ModelRuntime::notifyCancelled(const InferenceJobPtr& job) {
     }
 }
 
-void ModelRuntime::notifyError(const InferenceJobPtr& job,
-                            const GenAIException& error) {
+void ModelRuntime::notifyError(const GenerativeJobPtr& job,
+                               const GenAIException& error) {
     if (!job || !job->callbacks.on_error) {
         return;
     }

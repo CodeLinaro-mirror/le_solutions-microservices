@@ -201,7 +201,7 @@ set(QAI_FORGE_SOURCES
     src/scheduler/EvictionPolicy.cpp
     src/scheduler/ModelRuntime.cpp
     src/scheduler/WarmModelPool.cpp
-    src/scheduler/ModelScheduler.cpp
+    src/scheduler/InferenceScheduler.cpp
 
     # Predictive AI scheduler (Phase 4 — pool + runtime for tensor inference)
     src/scheduler/PredictiveModelRuntime.cpp

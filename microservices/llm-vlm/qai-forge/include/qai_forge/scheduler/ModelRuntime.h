@@ -54,6 +54,8 @@ struct ModelRuntimeAdmissionSnapshot {
 struct ModelRuntimeEvents {
     std::function<void(const std::string& model_id, ModelRuntimeState state)>
         on_state_changed;
+    std::function<void()> acquire_load_permit;
+    std::function<void()> release_load_permit;
 };
 
 // Owns one model's queue and resident backend lifecycle.
@@ -78,7 +80,7 @@ public:
     ModelRuntime& operator=(ModelRuntime&&) = delete;
 
     void start();
-    void enqueue(InferenceJobPtr job);
+    void enqueue(GenerativeJobPtr job);
     bool activate();
     CancelResult cancel(const std::string& job_id);
     void requestDrain();
@@ -98,7 +100,7 @@ private:
 
     void executorLoop();
     size_t promoteAgedJobs();
-    void runJob(InferenceJob& job);
+    void runJob(GenerativeJob& job);
     void unloadBackend(bool force);
     void armCancelWatchdog(const std::string& job_id);
     void invalidateCancelWatchdog();
@@ -111,8 +113,9 @@ private:
     void notifyStateChanges(const std::vector<ModelRuntimeState>& state_events);
 
     static bool isResidentState(ModelRuntimeState state);
-    static void notifyCancelled(const InferenceJobPtr& job);
-    static void notifyError(const InferenceJobPtr& job, const GenAIException& error);
+    static void notifyCancelled(const GenerativeJobPtr& job);
+    static void notifyError(const GenerativeJobPtr& job,
+                            const GenAIException& error);
 
     const std::string model_id_;
     PriorityModelQueue queue_;
@@ -136,7 +139,7 @@ private:
 
     ModelRuntimeState state_ = ModelRuntimeState::NotResident;
     bool backend_healthy_ = false;
-    InferenceJobPtr running_job_;
+    GenerativeJobPtr running_job_;
 
     std::mutex cancel_watchdog_mutex_;
     std::condition_variable cancel_watchdog_cv_;

@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "qai_forge/scheduler/InferenceJob.h"
+#include "qai_forge/scheduler/GenerativeJob.h"
 
 #include <chrono>
 #include <cstddef>
@@ -36,9 +36,9 @@ struct QueueAdmissionCandidate {
 // lane and always pops from the highest-priority non-empty lane.
 class PriorityModelQueue {
 public:
-    void push(InferenceJobPtr job);
-    InferenceJobPtr pop();
-    InferenceJobPtr cancel(const std::string& job_id);
+    void push(GenerativeJobPtr job);
+    GenerativeJobPtr pop();
+    GenerativeJobPtr cancel(const std::string& job_id);
 
     bool empty() const;
     size_t size() const;
@@ -52,11 +52,11 @@ public:
                                   std::chrono::milliseconds threshold);
 
 private:
-    using Lane = std::deque<InferenceJobPtr>;
+    using Lane = std::deque<GenerativeJobPtr>;
 
     Lane& laneFor(JobPriority priority);
     const Lane& laneFor(JobPriority priority) const;
-    InferenceJobPtr popFrom(Lane& lane);
+    GenerativeJobPtr popFrom(Lane& lane);
     QueueAdmissionCandidate peekFrom(const Lane& lane,
                                      JobPriority priority) const;
 

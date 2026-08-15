@@ -28,7 +28,7 @@ const char* priorityToString(JobPriority priority) {
 
 } // namespace
 
-void PriorityModelQueue::push(InferenceJobPtr job) {
+void PriorityModelQueue::push(GenerativeJobPtr job) {
     if (!job) {
         throw std::invalid_argument("PriorityModelQueue::push received null job");
     }
@@ -41,7 +41,7 @@ void PriorityModelQueue::push(InferenceJobPtr job) {
              << " priority=" << priorityToString(priority));
 }
 
-InferenceJobPtr PriorityModelQueue::pop() {
+GenerativeJobPtr PriorityModelQueue::pop() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (auto job = popFrom(control_)) {
@@ -67,14 +67,14 @@ InferenceJobPtr PriorityModelQueue::pop() {
     return job;
 }
 
-InferenceJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
+GenerativeJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto cancel_from = [&job_id](Lane& lane) -> InferenceJobPtr {
+    auto cancel_from = [&job_id](Lane& lane) -> GenerativeJobPtr {
         for (auto it = lane.begin(); it != lane.end(); ++it) {
-            const InferenceJobPtr& job = *it;
+            const GenerativeJobPtr& job = *it;
             if (job && job->job_id == job_id) {
-                InferenceJobPtr cancelled = job;
+                GenerativeJobPtr cancelled = job;
                 cancelled->cancel();
                 lane.erase(it);
                 LOG_INFO("[PriorityModelQueue] Cancelled queued job: job="
@@ -144,7 +144,7 @@ size_t PriorityModelQueue::promoteAgedNewRequests(
     Lane remaining_new_requests;
 
     while (!new_request_.empty()) {
-        InferenceJobPtr job = std::move(new_request_.front());
+        GenerativeJobPtr job = std::move(new_request_.front());
         new_request_.pop_front();
 
         if (!job) {
@@ -203,9 +203,9 @@ const PriorityModelQueue::Lane& PriorityModelQueue::laneFor(JobPriority priority
     return new_request_;
 }
 
-InferenceJobPtr PriorityModelQueue::popFrom(Lane& lane) {
+GenerativeJobPtr PriorityModelQueue::popFrom(Lane& lane) {
     while (!lane.empty()) {
-        InferenceJobPtr job = std::move(lane.front());
+        GenerativeJobPtr job = std::move(lane.front());
         lane.pop_front();
 
         if (!job || job->isCancelled()) {
@@ -221,7 +221,7 @@ InferenceJobPtr PriorityModelQueue::popFrom(Lane& lane) {
 QueueAdmissionCandidate PriorityModelQueue::peekFrom(
     const Lane& lane,
     JobPriority priority) const {
-    for (const InferenceJobPtr& job : lane) {
+    for (const GenerativeJobPtr& job : lane) {
         if (!job || job->isCancelled()) {
             continue;
         }

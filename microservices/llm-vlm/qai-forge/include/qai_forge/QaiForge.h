@@ -21,7 +21,7 @@
 //                                    via internal scheduler pipeline
 //   infer()                        → predictive models (classification,
 //                                    detection, segmentation)
-//                                    via PredictiveModelPool (Phase 4)
+//                                    via the internal inference scheduler
 //
 // Future modalities (stubs — not yet implemented):
 //   transcribe()   → audio-to-text (ASR)
@@ -183,9 +183,8 @@ private:
     QaiForge();
     ~QaiForge();
 
-    // Predictive AI pool — owns PredictiveModelRuntime instances.
-    // Initialized in start(), shut down in shutdown().
-    // Forward-declared to avoid pulling scheduler headers into the public API.
+    // Internal request orchestration and scheduler integration.
+    // Forward-declared to keep scheduler headers out of the public API.
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
