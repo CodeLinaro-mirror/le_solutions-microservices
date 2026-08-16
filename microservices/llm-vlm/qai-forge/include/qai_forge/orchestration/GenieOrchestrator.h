@@ -55,6 +55,15 @@ public:
         scheduler::GenerativeJob& job,
         IGenerativeBackend& backend) const override;
 
+    std::optional<scheduler::PostTurnTask> createPostTurnTask(
+        scheduler::GenerativeJob& job,
+        const StandardResponse& response) const override;
+
+    ConversationMemoryUpdate executePostTurn(
+        scheduler::PostTurnTask& task,
+        const ConversationMemoryUpdate& committed_memory,
+        IGenerativeBackend& backend) const override;
+
 private:
     GenieOrchestrator(const GenieOrchestrator&) = delete;
     GenieOrchestrator& operator=(const GenieOrchestrator&) = delete;

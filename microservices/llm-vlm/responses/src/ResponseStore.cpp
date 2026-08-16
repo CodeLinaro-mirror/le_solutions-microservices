@@ -226,6 +226,20 @@ bool ResponseStore::completeResponse(
     return true;
 }
 
+bool ResponseStore::updateConversationMemory(
+    const std::string& response_id,
+    const StoredConversationMemory& memory_update) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto found = responses_by_id_.find(response_id);
+    if (found == responses_by_id_.end() ||
+        found->second.status != StoredResponseStatus::Completed) {
+        return false;
+    }
+    found->second.conversation_memory = memory_update;
+    found->second.updated_at = currentUnixTime();
+    return true;
+}
+
 bool ResponseStore::failResponse(const std::string& response_id,
                                  const ResponseStoreJson& error_object) {
     std::lock_guard<std::mutex> lock(mu_);

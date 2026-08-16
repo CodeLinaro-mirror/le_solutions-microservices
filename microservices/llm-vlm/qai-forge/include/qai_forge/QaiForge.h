@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -57,7 +58,14 @@ struct GenerateOptions {
 
     // Response history (Responses API — ancestor messages from ResponseStore)
     bool use_response_history = false;
+    bool response_history_is_pruned = false;
     json response_history = json::array();
+
+    // Conversation memory identity. Responses uses response-lineage keys so
+    // sibling response branches never share post-turn memory. When both are
+    // omitted, QaiForge uses session_id for both keys.
+    std::string conversation_memory_read_key;
+    std::string conversation_memory_write_key;
 
     // Generic conversation memory used to seed orchestrator prompt slots.
     std::string summary_content;
@@ -175,6 +183,14 @@ public:
      * @return true if the request was found and cancelled.
      */
     bool cancel(const std::string& response_id);
+
+    /** @brief Await and read the latest committed conversation memory snapshot. */
+    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
+        const std::string& memory_key);
+
+    /** @brief Queue idempotent consumer-owned persistence after delivery. */
+    bool enqueueStoreTask(std::string idempotency_key,
+                          std::function<void()> task);
 
     QaiForge(const QaiForge&) = delete;
     QaiForge& operator=(const QaiForge&) = delete;

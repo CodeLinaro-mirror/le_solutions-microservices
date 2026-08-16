@@ -78,6 +78,7 @@ struct GenerativeJobContext {
     qai_forge::GenerateOptions caller;
 
     std::string tool_chain_id;
+    std::string conversation_memory_write_key;
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::NEW_REQUEST;
     bool tool_continuation = false;

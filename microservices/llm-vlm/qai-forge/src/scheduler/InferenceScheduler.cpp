@@ -264,10 +264,13 @@ InferenceScheduler::InferenceScheduler(
     PredictiveBackendFactory predictive_factory)
     : config_(normalizeConfig(std::move(config))),
       max_concurrent_model_loads_(config_.max_concurrent_model_loads),
+      memory_coordinator_(
+          std::make_shared<ConversationMemoryCoordinator>()),
       generative_pool_(
           config_.generative_pool_config,
           std::move(generative_factory),
-          loadEvents(this)),
+          loadEvents(this),
+          memory_coordinator_),
       predictive_pool_(
           config_.predictive_pool_config,
           std::move(predictive_factory),
@@ -303,6 +306,7 @@ void InferenceScheduler::start() {
         return;
     }
     shutdown_requested_ = false;
+    store_worker_.start();
     generative_pool_.start();
     started_ = true;
     LOG_INFO("[InferenceScheduler] Started");
@@ -328,6 +332,25 @@ PredictiveRuntimeHandle InferenceScheduler::reserve(
         &predictive_pool_,
         runtime,
         std::move(stored_metadata));
+}
+
+std::shared_ptr<ConversationMemoryCoordinator>
+InferenceScheduler::memoryCoordinator() const {
+    return memory_coordinator_;
+}
+
+std::optional<ConversationMemoryUpdate>
+InferenceScheduler::awaitConversationMemory(const std::string& memory_key) {
+    memory_coordinator_->awaitReady(memory_key);
+    return memory_coordinator_->committedSnapshot(memory_key);
+}
+
+bool InferenceScheduler::enqueueStoreTask(
+    std::string idempotency_key,
+    std::function<void()> task) {
+    return store_worker_.enqueue(
+        std::move(idempotency_key),
+        std::move(task));
 }
 
 CancelResult InferenceScheduler::cancel(const std::string& job_id) {
@@ -362,6 +385,8 @@ void InferenceScheduler::shutdown(bool force) {
 
     generative_pool_.stop(force);
     predictive_pool_.stop(force);
+    memory_coordinator_->cancelPending();
+    store_worker_.stop(force);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

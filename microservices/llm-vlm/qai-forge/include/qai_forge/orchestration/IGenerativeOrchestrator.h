@@ -6,6 +6,8 @@
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/scheduler/GenerativeJob.h"
 
+#include <optional>
+
 class IGenerativeOrchestrator {
 public:
     virtual ~IGenerativeOrchestrator() = default;
@@ -17,4 +19,17 @@ public:
     virtual StandardResponse execute(
         scheduler::GenerativeJob& job,
         IGenerativeBackend& backend) const = 0;
+
+    virtual std::optional<scheduler::PostTurnTask> createPostTurnTask(
+        scheduler::GenerativeJob&,
+        const StandardResponse&) const {
+        return std::nullopt;
+    }
+
+    virtual ConversationMemoryUpdate executePostTurn(
+        scheduler::PostTurnTask&,
+        const ConversationMemoryUpdate& committed_memory,
+        IGenerativeBackend&) const {
+        return committed_memory;
+    }
 };

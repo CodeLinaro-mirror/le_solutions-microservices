@@ -7,12 +7,15 @@
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/GenerativeJob.h"
 #include "qai_forge/scheduler/PredictiveModelPool.h"
+#include "qai_forge/scheduler/StoreWorker.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
 
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace scheduler {
@@ -116,6 +119,11 @@ public:
         const GenerativeScheduleMetadata& metadata);
     PredictiveRuntimeHandle reserve(
         const PredictiveScheduleMetadata& metadata);
+    std::shared_ptr<ConversationMemoryCoordinator> memoryCoordinator() const;
+    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
+        const std::string& memory_key);
+    bool enqueueStoreTask(std::string idempotency_key,
+                          std::function<void()> task);
     CancelResult cancel(const std::string& job_id);
 
     bool openToolLease(const std::string& model_id,
@@ -144,6 +152,8 @@ private:
     bool started_ = false;
     bool shutdown_requested_ = false;
 
+    std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
+    StoreWorker store_worker_;
     WarmModelPool generative_pool_;
     PredictiveModelPool predictive_pool_;
 };

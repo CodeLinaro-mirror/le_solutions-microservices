@@ -49,6 +49,8 @@ const char* stateToString(ModelRuntimeState state) {
             return "idle";
         case ModelRuntimeState::Running:
             return "running";
+        case ModelRuntimeState::PostTurn:
+            return "post_turn";
         case ModelRuntimeState::Draining:
             return "draining";
         case ModelRuntimeState::Evicting:
@@ -77,14 +79,21 @@ const char* actionToString(int type) {
 
 WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
                              ModelRuntimePairFactory runtime_factory,
-                             ModelRuntimeEvents runtime_events)
+                             ModelRuntimeEvents runtime_events,
+                             std::shared_ptr<ConversationMemoryCoordinator>
+                                 memory_coordinator)
     : config_(config),
       runtime_factory_(runtime_factory ? std::move(runtime_factory)
                                        : defaultRuntimeFactory()),
       runtime_events_(std::move(runtime_events)),
+      memory_coordinator_(std::move(memory_coordinator)),
       eviction_policy_(std::make_unique<EvictionPolicy>()) {
     if (!runtime_factory_) {
         throw std::invalid_argument("WarmModelPool requires a runtime factory");
+    }
+    if (!memory_coordinator_) {
+        memory_coordinator_ =
+            std::make_shared<ConversationMemoryCoordinator>();
     }
     if (config_.blocked_admission_timeout.count() <= 0) {
         config_.blocked_admission_timeout = std::chrono::seconds(30);
@@ -625,6 +634,10 @@ void WarmModelPool::handleRuntimeStateChanged(const std::string& model_id,
                 record.idle_since.reset();
                 record.last_used_at = now;
                 break;
+            case ModelRuntimeState::PostTurn:
+                record.idle_since.reset();
+                record.last_used_at = now;
+                break;
             case ModelRuntimeState::Idle:
                 record.idle_since = now;
                 record.last_used_at = now;
@@ -681,6 +694,7 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
         model_id,
         std::move(pair.backend),
         std::move(pair.orchestrator),
+        memory_coordinator_,
         std::move(events));
     runtime->start();
 
@@ -790,6 +804,7 @@ bool WarmModelPool::isActiveReservedState(ModelRuntimeState state) {
     return state == ModelRuntimeState::Loading ||
            state == ModelRuntimeState::Idle ||
            state == ModelRuntimeState::Running ||
+           state == ModelRuntimeState::PostTurn ||
            state == ModelRuntimeState::Draining ||
            state == ModelRuntimeState::Evicting;
 }

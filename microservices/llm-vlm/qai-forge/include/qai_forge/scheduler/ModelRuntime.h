@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/scheduler/CancelResult.h"
+#include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 
@@ -21,11 +22,14 @@ class IGenerativeBackend;
 
 namespace scheduler {
 
+class PostTurnWorker;
+
 enum class ModelRuntimeState {
     NotResident,
     Loading,
     Idle,
     Running,
+    PostTurn,
     Draining,
     Evicting,
     Failed,
@@ -71,6 +75,7 @@ public:
     ModelRuntime(std::string model_id,
                  std::unique_ptr<IGenerativeBackend> backend,
                  std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+                 std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                  ModelRuntimeEvents events = {});
     ~ModelRuntime();
 
@@ -100,7 +105,10 @@ private:
 
     void executorLoop();
     size_t promoteAgedJobs();
-    void runJob(GenerativeJob& job);
+    bool runJob(GenerativeJob& job);
+    bool beginPostTurn(GenerativeJob& job,
+                       const StandardResponse& response);
+    void finishPostTurn();
     void unloadBackend(bool force);
     void armCancelWatchdog(const std::string& job_id);
     void invalidateCancelWatchdog();
@@ -121,6 +129,8 @@ private:
     PriorityModelQueue queue_;
     std::unique_ptr<IGenerativeBackend> backend_;
     std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
+    std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
+    std::unique_ptr<PostTurnWorker> post_turn_worker_;
     ModelRuntimeEvents events_;
 
     mutable std::mutex mutex_;

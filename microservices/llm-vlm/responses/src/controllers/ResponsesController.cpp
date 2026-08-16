@@ -301,15 +301,9 @@ static TokenBudgetUtils::ContextBudgetResult resolve_response_context_budget(
 }
 
 static std::optional<StoredConversationMemory> make_store_memory_update(
-    const StandardResponse& result,
+    const ConversationMemoryUpdate& update,
     const std::optional<StoredConversationMemory>& previous_memory,
     const std::vector<std::string>& runtime_ancestor_response_ids) {
-    if (!result.updated_conversation_memory.has_value()) {
-        return std::nullopt;
-    }
-
-    const ConversationMemoryUpdate& update =
-        result.updated_conversation_memory.value();
     std::string previous_watermark = previous_memory.has_value()
         ? previous_memory->summarized_until_response_id
         : std::string();
@@ -324,6 +318,54 @@ static std::optional<StoredConversationMemory> make_store_memory_update(
             runtime_ancestor_response_ids,
             update.evicted_message_count);
     return memory;
+}
+
+static std::optional<StoredConversationMemory> make_store_memory_update(
+    const StandardResponse& result,
+    const std::optional<StoredConversationMemory>& previous_memory,
+    const std::vector<std::string>& runtime_ancestor_response_ids) {
+    if (!result.updated_conversation_memory.has_value()) {
+        return std::nullopt;
+    }
+    return make_store_memory_update(
+        result.updated_conversation_memory.value(),
+        previous_memory,
+        runtime_ancestor_response_ids);
+}
+
+static void enqueue_store_memory_update(
+    const std::string& response_id,
+    const std::string& conversation_memory_key,
+    const std::optional<StoredConversationMemory>& previous_memory,
+    const std::vector<std::string>& runtime_ancestor_response_ids) {
+    const bool queued =
+        qai_forge::QaiForge::getInstance().enqueueStoreTask(
+            "responses-memory:" + response_id,
+            [response_id,
+             conversation_memory_key,
+             previous_memory,
+             runtime_ancestor_response_ids]() {
+                const std::optional<ConversationMemoryUpdate> update =
+                    qai_forge::QaiForge::getInstance()
+                        .awaitConversationMemory(conversation_memory_key);
+                if (!update.has_value()) {
+                    return;
+                }
+                const std::optional<StoredConversationMemory> stored_memory =
+                    make_store_memory_update(
+                        update.value(),
+                        previous_memory,
+                        runtime_ancestor_response_ids);
+                if (stored_memory.has_value()) {
+                    ResponseStore::getInstance().updateConversationMemory(
+                        response_id,
+                        stored_memory.value());
+                }
+            });
+    if (!queued) {
+        LOG_WARN("[ResponsesController] StoreWorker rejected memory hand-off: response="
+                 << response_id);
+    }
 }
 
 static void collect_tool_call_ids(const json& messages,
@@ -1262,6 +1304,36 @@ void ResponsesController::createResponse(
 
         if (!is_vlm) {
             prepared_text_messages = prepare_text_runtime_messages(walk);
+            if (!previous_response_id.empty()) {
+                const std::optional<ConversationMemoryUpdate> update =
+                    qai_forge::QaiForge::getInstance()
+                        .awaitConversationMemory(previous_response_id);
+                if (update.has_value()) {
+                    const std::optional<StoredConversationMemory>
+                        stored_memory = make_store_memory_update(
+                            update.value(),
+                            walk.conversation_memory,
+                            prepared_text_messages
+                                .ancestor_message_response_ids);
+                    if (stored_memory.has_value()) {
+                        store.updateConversationMemory(
+                            previous_response_id,
+                            stored_memory.value());
+                        walk = store.buildCandidateMessages(
+                            previous_response_id,
+                            request_messages);
+                        if (!walk.ok) {
+                            callback(make_error_response(
+                                walk.http_status,
+                                walk.error_message,
+                                "invalid_request_error",
+                                "previous_response_id"));
+                            return;
+                        }
+                    }
+                }
+            }
+            prepared_text_messages = prepare_text_runtime_messages(walk);
             if (!resolved_max_output_tokens.has_value()
                 || resolved_max_output_tokens == requested_max_output_tokens) {
                 TokenBudgetUtils::ContextBudgetResult budget =
@@ -1345,8 +1417,11 @@ void ResponsesController::createResponse(
 
     qai_forge::GenerateOptions invoke_options;
     invoke_options.response_id = response_id;
-    invoke_options.session_id = response_id;
+    invoke_options.session_id = begin.session_id;
+    invoke_options.conversation_memory_read_key = previous_response_id;
+    invoke_options.conversation_memory_write_key = response_id;
     invoke_options.use_response_history = true;
+    invoke_options.response_history_is_pruned = true;
     invoke_options.response_history = std::move(runtime_ancestor_messages);
     invoke_options.evicted_message_count = 0;
     if (begin.conversation_memory.has_value()) {
@@ -1628,6 +1703,13 @@ void ResponsesController::createResponse(
 
                             stream_ptr->send("data: [DONE]\n\n");
                             stream_ptr->close();
+                            if (response.updated_conversation_memory.has_value()) {
+                                enqueue_store_memory_update(
+                                    response_id,
+                                    response_id,
+                                    begin_memory,
+                                    runtime_ancestor_response_ids);
+                            }
                         };
 
                         callbacks.onError = [shared_stream, response_id](const GenAIException& error) {
@@ -1778,6 +1860,13 @@ void ResponsesController::createResponse(
 
             auto resp = make_json_response(response_obj, k200OK);
             callback(resp);
+            if (result.updated_conversation_memory.has_value()) {
+                enqueue_store_memory_update(
+                    response_id,
+                    response_id,
+                    begin.conversation_memory,
+                    runtime_ancestor_response_ids);
+            }
         }
 
     } catch (const GenAIException& e) {
