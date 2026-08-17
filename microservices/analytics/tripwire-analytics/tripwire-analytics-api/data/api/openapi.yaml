@@ -472,6 +472,7 @@ components:
         - tripwire_id
         - trigger_id
         - trigger_name
+        - trigger_direction
         - trigger_condition
         - params
 
@@ -510,6 +511,12 @@ components:
               $ref: "#/components/schemas/Coord"
             exit:
               $ref: "#/components/schemas/Coord"
+      required:
+        - monitor_id
+        - tripwire_id
+        - tripwire_name
+        - wire
+        - direction
 
     Tripwires:
       description: List of Tripwire objects

@@ -123,35 +123,45 @@ async def async_main():
     ta = TripwireAnalytics(r)
     channel_listener_task = None
     statistics_process_task = None
+    pubsub = None
+    main_task = asyncio.current_task()
 
     try:
+        def quit_handler():
+            logging.info('Got shutdown signal, cancelling main task..')
+            main_task.cancel()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, quit_handler)
+
         await connect_to_redis(r)
 
-        def quit_handler ():
-            if channel_listener_task == None:
-                raise RuntimeError('Got SIGTERM but no task to cancel!')
-            logging.info('Got SIGTERM, cancelling listener task..')
-            channel_listener_task.cancel()
-
-            ta.deInit()
-
         pubsub = await register_pubsub_listener(r, ta)
-        loop = asyncio.get_event_loop()
-        loop.add_signal_handler(signal.SIGTERM, quit_handler)
 
         await ta.init()
         statistics_process_task = ta.start_statistics_task()
 
         channel_listener_task = asyncio.create_task(pubsub.run()) # runs forever until cancelled
 
-        await channel_listener_task
-        await statistics_process_task
+        await asyncio.gather(
+            channel_listener_task,
+            statistics_process_task,
+            return_exceptions=True
+        )
 
     except asyncio.CancelledError:
         logger.info('Got cancelled exception, shutting down..')
     finally:
-        logger.info('Closing redis client..')
+        logger.info('Cleaning up resources..')
+        ta.deinit()
+        if pubsub is not None:
+            try:
+                await pubsub.aclose()
+            except Exception as e:
+                logger.debug(f'pubsub close: {e}')
         await r.aclose()
+        logger.info('Shutdown complete.')
 
 
 if __name__ == "__main__":
