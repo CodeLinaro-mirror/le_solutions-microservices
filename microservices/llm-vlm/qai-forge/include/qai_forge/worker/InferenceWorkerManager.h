@@ -113,6 +113,20 @@ public:
                         DoneCallback on_done,
                         ErrorCallback on_error);
 
+    void executeStructuredRequest(const std::string& event_id,
+                                  const json& messages,
+                                  const json& tools,
+                                  bool streaming,
+                                  int max_tokens,
+                                  float temperature,
+                                  float top_p,
+                                  int top_k,
+                                  float presence_penalty,
+                                  float frequency_penalty,
+                                  TokenCallback on_token,
+                                  DoneCallback on_done,
+                                  ErrorCallback on_error);
+
     /**
      * Send a RESET command and wait for the matching READY response.
      * Called by Layer 2's ConcurrencyMiddleware (not by Layer 3 itself).

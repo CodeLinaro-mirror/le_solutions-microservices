@@ -257,56 +257,6 @@ GenAIException submitErrorToException(const SubmitResult& result) {
     return GenAIException(code, message, status);
 }
 
-InferenceJobPtr buildJob(const CreateChatCompletionRequest& request,
-                         SchedulerInvokeOptions options) {
-    if (!options.response_history.is_array()) {
-        options.response_history = json::array();
-    }
-
-    auto job = std::make_shared<InferenceJob>();
-    job->job_id = options.response_id.empty()
-        ? generatedJobId()
-        : options.response_id;
-    job->response_id = options.response_id.empty()
-        ? job->job_id : options.response_id;
-    job->previous_response_id = options.previous_response_id;
-    if (!options.session_id.empty()) {
-        job->session_id = options.session_id;
-    } else if (request.user.has_value() && !request.user.value().empty()) {
-        job->session_id = request.user.value();
-    } else if (!job->previous_response_id.empty()) {
-        job->session_id = job->previous_response_id;
-    } else {
-        job->session_id = job->response_id;
-    }
-    job->model_id = request.model;
-    job->kind = options.kind;
-    job->priority = options.priority;
-    job->allow_tool_chain_fallback = options.allow_tool_chain_fallback;
-    job->request = request;
-    if (!job->session_id.empty()) {
-        job->request.user = job->session_id;
-    }
-
-    const bool tool_output =
-        options.tool_output_submission || requestContainsToolOutput(request);
-    job->invoke_options = std::make_shared<const SchedulerInvokeOptions>(
-        std::move(options));
-    if (tool_output && !job->previous_response_id.empty()) {
-        job->is_tool_output_submission = true;
-        job->priority = JobPriority::READY_TOOL_CONT;
-    } else if (job->priority == JobPriority::NEW_REQUEST &&
-               !job->previous_response_id.empty()) {
-        job->priority = JobPriority::SESSION_CONT;
-    }
-
-    job->is_tool_continuation =
-        job->priority == JobPriority::READY_TOOL_CONT ||
-        job->is_tool_output_submission;
-
-    return job;
-}
-
 void submitOrThrow(ModelScheduler& scheduler, const InferenceJobPtr& job) {
     SubmitResult result = scheduler.submit(job);
     if (!result.accepted()) {
@@ -371,29 +321,132 @@ void ModelScheduler::start() {
     LOG_INFO("[ModelScheduler] Started");
 }
 
+GenerativeJobContext ModelScheduler::prepareContext(
+    const CreateChatCompletionRequest& request,
+    const qai_forge::GenerateOptions& options,
+    JobKind kind) {
+    GenerativeJobContext context;
+    context.job_id = options.response_id.empty()
+        ? generatedJobId() : options.response_id;
+    context.model_id = request.model;
+    context.request = request;
+    context.caller = options;
+    context.kind = kind;
+    context.priority = JobPriority::NEW_REQUEST;
+    context.skip_post_turn_summarization = true;
+
+    const std::string response_id = options.response_id.empty()
+        ? context.job_id : options.response_id;
+    std::string session_id;
+    if (!options.session_id.empty()) {
+        session_id = options.session_id;
+    } else if (request.user.has_value() && !request.user->empty()) {
+        session_id = request.user.value();
+    } else if (!options.previous_response_id.empty()) {
+        session_id = options.previous_response_id;
+    } else {
+        session_id = response_id;
+    }
+    context.request.user = session_id;
+
+    bool tool_output = options.tool_output_submission ||
+        requestContainsToolOutput(request);
+    if (tool_output && !options.previous_response_id.empty()) {
+        const ToolChainResolveResult resolved =
+            tool_chains_.resolveByPreviousResponseId(
+                options.previous_response_id);
+        if (resolved.status == ToolChainResolveStatus::Expired) {
+            if (!options.allow_tool_chain_fallback) {
+                throw submitErrorToException(reject(
+                    SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
+                    context.job_id,
+                    resolved.message));
+            }
+            tool_output = false;
+        }
+        if (tool_output &&
+            (resolved.status == ToolChainResolveStatus::NotFound ||
+             !resolved.entry.has_value())) {
+            if (!options.allow_tool_chain_fallback) {
+                throw submitErrorToException(reject(
+                    SubmitStatus::REJECTED_PREVIOUS_RESPONSE_NOT_FOUND,
+                    context.job_id,
+                    resolved.message));
+            }
+            tool_output = false;
+        }
+
+        if (tool_output) {
+            const ToolChainEntry& chain = resolved.entry.value();
+            context.tool_chain_id = chain.chain_id;
+            context.model_id = chain.model_id;
+            context.request.model = chain.model_id;
+            context.request.user = chain.session_id;
+            context.priority = JobPriority::READY_TOOL_CONT;
+            context.tool_continuation = true;
+            if (!tool_chains_.markContinuationQueued(
+                    chain.chain_id,
+                    context.job_id,
+                    config_.tool_response_timeout)) {
+                if (!options.allow_tool_chain_fallback) {
+                    throw submitErrorToException(reject(
+                        SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
+                        context.job_id,
+                        "Tool response window expired for previous_response_id '" +
+                            options.previous_response_id + "'"));
+                }
+                context.tool_chain_id.clear();
+                context.model_id = request.model;
+                context.request.model = request.model;
+                context.request.user = session_id;
+                context.priority = JobPriority::SESSION_CONT;
+                context.tool_continuation = false;
+            } else {
+                pool_.renewToolLease(
+                    chain.model_id,
+                    chain.chain_id,
+                    config_.tool_response_timeout);
+            }
+        }
+    }
+
+    if (!context.tool_continuation &&
+        !options.previous_response_id.empty()) {
+        context.priority = JobPriority::SESSION_CONT;
+    }
+    return context;
+}
+
+GenerativeJobPtr ModelScheduler::createJob(
+    GenerativeJobContext context,
+    GenerativeCallbacks callbacks) {
+    const std::string model_id = context.model_id;
+    const std::string tool_chain_id = context.tool_chain_id;
+    try {
+        return BackendFactory::createGenerativeOrchestratorForModel(
+                   model_id)
+            ->createJob(std::move(context), std::move(callbacks));
+    } catch (...) {
+        closeChainIfPresent(model_id, tool_chain_id);
+        throw;
+    }
+}
+
 StandardResponse ModelScheduler::runBlocking(
     const CreateChatCompletionRequest& request,
-    SchedulerInvokeOptions options) {
+    const qai_forge::GenerateOptions& options) {
     validateSchedulableOrThrow(request, "Blocking");
-
-    InferenceJobPtr job = buildJob(request, std::move(options));
-    LOG_INFO("[ModelScheduler] Submitting blocking request: job="
-             << job->job_id << " response=" << job->response_id
-             << " model=" << job->model_id
-             << " session=" << job->session_id
-             << " previous=" << job->previous_response_id
-             << " kind=" << kindToString(job->kind)
-             << " priority=" << priorityToString(job->priority)
-             << " tool_output="
-             << (job->is_tool_output_submission ? "true" : "false"));
+    GenerativeJobContext context = prepareContext(
+        request, options, JobKind::HTTP_NON_STREAMING);
 
     auto promise = std::make_shared<std::promise<StandardResponse>>();
     auto future = promise->get_future();
     auto mutex = std::make_shared<std::mutex>();
     auto completed = std::make_shared<bool>(false);
 
-    job->callbacks.on_complete =
-        [promise, mutex, completed, job_id = job->job_id](
+    GenerativeCallbacks callbacks;
+    callbacks.on_complete =
+        [promise, mutex, completed, job_id = context.job_id](
             const StandardResponse& response) {
             LOG_INFO("[ModelScheduler] Blocking request completed: job="
                      << job_id << " finish_reason=" << response.finish_reason
@@ -408,8 +461,8 @@ StandardResponse ModelScheduler::runBlocking(
                 });
         };
 
-    job->callbacks.on_error =
-        [promise, mutex, completed, job_id = job->job_id](
+    callbacks.on_error =
+        [promise, mutex, completed, job_id = context.job_id](
             const GenAIException& error) {
             LOG_WARN("[ModelScheduler] Blocking request failed: job="
                      << job_id << " status=" << error.http_status
@@ -423,8 +476,8 @@ StandardResponse ModelScheduler::runBlocking(
                 });
         };
 
-    job->callbacks.on_cancelled =
-        [promise, mutex, completed, job_id = job->job_id]() {
+    callbacks.on_cancelled =
+        [promise, mutex, completed, job_id = context.job_id]() {
             LOG_WARN("[ModelScheduler] Blocking request cancelled: job="
                      << job_id);
             setPromiseOnce(
@@ -440,6 +493,18 @@ StandardResponse ModelScheduler::runBlocking(
                 });
         };
 
+    InferenceJobPtr job = createJob(
+        std::move(context), std::move(callbacks));
+    LOG_INFO("[ModelScheduler] Submitting blocking request: job="
+             << job->job_id << " response=" << job->response_id
+             << " model=" << job->model_id
+             << " session=" << job->session_id
+             << " previous=" << options.previous_response_id
+             << " kind=" << kindToString(job->kind)
+             << " priority=" << priorityToString(job->priority)
+             << " tool_output="
+             << (!job->tool_chain_id.empty() ? "true" : "false"));
+
     submitOrThrow(*this, job);
     return future.get();
 }
@@ -447,33 +512,22 @@ StandardResponse ModelScheduler::runBlocking(
 StandardResponse ModelScheduler::runStreaming(
     const CreateChatCompletionRequest& request,
     std::function<void(const StreamChunk&)> callback,
-    SchedulerInvokeOptions options) {
+    const qai_forge::GenerateOptions& options) {
     validateSchedulableOrThrow(request, "Streaming");
-
-    if (options.kind == JobKind::HTTP_NON_STREAMING) {
-        options.kind = JobKind::HTTP_STREAMING;
-    }
-
-    InferenceJobPtr job = buildJob(request, std::move(options));
-    job->request.stream = true;
-    LOG_INFO("[ModelScheduler] Submitting streaming request: job="
-             << job->job_id << " response=" << job->response_id
-             << " model=" << job->model_id
-             << " session=" << job->session_id
-             << " previous=" << job->previous_response_id
-             << " kind=" << kindToString(job->kind)
-             << " priority=" << priorityToString(job->priority)
-             << " tool_output="
-             << (job->is_tool_output_submission ? "true" : "false"));
+    CreateChatCompletionRequest streaming_request = request;
+    streaming_request.stream = true;
+    GenerativeJobContext context = prepareContext(
+        streaming_request, options, JobKind::HTTP_STREAMING);
 
     auto promise = std::make_shared<std::promise<StandardResponse>>();
     auto future = promise->get_future();
     auto mutex = std::make_shared<std::mutex>();
     auto completed = std::make_shared<bool>(false);
 
-    job->callbacks.on_token = std::move(callback);
-    job->callbacks.on_complete =
-        [promise, mutex, completed, job_id = job->job_id](
+    GenerativeCallbacks callbacks;
+    callbacks.on_token = std::move(callback);
+    callbacks.on_complete =
+        [promise, mutex, completed, job_id = context.job_id](
             const StandardResponse& response) {
             LOG_INFO("[ModelScheduler] Streaming request completed: job="
                      << job_id << " finish_reason=" << response.finish_reason);
@@ -486,8 +540,8 @@ StandardResponse ModelScheduler::runStreaming(
                 });
         };
 
-    job->callbacks.on_error =
-        [promise, mutex, completed, job_id = job->job_id](
+    callbacks.on_error =
+        [promise, mutex, completed, job_id = context.job_id](
             const GenAIException& error) {
             LOG_WARN("[ModelScheduler] Streaming request failed: job="
                      << job_id << " status=" << error.http_status
@@ -501,8 +555,8 @@ StandardResponse ModelScheduler::runStreaming(
                 });
         };
 
-    job->callbacks.on_cancelled =
-        [promise, mutex, completed, job_id = job->job_id]() {
+    callbacks.on_cancelled =
+        [promise, mutex, completed, job_id = context.job_id]() {
             LOG_WARN("[ModelScheduler] Streaming request cancelled: job="
                      << job_id);
             setPromiseOnce(
@@ -518,6 +572,18 @@ StandardResponse ModelScheduler::runStreaming(
                 });
         };
 
+    InferenceJobPtr job = createJob(
+        std::move(context), std::move(callbacks));
+    LOG_INFO("[ModelScheduler] Submitting streaming request: job="
+             << job->job_id << " response=" << job->response_id
+             << " model=" << job->model_id
+             << " session=" << job->session_id
+             << " previous=" << options.previous_response_id
+             << " kind=" << kindToString(job->kind)
+             << " priority=" << priorityToString(job->priority)
+             << " tool_output="
+             << (!job->tool_chain_id.empty() ? "true" : "false"));
+
     submitOrThrow(*this, job);
     return future.get();
 }
@@ -525,30 +591,19 @@ StandardResponse ModelScheduler::runStreaming(
 void ModelScheduler::runStreamingAsync(
     const CreateChatCompletionRequest& request,
     qai_forge::StreamCallbacks callbacks,
-    SchedulerInvokeOptions options) {
+    const qai_forge::GenerateOptions& options) {
     validateSchedulableOrThrow(request, "StreamingAsync");
-
-    if (options.kind == JobKind::HTTP_NON_STREAMING) {
-        options.kind = JobKind::HTTP_STREAMING;
-    }
-
-    InferenceJobPtr job = buildJob(request, std::move(options));
-    job->request.stream = true;
-    LOG_INFO("[ModelScheduler] Submitting async streaming request: job="
-             << job->job_id << " response=" << job->response_id
-             << " model=" << job->model_id
-             << " session=" << job->session_id
-             << " previous=" << job->previous_response_id
-             << " kind=" << kindToString(job->kind)
-             << " priority=" << priorityToString(job->priority)
-             << " tool_output="
-             << (job->is_tool_output_submission ? "true" : "false"));
+    CreateChatCompletionRequest streaming_request = request;
+    streaming_request.stream = true;
+    GenerativeJobContext context = prepareContext(
+        streaming_request, options, JobKind::HTTP_STREAMING);
 
     // Wire callbacks directly - no promise/future blocking
-    job->callbacks.on_token = std::move(callbacks.onToken);
-    job->callbacks.on_complete =
+    GenerativeCallbacks inference_callbacks;
+    inference_callbacks.on_token = std::move(callbacks.onToken);
+    inference_callbacks.on_complete =
         [user_callback = std::move(callbacks.onComplete),
-         job_id = job->job_id](const StandardResponse& response) {
+         job_id = context.job_id](const StandardResponse& response) {
             LOG_INFO("[ModelScheduler] Async streaming request completed: job="
                      << job_id << " finish_reason=" << response.finish_reason);
             if (user_callback) {
@@ -556,9 +611,9 @@ void ModelScheduler::runStreamingAsync(
             }
         };
 
-    job->callbacks.on_error =
+    inference_callbacks.on_error =
         [user_callback = std::move(callbacks.onError),
-         job_id = job->job_id](const GenAIException& error) {
+         job_id = context.job_id](const GenAIException& error) {
             LOG_WARN("[ModelScheduler] Async streaming request failed: job="
                      << job_id << " status=" << error.http_status
                      << " message=\"" << error.message << "\"");
@@ -567,15 +622,27 @@ void ModelScheduler::runStreamingAsync(
             }
         };
 
-    job->callbacks.on_cancelled =
+    inference_callbacks.on_cancelled =
         [user_callback = std::move(callbacks.onCancelled),
-         job_id = job->job_id]() {
+         job_id = context.job_id]() {
             LOG_WARN("[ModelScheduler] Async streaming request cancelled: job="
                      << job_id);
             if (user_callback) {
                 user_callback();
             }
         };
+
+    InferenceJobPtr job = createJob(
+        std::move(context), std::move(inference_callbacks));
+    LOG_INFO("[ModelScheduler] Submitting async streaming request: job="
+             << job->job_id << " response=" << job->response_id
+             << " model=" << job->model_id
+             << " session=" << job->session_id
+             << " previous=" << options.previous_response_id
+             << " kind=" << kindToString(job->kind)
+             << " priority=" << priorityToString(job->priority)
+             << " tool_output="
+             << (!job->tool_chain_id.empty() ? "true" : "false"));
 
     // Submit and return immediately - non-blocking
     submitOrThrow(*this, job);
@@ -608,100 +675,13 @@ SubmitResult ModelScheduler::submit(InferenceJobPtr job) {
              << " response=" << job->response_id
              << " model=" << job->model_id
              << " session=" << job->session_id
-             << " previous=" << job->previous_response_id
              << " priority=" << priorityToString(job->priority)
-             << " tool_output=" << (job->is_tool_output_submission ? "true" : "false"));
-
-    if (job->is_tool_output_submission) {
-        const ToolChainResolveResult resolved =
-            tool_chains_.resolveByPreviousResponseId(
-                job->previous_response_id);
-
-        if (resolved.status == ToolChainResolveStatus::Expired) {
-            LOG_WARN("[ModelScheduler] Tool continuation expired: job="
-                     << job->job_id << " previous="
-                     << job->previous_response_id
-                     << " message=\"" << resolved.message << "\"");
-            if (job->allow_tool_chain_fallback) {
-                job->is_tool_output_submission = false;
-                job->is_tool_continuation = false;
-                job->priority = JobPriority::SESSION_CONT;
-                LOG_INFO("[ModelScheduler] Falling back to store-backed continuation: job="
-                         << job->job_id << " previous="
-                         << job->previous_response_id);
-            } else {
-                return reject(
-                    SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
-                    job->job_id,
-                    resolved.message);
-            }
-        }
-
-        if (resolved.status == ToolChainResolveStatus::NotFound ||
-            !resolved.entry.has_value()) {
-            LOG_WARN("[ModelScheduler] Tool continuation unknown: job="
-                     << job->job_id << " previous="
-                     << job->previous_response_id
-                     << " message=\"" << resolved.message << "\"");
-            if (job->allow_tool_chain_fallback) {
-                job->is_tool_output_submission = false;
-                job->is_tool_continuation = false;
-                job->priority = JobPriority::SESSION_CONT;
-                LOG_INFO("[ModelScheduler] Falling back to store-backed continuation: job="
-                         << job->job_id << " previous="
-                         << job->previous_response_id);
-            } else {
-                return reject(
-                    SubmitStatus::REJECTED_PREVIOUS_RESPONSE_NOT_FOUND,
-                    job->job_id,
-                    resolved.message);
-            }
-        }
-
-        if (!job->is_tool_output_submission) {
-            // ResponseStore already supplied the history. Missing/expired
-            // ToolChainTable state only removes the warm-priority optimization.
-        } else {
-            prepareToolContinuation(*job, resolved.entry.value());
-            LOG_INFO("[ModelScheduler] Tool continuation resolved: job="
-                     << job->job_id << " chain=" << job->tool_chain_id
-                     << " model=" << job->model_id
-                     << " session=" << job->session_id);
-            if (!tool_chains_.markContinuationQueued(
-                    job->tool_chain_id,
-                    job->job_id,
-                    config_.tool_response_timeout)) {
-                LOG_WARN("[ModelScheduler] Tool continuation lease expired while queueing: job="
-                         << job->job_id << " chain=" << job->tool_chain_id);
-                if (job->allow_tool_chain_fallback) {
-                    job->is_tool_output_submission = false;
-                    job->is_tool_continuation = false;
-                    job->priority = JobPriority::SESSION_CONT;
-                    job->tool_chain_id.clear();
-                    LOG_INFO("[ModelScheduler] Falling back after lease expiry: job="
-                             << job->job_id << " previous="
-                             << job->previous_response_id);
-                } else {
-                    return reject(
-                        SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT,
-                        job->job_id,
-                        "Tool response window expired for previous_response_id '" +
-                            job->previous_response_id + "'");
-                }
-            }
-
-            if (job->is_tool_output_submission) {
-                pool_.renewToolLease(
-                    job->model_id,
-                    job->tool_chain_id,
-                    config_.tool_response_timeout);
-            }
-        }
-    }
+             << " tool_continuation="
+             << (!job->tool_chain_id.empty() ? "true" : "false"));
 
     wrapCallbacks(*job);
     SubmitResult result = pool_.submit(job);
-    if (!result.accepted() && job->is_tool_continuation) {
+    if (!result.accepted() && !job->tool_chain_id.empty()) {
         closeChainIfPresent(job->model_id, job->tool_chain_id);
     }
     LOG_INFO("[ModelScheduler] Submit result: job=" << job->job_id
@@ -794,28 +774,9 @@ SubmitResult ModelScheduler::reject(SubmitStatus status,
     return result;
 }
 
-void ModelScheduler::prepareToolContinuation(
-    InferenceJob& job,
-    const ToolChainEntry& chain) {
-    job.tool_chain_id = chain.chain_id;
-    job.model_id = chain.model_id;
-    job.request.model = chain.model_id;
-    job.session_id = chain.session_id;
-    if (!job.session_id.empty()) {
-        job.request.user = job.session_id;
-    }
-    job.priority = JobPriority::READY_TOOL_CONT;
-    job.is_tool_continuation = true;
-    LOG_INFO("[ModelScheduler] Prepared tool continuation: job="
-             << job.job_id << " chain=" << job.tool_chain_id
-             << " response=" << chain.response_id
-             << " model=" << job.model_id
-             << " session=" << job.session_id);
-}
-
 void ModelScheduler::wrapCallbacks(InferenceJob& job) {
     auto original_callbacks =
-        std::make_shared<InferenceCallbacks>(std::move(job.callbacks));
+        std::make_shared<GenerativeCallbacks>(std::move(job.callbacks));
 
     const std::string response_id = job.response_id;
     const std::string model_id = job.model_id;

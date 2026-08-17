@@ -8,6 +8,7 @@
 #include <optional>
 #include <functional>
 #include <cstdint>
+#include <utility>
 
 // Use the official nlohmann forward-declaration header.
 // This provides the correct `using json = basic_json<>` alias without pulling
@@ -269,6 +270,13 @@ public:
      */
     struct TempFileGuard {
         std::vector<std::string> paths;
+
+        TempFileGuard() = default;
+        TempFileGuard(const TempFileGuard&) = delete;
+        TempFileGuard& operator=(const TempFileGuard&) = delete;
+        TempFileGuard(TempFileGuard&& other) noexcept
+            : paths(std::move(other.paths)) {}
+        TempFileGuard& operator=(TempFileGuard&&) = delete;
         ~TempFileGuard();
     };
 };

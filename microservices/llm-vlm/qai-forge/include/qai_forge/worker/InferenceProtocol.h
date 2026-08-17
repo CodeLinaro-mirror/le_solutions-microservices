@@ -128,6 +128,32 @@ public:
         };
     }
 
+    static json createStructuredExecuteCommand(
+        const std::string& event_id,
+        const json& messages,
+        const json& tools,
+        bool streaming,
+        int max_tokens = 1024,
+        float temperature = 1.0f,
+        float top_p = 1.0f,
+        int top_k = 40,
+        float presence_penalty = 0.0f,
+        float frequency_penalty = 0.0f) {
+        return {
+            {"type", CommandType::EXECUTE},
+            {"event_id", event_id},
+            {"messages", messages},
+            {"tools", tools},
+            {"streaming", streaming},
+            {"max_tokens", max_tokens},
+            {"temperature", temperature},
+            {"top_p", top_p},
+            {"top_k", top_k},
+            {"presence_penalty", presence_penalty},
+            {"frequency_penalty", frequency_penalty}
+        };
+    }
+
     static json createResetCommand(const std::string& command_id = "") {
         json cmd = {{"type", CommandType::RESET}};
         if (!command_id.empty()) cmd["command_id"] = command_id;

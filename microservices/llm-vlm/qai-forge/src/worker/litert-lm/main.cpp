@@ -355,6 +355,26 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     litert_lm_conversation_config_set_session_config(
         sess.conversation_config, sess.session_config);
 
+    json message_payload;
+    if (cmd.contains("messages") && cmd["messages"].is_array() &&
+        !cmd["messages"].empty()) {
+        json preface_messages = cmd["messages"];
+        message_payload = preface_messages.back();
+        preface_messages.erase(preface_messages.end() - 1);
+        if (!preface_messages.empty()) {
+            const std::string messages_json = preface_messages.dump();
+            litert_lm_conversation_config_set_messages(
+                sess.conversation_config, messages_json.c_str());
+        }
+        if (cmd.contains("tools") && cmd["tools"].is_array()) {
+            const std::string tools_json = cmd["tools"].dump();
+            litert_lm_conversation_config_set_tools(
+                sess.conversation_config, tools_json.c_str());
+        }
+    } else {
+        message_payload = {{"role", "user"}, {"content", text_input}};
+    }
+
     sess.conversation = litert_lm_conversation_create(
         sess.engine, sess.conversation_config);
     if (!sess.conversation) {
@@ -363,9 +383,7 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
         return;
     }
 
-    // Build user message JSON: {"role":"user","content":"<text>"}
-    json user_msg = {{"role", "user"}, {"content", text_input}};
-    std::string message_json = user_msg.dump();
+    std::string message_json = message_payload.dump();
 
     auto stream_callback = [](void* user_data, const char* chunk, bool is_final, const char* error_msg) {
         auto* data = static_cast<StreamCallbackData*>(user_data);

@@ -104,6 +104,21 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) override;
 
+    void generateStructured(
+        const std::string& event_id,
+        const json& messages,
+        const json& tools,
+        bool streaming,
+        int max_tokens,
+        float temperature,
+        float top_p,
+        int top_k,
+        float presence_penalty,
+        float frequency_penalty,
+        std::function<void(const IPCTokenEvent&)> on_token,
+        std::function<void(const IPCDoneEvent&)> on_done,
+        std::function<void(const IPCErrorEvent&)> on_error);
+
     /**
      * VLM inference — not supported by LiteRT-LM (LLM-only backend).
      * Calls on_error immediately.

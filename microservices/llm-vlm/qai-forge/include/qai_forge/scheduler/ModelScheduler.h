@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/InferenceJob.h"
 #include "qai_forge/scheduler/ToolChainTable.h"
@@ -18,10 +19,6 @@
 #include <vector>
 
 // Forward declaration
-namespace qai_forge {
-    struct StreamCallbacks;
-}
-
 namespace scheduler {
 
 struct ModelSchedulerConfig {
@@ -50,15 +47,15 @@ public:
     void start();
     StandardResponse runBlocking(
         const CreateChatCompletionRequest& request,
-        SchedulerInvokeOptions options = {});
+        const qai_forge::GenerateOptions& options = {});
     StandardResponse runStreaming(
         const CreateChatCompletionRequest& request,
         std::function<void(const StreamChunk&)> callback,
-        SchedulerInvokeOptions options = {});
+        const qai_forge::GenerateOptions& options = {});
     void runStreamingAsync(
         const CreateChatCompletionRequest& request,
         qai_forge::StreamCallbacks callbacks,
-        SchedulerInvokeOptions options = {});
+        const qai_forge::GenerateOptions& options = {});
     bool cancelResponse(const std::string& response_id);
     SubmitResult submit(InferenceJobPtr job);
     CancelResult cancel(const std::string& job_id);
@@ -74,8 +71,13 @@ private:
     SubmitResult reject(SubmitStatus status,
                         const std::string& job_id,
                         std::string message) const;
-    void prepareToolContinuation(InferenceJob& job,
-                                 const ToolChainEntry& chain);
+    GenerativeJobContext prepareContext(
+        const CreateChatCompletionRequest& request,
+        const qai_forge::GenerateOptions& options,
+        JobKind kind);
+    GenerativeJobPtr createJob(
+        GenerativeJobContext context,
+        GenerativeCallbacks callbacks);
     void wrapCallbacks(InferenceJob& job);
     void handleCompletion(const std::string& response_id,
                           const std::string& model_id,

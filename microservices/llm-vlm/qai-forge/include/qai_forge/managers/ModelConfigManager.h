@@ -126,7 +126,9 @@ public:
     // for the given model_id under a write lock.
     void updateLiteRTLMMetadata(const std::string& model_id,
                                  int max_context_length,
-                                 const std::string& jinja_template);
+                                 const std::string& jinja_template,
+                                 const std::string& tool_call_delimiter,
+                                 const std::string& tool_response_delimiter);
 
 private:
     ModelConfigManager() = default;

@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "qai_forge/orchestration/IOrchestrator.h"
-#include "qai_forge/session/SessionManager.h"
+#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/session/ConversationSession.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include <functional>
@@ -14,9 +14,9 @@
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GenieOrchestrator — Genie-specific IOrchestrator Implementation
+// GenieOrchestrator — Genie-specific generative orchestrator implementation
 //
-// Implements the IOrchestrator interface for the Qualcomm GenIE SDK backend.
+// Implements IGenerativeOrchestrator for the Qualcomm GenIE SDK backend.
 // This is the concrete orchestrator for all Genie-based LLM and VLM models.
 //
 // Genie-specific responsibilities:
@@ -39,7 +39,7 @@
 //   Step 4: Execution      — injected backend → ReasoningRouter → yield DTOs
 //   Step 5: Post-turn      — resetKvAsync
 // ─────────────────────────────────────────────────────────────────────────────
-class GenieOrchestrator : public IOrchestrator {
+class GenieOrchestrator : public IGenerativeOrchestrator {
 public:
     using CancellationPredicate = std::function<bool()>;
 
@@ -47,45 +47,13 @@ public:
     // per-model instances for the scheduler path.
     GenieOrchestrator();
 
-    static GenieOrchestrator& getInstance();
+    scheduler::GenerativeJobPtr createJob(
+        scheduler::GenerativeJobContext context,
+        scheduler::GenerativeCallbacks callbacks) const override;
 
-    // ── IOrchestrator interface ────────────────────────────────────────────────
-    /**
-     * Execute one inference turn with an injected backend.
-     *
-     * This is the primary entry point for the scheduler path (ModelRuntime).
-     * Creates a transient ConversationSession seeded from scheduler options.
-     * Blocking when callback is nullptr; streaming otherwise.
-     */
     StandardResponse execute(
-        const CreateChatCompletionRequest& request,
-        const scheduler::SchedulerInvokeOptions& options,
-        IGenerativeBackend& backend,
-        OrchestratorStreamCallback callback,
-        std::function<bool()> cancel) override;
-
-    /**
-     * @brief Execute a blocking chat request using the supplied backend.
-     * @detail Scheduler-safe entry point: no global concurrency guard is taken
-     *         and no singleton backend is used.
-     */
-    StandardResponse executeBlocking(
-        const CreateChatCompletionRequest& request,
-        IGenerativeBackend& backend,
-        CancellationPredicate cancel_requested = {},
-        bool skip_summarization_middleware = false);
-
-    /**
-     * @brief Execute a streaming chat request using the supplied backend.
-     * @detail Scheduler-safe entry point: no global concurrency guard is taken
-     *         and no singleton backend is used.
-     */
-    StandardResponse executeStreaming(
-        const CreateChatCompletionRequest& request,
-        IGenerativeBackend& backend,
-        OrchestratorStreamCallback callback,
-        CancellationPredicate cancel_requested = {},
-        bool skip_summarization_middleware = false);
+        scheduler::GenerativeJob& job,
+        IGenerativeBackend& backend) const override;
 
 private:
     GenieOrchestrator(const GenieOrchestrator&) = delete;
@@ -97,14 +65,7 @@ private:
      * Step 1: Extract and validate the request.
      * Throws GenAIException(INVALID_REQUEST) if model is not found.
      */
-    void validateRequest(const CreateChatCompletionRequest& request);
-
-    /**
-     * Step 2: Resolve or create a ConversationSession and issue a DraftTurn.
-     * The session_id is derived from the request (user field or hash-based lookup).
-     */
-    std::pair<std::shared_ptr<ConversationSession>, DraftTurn>
-    resolveSessionAndDraft(const CreateChatCompletionRequest& request);
+    void validateRequest(const CreateChatCompletionRequest& request) const;
 
     /**
      * Build the compacted context prompt for the inference worker.
@@ -123,23 +84,14 @@ private:
                                    int answer_budget = 0) const;
 
     StandardResponse executeBlockingPrepared(
-        const CreateChatCompletionRequest& request,
-        std::shared_ptr<ConversationSession> session,
-        DraftTurn&& draft,
-        IGenerativeBackend& backend,
-        const CancellationPredicate& cancel_requested,
-        bool skip_summarization_middleware,
-        bool register_session_hash);
+        scheduler::GenerativeJob& job,
+        const scheduler::GeniePreparedRequest& prepared,
+        IGenerativeBackend& backend) const;
 
     StandardResponse executeStreamingPrepared(
-        const CreateChatCompletionRequest& request,
-        std::shared_ptr<ConversationSession> session,
-        DraftTurn&& draft,
-        IGenerativeBackend& backend,
-        OrchestratorStreamCallback callback,
-        const CancellationPredicate& cancel_requested,
-        bool skip_summarization_middleware,
-        bool register_session_hash);
+        scheduler::GenerativeJob& job,
+        const scheduler::GeniePreparedRequest& prepared,
+        IGenerativeBackend& backend) const;
 
     // ── Post-turn memory management ────────────────────────────────────────────
 

@@ -4,7 +4,7 @@
 #include "qai_forge/scheduler/ModelRuntime.h"
 
 #include "qai_forge/backend/IGenerativeBackend.h"
-#include "qai_forge/orchestration/IOrchestrator.h"
+#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
 
@@ -110,7 +110,7 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
 
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<IGenerativeBackend> backend,
-                     std::unique_ptr<IOrchestrator> orchestrator,
+                     std::shared_ptr<IGenerativeOrchestrator> orchestrator,
                      ModelRuntimeEvents events)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
@@ -537,7 +537,8 @@ void ModelRuntime::executorLoop() {
             LOG_INFO("[ModelRuntime] Running job: model=" << model_id_
                      << " job=" << job->job_id
                      << " priority=" << static_cast<int>(job->priority)
-                     << " stream=" << (job->request.stream ? "true" : "false"));
+                     << " stream="
+                     << (job->callbacks.on_token ? "true" : "false"));
             runJob(*job);
             LOG_INFO("[ModelRuntime] Job run returned: model=" << model_id_
                      << " job=" << job->job_id);
@@ -668,53 +669,40 @@ void ModelRuntime::runJob(InferenceJob& job) {
             500);
     }
 
-    if (job.request.model.empty()) {
-        job.request.model = model_id_;
-    }
-
     auto notify_cancelled = [&job]() {
         if (job.markCancellationNotified() && job.callbacks.on_cancelled) {
             job.callbacks.on_cancelled();
         }
     };
 
-    auto cancel_requested = [&job]() -> bool {
-        return job.isCancelled();
-    };
-
     if (job.isCancelled()) {
         notify_cancelled();
         return;
     }
-
-    static const SchedulerInvokeOptions kDefaultInvokeOptions;
-    const SchedulerInvokeOptions& invoke_options = job.invoke_options
-        ? *job.invoke_options : kDefaultInvokeOptions;
-    // Build the stream callback: non-null for streaming jobs, null for blocking.
-    OrchestratorStreamCallback stream_callback = nullptr;
     std::string finish_reason = "stop";
     std::string response_id = job.session_id;
-
-    if (job.request.stream) {
-        stream_callback = [&job, &finish_reason, &response_id](
-                              const StreamChunk& chunk) {
-            if (chunk.finish_reason.has_value()) {
-                finish_reason = chunk.finish_reason.value();
-            }
-            if (!chunk.id.empty()) {
-                response_id = chunk.id;
-            }
-            if (job.isCancelled()) {
-                return;
-            }
-            if (job.callbacks.on_token) {
-                job.callbacks.on_token(chunk);
-            }
-        };
+    const auto original_on_token = job.callbacks.on_token;
+    const bool streaming = static_cast<bool>(original_on_token);
+    if (streaming) {
+        job.callbacks.on_token =
+            [&job,
+             &finish_reason,
+             &response_id,
+             original_on_token](const StreamChunk& chunk) {
+                if (chunk.finish_reason.has_value()) {
+                    finish_reason = chunk.finish_reason.value();
+                }
+                if (!chunk.id.empty()) {
+                    response_id = chunk.id;
+                }
+                if (!job.isCancelled()) {
+                    original_on_token(chunk);
+                }
+            };
     }
 
     try {
-        if (job.request.stream) {
+        if (streaming) {
             LOG_INFO("[ModelRuntime] Streaming execution started: job="
                      << job.job_id << " model=" << model_id_);
         } else {
@@ -722,12 +710,8 @@ void ModelRuntime::runJob(InferenceJob& job) {
                      << job.job_id << " model=" << model_id_);
         }
 
-        StandardResponse response = orchestrator_->execute(
-            job.request,
-            invoke_options,
-            *backend_,
-            stream_callback,
-            cancel_requested);
+        StandardResponse response = orchestrator_->execute(job, *backend_);
+        job.callbacks.on_token = original_on_token;
 
         if (job.isCancelled()) {
             notify_cancelled();
@@ -744,7 +728,7 @@ void ModelRuntime::runJob(InferenceJob& job) {
             job.callbacks.on_complete(response);
         }
 
-        if (job.request.stream) {
+        if (streaming) {
             LOG_INFO("[ModelRuntime] Streaming execution completed: job="
                      << job.job_id << " model=" << model_id_
                      << " finish_reason=" << finish_reason);
@@ -754,6 +738,7 @@ void ModelRuntime::runJob(InferenceJob& job) {
                      << " finish_reason=" << response.finish_reason);
         }
     } catch (...) {
+        job.callbacks.on_token = original_on_token;
         if (job.isCancelled()) {
             notify_cancelled();
             return;

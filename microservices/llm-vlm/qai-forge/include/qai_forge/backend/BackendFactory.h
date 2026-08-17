@@ -5,7 +5,7 @@
 
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/backend/IInferenceBackend.h"
-#include "qai_forge/orchestration/IOrchestrator.h"
+#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -35,7 +35,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 struct RuntimePair {
     std::unique_ptr<IGenerativeBackend> backend;
-    std::unique_ptr<IOrchestrator>      orchestrator;
+    std::shared_ptr<IGenerativeOrchestrator> orchestrator;
 };
 
 // Factory function type used by WarmModelPool to create RuntimePairs.
@@ -65,6 +65,20 @@ public:
      */
     static std::unique_ptr<IGenerativeBackend>
     createGenerativeBackendForModel(const std::string& model_id);
+
+    /**
+     * Create a generative orchestrator for a runtime.
+     *
+     * @param runtime Runtime identifier from ModelConfig.runtime.
+     */
+    static std::shared_ptr<IGenerativeOrchestrator>
+    createGenerativeOrchestrator(const std::string& runtime);
+
+    /**
+     * Resolve a model ID to its runtime and create its orchestrator.
+     */
+    static std::shared_ptr<IGenerativeOrchestrator>
+    createGenerativeOrchestratorForModel(const std::string& model_id);
 
     /**
      * Create a scheduler-owned (backend, orchestrator) pair for the given model.

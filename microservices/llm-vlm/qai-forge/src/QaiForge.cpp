@@ -19,32 +19,6 @@
 
 namespace qai_forge {
 
-namespace {
-
-// Convert public GenerateOptions → internal SchedulerInvokeOptions.
-// Sets kind, priority, and skip_summarization_middleware automatically.
-scheduler::SchedulerInvokeOptions toSchedulerOptions(
-    const GenerateOptions& opts,
-    scheduler::JobKind kind) {
-    scheduler::SchedulerInvokeOptions sched;
-    sched.response_id             = opts.response_id;
-    sched.previous_response_id    = opts.previous_response_id;
-    sched.session_id              = opts.session_id;
-    sched.tool_output_submission  = opts.tool_output_submission;
-    sched.allow_tool_chain_fallback = opts.allow_tool_chain_fallback;
-    sched.use_response_history    = opts.use_response_history;
-    sched.response_history        = opts.response_history;
-    sched.summary_content         = opts.summary_content;
-    sched.summary_token_count     = opts.summary_token_count;
-    sched.facts                   = opts.facts;
-    sched.evicted_message_count   = opts.evicted_message_count;
-    sched.kind                    = kind;
-    sched.skip_summarization_middleware = true;
-    return sched;
-}
-
-} // namespace
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Impl — Pimpl struct holding scheduler-internal members
 //
@@ -88,8 +62,7 @@ StandardResponse QaiForge::generate(
     const CreateChatCompletionRequest& request,
     const GenerateOptions& options) {
     return scheduler::ModelScheduler::getInstance().runBlocking(
-        request,
-        toSchedulerOptions(options, scheduler::JobKind::HTTP_NON_STREAMING));
+        request, options);
 }
 
 void QaiForge::generateStream(
@@ -99,7 +72,7 @@ void QaiForge::generateStream(
     scheduler::ModelScheduler::getInstance().runStreamingAsync(
         request,
         std::move(callbacks),
-        toSchedulerOptions(options, scheduler::JobKind::HTTP_STREAMING));
+        options);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

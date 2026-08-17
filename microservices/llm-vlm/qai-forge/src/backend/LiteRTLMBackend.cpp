@@ -156,6 +156,36 @@ void LiteRTLMBackend::generate(
         on_error);
 }
 
+void LiteRTLMBackend::generateStructured(
+    const std::string& event_id,
+    const json& messages,
+    const json& tools,
+    bool streaming,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    int top_k,
+    float presence_penalty,
+    float frequency_penalty,
+    std::function<void(const IPCTokenEvent&)> on_token,
+    std::function<void(const IPCDoneEvent&)> on_done,
+    std::function<void(const IPCErrorEvent&)> on_error) {
+    worker().executeStructuredRequest(
+        event_id,
+        messages,
+        tools,
+        streaming,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        presence_penalty,
+        frequency_penalty,
+        std::move(on_token),
+        std::move(on_done),
+        std::move(on_error));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // generateVlm() — not supported by LiteRT-LM (LLM-only backend)
 // ─────────────────────────────────────────────────────────────────────────────

@@ -77,52 +77,58 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
     return createGenerativeBackend(model_config->runtime);
 }
 
-RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
-    RuntimePair pair;
-    pair.backend = createGenerativeBackendForModel(model_id);
-
-    // Select the correct orchestrator based on the backend runtime
-    const auto* model_config =
-        ModelConfigManager::getInstance().getModelConfig(model_id);
-    std::string runtime = model_config ? model_config->runtime : "genie";
+std::shared_ptr<IGenerativeOrchestrator>
+BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
+    if (runtime == "genie") {
+        return std::make_shared<GenieOrchestrator>();
+    }
 
     if (runtime == "litert_lm") {
-        // Phase 4: LiteRTLMOrchestrator
-        // Do NOT call loadModel() here — ModelRuntime::executorLoop() is responsible
-        // for calling backend_->loadModel() when it transitions to the Loading state.
-        // Calling it here would cause a double-load (worker started twice).
-        // LiteRTLMOrchestrator initializes its metadata lazily on the first execute()
-        // call, after ModelRuntime has already loaded the model and the worker has
-        // sent the METADATA IPC event.
-        auto* litert_backend = dynamic_cast<LiteRTLMBackend*>(pair.backend.get());
-        if (litert_backend) {
-            pair.orchestrator = std::make_unique<LiteRTLMOrchestrator>();
-        } else {
-            LOG_WARN("[BackendFactory] litert_lm runtime but backend is not LiteRTLMBackend"
-                     " — falling back to GenieOrchestrator");
-            pair.orchestrator = std::make_unique<GenieOrchestrator>();
-        }
-    }
-#ifdef QAI_FORGE_BUILD_LLAMACPP
-    else if (runtime == "llamacpp") {
-        // Phase 4: LlamaCppOrchestrator
-        // Similar to LiteRTLM, do NOT call loadModel() here — ModelRuntime handles it.
-        // LlamaCppOrchestrator passes OpenAI JSON directly to llama-server without
-        // pre-rendering Jinja templates in C++.
-        auto* llamacpp_backend = dynamic_cast<qai_forge::LlamaCppBackend*>(pair.backend.get());
-        if (llamacpp_backend) {
-            pair.orchestrator = std::make_unique<qai_forge::LlamaCppOrchestrator>();
-        } else {
-            LOG_WARN("[BackendFactory] llamacpp runtime but backend is not LlamaCppBackend"
-                     " — falling back to GenieOrchestrator");
-            pair.orchestrator = std::make_unique<GenieOrchestrator>();
-        }
-    }
-#endif
-    else {
-        pair.orchestrator = std::make_unique<GenieOrchestrator>();
+        return std::make_shared<LiteRTLMOrchestrator>();
     }
 
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+    if (runtime == "llamacpp") {
+        return std::make_shared<qai_forge::LlamaCppOrchestrator>();
+    }
+#endif
+
+    throw GenAIException(
+        GenAIErrorCode::INVALID_REQUEST,
+        "Unsupported generative orchestrator runtime '" + runtime + "'.",
+        400);
+}
+
+std::shared_ptr<IGenerativeOrchestrator>
+BackendFactory::createGenerativeOrchestratorForModel(
+    const std::string& model_id) {
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id +
+                "' not found. Check /v1/models for available models.",
+            404);
+    }
+
+    return createGenerativeOrchestrator(model_config->runtime);
+}
+
+RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id +
+                "' not found. Check /v1/models for available models.",
+            404);
+    }
+
+    RuntimePair pair;
+    pair.backend = createGenerativeBackend(model_config->runtime);
+    pair.orchestrator = createGenerativeOrchestrator(model_config->runtime);
     return pair;
 }
 
