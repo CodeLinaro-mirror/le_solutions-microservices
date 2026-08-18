@@ -258,31 +258,69 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     config.model_type = metadata.value("model_type", "generative");
 
     // ── Tensor Specs (for Predictive AI) ────────────────────────────────────
+    // Primary source: input_specs / output_specs (flat array format).
+    // Fallback: model_files.<filename>.inputs / outputs (dict-of-dicts format,
+    //   where each key is the tensor name and the value holds shape/dtype).
+    // Only the first model file's specs are used (single-model bundles).
+    auto normalizeDtype = [](const std::string& dt) -> std::string {
+        // Normalize lowercase dtype strings (e.g. "uint8") to OIP uppercase ("UINT8")
+        std::string upper;
+        for (char c : dt) upper += static_cast<char>(std::toupper(c));
+        return upper;
+    };
+
     if (metadata.contains("input_specs") && metadata["input_specs"].is_array()) {
         for (const auto& spec_json : metadata["input_specs"]) {
             ModelTensorSpec spec;
-            spec.name = spec_json.value("name", "");
-            spec.dtype = spec_json.value("dtype", "FP32");
+            spec.name  = spec_json.value("name", "");
+            spec.dtype = normalizeDtype(spec_json.value("dtype", "FP32"));
             if (spec_json.contains("shape") && spec_json["shape"].is_array()) {
-                for (const auto& d : spec_json["shape"]) {
+                for (const auto& d : spec_json["shape"])
                     spec.shape.push_back(d.get<int64_t>());
-                }
             }
             config.input_specs.push_back(spec);
+        }
+    } else if (metadata.contains("model_files") && metadata["model_files"].is_object()) {
+        // Use the first model file entry
+        const auto& first_file = metadata["model_files"].begin().value();
+        if (first_file.contains("inputs") && first_file["inputs"].is_object()) {
+            for (const auto& [tensor_name, tensor_info] : first_file["inputs"].items()) {
+                ModelTensorSpec spec;
+                spec.name  = tensor_name;
+                spec.dtype = normalizeDtype(tensor_info.value("dtype", "FP32"));
+                if (tensor_info.contains("shape") && tensor_info["shape"].is_array()) {
+                    for (const auto& d : tensor_info["shape"])
+                        spec.shape.push_back(d.get<int64_t>());
+                }
+                config.input_specs.push_back(spec);
+            }
         }
     }
 
     if (metadata.contains("output_specs") && metadata["output_specs"].is_array()) {
         for (const auto& spec_json : metadata["output_specs"]) {
             ModelTensorSpec spec;
-            spec.name = spec_json.value("name", "");
-            spec.dtype = spec_json.value("dtype", "FP32");
+            spec.name  = spec_json.value("name", "");
+            spec.dtype = normalizeDtype(spec_json.value("dtype", "FP32"));
             if (spec_json.contains("shape") && spec_json["shape"].is_array()) {
-                for (const auto& d : spec_json["shape"]) {
+                for (const auto& d : spec_json["shape"])
                     spec.shape.push_back(d.get<int64_t>());
-                }
             }
             config.output_specs.push_back(spec);
+        }
+    } else if (metadata.contains("model_files") && metadata["model_files"].is_object()) {
+        const auto& first_file = metadata["model_files"].begin().value();
+        if (first_file.contains("outputs") && first_file["outputs"].is_object()) {
+            for (const auto& [tensor_name, tensor_info] : first_file["outputs"].items()) {
+                ModelTensorSpec spec;
+                spec.name  = tensor_name;
+                spec.dtype = normalizeDtype(tensor_info.value("dtype", "FP32"));
+                if (tensor_info.contains("shape") && tensor_info["shape"].is_array()) {
+                    for (const auto& d : tensor_info["shape"])
+                        spec.shape.push_back(d.get<int64_t>());
+                }
+                config.output_specs.push_back(spec);
+            }
         }
     }
 

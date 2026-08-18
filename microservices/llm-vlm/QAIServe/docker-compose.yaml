@@ -35,7 +35,6 @@ services:
     # DSP/DMA device access — GIDs are detected dynamically at startup
     devices:
       - /dev/dma_heap/system
-      - /dev/dma_heap/qcom,system
       - /dev/fastrpc-cdsp
       - /dev/fastrpc-cdsp1
 
