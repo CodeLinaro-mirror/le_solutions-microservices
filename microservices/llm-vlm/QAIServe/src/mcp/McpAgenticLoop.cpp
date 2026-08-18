@@ -162,7 +162,7 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
         // Build the assistant message with tool_calls for the next turn
         json assistant_msg = {
             {"role",       "assistant"},
-            {"content",    nullptr},
+            {"content",    ""},
             {"tool_calls", tool_calls}
         };
 
@@ -264,7 +264,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
         // Build next turn messages
         json assistant_msg = {
             {"role",       "assistant"},
-            {"content",    nullptr},
+            {"content",    ""},
             {"tool_calls", tool_calls}
         };
 
