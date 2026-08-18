@@ -20,6 +20,7 @@
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
 #include <drogon/HttpResponse.h>
+#include <trantor/net/EventLoop.h>
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <chrono>
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <thread>
 
 using json = nlohmann::ordered_json;
 
@@ -228,35 +230,46 @@ void InferController::infer(
     }
     request.output_names = oip_req.outputs;
 
-    // Route to QaiForge::infer (predictive AI)
-    try {
-        TensorInferenceResponse result =
-            qai_forge::QaiForge::getInstance().infer(request);
+    // Route to QaiForge::infer (predictive AI) on a background thread.
+    // infer() runs synchronously and can block for seconds on first-load
+    // (DSP model load) or during inference — running it directly on this
+    // Drogon IO thread would stall that thread's event loop, starving the
+    // socket reads of any other in-flight request pinned to the same loop
+    // (observed as a stalled/slow request body upload on a concurrent request).
+    auto* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    std::thread([request = std::move(request), loop, callback]() mutable {
+        HttpResponsePtr response;
+        try {
+            TensorInferenceResponse result =
+                qai_forge::QaiForge::getInstance().infer(request);
 
-        json outputs_json = json::array();
-        for (const auto& out : result.outputs) {
-            std::string dt = tensorDataTypeToString(out.dtype);
-            json shape_arr = json::array();
-            for (auto d : out.shape) shape_arr.push_back(d);
-            outputs_json.push_back({
-                {"name",     out.name},
-                {"datatype", dt},
-                {"shape",    shape_arr},
-                {"data",     encodeDataArray(out.data, dt)},
+            json outputs_json = json::array();
+            for (const auto& out : result.outputs) {
+                std::string dt = tensorDataTypeToString(out.dtype);
+                json shape_arr = json::array();
+                for (auto d : out.shape) shape_arr.push_back(d);
+                outputs_json.push_back({
+                    {"name",     out.name},
+                    {"datatype", dt},
+                    {"shape",    shape_arr},
+                    {"data",     encodeDataArray(out.data, dt)},
+                });
+            }
+
+            response = makeJson({
+                {"id",         result.request_id},
+                {"model_name", result.model},
+                {"outputs",    outputs_json},
             });
+
+        } catch (const GenAIException& e) {
+            response = makeError(e.http_status, e.message);
+        } catch (const std::exception& e) {
+            response = makeError(500, std::string("Internal error: ") + e.what());
         }
 
-        callback(makeJson({
-            {"id",         result.request_id},
-            {"model_name", result.model},
-            {"outputs",    outputs_json},
-        }));
-
-    } catch (const GenAIException& e) {
-        callback(makeError(e.http_status, e.message));
-    } catch (const std::exception& e) {
-        callback(makeError(500, std::string("Internal error: ") + e.what()));
-    }
+        loop->queueInLoop([callback, response]() { callback(response); });
+    }).detach();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

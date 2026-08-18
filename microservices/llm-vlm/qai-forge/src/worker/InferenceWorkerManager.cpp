@@ -83,7 +83,7 @@ void InferenceWorkerManager::ensureWorkerRunning(const std::string& model_id,
     }
 
     // Start worker if not running
-    if (worker_pid_ <= 0 || ::kill(worker_pid_, 0) != 0) {
+    if (!isWorkerRunningLocked()) {
         startWorker(model_id, config_file, sampler_config);
     }
 }
@@ -218,7 +218,7 @@ void InferenceWorkerManager::cleanupWorker(bool force) {
                 ::usleep(100000); // 100ms
             }
             // Force kill if still running
-            if (::kill(worker_pid_, 0) == 0) {
+            if (isWorkerRunningLocked()) {
                 ::kill(worker_pid_, SIGKILL);
             }
         }
@@ -527,7 +527,19 @@ void InferenceWorkerManager::shutdown() {
 // ─────────────────────────────────────────────────────────────────────────────
 bool InferenceWorkerManager::isWorkerRunning() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return worker_pid_ > 0 && ::kill(worker_pid_, 0) == 0;
+    return isWorkerRunningLocked();
+}
+
+bool InferenceWorkerManager::isWorkerRunningLocked() const {
+    if (worker_pid_ <= 0) return false;
+    // kill(pid, 0) alone can't tell a live process apart from a zombie —
+    // an exited-but-unreaped child still holds its PID, so kill() keeps
+    // returning 0 until something waitpid()s it. Reap it here if it has
+    // exited so a crashed worker is detected immediately instead of on
+    // the next request's IPC write failure.
+    int status = 0;
+    pid_t r = ::waitpid(worker_pid_, &status, WNOHANG);
+    return r == 0;
 }
 
 std::string InferenceWorkerManager::getCurrentModelId() const {
