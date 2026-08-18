@@ -50,7 +50,6 @@ void VlmInferenceWorkerManager::executeVlmRequest(
     ErrorCallback on_error) {
 
     std::lock_guard<std::mutex> lock(mutex_);
-    is_active_ = true;
 
     // Build the EXECUTE command using the standard factory method
     json execute_cmd = InferenceProtocol::createExecuteCommand(
@@ -73,6 +72,4 @@ void VlmInferenceWorkerManager::executeVlmRequest(
 
     // Delegate to the protected helper — mutex_ is already held above
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
-
-    is_active_ = false;
 }

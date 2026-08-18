@@ -15,9 +15,8 @@ namespace scheduler {
 
 enum class JobPriority {
     CONTROL = 0,
-    READY_TOOL_CONT = 1,
-    SESSION_CONT = 2,
-    NEW_REQUEST = 3,
+    TOOL_CONTINUATION = 1,
+    ANY_REQUEST = 2,
 };
 
 enum class JobKind {
@@ -80,7 +79,7 @@ struct GenerativeJobContext {
     std::string tool_chain_id;
     std::string conversation_memory_write_key;
     JobKind kind = JobKind::HTTP_NON_STREAMING;
-    JobPriority priority = JobPriority::NEW_REQUEST;
+    JobPriority priority = JobPriority::ANY_REQUEST;
     bool tool_continuation = false;
     bool skip_post_turn_summarization = false;
 };

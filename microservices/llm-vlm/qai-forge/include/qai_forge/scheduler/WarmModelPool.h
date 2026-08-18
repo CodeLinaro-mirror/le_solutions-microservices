@@ -30,8 +30,8 @@ class EvictionPolicy;
 struct WarmModelPoolConfig {
     size_t max_active_models = 3;
     std::chrono::milliseconds idle_timeout = std::chrono::minutes(5);
-    std::chrono::milliseconds blocked_admission_timeout =
-        std::chrono::seconds(30);
+    std::chrono::milliseconds cold_model_fairness_wait =
+        std::chrono::seconds(120);
     std::chrono::milliseconds tool_response_timeout = std::chrono::seconds(30);
     size_t max_queue_depth_per_model = 0; // 0 = unlimited
     long memory_headroom_mb = 1024;

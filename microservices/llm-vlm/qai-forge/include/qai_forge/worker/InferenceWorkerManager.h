@@ -32,16 +32,14 @@
 //      to call sendReset(). Layer 3 just executes commands blindly.
 //   E. Unique socket IDs: Socket path includes a UUID to prevent clashes
 //      when multiple workers run for the same model.
-//   F. Watchdog thread: A background thread monitors worker activity and
-//      kills the subprocess if it becomes unresponsive. Two configurable
-//      thresholds apply:
-//        - Idle timeout  (GENAI_WORKER_IDLE_TIMEOUT,   default 60 s):
-//          applies when no EXECUTE is in flight.
-//        - Active timeout (GENAI_WORKER_ACTIVE_TIMEOUT, default 600 s):
-//          applies while an EXECUTE command is in flight (long inference).
-//      The watchdog polls every GENAI_WATCHDOG_CHECK_INTERVAL seconds
-//      (default 5 s). last_activity_time_ is updated on every sendMessage()
-//      and readMessage() call so that any IPC traffic resets the timer.
+//   F. Watchdog thread: A background thread monitors active inference and
+//      kills the subprocess if it stops producing IPC activity. Idle worker
+//      lifetime is owned exclusively by the model scheduler.
+//      GENAI_WORKER_ACTIVE_TIMEOUT (default 600 s) applies while an EXECUTE
+//      command is in flight.
+//      The watchdog polls every 5 seconds. last_activity_time_ is updated on
+//      every sendMessage() and readMessage() call so that any IPC traffic
+//      resets the timer.
 //
 // Subprocess architecture:
 //   - Worker subprocess links libllmengine.so (LLM) or libvlmengine.so (VLM).
@@ -237,10 +235,9 @@ private:
     std::atomic<std::chrono::steady_clock::time_point> last_activity_time_{
         std::chrono::steady_clock::time_point{}};
 
-    // Configurable timeouts (read once from env in constructor).
-    int idle_timeout_seconds_   = 60;   // GENAI_WORKER_IDLE_TIMEOUT
+    // Active silence is configurable; polling cadence is internal.
     int active_timeout_seconds_ = 600;  // GENAI_WORKER_ACTIVE_TIMEOUT
-    int watchdog_interval_seconds_ = 5; // GENAI_WATCHDOG_CHECK_INTERVAL
+    int watchdog_interval_seconds_ = 5;
 
     // ── Eager background reset ─────────────────────────────────────────────
     // Background thread that runs sendReset() after each inference completes.
@@ -308,7 +305,9 @@ protected:
     // calling sendExecuteAndStream().
     mutable std::mutex mutex_;
 
-    // True while an EXECUTE command is in flight.
+    // True while an EXECUTE command is in flight. Managed by
+    // sendExecuteAndStream() so every request path has identical watchdog
+    // ownership and exception-safe cleanup.
     std::atomic<bool> is_active_{false};
 
     // ── Protected helpers for subclasses ──────────────────────────────────────
@@ -317,6 +316,7 @@ protected:
      * Send a pre-built EXECUTE command and stream responses back via callbacks.
      *
      * Caller MUST hold mutex_ before calling this method.
+     * This method arms and disarms the active-inference watchdog state.
      * Called by executeRequest() and by VlmInferenceWorkerManager::executeVlmRequest()
      * so that the VLM subclass can inject extra fields (e.g. image_urls) into the
      * EXECUTE command before it is sent, without duplicating the streaming loop.

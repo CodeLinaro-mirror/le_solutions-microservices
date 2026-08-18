@@ -106,7 +106,6 @@ private:
     };
 
     void executorLoop();
-    size_t promoteAgedJobs();
     bool runJob(GenerativeJob& job);
     bool beginPostTurn(GenerativeJob& job,
                        const StandardResponse& response);
@@ -147,8 +146,6 @@ private:
     bool activation_requested_ = false;
     ModelLoadCoordinator::LoadReservation pending_load_reservation_;
     DrainMode drain_mode_ = DrainMode::None;
-    std::chrono::milliseconds new_request_aging_threshold_ =
-        std::chrono::seconds(30);
     std::chrono::milliseconds cancel_grace_period_ =
         std::chrono::seconds(30);
 

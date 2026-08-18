@@ -15,18 +15,17 @@ namespace scheduler {
 
 struct QueueSnapshot {
     size_t control = 0;
-    size_t ready_tool_cont = 0;
-    size_t session_cont = 0;
-    size_t new_request = 0;
+    size_t tool_continuation = 0;
+    size_t any_request = 0;
 
     size_t total() const {
-        return control + ready_tool_cont + session_cont + new_request;
+        return control + tool_continuation + any_request;
     }
 };
 
 struct QueueAdmissionCandidate {
     bool has_work = false;
-    JobPriority priority = JobPriority::NEW_REQUEST;
+    JobPriority priority = JobPriority::ANY_REQUEST;
     std::chrono::steady_clock::time_point created_at =
         std::chrono::steady_clock::time_point::max();
     std::string job_id;
@@ -46,11 +45,6 @@ public:
     QueueSnapshot snapshot() const;
     QueueAdmissionCandidate admissionCandidate() const;
 
-    // Promote aged NEW_REQUEST jobs to SESSION_CONT. Tool continuations are
-    // intentionally unaffected and always keep priority over aged new requests.
-    size_t promoteAgedNewRequests(std::chrono::steady_clock::time_point now,
-                                  std::chrono::milliseconds threshold);
-
 private:
     using Lane = std::deque<GenerativeJobPtr>;
 
@@ -62,9 +56,8 @@ private:
 
     mutable std::mutex mutex_;
     Lane control_;
-    Lane ready_tool_cont_;
-    Lane session_cont_;
-    Lane new_request_;
+    Lane tool_continuation_;
+    Lane any_request_;
 };
 
 } // namespace scheduler
