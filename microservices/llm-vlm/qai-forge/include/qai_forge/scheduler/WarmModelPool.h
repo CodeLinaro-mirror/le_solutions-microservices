@@ -5,6 +5,7 @@
 
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
+#include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
 #include "qai_forge/scheduler/SubmitResult.h"
 #include "qai_forge/backend/BackendFactory.h"
@@ -69,7 +70,9 @@ public:
                            ModelRuntimePairFactory runtime_factory = {},
                            ModelRuntimeEvents runtime_events = {},
                            std::shared_ptr<ConversationMemoryCoordinator>
-                               memory_coordinator = {});
+                               memory_coordinator = {},
+                           std::shared_ptr<ModelLoadCoordinator>
+                               load_coordinator = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -118,12 +121,13 @@ private:
         PoolActionType type;
         std::string model_id;
         ModelRuntime* runtime = nullptr;
+        ModelLoadCoordinator::LoadReservation load_reservation;
     };
 
     void eventLoop();
     std::vector<PoolAction> planActionsLocked(
         std::chrono::steady_clock::time_point now);
-    void applyActions(const std::vector<PoolAction>& actions);
+    void applyActions(std::vector<PoolAction> actions);
     ModelPoolSnapshot snapshotLocked() const;
     void refreshTimedStateLocked(std::chrono::steady_clock::time_point now);
     void handleRuntimeStateChanged(const std::string& model_id,
@@ -146,6 +150,8 @@ private:
     ModelRuntimePairFactory runtime_factory_;
     ModelRuntimeEvents runtime_events_;
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
+    bool owns_load_coordinator_ = false;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

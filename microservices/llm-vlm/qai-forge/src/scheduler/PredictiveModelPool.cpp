@@ -16,16 +16,24 @@ namespace scheduler {
 PredictiveModelPool::PredictiveModelPool(
     WarmModelPoolConfig config,
     PredictiveBackendFactory factory,
-    ModelRuntimeEvents runtime_events)
+    ModelRuntimeEvents runtime_events,
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator)
     : config_(std::move(config))
     , factory_(std::move(factory))
     , runtime_events_(std::move(runtime_events))
+    , load_coordinator_(std::move(load_coordinator))
 {
     // Use default factory if none provided
     if (!factory_) {
         factory_ = [](const std::string& model_id) {
             return BackendFactory::createPredictiveBackendForModel(model_id);
         };
+    }
+    if (!load_coordinator_) {
+        owns_load_coordinator_ = true;
+        load_coordinator_ =
+            std::make_shared<ModelLoadCoordinator>(config_.memory_headroom_mb);
+        load_coordinator_->start();
     }
 
     LOG_INFO("[PredictiveModelPool] Initialized with max_active_models="
@@ -183,6 +191,9 @@ void PredictiveModelPool::stop(bool force) {
     }
 
     shutdown_requested_ = true;
+    if (owns_load_coordinator_) {
+        load_coordinator_->shutdown();
+    }
     LOG_INFO("[PredictiveModelPool] Stopping pool (force=" << force
              << ", active_models=" << runtimes_.size() << ")");
 
@@ -208,18 +219,25 @@ void PredictiveModelPool::stop(bool force) {
 
 void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
     const size_t active_count = activeModelCount();
+    const long available_mb = availableMemoryMb();
+    const long required_mb = modelMemoryMb(model_id_to_load);
+    const bool at_model_limit =
+        active_count >= config_.max_active_models;
+    const bool memory_available =
+        available_mb >= required_mb + config_.memory_headroom_mb;
 
-    // Check if we're at capacity
-    if (active_count < config_.max_active_models) {
+    if (!at_model_limit && memory_available) {
         return;
     }
 
-    // Check if we have enough memory
-    const long available_mb = availableMemoryMb();
-    const long required_mb = modelMemoryMb(model_id_to_load);
+    if (!at_model_limit &&
+        load_coordinator_->isMemoryTransitionActive()) {
+        LOG_INFO("[PredictiveModelPool] Shared memory is changing; "
+                 "deferring admission: model=" << model_id_to_load);
+        return;
+    }
 
-    if (available_mb >= required_mb + config_.memory_headroom_mb) {
-        // Enough memory, but at model count limit — evict LRU idle model
+    if (at_model_limit) {
         LOG_INFO("[PredictiveModelPool] At max_active_models ("
                  << config_.max_active_models << ") — evicting LRU model");
     } else {
@@ -229,10 +247,10 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
                  << "MB) — evicting models");
     }
 
-    // Build candidate list for eviction
-    std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> candidates;
+    std::vector<std::pair<
+        std::string,
+        std::chrono::steady_clock::time_point>> candidates;
     for (const auto& [model_id, record] : runtimes_) {
-        // Only evict idle models
         const ModelRuntimeSnapshot snapshot = record.runtime->snapshot();
         if (snapshot.state == ModelRuntimeState::Idle &&
             snapshot.queue.total() == 0 &&
@@ -245,18 +263,16 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
         throw GenAIException(
             GenAIErrorCode::INSUFFICIENT_MEMORY,
             "Cannot load model '" + model_id_to_load +
-                "': all models are busy (no idle models to evict)",
+                "': no idle predictive model is eligible for eviction",
             503);
     }
 
-    // Sort by last_used_at (oldest first)
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
                   return a.second < b.second;
               });
 
-    // Evict the oldest idle model
-    const std::string& victim_id = candidates.front().first;
+    const std::string victim_id = candidates.front().first;
     LOG_INFO("[PredictiveModelPool] Evicting model '" << victim_id
              << "' to make room for '" << model_id_to_load << "'");
 
@@ -269,6 +285,7 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
                       << e.what());
         }
         runtimes_.erase(it);
+        evictIfNeeded(model_id_to_load);
     }
 }
 
@@ -336,6 +353,8 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
         model_id,
         std::move(backend),
         BackendFactory::createPredictiveOrchestrator(),
+        load_coordinator_,
+        modelMemoryMb(model_id),
         runtime_events_);
 
     runtime->start();
@@ -373,7 +392,7 @@ size_t PredictiveModelPool::activeModelCount() const {
 }
 
 long PredictiveModelPool::availableMemoryMb() const {
-    return SystemResourceManager::getInstance().getAvailableMemoryMb();
+    return load_coordinator_->availableMemoryMb();
 }
 
 long PredictiveModelPool::modelMemoryMb(const std::string& model_id) const {

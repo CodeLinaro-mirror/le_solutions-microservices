@@ -198,6 +198,7 @@ set(QAI_FORGE_SOURCES
     # Scheduler (Layer 2 — model residency, job queuing, tool-chain continuity)
     src/scheduler/PriorityModelQueue.cpp
     src/scheduler/ConversationMemoryCoordinator.cpp
+    src/scheduler/ModelLoadCoordinator.cpp
     src/scheduler/ToolChainTable.cpp
     src/scheduler/EvictionPolicy.cpp
     src/scheduler/ModelRuntime.cpp
