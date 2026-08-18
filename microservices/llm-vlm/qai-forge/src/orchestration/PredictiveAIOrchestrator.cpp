@@ -50,9 +50,9 @@ TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
     std::string runtime = cfg.getRuntime(request.model);
     IInferenceBackend* backend = nullptr;
 
-    if (runtime == "qnn") {
+    if (runtime == "qnn" || runtime == "qnn_context_binary") {
         backend = &QNNBackend::getInstance();
-    } else if (runtime == "snpe") {
+    } else if (runtime == "snpe" || runtime == "qnn_dlc") {
         backend = &SNPEBackend::getInstance();
     } else if (runtime == "litert" || runtime == "tflite") {
         backend = &LiteRTBackend::getInstance();
@@ -65,8 +65,8 @@ TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
 
     // Initialize backend if needed (lazy initialization)
     if (!backend->isHealthy() ||
-        (runtime == "qnn"    && !QNNBackend::getInstance().isHealthy())  ||
-        (runtime == "snpe"   && !SNPEBackend::getInstance().isHealthy()) ||
+        ((runtime == "qnn" || runtime == "qnn_context_binary") && !QNNBackend::getInstance().isHealthy())  ||
+        ((runtime == "snpe" || runtime == "qnn_dlc") && !SNPEBackend::getInstance().isHealthy()) ||
         ((runtime == "litert" || runtime == "tflite") && !LiteRTBackend::getInstance().isHealthy()))
     {
         backend->initialize(request.model, "");
