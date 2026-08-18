@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "scheduler/CancelResult.h"
-#include "scheduler/InferenceJob.h"
-#include "scheduler/ToolChainTable.h"
-#include "scheduler/WarmModelPool.h"
+#include "qai_forge/scheduler/CancelResult.h"
+#include "qai_forge/scheduler/InferenceJob.h"
+#include "qai_forge/scheduler/ToolChainTable.h"
+#include "qai_forge/scheduler/WarmModelPool.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +16,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// Forward declaration
+namespace qai_forge {
+    struct StreamCallbacks;
+}
 
 namespace scheduler {
 
@@ -45,7 +50,7 @@ struct SchedulerInvokeOptions {
 class ModelScheduler {
 public:
     explicit ModelScheduler(ModelSchedulerConfig config = {},
-                            ModelBackendFactory backend_factory = {});
+                            ModelRuntimePairFactory runtime_factory = {});
     ~ModelScheduler();
 
     ModelScheduler(const ModelScheduler&) = delete;
@@ -62,6 +67,10 @@ public:
     StandardResponse runStreaming(
         const CreateChatCompletionRequest& request,
         std::function<void(const StreamChunk&)> callback,
+        const SchedulerInvokeOptions& options = {});
+    void runStreamingAsync(
+        const CreateChatCompletionRequest& request,
+        qai_forge::StreamCallbacks callbacks,
         const SchedulerInvokeOptions& options = {});
     bool cancelResponse(const std::string& response_id);
     SubmitResult submit(InferenceJobPtr job);

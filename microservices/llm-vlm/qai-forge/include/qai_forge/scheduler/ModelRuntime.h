@@ -3,8 +3,9 @@
 
 #pragma once
 
-#include "scheduler/CancelResult.h"
-#include "scheduler/PriorityModelQueue.h"
+#include "qai_forge/scheduler/CancelResult.h"
+#include "qai_forge/scheduler/PriorityModelQueue.h"
+#include "qai_forge/orchestration/IOrchestrator.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -58,10 +59,15 @@ struct ModelRuntimeEvents {
 //
 // A runtime can exist while cold: jobs are queued, but
 // backend.loadModel(model_id) only happens after admission calls activate().
+//
+// Each ModelRuntime owns one IOrchestrator instance (created by
+// BackendFactory::createRuntimePair). The orchestrator is stateless and
+// receives the backend as an injected parameter on each execute() call.
 class ModelRuntime {
 public:
     ModelRuntime(std::string model_id,
                  std::unique_ptr<IGenerativeBackend> backend,
+                 std::unique_ptr<IOrchestrator> orchestrator,
                  ModelRuntimeEvents events = {},
                  RunningCancelMode running_cancel_mode =
                      RunningCancelMode::SOFT);
@@ -109,6 +115,7 @@ private:
     const std::string model_id_;
     PriorityModelQueue queue_;
     std::unique_ptr<IGenerativeBackend> backend_;
+    std::unique_ptr<IOrchestrator> orchestrator_;
     ModelRuntimeEvents events_;
 
     mutable std::mutex mutex_;

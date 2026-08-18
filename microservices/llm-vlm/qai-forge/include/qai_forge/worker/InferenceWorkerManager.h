@@ -122,6 +122,31 @@ public:
     void sendReset();
 
     /**
+     * Initiate an eager background KV cache reset.
+     *
+     * Spawns a background thread that calls sendReset() (RESET + wait for READY).
+     * Returns immediately — the reset runs concurrently with returning the
+     * response to the HTTP layer and sending it to the client.
+     *
+     * The next executeRequest() call will wait for the reset to complete via
+     * waitForPendingReset() before acquiring mutex_ and sending EXECUTE.
+     * This ensures clean KV state with minimal added latency: by the time
+     * the next request arrives, the reset is typically already done.
+     *
+     * Safe to call multiple times — joins any previous reset thread first.
+     */
+    void initiateBackgroundReset();
+
+    /**
+     * Wait for any pending background reset to complete.
+     *
+     * Called at the start of executeRequest() to ensure the KV cache is
+     * clean before sending the EXECUTE command. If no reset is in progress,
+     * returns immediately (no-op).
+     */
+    void waitForPendingReset();
+
+    /**
      * Save the KV cache to a named checkpoint.
      * Used by Layer 2 for reasoning rewind (Section 6.B) and
      * ADHOC mode context swapping (Section 6.C).
@@ -196,6 +221,12 @@ private:
     int idle_timeout_seconds_   = 60;   // GENAI_WORKER_IDLE_TIMEOUT
     int active_timeout_seconds_ = 600;  // GENAI_WORKER_ACTIVE_TIMEOUT
     int watchdog_interval_seconds_ = 5; // GENAI_WATCHDOG_CHECK_INTERVAL
+
+    // ── Eager background reset ─────────────────────────────────────────────
+    // Background thread that runs sendReset() after each inference completes.
+    // Initiated by initiateBackgroundReset(); joined by waitForPendingReset()
+    // at the start of the next executeRequest() call.
+    std::thread reset_thread_;
 
     // ── Internal helpers (private — not accessible to subclasses) ─────────────
     void startWorker(const std::string& model_id,

@@ -265,7 +265,7 @@ RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid l
 
 # Bake fastrpc DSP path config for all supported Qualcomm devices.
 RUN { \
-      echo '# SPDX-License-Identifier:BSD-3-Clause-Clear'; \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
       echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
       echo 'machines:'; \
       echo '  Qualcomm Technologies, Inc. Monaco Monza addons:'; \
@@ -304,6 +304,9 @@ ENV GENAI_MODELS_DIR=/mnt/work/models
 ENV GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
 ENV GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
 ENV LOG_LEVEL=ERROR
+# Watchdog timeouts — override in docker-compose.yaml as needed
+ENV GENAI_WORKER_IDLE_TIMEOUT=120
+ENV GENAI_WORKER_ACTIVE_TIMEOUT=600
 
 EXPOSE 9002
 
@@ -313,3 +316,7 @@ WORKDIR /mnt/work/models
 # It calls drop_privileges_and_bind_devices() before starting Drogon.
 # Child processes (genai-inference-worker) inherit the dropped privileges.
 ENTRYPOINT ["/usr/bin/responses-server"]
+
+# ADSP library path for Hexagon DSP firmware lookup at runtime.
+# The DSP blobs are staged at /usr/lib/rfsa/adsp/ by the stager.
+ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp

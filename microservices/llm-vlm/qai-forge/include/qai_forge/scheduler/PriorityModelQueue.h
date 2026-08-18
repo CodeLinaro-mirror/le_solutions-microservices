@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "scheduler/InferenceJob.h"
+#include "qai_forge/scheduler/InferenceJob.h"
 
 #include <chrono>
 #include <cstddef>

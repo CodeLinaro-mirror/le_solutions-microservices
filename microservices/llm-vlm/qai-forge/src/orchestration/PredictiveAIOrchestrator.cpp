@@ -2,86 +2,17 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PredictiveAIOrchestrator — Layer 2 orchestrator for Predictive AI
+// DEPRECATED — PredictiveAIOrchestrator.cpp
 //
-// Routes tensor inference requests to QNNBackend or SNPEBackend based on
-// the model's "runtime" field in metadata.json.
+// This file is no longer compiled (removed from CMakeLists.txt in Phase 4).
+// PredictiveAIOrchestrator has been superseded by PredictiveModelPool.
+//
+// QaiForge::infer() now routes through PredictiveModelPool, which provides:
+//   - Multiple models loaded simultaneously (one PredictiveModelRuntime each)
+//   - LRU eviction when max_active_models is exceeded
+//   - Idle-timeout eviction for unused models
+//   - Per-model serialization + cross-model concurrency
+//   - Owned backend instances (not singletons) via BackendFactory::createPredictiveBackend()
+//
+// See qai-forge/docs/phase4-predictive-scheduler.md for the full design.
 // ─────────────────────────────────────────────────────────────────────────────
-
-#include "qai_forge/orchestration/PredictiveAIOrchestrator.h"
-#include "qai_forge/backend/LiteRTBackend.h"
-#include "qai_forge/backend/QNNBackend.h"
-#include "qai_forge/backend/SNPEBackend.h"
-#include "qai_forge/backend/IInferenceBackend.h"
-#include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/InternalDTOs.h"
-#include "qai_forge/utils/Logger.h"
-#include <stdexcept>
-
-PredictiveAIOrchestrator& PredictiveAIOrchestrator::getInstance() {
-    static PredictiveAIOrchestrator instance;
-    return instance;
-}
-
-TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
-    const TensorInferenceRequest& request)
-{
-    auto& cfg = ModelConfigManager::getInstance();
-
-    // Validate model exists
-    if (!cfg.validateModel(request.model)) {
-        throw GenAIException(
-            GenAIErrorCode::MODEL_NOT_FOUND,
-            "Model '" + request.model + "' not found. Check /v1/models for available models.",
-            404);
-    }
-
-    // Validate model type
-    std::string model_type = cfg.getModelType(request.model);
-    if (model_type != "predictive") {
-        throw GenAIException(
-            GenAIErrorCode::INVALID_REQUEST,
-            "Model '" + request.model + "' is a generative model. "
-            "Use POST /v1/chat/completions instead of /v2/models/{model}/infer.",
-            400);
-    }
-
-    // Select backend based on runtime
-    std::string runtime = cfg.getRuntime(request.model);
-    IInferenceBackend* backend = nullptr;
-
-    if (runtime == "qnn" || runtime == "qnn_context_binary") {
-        backend = &QNNBackend::getInstance();
-    } else if (runtime == "snpe" || runtime == "qnn_dlc") {
-        backend = &SNPEBackend::getInstance();
-    } else if (runtime == "litert" || runtime == "tflite") {
-        backend = &LiteRTBackend::getInstance();
-    } else {
-        throw GenAIException(
-            GenAIErrorCode::INVALID_REQUEST,
-            "Unknown Predictive AI runtime '" + runtime + "' for model '" + request.model + "'.",
-            400);
-    }
-
-    // Initialize backend if needed (lazy initialization)
-    if (!backend->isHealthy() ||
-        ((runtime == "qnn" || runtime == "qnn_context_binary") && !QNNBackend::getInstance().isHealthy())  ||
-        ((runtime == "snpe" || runtime == "qnn_dlc") && !SNPEBackend::getInstance().isHealthy()) ||
-        ((runtime == "litert" || runtime == "tflite") && !LiteRTBackend::getInstance().isHealthy()))
-    {
-        backend->initialize(request.model, "");
-    }
-
-    LOG_DEBUG("[PredictiveAIOrchestrator] Routing model='" << request.model
-              << "' runtime='" << runtime << "' to " << backend->name());
-
-    // Run inference
-    try {
-        return backend->infer(request);
-    } catch (const std::exception& e) {
-        throw GenAIException(
-            GenAIErrorCode::INFERENCE_FAILED,
-            std::string("Inference failed for model '") + request.model + "': " + e.what(),
-            500);
-    }
-}

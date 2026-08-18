@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "mcp/McpAgenticLoop.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include <iostream>
 #include <sstream>
 #include <chrono>
@@ -131,7 +131,6 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
 McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_request,
                                    const json& mcp_tools) {
     McpLoopResult loop_result;
-    auto& orchestrator = ChatOrchestrator::getInstance();
 
     // Build the working request (will be mutated each iteration)
     CreateChatCompletionRequest current_request = base_request;
@@ -142,7 +141,10 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
         loop_result.iterations = iter + 1;
 
         // Run one inference round
-        StandardResponse response = orchestrator.handleBlocking(current_request);
+        qai_forge::GenerateOptions opts;
+        opts.session_id = current_request.user.value_or("");
+        StandardResponse response =
+            qai_forge::QaiForge::getInstance().generate(current_request, opts);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
             || response.tool_calls.value().empty()) {
@@ -181,7 +183,10 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
     // Run one final inference without tools to get a text response
     current_request.tools = std::nullopt;
     try {
-        loop_result.final_response = orchestrator.handleBlocking(current_request);
+        qai_forge::GenerateOptions opts;
+        opts.session_id = current_request.user.value_or("");
+        loop_result.final_response =
+            qai_forge::QaiForge::getInstance().generate(current_request, opts);
     } catch (...) {
         // If final inference fails, return a synthetic response
         loop_result.final_response.content = "(Response truncated: maximum tool call iterations reached)";
@@ -199,7 +204,6 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                                             McpSseEmitter emitter,
                                             const std::string& response_id) {
     McpLoopResult loop_result;
-    auto& orchestrator = ChatOrchestrator::getInstance();
 
     CreateChatCompletionRequest current_request = base_request;
     current_request.stream = false;  // Use blocking internally; we emit SSE manually
@@ -209,7 +213,10 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
         loop_result.iterations = iter + 1;
 
         // Run one inference round (blocking)
-        StandardResponse response = orchestrator.handleBlocking(current_request);
+        qai_forge::GenerateOptions opts;
+        opts.session_id = current_request.user.value_or("");
+        StandardResponse response =
+            qai_forge::QaiForge::getInstance().generate(current_request, opts);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
             || response.tool_calls.value().empty()) {
@@ -274,7 +281,10 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
     loop_result.truncated = true;
     current_request.tools = std::nullopt;
     try {
-        loop_result.final_response = orchestrator.handleBlocking(current_request);
+        qai_forge::GenerateOptions opts;
+        opts.session_id = current_request.user.value_or("");
+        loop_result.final_response =
+            qai_forge::QaiForge::getInstance().generate(current_request, opts);
         std::string final_text = loop_result.final_response.content.value_or("");
         int output_index = static_cast<int>(loop_result.call_records.size());
 

@@ -11,7 +11,7 @@
 
 #include "mcp/McpAgenticLoop.h"
 #include "qai_forge/utils/Logger.h"
-#include "scheduler/ModelScheduler.h"
+#include "qai_forge/QaiForge.h"
 #include <iostream>
 #include <sstream>
 #include <chrono>
@@ -154,19 +154,15 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
                  << " previous=" << previous_round_response_id);
 
         // Run one inference round
-        scheduler::SchedulerInvokeOptions invoke_options;
+        qai_forge::GenerateOptions invoke_options;
         invoke_options.response_id = response_id;
         invoke_options.previous_response_id = previous_round_response_id;
-        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
         if (iter > 0 && !previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
             invoke_options.tool_output_submission = true;
-        } else if (!previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::SESSION_CONT;
         }
 
         StandardResponse response =
-            scheduler::ModelScheduler::getInstance().runBlocking(
+            qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
@@ -215,17 +211,15 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
     // Run one final inference without tools to get a text response
     current_request.tools = std::nullopt;
     try {
-        scheduler::SchedulerInvokeOptions invoke_options;
+        qai_forge::GenerateOptions invoke_options;
         invoke_options.response_id = response_id;
         invoke_options.previous_response_id = previous_round_response_id;
-        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
         if (!previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
             invoke_options.tool_output_submission = true;
         }
 
         loop_result.final_response =
-            scheduler::ModelScheduler::getInstance().runBlocking(
+            qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
     } catch (...) {
         // If final inference fails, return a synthetic response
@@ -258,19 +252,15 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                  << " previous=" << previous_round_response_id);
 
         // Run one inference round (blocking)
-        scheduler::SchedulerInvokeOptions invoke_options;
+        qai_forge::GenerateOptions invoke_options;
         invoke_options.response_id = response_id;
         invoke_options.previous_response_id = previous_round_response_id;
-        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
         if (iter > 0 && !previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
             invoke_options.tool_output_submission = true;
-        } else if (!previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::SESSION_CONT;
         }
 
         StandardResponse response =
-            scheduler::ModelScheduler::getInstance().runBlocking(
+            qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
 
         if (response.finish_reason != "tool_calls" || !response.tool_calls.has_value()
@@ -345,17 +335,15 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
              << response_id << " max_iterations=" << max_iterations_);
     current_request.tools = std::nullopt;
     try {
-        scheduler::SchedulerInvokeOptions invoke_options;
+        qai_forge::GenerateOptions invoke_options;
         invoke_options.response_id = response_id;
         invoke_options.previous_response_id = previous_round_response_id;
-        invoke_options.kind = scheduler::JobKind::MCP_ROUND;
         if (!previous_round_response_id.empty()) {
-            invoke_options.priority = scheduler::JobPriority::READY_TOOL_CONT;
             invoke_options.tool_output_submission = true;
         }
 
         loop_result.final_response =
-            scheduler::ModelScheduler::getInstance().runBlocking(
+            qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
         std::string final_text = loop_result.final_response.content.value_or("");
         int output_index = static_cast<int>(loop_result.call_records.size());

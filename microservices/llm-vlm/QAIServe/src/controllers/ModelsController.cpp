@@ -85,7 +85,7 @@ void ModelsController::listModelsV1(const HttpRequestPtr& /*req*/,
             {"id",       m.id},
             {"object",   "model"},
             {"created",  static_cast<int64_t>(std::time(nullptr))},
-            {"owned_by", "qualcomm"},
+            {"owned_by", ""},
         });
     }
 

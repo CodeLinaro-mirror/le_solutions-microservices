@@ -249,8 +249,8 @@ void AiHubClient::download(const std::string& url,
         }
 
         // Verify download completeness using Content-Length
-        double content_length = 0;
-        curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &content_length);
+        curl_off_t content_length = 0;
+        curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
         int64_t actual = static_cast<int64_t>(fs::file_size(dest));
         int64_t expected = bytes_so_far + static_cast<int64_t>(content_length);
 

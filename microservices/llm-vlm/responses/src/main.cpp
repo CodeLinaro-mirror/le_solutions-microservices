@@ -8,7 +8,7 @@
 #include "mcp/NativeToolRegistry.h"
 #include "tools/DateTimeTool.h"
 #include "tools/CalculatorTool.h"
-#include "scheduler/ModelScheduler.h"
+#include "qai_forge/QaiForge.h"
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -40,7 +40,7 @@ int main() {
             ModelConfigManager::getInstance().scanModelBundles();
             std::cout << "[main] Model bundles scanned." << std::endl;
 
-            scheduler::ModelScheduler::getInstance().start();
+            qai_forge::QaiForge::getInstance().start();
             std::cout << "[main] Model scheduler started." << std::endl;
 
             // ── Step 3b: Register built-in native tools ───────────────────────
@@ -107,7 +107,7 @@ int main() {
         .run();
 
     // Cleanup: stop scheduler infrastructure and disconnect MCP servers on shutdown.
-    scheduler::ModelScheduler::getInstance().shutdown();
+    qai_forge::QaiForge::getInstance().shutdown();
     McpClientRegistry::getInstance().disconnectAll();
 
     return 0;

@@ -26,7 +26,7 @@
 #include "mcp/McpAgenticLoop.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -577,18 +577,28 @@ void ResponsesController::createResponse(
         sdk_request.tools = function_tools;
     }
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
-
     try {
         if (streaming) {
             // ── Streaming: emit Responses API SSE events ──────────────────────
             auto resp = HttpResponse::newAsyncStreamResponse(
-                [&orchestrator, sdk_request, response_id, model](ResponseStreamPtr stream) {
-                    auto emit_event = [&stream](const std::string& event_type,
-                                                 const json& data) {
-                        stream->send("event: " + event_type + "\n");
-                        stream->send("data: " + data.dump() + "\n\n");
-                    };
+                [sdk_request, response_id, model](ResponseStreamPtr stream) {
+                // Convert unique_ptr to shared_ptr so callbacks can keep stream alive
+                auto shared_stream = std::shared_ptr<ResponseStream>(std::move(stream));
+                auto stream_ptr = shared_stream.get();
+
+                // Create emit_event as a shared function that can be captured in callbacks
+                auto emit_event_impl = [](ResponseStream* stream, const std::string& event_type,
+                                          const json& data) {
+                    stream->send("event: " + event_type + "\n");
+                    stream->send("data: " + data.dump() + "\n\n");
+                    // Yield control to allow Drogon's event loop to flush the stream
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                };
+
+                auto emit_event = [stream_ptr, emit_event_impl](const std::string& event_type,
+                                                                 const json& data) {
+                    emit_event_impl(stream_ptr, event_type, data);
+                };
 
                     int created_time = current_unix_time();
 
@@ -626,47 +636,95 @@ void ResponsesController::createResponse(
                         {"part",          {{"type", "output_text"}, {"text", ""}}}
                     });
 
-                    std::string full_text;
-                    bool had_error = false;
-                    std::string error_msg;
-                    int token_count = 0;
+                    // Shared state for callbacks (must outlive async operation)
+                    auto shared_full_text = std::make_shared<std::string>();
+                    auto shared_had_error = std::make_shared<bool>(false);
+                    auto shared_error_msg = std::make_shared<std::string>();
+                    auto shared_token_count = std::make_shared<int>(0);
+                    auto shared_result = std::make_shared<StandardResponse>();
+
+                    // Add completion synchronization
+                    auto completion_promise = std::make_shared<std::promise<void>>();
+                    auto completion_future = completion_promise->get_future();
 
                     // Re-enable streaming for the SDK call
                     CreateChatCompletionRequest streaming_req = sdk_request;
                     streaming_req.stream = true;
 
-                    try {
-                        orchestrator.handleStreaming(streaming_req,
-                            [&](const StreamChunk& chunk) {
-                                if (chunk.content_delta.has_value()
-                                    && !chunk.content_delta.value().empty()) {
-                                    full_text += chunk.content_delta.value();
-                                    token_count++;
-                                    emit_event("response.output_text.delta", {
-                                        {"type",          "response.output_text.delta"},
-                                        {"output_index",  0},
-                                        {"content_index", 0},
-                                        {"delta",         chunk.content_delta.value()}
-                                    });
-                                }
-                                if (chunk.reasoning_content.has_value()
-                                    && !chunk.reasoning_content.value().empty()) {
-                                    emit_event("response.reasoning.delta", {
-                                        {"type",         "response.reasoning.delta"},
-                                        {"output_index", 0},
-                                        {"delta",        chunk.reasoning_content.value()}
-                                    });
-                                }
-                            });
-                    } catch (const GenAIException& e) {
-                        had_error = true;
-                        error_msg = e.message;
-                    } catch (const std::exception& e) {
-                        had_error = true;
-                        error_msg = e.what();
-                    }
+                    // Get event loop for thread-safe callback marshaling
+                    auto loop = app().getLoop();
 
-                    if (!had_error) {
+                    // Build StreamCallbacks struct
+                    qai_forge::StreamCallbacks callbacks;
+
+                    callbacks.onToken = [shared_stream, shared_full_text, shared_token_count](
+                        const StreamChunk& chunk) {
+                        auto stream_ptr = shared_stream.get();
+                        // Call emit_event directly - no queueInLoop to avoid deadlock with completion_future.wait()
+                        if (chunk.content_delta.has_value()
+                            && !chunk.content_delta.value().empty()) {
+                            *shared_full_text += chunk.content_delta.value();
+                            (*shared_token_count)++;
+                            stream_ptr->send("event: response.output_text.delta\n");
+                            stream_ptr->send("data: " + json({
+                                {"type",          "response.output_text.delta"},
+                                {"output_index",  0},
+                                {"content_index", 0},
+                                {"delta",         chunk.content_delta.value()}
+                            }).dump() + "\n\n");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                        if (chunk.reasoning_content.has_value()
+                            && !chunk.reasoning_content.value().empty()) {
+                            stream_ptr->send("event: response.reasoning.delta\n");
+                            stream_ptr->send("data: " + json({
+                                {"type",         "response.reasoning.delta"},
+                                {"output_index", 0},
+                                {"delta",        chunk.reasoning_content.value()}
+                            }).dump() + "\n\n");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    };
+
+                    callbacks.onComplete = [shared_result, completion_promise](
+                        const StandardResponse& response) {
+                        // Call directly - no queueInLoop needed
+                        *shared_result = response;
+                        completion_promise->set_value(); // Signal completion
+                    };
+
+                    callbacks.onError = [shared_had_error, shared_error_msg, completion_promise](
+                        const GenAIException& error) {
+                        // Call directly - no queueInLoop needed
+                        *shared_had_error = true;
+                        *shared_error_msg = error.message;
+                        completion_promise->set_value(); // Signal completion even on error
+                    };
+
+                    callbacks.onCancelled = [shared_had_error, shared_error_msg, completion_promise]() {
+                        // Call directly - no queueInLoop needed
+                        *shared_had_error = true;
+                        *shared_error_msg = "Request was cancelled";
+                        completion_promise->set_value(); // Signal completion on cancel
+                    };
+
+                    qai_forge::GenerateOptions opts;
+                    opts.session_id = response_id;
+
+                    // Redefine callbacks to handle completion in the callback itself
+                    callbacks.onComplete = [shared_stream, response_id, model,
+                                           shared_full_text, shared_token_count](
+                        const StandardResponse& response) {
+                        auto stream_ptr = shared_stream.get();
+                        auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                            stream_ptr->send("event: " + event_type + "\n");
+                            stream_ptr->send("data: " + data.dump() + "\n\n");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        };
+
+                        std::string full_text = *shared_full_text;
+                        int token_count = *shared_token_count;
+
                         emit_event("response.output_text.done", {
                             {"type",          "response.output_text.done"},
                             {"output_index",  0},
@@ -709,16 +767,53 @@ void ResponsesController::createResponse(
                                 }}
                             }}
                         });
-                    } else {
+
+                        stream_ptr->send("data: [DONE]\n\n");
+                        stream_ptr->close();
+                    };
+
+                    callbacks.onError = [shared_stream](
+                        const GenAIException& error) {
+                        auto stream_ptr = shared_stream.get();
+                        auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                            stream_ptr->send("event: " + event_type + "\n");
+                            stream_ptr->send("data: " + data.dump() + "\n\n");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        };
+
                         emit_event("error", {
                             {"type",    "error"},
                             {"code",    "server_error"},
-                            {"message", error_msg}
+                            {"message", error.message}
                         });
-                    }
 
-                    stream->send("data: [DONE]\n\n");
-                    stream->close();
+                        stream_ptr->send("data: [DONE]\n\n");
+                        stream_ptr->close();
+                    };
+
+                    callbacks.onCancelled = [shared_stream]() {
+                        auto stream_ptr = shared_stream.get();
+                        auto emit_event = [stream_ptr](const std::string& event_type, const json& data) {
+                            stream_ptr->send("event: " + event_type + "\n");
+                            stream_ptr->send("data: " + data.dump() + "\n\n");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        };
+
+                        emit_event("error", {
+                            {"type",    "error"},
+                            {"code",    "cancelled"},
+                            {"message", "Request was cancelled"}
+                        });
+
+                        stream_ptr->send("data: [DONE]\n\n");
+                        stream_ptr->close();
+                    };
+
+                    // Submit async - returns immediately, callbacks handle completion
+                    qai_forge::QaiForge::getInstance().generateStream(
+                        streaming_req,
+                        std::move(callbacks),
+                        opts);
                 }
             );
             resp->addHeader("Content-Type", "text/event-stream");
@@ -728,7 +823,11 @@ void ResponsesController::createResponse(
 
         } else {
             // ── Non-streaming ─────────────────────────────────────────────────
-            StandardResponse result = orchestrator.handleBlocking(sdk_request);
+            qai_forge::GenerateOptions opts;
+            opts.session_id = response_id;
+
+            StandardResponse result =
+                qai_forge::QaiForge::getInstance().generate(sdk_request, opts);
 
             // Build output array.
             // build_output_array() automatically emits a separate top-level
@@ -795,15 +894,8 @@ void ResponsesController::deleteResponse(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& response_id) {
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
-    bool deleted = orchestrator.deleteSession(response_id);
-
-    if (!deleted) {
-        callback(make_error_response(404, "Response " + response_id + " not found",
-                                     "invalid_request_error"));
-        return;
-    }
-
+    // In the scheduler path, sessions are transient — there is no persistent
+    // session to delete. Return success for compatibility.
     json response = {
         {"id",      response_id},
         {"object",  "response.deleted"},
@@ -822,8 +914,8 @@ void ResponsesController::cancelResponse(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& response_id) {
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
-    bool cancelled = orchestrator.cancelSession(response_id);
+    bool cancelled =
+        qai_forge::QaiForge::getInstance().cancel(response_id);
 
     if (!cancelled) {
         callback(make_error_response(404,

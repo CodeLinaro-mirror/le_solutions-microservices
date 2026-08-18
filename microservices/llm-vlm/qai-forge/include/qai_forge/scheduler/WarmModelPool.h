@@ -3,13 +3,13 @@
 
 #pragma once
 
-#include "scheduler/CancelResult.h"
-#include "scheduler/ModelRuntime.h"
+#include "qai_forge/scheduler/CancelResult.h"
+#include "qai_forge/scheduler/ModelRuntime.h"
+#include "qai_forge/backend/BackendFactory.h"
 
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -62,15 +62,12 @@ struct ModelPoolSnapshot {
     std::vector<ModelPoolRuntimeSnapshot> runtimes;
 };
 
-using ModelBackendFactory =
-    std::function<std::unique_ptr<IGenerativeBackend>(const std::string&)>;
-
 // Owns warm model residency. It coordinates which ModelRuntime may load/unload,
 // but ModelRuntime still owns actual per-model execution.
 class WarmModelPool {
 public:
     explicit WarmModelPool(WarmModelPoolConfig config,
-                           ModelBackendFactory backend_factory = {});
+                           ModelRuntimePairFactory runtime_factory = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -147,7 +144,7 @@ private:
     static bool isActiveReservedState(ModelRuntimeState state);
 
     WarmModelPoolConfig config_;
-    ModelBackendFactory backend_factory_;
+    ModelRuntimePairFactory runtime_factory_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

@@ -25,6 +25,13 @@ class PredictiveWorkerManager;
 
 class QNNBackend : public IInferenceBackend {
 public:
+    /**
+     * Public constructor — creates an owned (non-singleton) instance.
+     * Used by BackendFactory::createPredictiveBackend() for scheduler-owned
+     * instances. Each PredictiveModelRuntime owns its own QNNBackend.
+     */
+    QNNBackend();
+
     static QNNBackend& getInstance();
 
     std::string name() const override { return "QNN"; }
@@ -38,7 +45,6 @@ public:
     void shutdown() override;
 
 private:
-    QNNBackend();
     QNNBackend(const QNNBackend&) = delete;
     QNNBackend& operator=(const QNNBackend&) = delete;
 

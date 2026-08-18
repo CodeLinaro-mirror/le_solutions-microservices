@@ -46,7 +46,7 @@ InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
         if (!val) return default_val;
         try { return std::stoi(val); } catch (...) { return default_val; }
     };
-    idle_timeout_seconds_      = read_env_int("GENAI_WORKER_IDLE_TIMEOUT",     60);
+    idle_timeout_seconds_      = read_env_int("GENAI_WORKER_IDLE_TIMEOUT",     120);
     active_timeout_seconds_    = read_env_int("GENAI_WORKER_ACTIVE_TIMEOUT",   600);
     watchdog_interval_seconds_ = read_env_int("GENAI_WATCHDOG_CHECK_INTERVAL", 5);
 }
@@ -372,6 +372,12 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
                                              TokenCallback on_token,
                                              DoneCallback on_done,
                                              ErrorCallback on_error) {
+    // Wait for any pending background KV reset to complete before acquiring
+    // mutex_ and sending EXECUTE. In the common case the reset is already done
+    // (it ran concurrently while the previous response was being sent to the
+    // client), so this is a no-op with zero added latency.
+    waitForPendingReset();
+
     std::lock_guard<std::mutex> lock(mutex_);
     is_active_ = true;
 
@@ -403,6 +409,52 @@ void InferenceWorkerManager::sendReset() {
         throw std::runtime_error("RESET command failed or timed out");
     }
     LOG_INFO("[" << process_type_ << "Worker] KV cache reset successfully");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// initiateBackgroundReset — Eager post-inference KV cache reset
+//
+// Spawns a background thread that calls sendReset() (RESET + wait for READY).
+// Returns immediately so the caller can return the response to the HTTP layer
+// while the reset runs concurrently.
+//
+// The next executeRequest() call joins this thread via waitForPendingReset()
+// before acquiring mutex_, ensuring clean KV state with minimal latency.
+// ─────────────────────────────────────────────────────────────────────────────
+void InferenceWorkerManager::initiateBackgroundReset() {
+    // Join any previous reset thread before spawning a new one.
+    // In normal operation the previous reset is already done by the time
+    // the next request arrives, so this join is a no-op.
+    if (reset_thread_.joinable()) {
+        reset_thread_.join();
+    }
+
+    reset_thread_ = std::thread([this]() {
+        try {
+            sendReset();
+        } catch (const std::exception& e) {
+            LOG_WARN("[" << process_type_ << "Worker] Background KV reset failed: "
+                     << e.what() << " (non-fatal — next request will rebuild from scratch)");
+        } catch (...) {
+            LOG_WARN("[" << process_type_ << "Worker] Background KV reset failed "
+                     "with unknown exception (non-fatal)");
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// waitForPendingReset — Block until the background reset thread completes
+//
+// Called at the start of executeRequest() to ensure the KV cache is clean
+// before sending the EXECUTE command. If no reset is in progress (thread not
+// joinable), returns immediately.
+// ─────────────────────────────────────────────────────────────────────────────
+void InferenceWorkerManager::waitForPendingReset() {
+    if (reset_thread_.joinable()) {
+        LOG_INFO("[" << process_type_ << "Worker] Waiting for background KV reset to complete");
+        reset_thread_.join();
+        LOG_INFO("[" << process_type_ << "Worker] Background KV reset complete — ready for inference");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -438,6 +490,14 @@ bool InferenceWorkerManager::restoreKvCache(const std::string& checkpoint_name) 
 // terminateWorker — SIGKILL for cancellation (Section 7)
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::terminateWorker(bool force) {
+    // Join any pending background KV reset BEFORE acquiring mutex_.
+    // The reset thread calls sendReset() which acquires mutex_, so holding
+    // mutex_ while joining would deadlock. In the common case the reset
+    // already completed, so this is a no-op join.
+    // Failure to join here causes std::terminate() when the std::thread
+    // destructor fires on a still-joinable thread during model eviction.
+    waitForPendingReset();
+
     std::lock_guard<std::mutex> lock(mutex_);
     cleanupWorker(force);
 }
@@ -446,6 +506,13 @@ void InferenceWorkerManager::terminateWorker(bool force) {
 // shutdown — Graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::shutdown() {
+    // Join any pending background KV reset BEFORE acquiring mutex_.
+    // Same reasoning as terminateWorker(): the reset thread holds mutex_
+    // internally, so we must not hold it while joining.
+    // This also covers the destructor path (~InferenceWorkerManager calls
+    // shutdown()), ensuring reset_thread_ is never joinable at destruction.
+    waitForPendingReset();
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (worker_pid_ > 0 && sock_fd_ >= 0) {
         try {

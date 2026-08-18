@@ -16,9 +16,8 @@
 #include "oip/OipDTOs.h"
 #include "oip/OipBinaryParser.h"
 #include "oip/MultipartParser.h"
-#include "qai_forge/routing/IInferenceRouter.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
 #include <drogon/HttpResponse.h>
 #include <nlohmann/json.hpp>
@@ -229,10 +228,10 @@ void InferController::infer(
     }
     request.output_names = oip_req.outputs;
 
-    // Route to PredictiveAIOrchestrator
+    // Route to QaiForge::infer (predictive AI)
     try {
         TensorInferenceResponse result =
-            IInferenceRouter::getInstance().handleInfer(request);
+            qai_forge::QaiForge::getInstance().infer(request);
 
         json outputs_json = json::array();
         for (const auto& out : result.outputs) {
@@ -316,23 +315,15 @@ void InferController::generate(
         return;
     }
 
-    // Build ChatOrchestrator request
+    // Build inference request
     CreateChatCompletionRequest chat_req = buildChatRequest(oip_req, model_name);
 
-    // OIP stateless: reset KV cache before inference
-    auto& orchestrator = ChatOrchestrator::getInstance();
-    orchestrator.resetKvCache(model_name);
-
     try {
-        StandardResponse resp = orchestrator.handleBlocking(chat_req);
+        qai_forge::GenerateOptions opts;
+        opts.session_id = chat_req.user.value_or(generateRequestId());
 
-        // OIP stateless: reset KV cache after inference
-        orchestrator.resetKvCache(model_name);
-
-        // Clean up ephemeral session (stateless mode)
-        if (!oip_req.parameters.user.empty()) {
-            orchestrator.deleteSession(resp.id);
-        }
+        StandardResponse resp =
+            qai_forge::QaiForge::getInstance().generate(chat_req, opts);
 
         OipGenerateResponse oip_resp;
         oip_resp.model_name        = model_name;
@@ -345,10 +336,8 @@ void InferController::generate(
         callback(makeJson(oip_resp.toJson()));
 
     } catch (const GenAIException& e) {
-        orchestrator.resetKvCache(model_name); // ensure clean state on error
         callback(makeError(e.http_status, e.message));
     } catch (const std::exception& e) {
-        orchestrator.resetKvCache(model_name);
         callback(makeError(500, std::string("Internal error: ") + e.what()));
     }
 }
@@ -408,24 +397,20 @@ void InferController::generateStream(
     CreateChatCompletionRequest chat_req = buildChatRequest(oip_req, model_name);
     chat_req.stream = true;
 
-    // OIP stateless: reset KV cache before inference
-    auto& orchestrator = ChatOrchestrator::getInstance();
-    orchestrator.resetKvCache(model_name);
-
     // Set up SSE response
     auto sse_resp = HttpResponse::newAsyncStreamResponse(
-        [model_name, chat_req, &orchestrator, oip_req]
+        [model_name, chat_req, oip_req]
         (drogon::ResponseStreamPtr stream) mutable {
             int completion_tokens = 0;
-            std::string session_id;
 
             try {
-                orchestrator.handleStreaming(
-                    chat_req,
-                    [&stream, &model_name, &completion_tokens, &session_id]
-                    (const StreamChunk& chunk) {
-                        if (!session_id.empty()) session_id = chunk.id;
+                qai_forge::GenerateOptions opts;
+                opts.session_id = chat_req.user.value_or(
+                    "oip_stream_" + model_name);
 
+                qai_forge::StreamCallbacks callbacks;
+                callbacks.onToken = [&stream, &model_name, &completion_tokens]
+                    (const StreamChunk& chunk) {
                         OipStreamChunk oip_chunk;
                         oip_chunk.model_name = model_name;
 
@@ -444,18 +429,25 @@ void InferController::generateStream(
 
                         std::string event = "data: " + oip_chunk.toJson().dump() + "\n\n";
                         stream->send(event);
-                    });
+                    };
+                callbacks.onComplete = [&stream](const StandardResponse& resp) {
+                    // Completion handled by final token with finish_reason
+                };
+                callbacks.onError = [&stream](const GenAIException& e) {
+                    std::string err_event = "data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n";
+                    stream->send(err_event);
+                };
+                callbacks.onCancelled = [&stream]() {
+                    std::string cancel_event = "data: {\"error\":\"Request cancelled\"}\n\n";
+                    stream->send(cancel_event);
+                };
 
-                // OIP stateless: reset KV cache after inference
-                orchestrator.resetKvCache(model_name);
-
-                // Clean up ephemeral session
-                if (!session_id.empty()) {
-                    orchestrator.deleteSession(session_id);
-                }
+                qai_forge::QaiForge::getInstance().generateStream(
+                    chat_req,
+                    callbacks,
+                    opts);
 
             } catch (const std::exception& e) {
-                orchestrator.resetKvCache(model_name);
                 std::string err_event = "data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n";
                 stream->send(err_event);
             }

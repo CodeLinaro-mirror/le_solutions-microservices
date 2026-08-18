@@ -19,7 +19,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "ws/WsResponsesController.h"
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/session/SessionManager.h"
 #include <iostream>
@@ -452,8 +452,6 @@ void WsResponsesController::runResponse(
     std::vector<McpCallRecord> mcp_records;
     StandardResponse final_response;
 
-    auto& orchestrator = ChatOrchestrator::getInstance();
-
     if (has_mcp_tools && !mcp_function_tools.empty()) {
         // ── MCP path: McpAgenticLoop::runStreaming() ──────────────────────────
         const char* max_iter_env = std::getenv("RESPONSES_MCP_MAX_ITERATIONS");
@@ -484,7 +482,7 @@ void WsResponsesController::runResponse(
         }
 
     } else {
-        // ── Standard path: ChatOrchestrator::handleStreaming() ────────────────
+        // ── Standard path: ModelScheduler::runStreaming() ─────────────────────
         // Emit content_part.added before streaming tokens
         sendEvent(conn, {
             {"type",          WsProtocol::SERVER_CONTENT_PART_ADDED},
@@ -497,27 +495,54 @@ void WsResponsesController::runResponse(
         sdk_request.stream = true;
 
         try {
-            orchestrator.handleStreaming(sdk_request,
-                [&conn, &full_text, &response_id](const StreamChunk& chunk) {
-                    if (chunk.content_delta.has_value()
-                        && !chunk.content_delta.value().empty()) {
-                        full_text += chunk.content_delta.value();
-                        sendEvent(conn, {
-                            {"type",          WsProtocol::SERVER_OUTPUT_TEXT_DELTA},
-                            {"output_index",  0},
-                            {"content_index", 0},
-                            {"delta",         chunk.content_delta.value()}
-                        });
-                    }
-                    if (chunk.reasoning_content.has_value()
-                        && !chunk.reasoning_content.value().empty()) {
-                        sendEvent(conn, {
-                            {"type",         WsProtocol::SERVER_REASONING_DELTA},
-                            {"output_index", 0},
-                            {"delta",        chunk.reasoning_content.value()}
-                        });
-                    }
-                });
+            qai_forge::GenerateOptions opts;
+            opts.session_id = sdk_request.user.value_or(new_session_id);
+
+            // Use new async API with StreamCallbacks
+            qai_forge::StreamCallbacks callbacks;
+
+            callbacks.onToken = [conn, &full_text](const StreamChunk& chunk) {
+                if (chunk.content_delta.has_value()
+                    && !chunk.content_delta.value().empty()) {
+                    full_text += chunk.content_delta.value();
+                    sendEvent(conn, {
+                        {"type",          WsProtocol::SERVER_OUTPUT_TEXT_DELTA},
+                        {"output_index",  0},
+                        {"content_index", 0},
+                        {"delta",         chunk.content_delta.value()}
+                    });
+                }
+                if (chunk.reasoning_content.has_value()
+                    && !chunk.reasoning_content.value().empty()) {
+                    sendEvent(conn, {
+                        {"type",         WsProtocol::SERVER_REASONING_DELTA},
+                        {"output_index", 0},
+                        {"delta",        chunk.reasoning_content.value()}
+                    });
+                }
+            };
+
+            callbacks.onComplete = [&final_response, &new_session_id, &model](const StandardResponse& response) {
+                final_response = response;
+                final_response.id = new_session_id;
+                final_response.model = model;
+            };
+
+            callbacks.onError = [&had_error, &error_msg](const GenAIException& error) {
+                had_error = true;
+                error_msg = error.message;
+            };
+
+            callbacks.onCancelled = [&had_error, &error_msg]() {
+                had_error = true;
+                error_msg = "Request was cancelled";
+            };
+
+            qai_forge::QaiForge::getInstance().generateStream(
+                sdk_request,
+                std::move(callbacks),
+                opts);
+
         } catch (const GenAIException& e) {
             had_error = true;
             error_msg = e.message;
@@ -527,10 +552,6 @@ void WsResponsesController::runResponse(
         }
 
         if (!had_error) {
-            final_response.content = full_text;
-            final_response.id      = new_session_id;
-            final_response.model   = model;
-
             // response.output_text.done
             sendEvent(conn, {
                 {"type",          WsProtocol::SERVER_OUTPUT_TEXT_DONE},
