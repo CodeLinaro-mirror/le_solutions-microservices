@@ -54,7 +54,7 @@ TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
         backend = &QNNBackend::getInstance();
     } else if (runtime == "snpe") {
         backend = &SNPEBackend::getInstance();
-    } else if (runtime == "litert") {
+    } else if (runtime == "litert" || runtime == "tflite") {
         backend = &LiteRTBackend::getInstance();
     } else {
         throw GenAIException(
@@ -67,7 +67,7 @@ TensorInferenceResponse PredictiveAIOrchestrator::handleInfer(
     if (!backend->isHealthy() ||
         (runtime == "qnn"    && !QNNBackend::getInstance().isHealthy())  ||
         (runtime == "snpe"   && !SNPEBackend::getInstance().isHealthy()) ||
-        (runtime == "litert" && !LiteRTBackend::getInstance().isHealthy()))
+        ((runtime == "litert" || runtime == "tflite") && !LiteRTBackend::getInstance().isHealthy()))
     {
         backend->initialize(request.model, "");
     }
