@@ -547,11 +547,9 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
                                              bool bypass_think_filter,
                                              TokenCallback on_token,
                                              DoneCallback on_done,
-                                             ErrorCallback on_error) {
-    // Wait for any pending background KV reset to complete before acquiring
-    // mutex_ and sending EXECUTE. In the common case the reset is already done
-    // (it ran concurrently while the previous response was being sent to the
-    // client), so this is a no-op with zero added latency.
+                                             ErrorCallback on_error,
+                                             const std::string& session_id,
+                                             bool kv_invalidated) {
     waitForPendingReset();
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -571,7 +569,8 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
 
     json execute_cmd = InferenceProtocol::createExecuteCommand(
         event_id, prompt_ref, streaming, max_tokens, temperature,
-        top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter
+        top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter,
+        session_id, kv_invalidated
     );
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
 }
@@ -698,6 +697,15 @@ bool InferenceWorkerManager::restoreKvCache(const std::string& checkpoint_name) 
     bool ok = sendCommandAndWaitReady(cmd, 30);
     if (ok) LOG_INFO("[" << process_type_ << "Worker] KV restored: " << checkpoint_name);
     return ok;
+}
+
+void InferenceWorkerManager::sendClearSession(const std::string& session_id) {
+    if (session_id.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!isWorkerRunningLocked()) return;
+    json cmd = InferenceProtocol::createClearSessionCommand(session_id);
+    sendCommandAndWaitReady(cmd, 10);
+    LOG_INFO("[" << process_type_ << "Worker] clearSession sent: " << session_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

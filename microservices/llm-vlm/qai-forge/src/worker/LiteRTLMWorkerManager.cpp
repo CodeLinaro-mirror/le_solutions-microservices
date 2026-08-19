@@ -175,6 +175,8 @@ void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
                 captured_metadata.max_context_length   = meta.value("max_context_length", 4096);
                 captured_metadata.tool_call_delimiter  = meta.value("tool_call_delimiter", "");
                 captured_metadata.tool_response_delimiter = meta.value("tool_response_delimiter", "");
+                captured_metadata.think_start          = meta.value("think_start", "");
+                captured_metadata.think_end            = meta.value("think_end", "");
                 captured_metadata.received             = true;
                 metadata_received = true;
             } catch (...) {}
@@ -202,7 +204,9 @@ void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
         LOG_INFO("[LiteRTLMWorkerManager] Metadata received:"
                  << " model_type=" << metadata_.model_type
                  << " ctx=" << metadata_.max_context_length
-                 << " tool_call_delim='" << metadata_.tool_call_delimiter << "'");
+                 << " jinja_len=" << metadata_.jinja_template.size()
+                 << " think_start='" << metadata_.think_start << "'"
+                 << " think_end='" << metadata_.think_end << "'");
 
         // Push dynamic metadata into ModelConfigManager so that TokenBudgetUtils
         // and other consumers see the real context length and jinja template.

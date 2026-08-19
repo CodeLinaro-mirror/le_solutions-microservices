@@ -436,6 +436,11 @@ ModelRuntimeState ModelRuntime::state() const {
     return state_;
 }
 
+void ModelRuntime::clearSession(const std::string& session_id) {
+    if (!backend_) return;
+    backend_->clearSession(session_id);
+}
+
 void ModelRuntime::executorLoop() {
     while (true) {
         bool should_load = false;

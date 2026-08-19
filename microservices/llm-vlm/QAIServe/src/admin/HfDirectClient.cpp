@@ -112,6 +112,10 @@ std::vector<HfDirectClient::FileInfo> HfDirectClient::listFiles(
             FileInfo fi;
             fi.name = sibling.value("rfilename", "");
             fi.size = sibling.value("size", int64_t(0));
+            // HF LFS files may not have top-level size; fall back to lfs.size
+            if (fi.size == 0 && sibling.contains("lfs") && sibling["lfs"].is_object()) {
+                fi.size = sibling["lfs"].value("size", int64_t(0));
+            }
             if (!fi.name.empty()) files.push_back(std::move(fi));
         }
     } catch (const std::exception& e) {
@@ -132,10 +136,29 @@ std::string HfDirectClient::pull(
         const std::string& dest_dir,
         std::function<void(int64_t, int64_t)> progress_cb) {
 
-    // 1. Query file list
+    // 1. Check local cache before any network I/O.
+    fs::path install_dir = fs::path(dest_dir) / repo;
+    {
+        std::error_code ec;
+        if (fs::exists(install_dir / "hf_manifest.json", ec) && !ec) {
+            // Complete bundle already on disk — report size and return immediately.
+            if (progress_cb) {
+                int64_t cached_size = 0;
+                std::error_code sz_ec;
+                for (const auto& e : fs::recursive_directory_iterator(install_dir, sz_ec)) {
+                    if (!sz_ec && e.is_regular_file())
+                        cached_size += static_cast<int64_t>(fs::file_size(e.path(), sz_ec));
+                }
+                if (cached_size > 0) progress_cb(cached_size, cached_size);
+            }
+            return install_dir.string();
+        }
+    }
+
+    // 2. Query file list (network)
     auto all_files = listFiles(repo);
 
-    // 2. Filter to supported model files
+    // 3. Filter to supported model files
     std::vector<FileInfo> model_files;
     for (const auto& fi : all_files) {
         if (isSupportedModelFile(fi.name)) model_files.push_back(fi);
@@ -146,19 +169,12 @@ std::string HfDirectClient::pull(
                         "found in repo: ") + repo);
     }
 
-    // 3. Create destination directory: dest_dir/{org}/{repo-leaf}/
-    fs::path install_dir = fs::path(dest_dir) / repo;
+    // 4. Create destination directory: dest_dir/{org}/{repo-leaf}/
     {
         std::error_code ec;
 
-        // If bundle already exists, check if it is complete.
-        // - Complete (hf_manifest.json present): return early (cached).
-        // - Incomplete (no manifest): remove and re-download cleanly.
+        // Incomplete bundle (directory exists but no manifest) — clean up and re-download.
         if (fs::exists(install_dir, ec)) {
-            bool complete = fs::exists(install_dir / "hf_manifest.json");
-            if (complete) {
-                return install_dir.string();  // already complete, use cached
-            }
             // Incomplete bundle from a previous interrupted download — clean up
             fs::remove_all(install_dir, ec);
             if (ec) {
@@ -219,24 +235,24 @@ std::string HfDirectClient::pull(
 
         std::cout << "[HfDirectClient] Downloading " << fi.name << " from " << repo << "\n";
         AiHubClient::download(url, dest_path.string(), file_progress);
-        bytes_so_far += fi.size;
+        // Use actual file size on disk in case fi.size was 0 (HF API omitted size)
+        {
+            std::error_code sz_ec;
+            auto actual_size = fs::file_size(dest_path, sz_ec);
+            bytes_so_far += (!sz_ec && actual_size > 0)
+                ? static_cast<int64_t>(actual_size)
+                : fi.size;
+        }
 
         if (primary_file.empty()) primary_file = fi.name;
     }
 
-    // Signal completion
-    if (progress_cb) progress_cb(total_bytes, total_bytes);
+    // Signal completion with actual bytes downloaded (bytes_so_far is reliable;
+    // total_bytes may be 0 if HF API did not return file sizes).
+    if (progress_cb) progress_cb(bytes_so_far, bytes_so_far > 0 ? bytes_so_far : total_bytes);
 
     // 6. Determine PluginId from file extension
-    std::string plugin_id;
-    {
-        const std::string ext = fileExtension(primary_file);
-        if (ext == ".task" || ext == ".tflite" || ext == ".litertlm") {
-            plugin_id = "litert_lm";
-        } else {
-            plugin_id = "litert_lm";  // safe default for any future extensions
-        }
-    }
+    const std::string plugin_id = "litert_lm";
 
     // 7. Derive ModelName: leaf part of repo (after last '/')
     std::string model_name = repo;

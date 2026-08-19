@@ -127,7 +127,9 @@ public:
                         bool bypass_think_filter,
                         TokenCallback on_token,
                         DoneCallback on_done,
-                        ErrorCallback on_error);
+                        ErrorCallback on_error,
+                        const std::string& session_id = "",
+                        bool kv_invalidated = false);
 
     void executeStructuredRequest(const std::string& event_id,
                                   const json& messages,
@@ -187,6 +189,12 @@ public:
      * Restore the KV cache from a named checkpoint.
      */
     bool restoreKvCache(const std::string& checkpoint_name);
+
+    /**
+     * Send a CLEAR_SESSION command to release per-session KV state in the worker.
+     * Used by LiteRT-LM backend to free g_kv_sessions entries after a session ends.
+     */
+    void sendClearSession(const std::string& session_id);
 
     /**
      * Terminate the worker subprocess immediately (SIGKILL).

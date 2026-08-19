@@ -453,8 +453,17 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                             runtime, precision, version, chipset, "downloading"),
                         lock_error);
 
+                    // If an HF-fallback bundle already exists (hf_manifest.json
+                    // present), skip GenieX entirely — it would only pollute the
+                    // directory and force a redundant re-download.
                     bool use_hf_fallback = false;
-                    try {
+                    {
+                        fs::path hf_bundle = fs::path(models_dir) / "models" / model;
+                        if (fs::exists(hf_bundle / "hf_manifest.json")) {
+                            use_hf_fallback = true;
+                        }
+                    }
+                    if (!use_hf_fallback) try {
                         GenieXClient::pull(
                             model, precision,
                             GenieXClient::Hub::Auto,   // auto-select hub from repo name
@@ -479,11 +488,10 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                     }
 
                     if (use_hf_fallback) {
-                        // HF installs to models_dir/<org>/<repo> (no double-prefix).
-                        // Update the lock's target_path BEFORE starting the download
-                        // so that a concurrent DELETE issued during the download is
-                        // correctly blocked (findBlockingLock matches target_path).
-                        fs::path hf_install = fs::path(models_dir) / model;
+                        // HF fallback installs to the same directory as GenieX SDK
+                        // (models_dir/models/<org>/<repo>), so DELETE and scan see
+                        // both paths consistently.
+                        fs::path hf_install = fs::path(models_dir) / "models" / model;
                         {
                             admin::LockJson updated = admin::buildUpdatedDownloadLockJson(
                                 lock_path, models_dir, job->job_id, source, model,
@@ -496,7 +504,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                         }
 
                         HfDirectClient::pull(
-                            model, models_dir,
+                            model, (fs::path(models_dir) / "models").string(),
                             [&job](int64_t done, int64_t total) {
                                 job->bytes_downloaded.store(done);
                                 job->total_bytes.store(total);
@@ -525,6 +533,14 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                             throw std::runtime_error(
                                 "HF fallback: model installed at " + hf_install.string() +
                                 " but not found in registry after scan");
+                        }
+
+                        // Back-fill runtime from registry so the job response shows
+                        // the actual runtime (e.g. "litert_lm", "llamacpp").
+                        {
+                            const ModelConfig* cfg =
+                                ModelConfigManager::getInstance().getModelConfig(hf_id);
+                            if (cfg && !cfg->runtime.empty()) job->runtime = cfg->runtime;
                         }
 
                         job->setInstalled(hf_id, hf_install.string());
@@ -596,6 +612,13 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                         throw std::runtime_error(
                             "GenieX model installed at " + paths.model_dir +
                             " but id '" + registered_id + "' not found in registry after scan");
+                    }
+
+                    // Back-fill runtime from registry.
+                    {
+                        const ModelConfig* cfg =
+                            ModelConfigManager::getInstance().getModelConfig(registered_id);
+                        if (cfg && !cfg->runtime.empty()) job->runtime = cfg->runtime;
                     }
 
                     job->setInstalled(registered_id, paths.model_dir);

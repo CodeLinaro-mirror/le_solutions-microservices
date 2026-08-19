@@ -192,6 +192,13 @@ public:
     bool enqueueStoreTask(std::string idempotency_key,
                           std::function<void()> task);
 
+    /**
+     * Release per-session Conversation API state across all loaded LiteRT-LM
+     * models. Called when an HTTP chat session ends (DELETE /v1/sessions/{id}).
+     * No-op for non-LiteRT-LM backends.
+     */
+    void clearSession(const std::string& session_id);
+
     QaiForge(const QaiForge&) = delete;
     QaiForge& operator=(const QaiForge&) = delete;
 

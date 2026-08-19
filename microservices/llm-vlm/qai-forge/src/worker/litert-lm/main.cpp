@@ -39,6 +39,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <fstream>
+#include <cstdint>
 #include <cerrno>
 #include <csignal>
 
@@ -124,6 +127,190 @@ static void sendError(const std::string& event_id, const std::string& message) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// .litertlm file parser — extract jinja_prompt_template without SDK
+//
+// File layout:
+//   [0..7]   magic "LITERTLM"
+//   [8..11]  major_version (uint32 LE)
+//   [12..15] minor_version (uint32 LE)
+//   [16..19] patch_version (uint32 LE)
+//   [20..23] padding (4 bytes)
+//   [24..31] header_end_offset (uint64 LE)
+//   [32..header_end) flatbuffer LiteRTLMMetaData header
+//   [header_end..)  section data (TFLite models, tokenizer, LlmMetadataProto, ...)
+//
+// Strategy: scan section data for proto field 7 (tag=0x3a, wire type 2).
+// The jinja_prompt_template is a long string (>100 bytes) starting with
+// a jinja token ("{%" or "{{"). This is deterministic regardless of model.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Decode protobuf varint. Returns bytes consumed, 0 on error.
+static int decodeVarint(const uint8_t* d, size_t len, uint64_t* out) {
+    *out = 0;
+    for (int i = 0; i < 10 && (size_t)i < len; ++i) {
+        *out |= (uint64_t)(d[i] & 0x7f) << (7*i);
+        if (!(d[i] & 0x80)) return i+1;
+    }
+    return 0;
+}
+
+// Extract jinja_prompt_template from a .litertlm model file.
+// Scans section data after the flatbuffer header for proto field 7 string.
+// Returns empty string if not found.
+static std::string extractJinjaTemplate(const std::string& model_path) {
+    std::ifstream f(model_path, std::ios::binary);
+    if (!f) return "";
+
+    // Validate magic
+    char magic[8]; f.read(magic, 8);
+    if (f.gcount() != 8 || std::string(magic, 8) != "LITERTLM") return "";
+
+    // Read header_end_offset at byte 24 (skip 3x uint32 version + 4 bytes padding)
+    f.ignore(16);
+    uint64_t hdr_end;
+    f.read(reinterpret_cast<char*>(&hdr_end), 8);
+    if (!f) return "";
+
+    // Seek to start of section data
+    f.seekg(static_cast<std::streamoff>(hdr_end));
+    if (!f) return "";
+
+    // Read section data in chunks and scan for proto field 7 (tag=0x3a)
+    // The LlmMetadataProto section contains a proto-encoded LlmMetadata message.
+    // Field 7 = jinja_prompt_template (string, wire type 2, tag=0x3a).
+    // We scan for: 0x3a + varint(len >= 100) + content starting with "{%" or "{{"
+    const size_t kChunkSize = 65536;
+    const size_t kMaxScan   = 64 * 1024 * 1024; // 64MB max scan
+    std::vector<uint8_t> buf(kChunkSize + 256); // overlap for boundary crossing
+    size_t scanned = 0;
+    size_t overlap = 0;
+
+    while (scanned < kMaxScan) {
+        f.read(reinterpret_cast<char*>(buf.data() + overlap), kChunkSize);
+        size_t got = (size_t)f.gcount();
+        if (got == 0) break;
+        size_t window = overlap + got;
+
+        for (size_t i = 0; i + 1 < window; ++i) {
+            if (buf[i] != 0x3a) continue; // field 7, wire type 2
+
+            uint64_t sz = 0;
+            int n = decodeVarint(buf.data() + i + 1, window - i - 1, &sz);
+            if (!n || sz < 100 || sz > 1024*1024) continue;
+            size_t str_start = i + 1 + n;
+            if (str_start + 2 > window) continue;
+
+            // Check jinja prefix
+            if ((buf[str_start] == '{' && buf[str_start+1] == '%') ||
+                (buf[str_start] == '{' && buf[str_start+1] == '{')) {
+                // Read full string — may need to re-seek if it spans chunk boundary
+                if (str_start + sz <= window) {
+                    // String fully in buffer
+                    std::string result(reinterpret_cast<const char*>(buf.data() + str_start), sz);
+                    // Validate it's valid UTF-8 jinja (contains expected tokens)
+                    if (result.find("{%") != std::string::npos || result.find("{{") != std::string::npos) {
+                        return result;
+                    }
+                } else {
+                    // String spans boundary — seek and read it directly
+                    std::streamoff str_file_off =
+                        static_cast<std::streamoff>(hdr_end) +
+                        static_cast<std::streamoff>(scanned - overlap + i + 1 + n);
+                    std::ifstream f2(model_path, std::ios::binary);
+                    if (!f2) continue;
+                    f2.seekg(str_file_off);
+                    std::vector<uint8_t> sbuf(sz);
+                    f2.read(reinterpret_cast<char*>(sbuf.data()), sz);
+                    if ((size_t)f2.gcount() != sz) continue;
+                    std::string result(reinterpret_cast<const char*>(sbuf.data()), sz);
+                    if (result.find("{%") != std::string::npos || result.find("{{") != std::string::npos) {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        scanned += got;
+        // Keep last 256 bytes as overlap for boundary crossing
+        overlap = std::min(window, (size_t)256);
+        std::memmove(buf.data(), buf.data() + window - overlap, overlap);
+        if (f.eof()) break;
+    }
+    return "";
+}
+
+// Extract thinking channel start/end tokens from LlmMetadata proto.
+// Proto LlmMetadata field 8 = repeated Channel message:
+//   Channel: field 1=channel_name(string), field 2=start(string), field 3=end(string)
+// We look for a channel whose name contains "think" or "thought".
+// Returns {start, end} pair, both empty if no thinking channel found.
+static std::pair<std::string,std::string> extractThinkTokens(const std::string& model_path) {
+    std::ifstream f(model_path, std::ios::binary);
+    if (!f) return {};
+    char magic[8]; f.read(magic, 8);
+    if (f.gcount() != 8 || std::string(magic, 8) != "LITERTLM") return {};
+    f.ignore(16);
+    uint64_t hdr_end; f.read(reinterpret_cast<char*>(&hdr_end), 8); if (!f) return {};
+    f.seekg(static_cast<std::streamoff>(hdr_end));
+
+    const size_t kChunkSize = 65536;
+    const size_t kMaxScan = 32 * 1024 * 1024;
+    std::vector<uint8_t> buf(kChunkSize + 512);
+    size_t scanned = 0, overlap = 0;
+
+    while (scanned < kMaxScan) {
+        f.read(reinterpret_cast<char*>(buf.data() + overlap), kChunkSize);
+        size_t got = (size_t)f.gcount(); if (!got) break;
+        size_t window = overlap + got;
+
+        // Scan for field 8 (Channel message), tag = (8<<3)|2 = 0x42
+        for (size_t i = 0; i + 1 < window; ++i) {
+            if (buf[i] != 0x42) continue;
+            uint64_t sz = 0; int n = decodeVarint(buf.data()+i+1, window-i-1, &sz);
+            if (!n || sz < 2 || sz > 500) continue;
+            size_t start = i+1+n;
+            if (start+sz > window) continue;
+
+            // Parse Channel proto: field1=name, field2=start_token, field3=end_token
+            std::string ch_name, ch_start, ch_end;
+            size_t pos = start;
+            size_t end_pos = start + sz;
+            while (pos < end_pos) {
+                uint64_t tag = 0; int tn = decodeVarint(buf.data()+pos, end_pos-pos, &tag);
+                if (!tn) break; pos += tn;
+                int fnum = (int)(tag>>3), wt = (int)(tag&7);
+                if (wt == 2) {
+                    uint64_t fsz = 0; int fn = decodeVarint(buf.data()+pos, end_pos-pos, &fsz);
+                    if (!fn || pos+fn+fsz > end_pos) break; pos += fn;
+                    std::string val(reinterpret_cast<const char*>(buf.data()+pos), fsz); pos += fsz;
+                    if (fnum == 1) ch_name = val;
+                    else if (fnum == 2) ch_start = val;
+                    else if (fnum == 3) ch_end = val;
+                } else if (wt == 0) { uint64_t v=0; int vn=decodeVarint(buf.data()+pos,end_pos-pos,&v); if(!vn)break; pos+=vn; }
+                else if (wt == 5) { if(pos+4>end_pos)break; pos+=4; }
+                else if (wt == 1) { if(pos+8>end_pos)break; pos+=8; }
+                else break;
+            }
+
+            // Check if this is the thinking channel
+            if (!ch_name.empty() && !ch_start.empty() && !ch_end.empty()) {
+                std::string lower = ch_name;
+                for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+                if (lower.find("think") != std::string::npos || lower.find("thought") != std::string::npos) {
+                    return {ch_start, ch_end};
+                }
+            }
+        }
+
+        scanned += got;
+        overlap = std::min(window, (size_t)512);
+        std::memmove(buf.data(), buf.data()+window-overlap, overlap);
+        if (f.eof()) break;
+    }
+    return {};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LiteRT-LM Session wrapper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -131,23 +318,53 @@ struct LiteRTLMSession {
     std::string model_path;
     std::string jinja_template;
     std::string model_type;
-    int         max_context_length = 4096;
+    int         max_context_length = 0;
     std::string tool_call_delimiter;
     std::string tool_response_delimiter;
+    std::string think_start;   // e.g. "<think>"  — from LlmMetadata.channels
+    std::string think_end;     // e.g. "</think>" — empty if no thinking mode
 
 #ifdef LITERT_LM_AVAILABLE
-    LiteRtLmEngine*             engine              = nullptr;
-    LiteRtLmEngineSettings*     settings            = nullptr;
-    LiteRtLmConversation*       conversation        = nullptr;
-    LiteRtLmConversationConfig* conversation_config = nullptr;
-    LiteRtLmSessionConfig*      session_config      = nullptr;
+    LiteRtLmEngine*         engine   = nullptr;
+    LiteRtLmEngineSettings* settings = nullptr;
 #endif
 
     bool loaded = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// loadModel — Load .litertlm model and extract metadata
+// Persistent KV session map — keyed by session_id from EXECUTE command.
+// Keeps LiteRtLmSession* alive across requests to reuse prefilled KV cache.
+// Only populated when EXECUTE carries a non-empty session_id.
+// ─────────────────────────────────────────────────────────────────────────────
+#ifdef LITERT_LM_AVAILABLE
+struct PersistentSession {
+    LiteRtLmSession*    session          = nullptr;
+    std::string         last_prompt;
+    uint64_t            last_used_seq    = 0;  // for LRU eviction
+};
+// Thread safety: the worker subprocess runs a single-threaded synchronous IPC loop,
+// so g_kv_sessions and g_kv_seq require no mutex. If background threads are added,
+// protect all accesses with a std::mutex.
+static std::unordered_map<std::string, PersistentSession> g_kv_sessions;
+static uint64_t g_kv_seq = 0;
+
+static constexpr size_t kMaxKvSessions = 16;
+
+// Evict the least-recently-used session when over limit.
+static void evictLruKvSession() {
+    if (g_kv_sessions.size() <= kMaxKvSessions) return;
+    auto lru = g_kv_sessions.begin();
+    for (auto it = g_kv_sessions.begin(); it != g_kv_sessions.end(); ++it) {
+        if (it->second.last_used_seq < lru->second.last_used_seq) {
+            lru = it;
+        }
+    }
+    LOG_INFO("[LiteRTLMWorker] KV LRU evict: session=" << lru->first);
+    litert_lm_session_delete(lru->second.session);
+    g_kv_sessions.erase(lru);
+}
+#endif
 // ─────────────────────────────────────────────────────────────────────────────
 
 static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
@@ -172,7 +389,8 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
     litert_lm_engine_settings_set_max_num_tokens(sess.settings, max_tokens);
 
     // Set dispatch lib dir for QNN NPU support
-    const char* dispatch_lib_dir = std::getenv("LITERT_LM_DISPATCH_LIB_DIR");
+    const char* dispatch_lib_dir = std::getenv("LITERT_DISPATCH_DIR");
+    if (!dispatch_lib_dir) dispatch_lib_dir = std::getenv("LITERT_LM_DISPATCH_LIB_DIR");
     if (dispatch_lib_dir) {
         litert_lm_engine_settings_set_litert_dispatch_lib_dir(
             sess.settings, dispatch_lib_dir);
@@ -187,53 +405,36 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
         return false;
     }
 
-    // Create session config (used by conversation)
-    sess.session_config = litert_lm_session_config_create();
-    if (!sess.session_config) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create session config");
-        litert_lm_engine_delete(sess.engine);
-        sess.engine = nullptr;
-        litert_lm_engine_settings_delete(sess.settings);
-        sess.settings = nullptr;
-        return false;
-    }
-    litert_lm_session_config_set_apply_prompt_template(sess.session_config, true);
+    // Session API: no session/conversation objects are created here. The engine
+    // holds the model and tokenizer; a fresh LiteRtLmSession is created per
+    // request in handleExecute() so per-request sampler/max_tokens can be applied
+    // without carrying stale KV state between requests.
 
-    // Create conversation config
-    sess.conversation_config = litert_lm_conversation_config_create();
-    if (!sess.conversation_config) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create conversation config");
-        litert_lm_session_config_delete(sess.session_config);
-        sess.session_config = nullptr;
-        litert_lm_engine_delete(sess.engine);
-        sess.engine = nullptr;
-        litert_lm_engine_settings_delete(sess.settings);
-        sess.settings = nullptr;
-        return false;
+    // Extract jinja_prompt_template directly from the model file.
+    sess.jinja_template = extractJinjaTemplate(model_path);
+    if (sess.jinja_template.empty()) {
+        LOG_WARN("[LiteRTLMWorker] jinja_prompt_template not found in model file: " << model_path);
+    } else {
+        LOG_INFO("[LiteRTLMWorker] jinja_prompt_template loaded (" << sess.jinja_template.size() << " bytes)");
     }
-    litert_lm_conversation_config_set_session_config(
-        sess.conversation_config, sess.session_config);
 
-    // Create conversation (manages KV cache across turns)
-    sess.conversation = litert_lm_conversation_create(
-        sess.engine, sess.conversation_config);
-    if (!sess.conversation) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create conversation for: " << model_path);
-        litert_lm_conversation_config_delete(sess.conversation_config);
-        sess.conversation_config = nullptr;
-        litert_lm_session_config_delete(sess.session_config);
-        sess.session_config = nullptr;
-        litert_lm_engine_delete(sess.engine);
-        sess.engine = nullptr;
-        litert_lm_engine_settings_delete(sess.settings);
-        sess.settings = nullptr;
-        return false;
+    // Extract thinking channel tokens (e.g. <think>/<think> for Qwen3).
+    auto think_tokens = extractThinkTokens(model_path);
+    sess.think_start = think_tokens.first;
+    sess.think_end   = think_tokens.second;
+    if (!sess.think_start.empty()) {
+        LOG_INFO("[LiteRTLMWorker] thinking channel: start='" << sess.think_start
+                 << "' end='" << sess.think_end << "'");
     }
 
     // Set metadata — read from env vars for model-specific overrides,
     // fall back to generic defaults.
     sess.model_type = std::string(
         std::getenv("LITERT_LM_MODEL_TYPE") ? std::getenv("LITERT_LM_MODEL_TYPE") : "unknown");
+    sess.max_context_length = []() -> int {
+        const char* env = std::getenv("LITERT_LM_DEFAULT_CONTEXT_LENGTH");
+        return (env && std::atoi(env) > 0) ? std::atoi(env) : 4096;
+    }();
     sess.tool_call_delimiter = std::string(
         std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") ? std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") : "<|tool_call|>");
     sess.tool_response_delimiter = std::string(
@@ -245,9 +446,14 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
     LOG_WARN("[LiteRTLMWorker] Built without LITERT_LM_AVAILABLE — running in stub mode");
     sess.jinja_template = "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}assistant:";
     sess.model_type = "llama3";
-    sess.max_context_length = 4096;
-    sess.tool_call_delimiter = "<|tool_call|>";
-    sess.tool_response_delimiter = "<|tool_response|>";
+    sess.max_context_length = []() -> int {
+        const char* env = std::getenv("LITERT_LM_DEFAULT_CONTEXT_LENGTH");
+        return (env && std::atoi(env) > 0) ? std::atoi(env) : 4096;
+    }();
+    sess.tool_call_delimiter = std::string(
+        std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") ? std::getenv("LITERT_LM_TOOL_CALL_DELIMITER") : "<|tool_call|>");
+    sess.tool_response_delimiter = std::string(
+        std::getenv("LITERT_LM_TOOL_RESPONSE_DELIMITER") ? std::getenv("LITERT_LM_TOOL_RESPONSE_DELIMITER") : "<|tool_response|>");
 #endif
 
     sess.loaded = true;
@@ -255,23 +461,6 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
              << " type=" << sess.model_type
              << " ctx=" << sess.max_context_length);
     return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// resetKvCache — Reset the KV cache between requests
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void resetKvCache(LiteRTLMSession& sess) {
-#ifdef LITERT_LM_AVAILABLE
-    // Conversation is recreated per-request, so KV cache is always clean.
-    if (sess.conversation) {
-        litert_lm_conversation_delete(sess.conversation);
-        sess.conversation = nullptr;
-    }
-#else
-    (void)sess;
-    LOG_DEBUG("[LiteRTLMWorker] Stub: KV cache reset");
-#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +487,9 @@ static void handleGetMetadata(const LiteRTLMSession& sess, const std::string& ev
         {"model_type", sess.model_type},
         {"max_context_length", sess.max_context_length},
         {"tool_call_delimiter", sess.tool_call_delimiter},
-        {"tool_response_delimiter", sess.tool_response_delimiter}
+        {"tool_response_delimiter", sess.tool_response_delimiter},
+        {"think_start", sess.think_start},
+        {"think_end", sess.think_end}
     };
 
     // Embed metadata as a TOKEN with a special prefix that LiteRTLMWorkerManager
@@ -322,7 +513,9 @@ static void handleGetMetadata(const LiteRTLMSession& sess, const std::string& ev
 }
 
 static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
-    std::string event_id = cmd.value("event_id", "");
+    std::string event_id     = cmd.value("event_id", "");
+    std::string session_id   = cmd.value("session_id", "");
+    bool        kv_invalidated = cmd.value("kv_invalidated", false);
 
     std::string prompt;
     try {
@@ -338,10 +531,7 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     float top_p          = cmd.value("top_p", 0.9f);
     int top_k            = cmd.value("top_k", 40);
 
-    // Extended: multimodal inputs array (text + base64 images)
-    // If "inputs" is present, use it; otherwise fall back to "prompt"
     std::string text_input = prompt;
-
     if (cmd.contains("inputs") && cmd["inputs"].is_array()) {
         text_input.clear();
         for (const auto& input : cmd["inputs"]) {
@@ -358,210 +548,186 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
         return;
     }
 
-    // Recreate conversation per request to apply per-request max_tokens/sampler.
-    if (sess.conversation) {
-        litert_lm_conversation_delete(sess.conversation);
-        sess.conversation = nullptr;
+    LiteRtLmSessionConfig* config = litert_lm_session_config_create();
+    if (!config) {
+        sendError(event_id, "Failed to create session config");
+        sendReady();
+        return;
     }
-    if (sess.conversation_config) {
-        litert_lm_conversation_config_delete(sess.conversation_config);
-        sess.conversation_config = nullptr;
+    litert_lm_session_config_set_apply_prompt_template(config, false);
+
+    LiteRtLmSamplerParams* sampler = litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
+    {
+        const char* e_tk  = std::getenv("LITERT_LM_DEFAULT_TOP_K");
+        const char* e_tp  = std::getenv("LITERT_LM_DEFAULT_TOP_P");
+        const char* e_tmp = std::getenv("LITERT_LM_DEFAULT_TEMPERATURE");
+        int   def_top_k   = (e_tk  && std::atoi(e_tk)  > 0)    ? std::atoi(e_tk)   : 40;
+        float def_top_p   = (e_tp  && std::stof(e_tp)  > 0.0f) ? std::stof(e_tp)   : 0.9f;
+        float def_temp    = (e_tmp && std::stof(e_tmp) > 0.0f) ? std::stof(e_tmp)  : 0.7f;
+        litert_lm_sampler_params_set_top_k(sampler, top_k > 0 ? top_k : def_top_k);
+        litert_lm_sampler_params_set_top_p(sampler, top_p > 0.0f ? top_p : def_top_p);
+        litert_lm_sampler_params_set_temperature(sampler, temperature > 0.0f ? temperature : def_temp);
     }
-    if (sess.session_config) {
-        litert_lm_session_config_delete(sess.session_config);
-        sess.session_config = nullptr;
+    {
+        const char* seed_env = std::getenv("LITERT_LM_SAMPLER_SEED");
+        int seed = seed_env ? std::atoi(seed_env) : 0;
+        litert_lm_sampler_params_set_seed(sampler, seed);
     }
+    litert_lm_session_config_set_sampler_params(config, sampler);
+    litert_lm_sampler_params_delete(sampler);
+    litert_lm_session_config_set_max_output_tokens(config, max_tokens > 0 ? max_tokens : 512);
 
-    sess.session_config = litert_lm_session_config_create();
-    LiteRtLmSamplerParams* sampler_params =
-        litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
-    litert_lm_sampler_params_set_top_k(sampler_params, top_k > 0 ? top_k : 40);
-    litert_lm_sampler_params_set_top_p(sampler_params, top_p > 0.0f ? top_p : 0.9f);
-    litert_lm_sampler_params_set_temperature(
-        sampler_params, temperature > 0.0f ? temperature : 0.7f);
-    litert_lm_sampler_params_set_seed(sampler_params, 0);
-    litert_lm_session_config_set_sampler_params(sess.session_config, sampler_params);
-    litert_lm_sampler_params_delete(sampler_params);
-    litert_lm_session_config_set_max_output_tokens(
-        sess.session_config, max_tokens > 0 ? max_tokens : 512);
-    litert_lm_session_config_set_apply_prompt_template(sess.session_config, true);
+    // ── KV cache reuse ─────────────────────────────────────────────────────────
+    LiteRtLmSession* session  = nullptr;
+    std::string prefill_text  = text_input;
 
-    sess.conversation_config = litert_lm_conversation_config_create();
-    litert_lm_conversation_config_set_session_config(
-        sess.conversation_config, sess.session_config);
-
-    json message_payload;
-    if (cmd.contains("messages") && cmd["messages"].is_array() &&
-        !cmd["messages"].empty()) {
-        json preface_messages = cmd["messages"];
-        message_payload = preface_messages.back();
-        preface_messages.erase(preface_messages.end() - 1);
-        if (!preface_messages.empty()) {
-            const std::string messages_json = preface_messages.dump();
-            litert_lm_conversation_config_set_messages(
-                sess.conversation_config, messages_json.c_str());
+    if (!session_id.empty()) {
+        // kv_invalidated: context eviction occurred — must rebuild session
+        if (kv_invalidated) {
+            auto it = g_kv_sessions.find(session_id);
+            if (it != g_kv_sessions.end()) {
+                litert_lm_session_delete(it->second.session);
+                g_kv_sessions.erase(it);
+                LOG_INFO("[LiteRTLMWorker] KV invalidated (context eviction): session=" << session_id);
+            }
+        } else {
+            auto it = g_kv_sessions.find(session_id);
+            if (it != g_kv_sessions.end() && it->second.session != nullptr) {
+                const std::string& prev = it->second.last_prompt;
+                if (text_input.size() > prev.size() &&
+                        text_input.substr(0, prev.size()) == prev) {
+                    // KV reuse: session alive and prompt is a strict prefix extension
+                    session      = it->second.session;
+                    prefill_text = text_input.substr(prev.size());
+                    it->second.last_used_seq = ++g_kv_seq;
+                    LOG_INFO("[LiteRTLMWorker] KV reuse: session=" << session_id
+                             << " delta_len=" << prefill_text.size()
+                             << " total_len=" << text_input.size());
+                } else {
+                    litert_lm_session_delete(it->second.session);
+                    g_kv_sessions.erase(it);
+                    LOG_INFO("[LiteRTLMWorker] KV invalidated (prompt diverged): session=" << session_id);
+                }
+            }
         }
-        if (cmd.contains("tools") && cmd["tools"].is_array()) {
-            const std::string tools_json = cmd["tools"].dump();
-            litert_lm_conversation_config_set_tools(
-                sess.conversation_config, tools_json.c_str());
-        }
-    } else {
-        message_payload = {{"role", "user"}, {"content", text_input}};
     }
 
-    sess.conversation = litert_lm_conversation_create(
-        sess.engine, sess.conversation_config);
-    if (!sess.conversation) {
-        sendError(event_id, "Failed to create conversation");
+    if (!session) {
+        // No reuse — create fresh session with config/sampler
+        session = litert_lm_engine_create_session(sess.engine, config);
+    }
+    litert_lm_session_config_delete(config);
+
+    if (!session) {
+        sendError(event_id, "Failed to create session");
         sendReady();
         return;
     }
 
-    std::string message_json = message_payload.dump();
+    // Prefill delta (or full prompt for new sessions)
+    LiteRtLmInputData* input_data = litert_lm_input_data_create(
+        kLiteRtLmInputDataTypeText, prefill_text.c_str(), prefill_text.size());
+    if (!input_data) {
+        litert_lm_session_delete(session);
+        if (!session_id.empty()) g_kv_sessions.erase(session_id);
+        sendError(event_id, "Failed to create input data");
+        sendReady();
+        return;
+    }
+    const LiteRtLmInputData* inputs[] = {input_data};
+    int prefill_status = litert_lm_session_run_prefill(session, inputs, 1);
+    litert_lm_input_data_delete(input_data);
 
-    auto stream_callback = [](void* user_data, const char* chunk, bool is_final, const char* error_msg) {
+    if (prefill_status != 0) {
+        litert_lm_session_delete(session);
+        if (!session_id.empty()) g_kv_sessions.erase(session_id);
+        sendError(event_id, "Prefill failed: " + std::to_string(prefill_status));
+        sendReady();
+        return;
+    }
+
+    // Stream decode. chunk is raw text (not JSON); is_final=true sends nullptr.
+    StreamCallbackData cb_data;
+    cb_data.event_id = event_id;
+
+    auto stream_callback = [](void* user_data, const char* chunk, bool is_final,
+                               const char* error_msg) {
         auto* data = static_cast<StreamCallbackData*>(user_data);
 
         if (error_msg && error_msg[0] != '\0') {
             std::string err_str(error_msg);
-            if (err_str.find("Max number of tokens") != std::string::npos ||
-                err_str.find("max_tokens") != std::string::npos) {
-                json done_tok = {
-                    {"type", "TOKEN"},
-                    {"event_id", data->event_id},
-                    {"content", chunk ? std::string(chunk) : ""},
-                    {"is_final", true},
-                    {"finish_reason", "length"}
-                };
+            if (err_str.find("Max number of tokens") != std::string::npos) {
+                json done_tok = {{"type","TOKEN"},{"event_id",data->event_id},
+                                 {"content", chunk ? std::string(chunk) : ""},
+                                 {"is_final",true},{"finish_reason","length"}};
                 sendMessage(done_tok);
-                data->done = true;
-                return;
+            } else {
+                sendMessage(json{{"type","ERROR"},{"event_id",data->event_id},
+                                 {"message",err_str}});
             }
-            json err_msg = {
-                {"type", "ERROR"},
-                {"event_id", data->event_id},
-                {"message", err_str}
-            };
-            sendMessage(err_msg);
             data->done = true;
             return;
         }
 
-        // chunk may be a JSON response — extract text content, skip thought channels
-        std::string text_chunk;
-        if (chunk) {
-            std::string chunk_str(chunk);
-            if (!chunk_str.empty() && chunk_str[0] == '{') {
-                try {
-                    auto j = json::parse(chunk_str);
-                    // Skip thought/reasoning channels
-                    if (j.contains("channels")) {
-                        // thought channel — skip silently
-                    } else if (j.contains("content") && j["content"].is_array()) {
-                        for (const auto& part : j["content"]) {
-                            if (part.value("type", "") == "text") {
-                                text_chunk += part.value("text", "");
-                            }
-                        }
-                    } else if (j.contains("content") && j["content"].is_string()) {
-                        text_chunk = j.value("content", "");
-                    } else if (j.contains("text")) {
-                        text_chunk = j.value("text", "");
-                    } else {
-                        text_chunk = chunk_str;
-                    }
-                } catch (...) {
-                    text_chunk = chunk_str;
-                }
-            } else {
-                text_chunk = chunk_str;
-            }
-        }
-
-        json token_msg = {
-            {"type", "TOKEN"},
-            {"event_id", data->event_id},
-            {"content", text_chunk},
-            {"is_final", is_final}
-        };
-        if (is_final) {
-            token_msg["finish_reason"] = "stop";
-        }
+        // chunk is raw text token; nullptr when is_final=true (stream end marker)
+        json token_msg = {{"type","TOKEN"},{"event_id",data->event_id},
+                          {"content", chunk ? std::string(chunk) : ""},
+                          {"is_final", is_final}};
+        if (is_final) token_msg["finish_reason"] = "stop";
         sendMessage(token_msg);
-
-        if (is_final) {
-            data->done = true;
-        }
+        if (is_final) data->done = true;
     };
 
-    StreamCallbackData cb_data;
-    cb_data.event_id = event_id;
+    int gen_status = litert_lm_session_run_decode_async(session, stream_callback, &cb_data);
 
-    int gen_status = litert_lm_conversation_send_message_stream(
-        sess.conversation,
-        message_json.c_str(),
-        nullptr,  // extra_context
-        nullptr,  // optional_args
-        stream_callback, &cb_data);
-
-    LOG_INFO("[LiteRTLMWorker] send_message_stream returned status=" << gen_status
-             << " cb_done=" << cb_data.done);
+    LOG_INFO("[LiteRTLMWorker] decode_async status=" << gen_status);
 
     if (gen_status != 0 && !cb_data.done) {
-        sendError(event_id, "Generate failed with status: " + std::to_string(gen_status));
+        litert_lm_session_delete(session);
+        if (!session_id.empty()) g_kv_sessions.erase(session_id);
+        sendError(event_id, "decode_async failed: " + std::to_string(gen_status));
         sendReady();
         return;
     }
 
-    // Wait for all callbacks to complete (non-blocking call)
     {
         int wait_ms = 0;
-        const int max_wait_ms = 300000; // 5 min
+        const char* timeout_env = std::getenv("LITERT_LM_DECODE_TIMEOUT_MS");
+        const int max_wait_ms = timeout_env ? std::atoi(timeout_env) : 300000; // default 5 min
         while (!cb_data.done && wait_ms < max_wait_ms) {
-            ::usleep(10000); // 10ms
+            ::usleep(10000);
             wait_ms += 10;
         }
-        if (!cb_data.done) {
-            LOG_WARN("[LiteRTLMWorker] send_message_stream timed out");
-        }
+        if (!cb_data.done) LOG_WARN("[LiteRTLMWorker] decode_async timed out");
     }
 
-    // Send DONE
-    json done_msg = {
-        {"type", "DONE"},
-        {"event_id", event_id},
-        {"finish_reason", "stop"}
-    };
+    json done_msg = {{"type","DONE"},{"event_id",event_id},{"finish_reason","stop"}};
     sendMessage(done_msg);
+
+    // Persist session for KV reuse, or release immediately for stateless requests.
+    if (!session_id.empty()) {
+        g_kv_sessions[session_id] = {session, text_input, ++g_kv_seq};
+        evictLruKvSession();  // enforce max session limit (new session has highest seq, never evicted)
+        LOG_INFO("[LiteRTLMWorker] KV session stored: session=" << session_id
+                 << " prompt_len=" << text_input.size()
+                 << " seq=" << g_kv_seq
+                 << " active_sessions=" << g_kv_sessions.size());
+    } else {
+        litert_lm_session_delete(session);
+    }
 
 #else
-    // ── Stub mode: echo back a synthetic response ──────────────────────────
-    (void)temperature; (void)top_p; (void)top_k;
-
-    std::string stub_response = "[LiteRT-LM stub] Received: " + text_input.substr(0, 50);
-    int tokens_to_emit = std::min(max_tokens, 20);
-
-    for (int i = 0; i < tokens_to_emit; ++i) {
-        std::string token = (i == 0) ? stub_response : " token" + std::to_string(i);
-        json token_msg = {
-            {"type", "TOKEN"},
-            {"event_id", event_id},
-            {"content", token},
-            {"is_final", false}
-        };
-        sendMessage(token_msg);
+    // ── Stub mode ─────────────────────────────────────────────────────────────
+    (void)temperature; (void)top_p; (void)top_k; (void)session_id; (void)kv_invalidated;
+    std::string stub = "[LiteRT-LM stub] input=" + text_input.substr(0, 40);
+    for (int i = 0; i < std::min(max_tokens, 20); ++i) {
+        sendMessage(json{{"type","TOKEN"},{"event_id",event_id},
+                         {"content", i==0 ? stub : " t"+std::to_string(i)},
+                         {"is_final",false}});
     }
-
-    json done_msg = {
-        {"type", "DONE"},
-        {"event_id", event_id},
-        {"finish_reason", "stop"}
-    };
-    sendMessage(done_msg);
+    sendMessage(json{{"type","DONE"},{"event_id",event_id},{"finish_reason","stop"}});
 #endif
 
-    // Send READY to signal completion of this request
     sendReady();
 }
 
@@ -569,10 +735,36 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
 // handleReset — Reset KV cache and send READY
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void handleReset(LiteRTLMSession& sess, const json& cmd) {
+static void handleReset(LiteRTLMSession& /*sess*/, const json& cmd) {
     std::string command_id = cmd.value("command_id", "");
-    LOG_DEBUG("[LiteRTLMWorker] RESET command_id=" << command_id);
-    resetKvCache(sess);
+#ifdef LITERT_LM_AVAILABLE
+    for (auto& [sid, ps] : g_kv_sessions) {
+        litert_lm_session_delete(ps.session);
+    }
+    if (!g_kv_sessions.empty()) {
+        LOG_INFO("[LiteRTLMWorker] RESET: freed " << g_kv_sessions.size() << " KV session(s)");
+        g_kv_sessions.clear();
+    }
+#endif
+    sendReady(command_id);
+}
+
+static void handleClearSession(LiteRTLMSession& /*sess*/, const json& cmd) {
+    std::string command_id = cmd.value("command_id", "");
+    std::string session_id = cmd.value("session_id", "");
+    if (session_id.empty()) {
+        LOG_WARN("[LiteRTLMWorker] CLEAR_SESSION received with empty session_id");
+        sendReady(command_id);
+        return;
+    }
+#ifdef LITERT_LM_AVAILABLE
+    auto it = g_kv_sessions.find(session_id);
+    if (it != g_kv_sessions.end()) {
+        litert_lm_session_delete(it->second.session);
+        g_kv_sessions.erase(it);
+        LOG_INFO("[LiteRTLMWorker] clearSession: freed KV for session=" << session_id);
+    }
+#endif
     sendReady(command_id);
 }
 
@@ -650,7 +842,9 @@ int main() {
         {"model_type", sess.model_type},
         {"max_context_length", sess.max_context_length},
         {"tool_call_delimiter", sess.tool_call_delimiter},
-        {"tool_response_delimiter", sess.tool_response_delimiter}
+        {"tool_response_delimiter", sess.tool_response_delimiter},
+        {"think_start", sess.think_start},
+        {"think_end", sess.think_end}
     };
     sendMessage(metadata_msg);
 
@@ -669,7 +863,6 @@ int main() {
         std::string type = cmd.value("type", "");
 
         if (type == "EXECUTE") {
-            // Special metadata probe from LiteRTLMWorkerManager
             std::string event_id = cmd.value("event_id", "");
             if (event_id == "__GET_METADATA__") {
                 handleGetMetadata(sess, event_id);
@@ -678,17 +871,30 @@ int main() {
             }
         } else if (type == "RESET") {
             handleReset(sess, cmd);
+        } else if (type == "CLEAR_SESSION") {
+            handleClearSession(sess, cmd);
         } else if (type == "SHUTDOWN") {
             LOG_INFO("[LiteRTLMWorker] SHUTDOWN received — exiting");
+#ifdef LITERT_LM_AVAILABLE
+            for (auto& [sid, ps] : g_kv_sessions) {
+                litert_lm_session_delete(ps.session);
+            }
+            g_kv_sessions.clear();
+#endif
             break;
         } else if (type == "SAVE_KV") {
-            // KV save/restore not yet supported for LiteRT-LM
+            // KV save/restore is not supported by the LiteRT-LM Session API.
+            // Return error so callers do not silently assume state was saved.
             std::string command_id = cmd.value("command_id", "");
-            LOG_WARN("[LiteRTLMWorker] SAVE_KV not supported — sending READY anyway");
+            std::string event_id   = cmd.value("event_id", "");
+            LOG_WARN("[LiteRTLMWorker] SAVE_KV not supported by LiteRT-LM Session API");
+            sendError(event_id, "SAVE_KV not supported by LiteRT-LM");
             sendReady(command_id);
         } else if (type == "RESTORE_KV") {
             std::string command_id = cmd.value("command_id", "");
-            LOG_WARN("[LiteRTLMWorker] RESTORE_KV not supported — sending READY anyway");
+            std::string event_id   = cmd.value("event_id", "");
+            LOG_WARN("[LiteRTLMWorker] RESTORE_KV not supported by LiteRT-LM Session API");
+            sendError(event_id, "RESTORE_KV not supported by LiteRT-LM");
             sendReady(command_id);
         } else {
             LOG_WARN("[LiteRTLMWorker] Unknown command type: " << type);
@@ -697,18 +903,6 @@ int main() {
 
     // Cleanup
 #ifdef LITERT_LM_AVAILABLE
-    if (sess.conversation) {
-        litert_lm_conversation_delete(sess.conversation);
-        sess.conversation = nullptr;
-    }
-    if (sess.conversation_config) {
-        litert_lm_conversation_config_delete(sess.conversation_config);
-        sess.conversation_config = nullptr;
-    }
-    if (sess.session_config) {
-        litert_lm_session_config_delete(sess.session_config);
-        sess.session_config = nullptr;
-    }
     if (sess.engine) {
         litert_lm_engine_delete(sess.engine);
         sess.engine = nullptr;
