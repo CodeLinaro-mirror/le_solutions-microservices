@@ -8,7 +8,10 @@
 // isolation. If the QNN backend crashes (DSP fault, OOM), only this process
 // dies — the server process is unaffected.
 //
-// Protocol (JSON Lines over Unix socket, fd from CONV_SOCKET_FD env var):
+// Protocol (JSON Lines over Unix socket, fd from CONV_SOCKET_FD env var).
+// Tensor bytes travel via a shared-memory region (memfd inherited from the
+// parent via CONV_SHM_FD, sized CONV_SHM_DIR_BYTES per direction) rather than
+// inline in JSON — messages carry only a data_ref {offset,len} into it:
 //
 //   Startup:
 //     Worker → Server: {"type":"READY"}
@@ -20,10 +23,12 @@
 //
 //   EXECUTE (run inference):
 //     Server → Worker: {"type":"EXECUTE","event_id":"...","model":"...",
-//                        "inputs":[{"name":"...","dtype":"FP32","shape":[...],"data_b64":"..."}],
+//                        "inputs":[{"name":"...","dtype":"FP32","shape":[...],
+//                                   "data_ref":{"offset":0,"len":602112}}],
 //                        "output_names":["..."]}
 //     Worker → Server: {"type":"RESULT","event_id":"...",
-//                        "outputs":[{"name":"...","dtype":"FP32","shape":[...],"data_b64":"..."}]}
+//                        "outputs":[{"name":"...","dtype":"FP32","shape":[...],
+//                                    "data_ref":{"offset":33554432,"len":4000}}]}
 //                   or  {"type":"ERROR","event_id":"...","message":"..."}
 //
 //   SHUTDOWN:
@@ -36,6 +41,7 @@
 #include <nlohmann/json.hpp>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/mman.h>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -47,59 +53,21 @@
 using json = nlohmann::ordered_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Base64 (same implementation as PredictiveWorkerManager.cpp)
+// Shared-memory tensor region (see PredictiveWorkerManager for full design)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static const char B64_CHARS[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static uint8_t* g_shm_ptr       = nullptr;
+static size_t   g_shm_dir_bytes = 0;
 
-static std::string base64Encode(const uint8_t* data, size_t len) {
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t b = (uint32_t)data[i] << 16;
-        if (i + 1 < len) b |= (uint32_t)data[i + 1] << 8;
-        if (i + 2 < len) b |= (uint32_t)data[i + 2];
-        out += B64_CHARS[(b >> 18) & 0x3F];
-        out += B64_CHARS[(b >> 12) & 0x3F];
-        out += (i + 1 < len) ? B64_CHARS[(b >> 6) & 0x3F] : '=';
-        out += (i + 2 < len) ? B64_CHARS[b & 0x3F]        : '=';
-    }
-    return out;
+// Every tensor's start offset within its shm half is rounded up to this
+// boundary. Only strictly required by SNPE's ExecuteUserBuffers, but applied
+// here too for consistency with the server-side offset packing.
+static constexpr size_t kShmAlign = 128;
+
+static size_t alignUp(size_t offset, size_t align) {
+    return (offset + align - 1) / align * align;
 }
 
-static std::vector<uint8_t> base64Decode(const std::string& s) {
-    static const int8_t LUT[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-    };
-    std::vector<uint8_t> out;
-    out.reserve((s.size() / 4) * 3);
-    uint32_t b = 0; int bits = 0;
-    for (char c : s) {
-        if (c == '=') break;
-        int8_t v = LUT[(uint8_t)c];
-        if (v < 0) continue;
-        b = (b << 6) | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) { bits -= 8; out.push_back((uint8_t)((b >> bits) & 0xFF)); }
-    }
-    return out;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC helpers
@@ -155,6 +123,23 @@ int main() {
     if (!fd_env) { std::cerr << "[qnn-worker] CONV_SOCKET_FD not set\n"; return 1; }
     g_sock_fd = std::atoi(fd_env);
 
+    // Attach the shared-memory tensor region inherited from the parent.
+    const char* shm_fd_env = std::getenv("CONV_SHM_FD");
+    const char* shm_bytes_env = std::getenv("CONV_SHM_DIR_BYTES");
+    if (!shm_fd_env || !shm_bytes_env) {
+        std::cerr << "[qnn-worker] CONV_SHM_FD/CONV_SHM_DIR_BYTES not set\n";
+        return 1;
+    }
+    int shm_fd = std::atoi(shm_fd_env);
+    g_shm_dir_bytes = std::strtoull(shm_bytes_env, nullptr, 10);
+    void* mapped = mmap(nullptr, 2 * g_shm_dir_bytes, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, shm_fd, 0);
+    if (mapped == MAP_FAILED) {
+        std::cerr << "[qnn-worker] mmap of shm region failed\n";
+        return 1;
+    }
+    g_shm_ptr = static_cast<uint8_t*>(mapped);
+
     // Signal ready
     sendMsg({{"type", "READY"}});
 
@@ -198,35 +183,46 @@ int main() {
             }
 
             try {
-                // Decode input tensors
+                // Inputs: point directly into the shm input half via data_ref
+                // — no decode buffer.
                 const auto& inputs_json = msg["inputs"];
-                std::vector<std::vector<uint8_t>> input_bufs;
-                std::vector<const uint8_t*>       input_ptrs;
-                std::vector<size_t>               input_sizes;
+                std::vector<const uint8_t*> input_ptrs;
+                std::vector<size_t>         input_sizes;
 
                 for (const auto& t : inputs_json) {
-                    auto buf = base64Decode(t.value("data_b64", ""));
-                    input_bufs.push_back(std::move(buf));
-                }
-                for (auto& buf : input_bufs) {
-                    input_ptrs.push_back(buf.data());
-                    input_sizes.push_back(buf.size());
+                    const auto& ref = t.at("data_ref");
+                    size_t offset = ref.value("offset", (size_t)0);
+                    size_t len    = ref.value("len", (size_t)0);
+                    if (offset + len > g_shm_dir_bytes)
+                        throw std::runtime_error("input data_ref out of bounds");
+                    input_ptrs.push_back(g_shm_ptr + offset);
+                    input_sizes.push_back(len);
                 }
 
-                // Allocate output buffers based on engine output specs
+                // Outputs: lay out each tensor at a 128-byte-aligned offset
+                // within the shm output half [g_shm_dir_bytes,
+                // 2*g_shm_dir_bytes), and hand engine->infer() pointers
+                // directly into shared memory — it writes results straight
+                // there, no intermediate buffer.
                 const auto& out_specs = engine->outputSpecs();
-                std::vector<std::vector<uint8_t>> output_bufs(out_specs.size());
-                std::vector<uint8_t*>             output_ptrs;
-                std::vector<size_t>               output_sizes;
+                std::vector<uint8_t*> output_ptrs;
+                std::vector<size_t>   output_sizes;
+                std::vector<size_t>   output_offsets;
 
+                size_t write_offset = g_shm_dir_bytes;
                 for (size_t i = 0; i < out_specs.size(); ++i) {
+                    size_t aligned_offset = alignUp(write_offset, kShmAlign);
                     size_t bytes = out_specs[i].bytes;
-                    output_bufs[i].resize(bytes);
-                    output_ptrs.push_back(output_bufs[i].data());
+                    if (aligned_offset + bytes > 2 * g_shm_dir_bytes)
+                        throw std::runtime_error("output tensor '" + out_specs[i].name +
+                                                  "' exceeds shared-memory capacity");
+                    output_ptrs.push_back(g_shm_ptr + aligned_offset);
                     output_sizes.push_back(bytes);
+                    output_offsets.push_back(aligned_offset);
+                    write_offset = aligned_offset + bytes;
                 }
 
-                // Run inference
+                // Run inference — writes outputs directly into shared memory
                 engine->infer(input_ptrs, input_sizes, output_ptrs, output_sizes);
 
                 // Build RESULT response
@@ -238,7 +234,7 @@ int main() {
                     json shape_arr = json::array();
                     for (auto d : out_specs[i].shape) shape_arr.push_back(d);
                     t["shape"]    = shape_arr;
-                    t["data_b64"] = base64Encode(output_bufs[i].data(), output_bufs[i].size());
+                    t["data_ref"] = {{"offset", output_offsets[i]}, {"len", output_sizes[i]}};
                     outputs_json.push_back(t);
                 }
 

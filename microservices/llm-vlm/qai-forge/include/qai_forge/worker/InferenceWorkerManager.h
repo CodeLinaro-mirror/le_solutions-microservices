@@ -13,6 +13,8 @@
 #include <thread>
 #include <chrono>
 #include <condition_variable>
+#include <vector>
+#include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceWorkerManager — Layer 3 (Process Management & IPC)
@@ -40,6 +42,22 @@
 //      The watchdog polls every 5 seconds. last_activity_time_ is updated on
 //      every sendMessage() and readMessage() call so that any IPC traffic
 //      resets the timer.
+//   G. Prompt shared memory: the EXECUTE command's prompt text is not
+//      inlined as a JSON string. Before fork()/exec(), startWorker() creates
+//      a memfd-backed region (memfd_create + ftruncate + mmap, sized
+//      GENAI_PROMPT_SHM_BYTES, default 4MB) and hands the fd/size to the
+//      child via the PROMPT_SHM_FD/PROMPT_SHM_BYTES env vars — the same
+//      inherited-fd convention already used for the socket fd. executeRequest()
+//      memcpy's the prompt into this region via writePromptToShm() and sends
+//      only a {"offset","len"} "prompt_ref" over the socket. The region is
+//      fixed-size: a prompt that doesn't fit fails the request via on_error
+//      rather than falling back to inline JSON.
+//   H. Image shared memory (VLM only): mirrors Section G for preprocessed
+//      VLM image tensors. Created only when process_type_ == "vlm", sized
+//      GENAI_IMAGE_SHM_BYTES (default 32MB), exported via IMAGE_SHM_FD/
+//      IMAGE_SHM_BYTES. VlmInferenceWorkerManager::executeVlmRequest() packs
+//      each image into this region via writeImagesToShm() and sends an
+//      "image_refs" array of {"offset","len"} instead of file paths.
 //
 // Subprocess architecture:
 //   - Worker subprocess links libllmengine.so (LLM) or libvlmengine.so (VLM).
@@ -206,6 +224,32 @@ private:
     int worker_pid_ = -1;
     int sock_fd_ = -1;
 
+    // Bytes already read from sock_fd_ but not yet consumed as a full line —
+    // carried across readMessage() calls so a single recv() can satisfy
+    // multiple/partial lines without re-reading one byte at a time.
+    std::string read_buf_;
+
+    // memfd-backed shared-memory region for the EXECUTE command's prompt
+    // text (Section G above). Single flat buffer, one direction (server
+    // writes, worker reads) — unlike PredictiveWorkerManager's tensor region
+    // there is no alignment requirement and no concurrent multi-tensor
+    // packing, since only one prompt is in flight at a time under mutex_.
+    // Created fresh per startWorker() call; torn down in cleanupWorker().
+    void*  prompt_shm_ptr_   = nullptr;
+    int    prompt_shm_fd_    = -1;
+    size_t prompt_shm_bytes_ = 0;
+
+    // memfd-backed shared-memory region for VLM image tensors (Section H
+    // above). Only created when process_type_ == "vlm" — LLM/litert-lm
+    // workers never touch this. Packs multiple images sequentially starting
+    // at offset 0, same single-writer/single-reader reasoning as the prompt
+    // region (only one EXECUTE in flight at a time under mutex_).
+    // Created fresh per startWorker() call; torn down in cleanupWorker().
+    void*  image_shm_ptr_   = nullptr;
+    int    image_shm_fd_    = -1;
+    size_t image_shm_bytes_ = 0;
+
+
     // ── Watchdog ───────────────────────────────────────────────────────────
     // Background thread that kills the worker if it stops producing IPC
     // traffic within the configured timeout window.
@@ -318,7 +362,7 @@ protected:
      * Caller MUST hold mutex_ before calling this method.
      * This method arms and disarms the active-inference watchdog state.
      * Called by executeRequest() and by VlmInferenceWorkerManager::executeVlmRequest()
-     * so that the VLM subclass can inject extra fields (e.g. image_urls) into the
+     * so that the VLM subclass can inject extra fields (e.g. image_refs) into the
      * EXECUTE command before it is sent, without duplicating the streaming loop.
      */
     void sendExecuteAndStream(const json& execute_cmd,
@@ -326,4 +370,32 @@ protected:
                                TokenCallback on_token,
                                DoneCallback on_done,
                                ErrorCallback on_error);
+
+    /**
+     * Copy `prompt` into the prompt shared-memory region and return a
+     * {"offset","len"} reference to pass as EXECUTE's "prompt_ref" field.
+     *
+     * Caller MUST hold mutex_ (only one EXECUTE is ever in flight, so the
+     * region has no concurrent-write hazard and every prompt is written at
+     * offset 0). Throws std::runtime_error if `prompt` exceeds
+     * prompt_shm_bytes_ — callers should catch this and route it to
+     * on_error rather than letting it propagate, since the region is
+     * fixed-size with no inline-JSON fallback.
+     */
+    json writePromptToShm(const std::string& prompt);
+
+    /**
+     * Copy each image's bytes sequentially into the image shared-memory
+     * region and return a JSON array of {"offset","len"} references, one
+     * per image in input order, to pass as EXECUTE's "image_refs" field.
+     *
+     * Caller MUST hold mutex_ (only one EXECUTE is ever in flight, so the
+     * region has no concurrent-write hazard). Only valid when
+     * process_type_ == "vlm" (image_shm_ptr_ is null otherwise). Throws
+     * std::runtime_error if the total size exceeds image_shm_bytes_ —
+     * callers should catch this and route it to on_error rather than
+     * letting it propagate, since the region is fixed-size with no
+     * inline-JSON fallback.
+     */
+    json writeImagesToShm(const std::vector<std::vector<uint8_t>>& images);
 };

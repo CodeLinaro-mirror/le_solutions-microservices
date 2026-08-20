@@ -686,14 +686,14 @@ PreprocessedImage ImageUtils::preprocessImage(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// preprocessImageToTempFile — download + preprocess + write .raw temp file
+// preprocessImageToBuffer — download + preprocess, return raw float32 bytes
 // ─────────────────────────────────────────────────────────────────────────────
-std::string ImageUtils::preprocessImageToTempFile(
+std::vector<uint8_t> ImageUtils::preprocessImageToBuffer(
     const std::string& url,
     const VisionPreprocessConfig& config,
     const std::string& model_id) {
 
-    LOG_DEBUG("[ImageUtils] Preprocessing image to temp file: "
+    LOG_DEBUG("[ImageUtils] Preprocessing image to buffer: "
               << url.substr(0, 80) << (url.size() > 80 ? "..." : ""));
 
     // 1. Download / decode to raw compressed bytes
@@ -707,54 +707,12 @@ std::string ImageUtils::preprocessImageToTempFile(
     // 2. Preprocess to float32 (L, D) tensor using model-specific adapter
     PreprocessedImage preprocessed = preprocessImage(compressed, config, model_id);
 
-    // 3. Write float32 bytes to a temp file with .raw extension
+    // 3. Return the float32 bytes directly — the caller copies them into the
+    // VLM worker's IPC shared-memory region (no temp file involved).
     std::vector<uint8_t> raw_bytes = preprocessed.toBytes();
 
-    std::string tmpl = "/tmp/vlm_pre_XXXXXX.raw";
-    std::vector<char> buf(tmpl.begin(), tmpl.end());
-    buf.push_back('\0');
-
-    int fd = ::mkstemps(buf.data(), 4 /* ".raw" */);
-    if (fd < 0) {
-        throw std::runtime_error(
-            std::string("Failed to create preprocessed image temp file: ") + strerror(errno));
-    }
-
-    std::string path(buf.data());
-    const uint8_t* ptr = raw_bytes.data();
-    size_t remaining = raw_bytes.size();
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, ptr, remaining);
-        if (written < 0) {
-            ::close(fd);
-            ::unlink(path.c_str());
-            throw std::runtime_error(
-                std::string("Failed to write preprocessed image temp file: ") + strerror(errno));
-        }
-        ptr += written;
-        remaining -= static_cast<size_t>(written);
-    }
-    ::close(fd);
-
-    LOG_INFO("[ImageUtils] Wrote preprocessed image: " << path
-             << " (" << raw_bytes.size() << " bytes"
+    LOG_INFO("[ImageUtils] Preprocessed image: " << raw_bytes.size() << " bytes"
              << ", patches=" << preprocessed.num_patches
-             << "x" << preprocessed.patch_dim << ")");
-    return path;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TempFileGuard::~TempFileGuard
-// ─────────────────────────────────────────────────────────────────────────────
-ImageUtils::TempFileGuard::~TempFileGuard() {
-    for (const auto& path : paths) {
-        if (!path.empty()) {
-            if (::unlink(path.c_str()) != 0) {
-                LOG_WARN("[ImageUtils] Failed to delete temp file: " << path
-                         << " (" << strerror(errno) << ")");
-            } else {
-                LOG_DEBUG("[ImageUtils] Deleted temp file: " << path);
-            }
-        }
-    }
+             << "x" << preprocessed.patch_dim);
+    return raw_bytes;
 }

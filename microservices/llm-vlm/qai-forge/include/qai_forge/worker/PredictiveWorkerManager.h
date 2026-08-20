@@ -22,14 +22,22 @@ using json = nlohmann::ordered_json;
 //   Server → Worker: INIT, EXECUTE, SHUTDOWN
 //   Worker → Server: READY, RESULT, ERROR
 //
-// The EXECUTE command carries base64-encoded input tensors.
-// The RESULT response carries base64-encoded output tensors.
+// Tensor bytes do not travel inline in JSON. Before fork()/exec(), the parent
+// creates an anonymous memfd-backed shared-memory region (2 * per-direction
+// capacity: input half + output half) and mmaps it; the fd number and
+// per-direction byte capacity are handed to the child the same way the
+// CONV_SOCKET_FD socket is — via inherited fd + env vars (CONV_SHM_FD,
+// CONV_SHM_DIR_BYTES). EXECUTE/RESULT tensor entries carry only a
+// {"offset":..,"len":..} "data_ref" pointing into that region; the server
+// memcpy's input tensors into the input half before sending EXECUTE, and the
+// worker writes outputs directly into the output half before replying
+// RESULT. The region is fixed-size (GENAI_PREDICTIVE_SHM_BYTES per
+// direction) — a request whose tensors don't fit fails with ERROR/on_error
+// rather than falling back to inline encoding.
 //
 // Subprocess isolation: if the worker crashes (DSP fault, OOM), the socket
 // closes, the error callback is invoked, and the next call to
 // ensureWorkerRunning() starts a fresh worker.
-//
-// See docs/unified-inference-service.md §10 for the IPC protocol details.
 // ─────────────────────────────────────────────────────────────────────────────
 
 using PredictiveResultCallback = std::function<void(const TensorInferenceResponse&)>;
@@ -102,6 +110,15 @@ private:
     // carried across readMessage() calls so a single recv() can satisfy
     // multiple/partial lines without re-reading one byte at a time.
     std::string read_buf_;
+
+    // memfd-backed shared-memory region used for zero-copy tensor transport.
+    // Split into two halves of shm_dir_bytes_ each: [0, shm_dir_bytes_) is the
+    // input half (this process writes, worker reads), [shm_dir_bytes_,
+    // 2*shm_dir_bytes_) is the output half (worker writes, this process
+    // reads). Created fresh per startWorker() call.
+    void*  shm_ptr_      = nullptr;
+    int    shm_fd_        = -1;
+    size_t shm_dir_bytes_ = 0;
 
     void startWorker(const std::string& model_id, const json& init_params);
     void cleanupWorker(bool force = false);

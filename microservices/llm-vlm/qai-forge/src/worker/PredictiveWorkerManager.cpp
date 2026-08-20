@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <unistd.h>
 #include <signal.h>
@@ -27,64 +28,19 @@
 #include <iomanip>
 #include <algorithm>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Base64 encode/decode (no external dependency)
-// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+// Every tensor's start offset within its shm half is rounded up to this
+// boundary — required by SNPE's ExecuteUserBuffers (unaligned -> error 407),
+// harmless for QNN. Applied uniformly so pointers into the mmap'd region can
+// be handed to either engine directly, with no intermediate aligned buffer.
+constexpr size_t kShmAlign = 128;
 
-static const char B64_CHARS[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static std::string base64Encode(const uint8_t* data, size_t len) {
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t b = (uint32_t)data[i] << 16;
-        if (i + 1 < len) b |= (uint32_t)data[i + 1] << 8;
-        if (i + 2 < len) b |= (uint32_t)data[i + 2];
-        out += B64_CHARS[(b >> 18) & 0x3F];
-        out += B64_CHARS[(b >> 12) & 0x3F];
-        out += (i + 1 < len) ? B64_CHARS[(b >> 6) & 0x3F] : '=';
-        out += (i + 2 < len) ? B64_CHARS[b & 0x3F]        : '=';
-    }
-    return out;
+size_t alignUp(size_t offset, size_t align) {
+    return (offset + align - 1) / align * align;
 }
 
-static std::vector<uint8_t> base64Decode(const std::string& s) {
-    static const int8_t LUT[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-    };
-    std::vector<uint8_t> out;
-    out.reserve((s.size() / 4) * 3);
-    uint32_t b = 0;
-    int bits = 0;
-    for (char c : s) {
-        if (c == '=') break;
-        int8_t v = LUT[(uint8_t)c];
-        if (v < 0) continue;
-        b = (b << 6) | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back((uint8_t)((b >> bits) & 0xFF));
-        }
-    }
-    return out;
-}
+constexpr size_t kDefaultShmDirBytes = 32u * 1024 * 1024;  // 32MB per direction
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PredictiveWorkerManager
@@ -95,7 +51,13 @@ PredictiveWorkerManager::PredictiveWorkerManager(
     const std::string& process_type)
     : worker_binary_(worker_binary)
     , process_type_(process_type)
-{}
+{
+    shm_dir_bytes_ = kDefaultShmDirBytes;
+    if (const char* env = std::getenv("GENAI_PREDICTIVE_SHM_BYTES")) {
+        size_t bytes = std::strtoull(env, nullptr, 10);
+        if (bytes > 0) shm_dir_bytes_ = bytes;
+    }
+}
 
 PredictiveWorkerManager::~PredictiveWorkerManager() {
     cleanupWorker(true);
@@ -135,8 +97,32 @@ void PredictiveWorkerManager::startWorker(
         throw std::runtime_error("[PredictiveWorkerManager] socketpair failed: "
                                  + std::string(strerror(errno)));
 
+    // Create the zero-copy tensor shared-memory region before fork() so both
+    // sides inherit the same fd number across fork/exec (mirrors sv[] above).
+    // No MFD_CLOEXEC — the fd must survive execl() in the child.
+    int shm_fd = memfd_create("qai-forge-predictive-shm", 0);
+    if (shm_fd < 0) {
+        close(sv[0]); close(sv[1]);
+        throw std::runtime_error("[PredictiveWorkerManager] memfd_create failed: "
+                                 + std::string(strerror(errno)));
+    }
+    size_t shm_total_bytes = 2 * shm_dir_bytes_;
+    if (ftruncate(shm_fd, static_cast<off_t>(shm_total_bytes)) < 0) {
+        close(shm_fd); close(sv[0]); close(sv[1]);
+        throw std::runtime_error("[PredictiveWorkerManager] ftruncate failed: "
+                                 + std::string(strerror(errno)));
+    }
+    void* shm_ptr = mmap(nullptr, shm_total_bytes, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        close(shm_fd); close(sv[0]); close(sv[1]);
+        throw std::runtime_error("[PredictiveWorkerManager] mmap failed: "
+                                 + std::string(strerror(errno)));
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
+        munmap(shm_ptr, shm_total_bytes); close(shm_fd);
         close(sv[0]); close(sv[1]);
         throw std::runtime_error("[PredictiveWorkerManager] fork failed");
     }
@@ -145,9 +131,11 @@ void PredictiveWorkerManager::startWorker(
         // Child process
         close(sv[0]);
 
-        // Pass socket fd via environment variable
-        std::string fd_str = std::to_string(sv[1]);
-        setenv("CONV_SOCKET_FD", fd_str.c_str(), 1);
+        // Pass socket fd and shm fd/size via environment variables — same
+        // fd-number-plus-env-var convention for both.
+        setenv("CONV_SOCKET_FD", std::to_string(sv[1]).c_str(), 1);
+        setenv("CONV_SHM_FD", std::to_string(shm_fd).c_str(), 1);
+        setenv("CONV_SHM_DIR_BYTES", std::to_string(shm_dir_bytes_).c_str(), 1);
 
         // Exec worker binary
         execl(worker_binary_.c_str(), worker_binary_.c_str(), nullptr);
@@ -158,6 +146,8 @@ void PredictiveWorkerManager::startWorker(
     close(sv[1]);
     sock_fd_    = sv[0];
     worker_pid_ = pid;
+    shm_ptr_    = shm_ptr;
+    shm_fd_     = shm_fd;
 
     // Wait for initial READY
     try {
@@ -210,6 +200,14 @@ void PredictiveWorkerManager::cleanupWorker(bool force) {
         close(sock_fd_);
         sock_fd_ = -1;
     }
+    if (shm_ptr_ != nullptr) {
+        munmap(shm_ptr_, 2 * shm_dir_bytes_);
+        shm_ptr_ = nullptr;
+    }
+    if (shm_fd_ >= 0) {
+        close(shm_fd_);
+        shm_fd_ = -1;
+    }
     read_buf_.clear();
     current_model_id_.clear();
 }
@@ -260,19 +258,33 @@ void PredictiveWorkerManager::executeInfer(
     PredictiveResultCallback    on_result,
     PredictiveErrorCallback     on_error)
 {
-    // Build EXECUTE command with base64-encoded input tensors
+    // Build EXECUTE command — input tensor bytes are memcpy'd into the shm
+    // input half at 128-byte-aligned offsets; JSON carries only a data_ref
+    // {offset,len} pointing into that region instead of the bytes themselves.
     json inputs_json = json::array();
+    size_t write_offset = 0;
     for (const auto& tensor : request.inputs) {
+        size_t aligned_offset = alignUp(write_offset, kShmAlign);
+        size_t len = tensor.data.size();
+        if (aligned_offset + len > shm_dir_bytes_) {
+            on_error("Input tensor '" + tensor.name + "' exceeds shared-memory "
+                     "capacity (" + std::to_string(shm_dir_bytes_) + " bytes per direction)");
+            return;
+        }
+        std::memcpy(static_cast<uint8_t*>(shm_ptr_) + aligned_offset,
+                    tensor.data.data(), len);
+
         json t;
         t["name"]     = tensor.name;
         t["dtype"]    = tensorDataTypeToString(tensor.dtype);
-        t["data_b64"] = base64Encode(tensor.data.data(), tensor.data.size());
+        t["data_ref"] = {{"offset", aligned_offset}, {"len", len}};
 
         json shape_arr = json::array();
         for (auto d : tensor.shape) shape_arr.push_back(d);
         t["shape"] = shape_arr;
 
         inputs_json.push_back(t);
+        write_offset = aligned_offset + len;
     }
 
     json output_names = json::array();
@@ -304,7 +316,7 @@ void PredictiveWorkerManager::executeInfer(
             return;
         }
 
-        // Decode output tensors
+        // Copy output tensors out of the shm output half.
         // request_id is Layer 1's client-facing ID (custom, or generated if the
         // client left it empty) — event_id is only for worker IPC correlation
         // and must not leak into the response in its place.
@@ -320,8 +332,14 @@ void PredictiveWorkerManager::executeInfer(
             for (auto d : t.value("shape", json::array()))
                 out.shape.push_back(d.get<int64_t>());
 
-            std::string b64 = t.value("data_b64", "");
-            out.data = base64Decode(b64);
+            const json& ref = t.at("data_ref");
+            size_t offset = ref.value("offset", (size_t)0);
+            size_t len    = ref.value("len", (size_t)0);
+            if (offset + len > 2 * shm_dir_bytes_)
+                throw std::runtime_error("output data_ref out of bounds");
+
+            out.data.resize(len);
+            std::memcpy(out.data.data(), static_cast<uint8_t*>(shm_ptr_) + offset, len);
 
             result.outputs.push_back(std::move(out));
         }

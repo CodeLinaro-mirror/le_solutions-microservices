@@ -126,7 +126,7 @@ public:
     void generateVlm(
         const std::string&              event_id,
         const std::string&              prompt,
-        const std::vector<std::string>& image_paths,
+        const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
         int                             max_tokens,
         float                           temperature,

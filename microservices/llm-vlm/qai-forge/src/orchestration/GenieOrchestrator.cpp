@@ -95,7 +95,7 @@ std::string renderToolCallsForPrompt(const json& tool_calls) {
     return oss.str();
 }
 
-ImageUtils::TempFileGuard preprocessImagesToTempFiles(
+std::vector<std::vector<uint8_t>> preprocessImagesToBuffers(
     const json& messages,
     const std::string& model_id) {
     VisionPreprocessConfig vision_cfg = VisionPreprocessConfig::defaults();
@@ -147,18 +147,17 @@ ImageUtils::TempFileGuard preprocessImagesToTempFiles(
         image_urls.push_back(image_urls[0]);
     }
 
-    ImageUtils::TempFileGuard guard;
+    std::vector<std::vector<uint8_t>> buffers;
     for (size_t i = 0; i < image_urls.size(); ++i) {
         try {
-            std::string temp_path = ImageUtils::preprocessImageToTempFile(
+            buffers.push_back(ImageUtils::preprocessImageToBuffer(
                 image_urls[i],
                 vision_cfg,
-                model_id);
-            guard.paths.push_back(temp_path);
+                model_id));
             LOG_INFO("[GenieOrchestrator] Preprocessed VLM image "
                      << (i + 1) << "/" << image_urls.size()
                      << ": model=" << model_id
-                     << " path=" << temp_path);
+                     << " bytes=" << buffers.back().size());
         } catch (const GenAIException&) {
             throw;
         } catch (const std::exception& e) {
@@ -170,7 +169,7 @@ ImageUtils::TempFileGuard preprocessImagesToTempFiles(
         }
     }
 
-    return guard;
+    return buffers;
 }
 
 } // namespace
@@ -391,11 +390,8 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     prepared.tools = std::move(request.tools).value_or(json::array());
     prepared.input_memory = makeConversationMemoryUpdate(session);
     if (is_vlm) {
-        prepared.vision.lifetime =
-            std::make_shared<ImageUtils::TempFileGuard>(
-                preprocessImagesToTempFiles(
-                    request.messages, context.model_id));
-        prepared.vision.paths = prepared.vision.lifetime->paths;
+        prepared.vision.buffers =
+            preprocessImagesToBuffers(request.messages, context.model_id);
     }
     prepared.conversation_messages = json::array();
     auto& conversation_messages =
@@ -459,11 +455,11 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
         LOG_INFO("[GenieOrchestrator] Blocking VLM execution: model="
                  << job.model_id
                  << " session=" << job.session_id
-                 << " images=" << prepared.vision.paths.size());
+                 << " images=" << prepared.vision.buffers.size());
         backend.generateVlm(
             event_id,
             prepared.final_prompt,
-            prepared.vision.paths,
+            prepared.vision.buffers,
             false,
             generation.max_tokens,
             generation.temperature,
@@ -619,11 +615,11 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
         LOG_INFO("[GenieOrchestrator] Streaming VLM execution: model="
                  << job.model_id
                  << " session=" << job.session_id
-                 << " images=" << prepared.vision.paths.size());
+                 << " images=" << prepared.vision.buffers.size());
         backend.generateVlm(
             event_id,
             prepared.final_prompt,
-            prepared.vision.paths,
+            prepared.vision.buffers,
             true,
             generation.max_tokens,
             generation.temperature,
@@ -768,7 +764,7 @@ GenieOrchestrator::createPostTurnTask(
     auto* prepared =
         std::get_if<scheduler::GeniePreparedRequest>(&job.prepared);
     if (!prepared || job.skip_post_turn_summarization ||
-        !prepared->vision.paths.empty() ||
+        !prepared->vision.buffers.empty() ||
         (response.tool_calls.has_value() &&
          !response.tool_calls.value().empty())) {
         return std::nullopt;

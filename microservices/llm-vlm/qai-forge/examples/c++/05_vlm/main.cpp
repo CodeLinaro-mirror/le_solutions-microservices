@@ -12,7 +12,7 @@
 // Key concepts:
 //   - OpenAI image_url content format in messages
 //   - VlmInferenceWorkerManager: spawns genai-vlm-inference-worker
-//   - image_urls in EXECUTE command → content_items in Query struct
+//   - image_refs in EXECUTE command (shared-memory offsets) → content_items in Query struct
 //   - Qwen25Adapter::preprocessVision() transforms image_url → vision tokens
 //
 // Usage:
