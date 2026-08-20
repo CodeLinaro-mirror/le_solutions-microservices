@@ -316,7 +316,7 @@ class SimpleSnpeEmbeddingApp(EmbeddingBackend):
         perf_profile = os.getenv("SNPE_PERF_PROFILE", "balanced")
         pad_token = int(os.getenv("SNPE_PAD_TOKEN", "0"))
 
-        tokenizer = load_snpe_tokenizer()
+        tokenizer = load_snpe_tokenizer(model_path)
 
         return cls(
             snpe_lib=snpe_lib,
@@ -348,6 +348,12 @@ class SimpleSnpeEmbeddingApp(EmbeddingBackend):
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not available.")
         return self.tokenizer.encode(text)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception as e:
+            print(f"An error occurred: {e}")
 
     def close(self):
         if self.snpe_handle:

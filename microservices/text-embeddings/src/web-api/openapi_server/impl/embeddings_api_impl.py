@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Dict, List, Optional, Tuple, Union
 from fastapi import HTTPException
 import asyncio
@@ -134,6 +135,26 @@ def _backend_factory(model_path: str, model_id: str = "") -> EmbeddingBackend:
 _backend_cache: Dict[str, EmbeddingBackend] = {}
 _backend_locks: Dict[str, threading.Lock] = {}
 _backend_meta_lock = threading.Lock()
+_last_seen_reload_count = 0
+
+
+def _clear_backend_cache() -> None:
+    """
+    Safely close and release hardware resources of all cached backends,
+    then clear the cache structures.
+    """
+    global _backend_cache, _backend_locks
+    with _backend_meta_lock:
+        logger.info(f"Clearing model backend cache. Releasing {len(_backend_cache)} cached backend(s).")
+        for cache_key, backend in list(_backend_cache.items()):
+            try:
+                logger.info(f"Closing and releasing resources for cached backend key={cache_key!r}")
+                backend.close()
+            except Exception as e:
+                logger.warning(f"Error while closing backend key={cache_key!r}: {e}")
+        _backend_cache.clear()
+        _backend_locks.clear()
+        logger.info("Model backend cache cleared successfully.")
 
 
 def _get_backend(model_path: str, model_id: str) -> Tuple[EmbeddingBackend, threading.Lock]:
@@ -155,6 +176,7 @@ def _get_backend(model_path: str, model_id: str) -> Tuple[EmbeddingBackend, thre
     Tuple[EmbeddingBackend, threading.Lock]
         The cached backend instance and its associated inference lock.
     """
+
     cache_key = f"{model_path}:{model_id}"
     # Phase 1: obtain (or create) the per-model lock without holding the
     # global meta-lock for longer than necessary.
@@ -198,6 +220,8 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         try:
             # ── Validate model ────────────────────────────────────────────
             requested_model = create_embeddings_request.model
+            if not requested_model or requested_model == "None" or requested_model == "":
+                requested_model = model_config_manager.get_default_model()
 
             if not model_config_manager.is_model_available(requested_model):
                 available_models = model_config_manager.get_available_model_ids()
@@ -228,7 +252,26 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
             model_info = model_config_manager.get_model_info(requested_model)
             model_file = model_info["model_file"]
             models_path = os.getenv("T2E_MODEL_DIR", "/mnt/work/models")
+
+            # Dynamically search for the model file in subdirectories if not at the root
             model_binary_path = os.path.join(models_path, model_file)
+            if not os.path.exists(model_binary_path):
+                model_basename = os.path.basename(model_file)
+                try:
+                    found_path = None
+                    for root, dirs, files in os.walk(models_path):
+                        depth = root[len(models_path):].count(os.sep)
+                        if depth > 3:  # scan up to 3 levels deep
+                            dirs.clear()
+                            continue
+                        if model_basename in files:
+                            found_path = os.path.join(root, model_basename)
+                            break
+                    if found_path:
+                        logger.info(f"Dynamically discovered model path: {found_path}")
+                        model_binary_path = found_path
+                except Exception as e:
+                    logger.warning(f"Error dynamically searching for model {model_file}: {e}")
 
             # ── Run inference ─────────────────────────────────────────────
             embeddings_data, token_counts = await self._get_embeddings_from_component(
@@ -321,6 +364,13 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         ef = normalize_encoding_format(encoding_format)
 
         def _work() -> Tuple[List[Union[List[float], str]], List[int]]:
+            global _last_seen_reload_count
+            current_reload = model_config_manager.get_reload_count()
+            if current_reload != _last_seen_reload_count:
+                logger.info(f"ModelConfigManager reload detected ({_last_seen_reload_count} -> {current_reload}). Clearing backend cache and releasing hardware resources.")
+                _clear_backend_cache()
+                _last_seen_reload_count = current_reload
+
             # Retrieve (or create) the cached backend and its inference lock.
             # The lock ensures tensor buffers are never accessed concurrently.
             backend, lock = _get_backend(model, model_id)
@@ -336,8 +386,14 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
 
                 # Both NomicEmbedBackend and SimpleQnnEmbeddingApp implement
                 # EmbeddingBackend, so no branching is needed here.
-                vectors: List[List[float]] = backend.embed_texts(inputs)
-                token_counts: List[int] = backend.count_tokens(inputs)
+                t_inf0 = time.time()
+                try:
+                    vectors: List[List[float]] = backend.embed_texts(inputs)
+                    token_counts: List[int] = backend.count_tokens(inputs)
+                    logger.info(f"Inference execution for model_id {model_id!r} succeeded in {time.time() - t_inf0:.4f}s")
+                except Exception as e:
+                    logger.error(f"Inference execution for model_id {model_id!r} failed: {e}", exc_info=True)
+                    raise
 
             # ── Optional dimension truncation ─────────────────────────────
             if dimensions and dimensions > 0:

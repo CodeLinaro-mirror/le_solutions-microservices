@@ -54,7 +54,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 _DEFAULT_LOG_FILE     = "/tmp/litert_backend.log"
-_DEFAULT_LOG_LEVEL    = "INFO"
+_DEFAULT_LOG_LEVEL    = "DEBUG"
 _DEFAULT_MAX_BYTES    = 10 * 1024 * 1024   # 10 MiB
 _DEFAULT_BACKUP_COUNT = 5
 

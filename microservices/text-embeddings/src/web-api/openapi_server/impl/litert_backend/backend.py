@@ -59,44 +59,72 @@ class Tokenizer:
 
 class HFTokenizer(Tokenizer):
     """
-    HuggingFace tokenizer loader using the lightweight ``tokenizers`` library.
-
-    Loads ``tokenizer.json`` directly from *tokenizer_dir* — no ``transformers``
-    dependency required.  This is the same approach used by
-    :class:`~openapi_server.impl.text_embed_qnn.HFTokenizerJSON`.
+    Robust local HuggingFace tokenizer loader using tokenizers library.
+    Works if tokenizer_dir contains tokenizer.json.
     """
 
     def __init__(self, tokenizer_dir: str):
-        from tokenizers import Tokenizer as HFTok
+        _log.info("HFTokenizer.__init__: initialising with tokenizer_dir=%r", tokenizer_dir)
+        self.tokenizer_dir = tokenizer_dir
+        self.tok = None
 
+        # Load tokenizer.json directly
         tok_json = os.path.join(tokenizer_dir, "tokenizer.json")
-        if not os.path.exists(tok_json):
-            raise ValueError(
-                f"Tokenizer dir '{tokenizer_dir}' does not contain tokenizer.json. "
-                f"Expected a HuggingFace tokenizer saved with save_pretrained() or "
-                f"tokenizer.save('tokenizer.json')."
-            )
-        self.tok = HFTok.from_file(tok_json)
+        _log.debug("HFTokenizer.__init__: checking for direct tokenizer.json path: %r", tok_json)
+        if os.path.exists(tok_json):
+            from tokenizers import Tokenizer as HF_Tokenizer
+            _log.debug("HFTokenizer.__init__: loading direct tokenizers.Tokenizer from file %r", tok_json)
+            self.tok = HF_Tokenizer.from_file(tok_json)
+            _log.info("HFTokenizer.__init__: successfully loaded direct tokenizers.Tokenizer")
+            return
+
+        raise ValueError(
+            f"Tokenizer dir '{tokenizer_dir}' is not a valid HF tokenizer folder. "
+            f"Expected tokenizer.json."
+        )
 
     def encode_batch(self, texts: List[str], seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-        self.tok.enable_padding(pad_id=0, pad_token="[PAD]", length=int(seq_len))
-        self.tok.enable_truncation(max_length=int(seq_len))
-        encodings = self.tok.encode_batch(texts)
-        input_ids = np.array([e.ids for e in encodings], dtype=np.int32)
-        attn = np.array([e.attention_mask for e in encodings], dtype=np.int32)
+        _log.debug("HFTokenizer.encode_batch: encoding %d texts with seq_len=%d", len(texts), seq_len)
+        try:
+            vocab = self.tok.get_vocab()
+            pad_id = vocab.get("[PAD]", vocab.get("<pad>", 0))
 
-        # Sanity check: huge ids usually mean mismatched tokenizer/vocab
-        if input_ids.size and int(input_ids.max()) > 10_000_000:
-            raise RuntimeError(
-                f"Suspicious token id max={int(input_ids.max())}. Tokenizer likely doesn't match model vocab."
-            )
-        return input_ids, attn
+            self.tok.enable_padding(length=seq_len, pad_id=pad_id, pad_token="[PAD]")
+            self.tok.enable_truncation(max_length=seq_len)
+
+            encodings = self.tok.encode_batch(texts)
+
+            input_ids_list = [enc.ids for enc in encodings]
+            attention_mask_list = [enc.attention_mask for enc in encodings]
+
+            input_ids = np.array(input_ids_list, dtype=np.int32)
+            attn = np.array(attention_mask_list, dtype=np.int32)
+
+            _log.debug("HFTokenizer.encode_batch: encoded input_ids shape=%s max_id=%d", input_ids.shape, int(input_ids.max()) if input_ids.size else -1)
+
+            # Sanity check: huge ids usually mean mismatched tokenizer/vocab
+            if input_ids.size and int(input_ids.max()) > 10_000_000:
+                raise RuntimeError(
+                    f"Suspicious token id max={int(input_ids.max())}. Tokenizer likely doesn't match model vocab."
+                )
+            return input_ids, attn
+        except Exception as e:
+            _log.error("HFTokenizer.encode_batch failed with exception: %s", e, exc_info=True)
+            raise
 
     def encode(self, text: str) -> List[int]:
         """Tokenise a single string and return token IDs without padding."""
-        self.tok.no_padding()
-        enc = self.tok.encode(text)
-        return list(enc.ids)
+        _log.debug("HFTokenizer.encode: tokenising single string (len=%d) context=%r", len(text), text[:100])
+        try:
+            self.tok.no_padding()
+            self.tok.no_truncation()
+            enc = self.tok.encode(text)
+            res = enc.ids
+            _log.debug("HFTokenizer.encode: tokenised into %d IDs: %s", len(res), res[:10])
+            return res
+        except Exception as e:
+            _log.error("HFTokenizer.encode failed with exception: %s", e, exc_info=True)
+            raise
 
 
 class SafePadTokenizer(Tokenizer):
@@ -110,8 +138,60 @@ class SafePadTokenizer(Tokenizer):
         return []
 
 
+def find_tokenizer_dir(model_path: str) -> Optional[str]:
+    # 1. Try to find dynamically near the model_path if provided
+    if model_path:
+        model_dir = os.path.dirname(model_path)
+        if os.path.isdir(model_dir):
+            json_path = os.path.join(model_dir, "tokenizer.json")
+            if os.path.exists(json_path):
+                _log.info(f"Dynamically discovered tokenizer.json near model: {json_path}")
+                return model_dir
+            # Recursively walk to find it
+            try:
+                for root, dirs, files in os.walk(model_dir):
+                    depth = root[len(model_dir):].count(os.sep)
+                    if depth > 2:
+                        dirs.clear()
+                        continue
+                    if "tokenizer.json" in files:
+                        found_json = os.path.join(root, "tokenizer.json")
+                        _log.info(f"Dynamically discovered tokenizer.json in model subdirectory: {found_json}")
+                        return root
+            except Exception as e:
+                _log.warning(f"Error while dynamically searching for tokenizer.json near {model_path}: {e}")
+
+    # 2. Try to find dynamically in the models root directory
+    models_dir = os.getenv("T2E_MODEL_DIR", "/mnt/work/models")
+    if os.path.isdir(models_dir):
+        try:
+            for root, dirs, files in os.walk(models_dir):
+                depth = root[len(models_dir):].count(os.sep)
+                if depth > 3:
+                    dirs.clear()
+                    continue
+                if "tokenizer.json" in files:
+                    found_json = os.path.join(root, "tokenizer.json")
+                    _log.info(f"Dynamically discovered tokenizer.json in T2E_MODEL_DIR: {found_json}")
+                    return root
+        except Exception as e:
+            _log.warning(f"Error while dynamically searching for tokenizer.json in T2E_MODEL_DIR {models_dir}: {e}")
+
+    # 3. Fallback to TOKENIZER_DIR
+    tok_dir = os.getenv("TOKENIZER_DIR")
+    if tok_dir and os.path.isdir(tok_dir):
+        json_path = os.path.join(tok_dir, "tokenizer.json")
+        if os.path.exists(json_path):
+            return tok_dir
+
+    return None
+
+
 def build_tokenizer(cfg: BackendConfig) -> Tokenizer:
-    if cfg.tokenizer_dir:
+    tok_dir = find_tokenizer_dir(cfg.model_path)
+    if tok_dir:
+        return HFTokenizer(tok_dir)
+    if cfg.tokenizer_dir and os.path.exists(os.path.join(cfg.tokenizer_dir, "tokenizer.json")):
         return HFTokenizer(cfg.tokenizer_dir)
     return SafePadTokenizer()
 
@@ -138,7 +218,7 @@ class NomicEmbedBackend(EmbeddingBackend):
     """
 
     @classmethod
-    def from_model_path(cls, model_path: str) -> "NomicEmbedBackend":
+    def from_model_path(cls, model_path: str) -> NomicEmbedBackend:
         """
         Construct a ``NomicEmbedBackend`` from environment variables.
 
@@ -148,14 +228,22 @@ class NomicEmbedBackend(EmbeddingBackend):
         perf_mode_str = os.environ.get("T2E_PERF_MODE")
         embed_dim_str = os.environ.get("T2E_EMBED_DIM")
 
+        # Automatically fallback to CPU (XNNPACK) for float models to avoid QNN desync/hang
+        is_float = "float" in model_path.lower()
+        prefer_htp_val = False if is_float else (os.environ.get("T2E_PREFER_HTP", "1") == "1")
+        require_htp_val = False if is_float else (os.environ.get("T2E_REQUIRE_HTP", "1") == "1")
+
+        if is_float:
+            _log.info("Float model detected. Disabling HTP acceleration and falling back to CPU (XNNPACK) for stability.")
+
         cfg = BackendConfig(
             model_path=model_path,
             runtime_lib=os.environ.get("T2E_RUNTIME_LIB", "libLiteRt.so"),
             dispatch_dir=os.environ.get("T2E_DISPATCH_DIR") or None,
             seq_len=int(os.environ.get("T2E_SEQ_LEN", "128")),
             normalize=os.environ.get("T2E_NORMALIZE", "1") == "1",
-            prefer_htp=os.environ.get("T2E_PREFER_HTP", "1") == "1",
-            require_htp=os.environ.get("T2E_REQUIRE_HTP", "1") == "1",
+            prefer_htp=prefer_htp_val,
+            require_htp=require_htp_val,
             qcom_perf_mode=int(perf_mode_str) if perf_mode_str else None,
             signature_index=int(os.environ.get("T2E_SIGNATURE_INDEX", "0")),
             output_dtype=os.environ.get("T2E_DTYPE", "float32"),
