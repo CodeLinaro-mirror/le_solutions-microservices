@@ -93,7 +93,15 @@ typedef struct {
     Usage usage;
 } Response;
 
-/* Callback for token / response handling */
-typedef void (*LLMResponseCallback)(const Response* response);
+// Lightweight structure for per-token streaming callbacks
+typedef struct {
+    char id[MAX_STRING_LENGTH];              //request ID
+    char model[MAX_STRING_LENGTH];           //model name
+    char content[MAX_STRING_LENGTH];         //token content
+    char finish_reason[MAX_STRING_LENGTH];   //"stop", "length", etc.
+} TokenResponse;
+
+/* Callback for individual tokens (streaming) */
+typedef void (*LLMTokenCallback)(const TokenResponse* token);
 
 #endif  // LLM_BUFFER_H

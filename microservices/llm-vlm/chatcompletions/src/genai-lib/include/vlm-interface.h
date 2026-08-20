@@ -32,17 +32,17 @@ VLMHandle vlm_create_object(const char* model, const char* config_path, const ch
 void vlm_destroy_object(VLMHandle handle);
 
 /**
- * @brief Perform a VLM completion request.
+ * @brief Perform a VLM completion request with token callback only.
  *
  * @param handle   VLMObject handle.
  * @param query    Pointer to a fully populated Query structure.
  * @param streaming Whether to stream partial results (must match the mode used at creation).
- * @param cb       Callback invoked when a response (or partial token) is ready.
+ * @param token_cb Callback invoked for each token. Final token includes finish_reason.
  */
 void vlm_chat_completion_create(VLMHandle handle,
                                 const Query* query,
                                 bool streaming,
-                                LLMResponseCallback cb);
+                                LLMTokenCallback token_cb);
 
 #ifdef __cplusplus
 }

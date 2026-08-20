@@ -71,11 +71,11 @@ void llm_reset_object(LLMHandle handle) {
 }
 
 void llm_chat_completion_create(LLMHandle handle, const Query* query,
-                                bool streaming, LLMResponseCallback cb) {
+                                bool streaming, LLMTokenCallback token_cb) {
     if (handle) {
         try {
             LLMObject* obj = static_cast<LLMObject*>(handle);
-            obj->responseCallback = cb;
+            obj->tokenCallback = token_cb;
             obj->stream = streaming;
             *(obj->query) = *query;
             obj->chat_completion_create();
@@ -83,36 +83,30 @@ void llm_chat_completion_create(LLMHandle handle, const Query* query,
             std::string err_msg = e.what();
             std::cerr << "[ERROR] Failed to create chat completion: "
                       << err_msg << std::endl;
-            if (cb) {
+            if (token_cb) {
                 std::string layman_msg = llm_get_error_message(err_msg);
-                Response errorResponse;
-                Message errorMessage;
-                snprintf(errorMessage.role, sizeof(errorMessage.role),
-                         "assistant");
-                snprintf(errorMessage.content, sizeof(errorMessage.content),
+                TokenResponse errorToken;
+                snprintf(errorToken.id, sizeof(errorToken.id), "error");
+                snprintf(errorToken.model, sizeof(errorToken.model), "llm");
+                snprintf(errorToken.content, sizeof(errorToken.content),
                          "%s", layman_msg.c_str());
-                errorResponse.choices[0].message = errorMessage;
-                snprintf(errorResponse.choices[0].finish_reason,
-                         sizeof(errorResponse.choices[0].finish_reason),
+                snprintf(errorToken.finish_reason, sizeof(errorToken.finish_reason),
                          "error");
-                cb(&errorResponse);
+                token_cb(&errorToken);
             }
         } catch (...) {
             std::cerr << "[ERROR] Failed to create chat completion: "
                       << "Unknown error" << std::endl;
-            if (cb) {
+            if (token_cb) {
                 std::string layman_msg = llm_get_error_message("");
-                Response errorResponse;
-                Message errorMessage;
-                snprintf(errorMessage.role, sizeof(errorMessage.role),
-                         "assistant");
-                snprintf(errorMessage.content, sizeof(errorMessage.content),
+                TokenResponse errorToken;
+                snprintf(errorToken.id, sizeof(errorToken.id), "error");
+                snprintf(errorToken.model, sizeof(errorToken.model), "llm");
+                snprintf(errorToken.content, sizeof(errorToken.content),
                          "%s", layman_msg.c_str());
-                errorResponse.choices[0].message = errorMessage;
-                snprintf(errorResponse.choices[0].finish_reason,
-                         sizeof(errorResponse.choices[0].finish_reason),
+                snprintf(errorToken.finish_reason, sizeof(errorToken.finish_reason),
                          "error");
-                cb(&errorResponse);
+                token_cb(&errorToken);
             }
         }
     }

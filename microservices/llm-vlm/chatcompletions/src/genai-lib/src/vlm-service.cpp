@@ -6,6 +6,7 @@
 //===========================================================================
 
 #include "vlm-service.hpp"
+#include "vlm-interface.h"
 #include <iostream> // Explicitly included for std::cout
 #include <fstream>
 #include <sstream>
@@ -867,9 +868,7 @@ void VLMObject::vlm_chat_completion_create() {
     // ---------------------------------------------------------------
     // 4. Execute the pipeline
     // ---------------------------------------------------------------
-    std::string responseText;
     VLMUserData userData;
-    userData.responseStr = &responseText;
     userData.stream = &stream;
     userData.vlmObj = this;
     userData.cv = &cv;
@@ -1010,50 +1009,37 @@ Genie_Status_t VLMObject::textOutputCallback(
                   << isEndOfSentence << ", isEndOfStream: "
                   << isEndOfStream << std::endl;
 
-        if (isStreaming) {
-            // Streaming mode: send each token immediately.
-            std::unique_ptr<Response> resp =
-                std::make_unique<Response>();
-            strlcpy(resp->model, udata->vlmObj->modelSelected,
-                sizeof(resp->model));
-            Message msg;
-            strlcpy(msg.role, "assistant", sizeof(msg.role));
-            if (responseStr) {
-                strlcpy(msg.content, responseStr, sizeof(msg.content));
-            }
-            resp->choices[0].message = msg;
+        // Per-token callback: use lightweight TokenResponse
+        if (responseStr && !isEndOfSentence) {
+            if (udata->vlmObj->tokenCallback) {
+                std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
+                strlcpy(token->id, udata->vlmObj->id, sizeof(token->id));
+                strlcpy(token->model, udata->vlmObj->modelSelected, sizeof(token->model));
+                strlcpy(token->content, responseStr, sizeof(token->content));
+                token->finish_reason[0] = '\0';  // Empty for intermediate tokens
 
-            if (isEndOfSentence) {
-                strlcpy(resp->choices[0].finish_reason, "stop",
-                    sizeof(resp->choices[0].finish_reason));
+                udata->vlmObj->tokenCallback(token.get());
+            } else {
+                std::cout << "[textOutputCallback] WARNING: tokenCallback is null, token lost!" << std::endl;
             }
+        }
 
-            if (udata->vlmObj->responseCallback) {
-                udata->vlmObj->responseCallback(resp.get());
-            }
-        } else {
-            // Non-streaming mode: accumulate the full response.
-            if (responseStr && udata->responseStr) {
-                *(udata->responseStr) += responseStr;
-            }
-
-            if (isEndOfSentence) {
-                // End of sentence: send the complete response.
-                std::unique_ptr<Response> resp =
-                    std::make_unique<Response>();
-                strlcpy(resp->model, udata->vlmObj->modelSelected,
-                    sizeof(resp->model));
-                Message msg;
-                strlcpy(msg.role, "assistant", sizeof(msg.role));
-                strlcpy(msg.content, udata->responseStr->c_str(),
-                    sizeof(msg.content));
-                resp->choices[0].message = msg;
-                strlcpy(resp->choices[0].finish_reason, "stop",
-                    sizeof(resp->choices[0].finish_reason));
-
-                if (udata->vlmObj->responseCallback) {
-                    udata->vlmObj->responseCallback(resp.get());
+        // Send final token with finish_reason
+        if (isEndOfSentence) {
+            if (udata->vlmObj->tokenCallback) {
+                std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
+                strlcpy(token->id, udata->vlmObj->id, sizeof(token->id));
+                strlcpy(token->model, udata->vlmObj->modelSelected, sizeof(token->model));
+                if (responseStr) {
+                    strlcpy(token->content, responseStr, sizeof(token->content));
+                } else {
+                    token->content[0] = '\0';
                 }
+                strlcpy(token->finish_reason, "stop", sizeof(token->finish_reason));
+
+                udata->vlmObj->tokenCallback(token.get());
+            } else {
+                std::cout << "[textOutputCallback] WARNING: tokenCallback is null, final token lost!" << std::endl;
             }
         }
 

@@ -57,6 +57,7 @@ class ModelMetrics:
         total_pipeline_latency_ms: float,
         tokens_generated: int,
         ttft_ms: Optional[float] = None,
+        token_generation_time_ms: Optional[float] = None,
         avg_stream_latency_ms: Optional[float] = None,
         preprocessing_time_ms: Optional[float] = None,
     ):
@@ -67,25 +68,28 @@ class ModelMetrics:
         Args:
             total_pipeline_latency_ms : End-to-end latency in ms
             tokens_generated          : Number of tokens generated
-            ttft_ms                   : Time to first token in ms (None if not streaming)
-            avg_stream_latency_ms     : Average inter-token latency in ms (None if not streaming)
+            ttft_ms                   : Time to first token in ms (from inference start)
+            token_generation_time_ms  : Pure token generation time (first to last token) in ms
+            avg_stream_latency_ms     : Average inter-token latency in ms
             preprocessing_time_ms     : Image encode/resize time in ms (VLM only)
         """
         with self._lock:
-            # Tokens/sec calculation
-            if total_pipeline_latency_ms > 0 and tokens_generated > 0:
-                # Default to overall pipeline TPS for non-streaming or edge cases
-                generation_time_ms = total_pipeline_latency_ms
-
-                # If streamed cleanly, use steady-state TPS (exclude TTFT)
-                if ttft_ms is not None and avg_stream_latency_ms is not None and ttft_ms < total_pipeline_latency_ms:
+            # Tokens/sec calculation - use pure generation time for accuracy
+            if tokens_generated > 1:  # Need at least 2 tokens for meaningful TPS
+                if token_generation_time_ms and token_generation_time_ms > 0:
+                    # Best: use pure generation time (first token to last token)
+                    # Subtract 1 from tokens_generated because TTFT measures the first token
+                    tps = ((tokens_generated - 1) / token_generation_time_ms) * 1000.0
+                    self._tokens_per_second_window.append(tps)
+                elif ttft_ms is not None and total_pipeline_latency_ms > ttft_ms:
+                    # Fallback: exclude TTFT from total pipeline time
                     steady_state_time = total_pipeline_latency_ms - ttft_ms
-                    # Avoid division by near-zero if stream dumped all at once
-                    if steady_state_time >= 50.0:
-                        generation_time_ms = steady_state_time
-
-                if generation_time_ms > 0:
-                    tps = (tokens_generated / generation_time_ms) * 1000.0
+                    if steady_state_time > 0:
+                        tps = ((tokens_generated - 1) / steady_state_time) * 1000.0
+                        self._tokens_per_second_window.append(tps)
+                elif total_pipeline_latency_ms > 0:
+                    # Last resort: use total pipeline time (less accurate)
+                    tps = (tokens_generated / total_pipeline_latency_ms) * 1000.0
                     self._tokens_per_second_window.append(tps)
 
             if ttft_ms is not None:
@@ -201,6 +205,7 @@ class MetricsManager:
         total_pipeline_latency_ms: float,
         tokens_generated: int,
         ttft_ms: Optional[float] = None,
+        token_generation_time_ms: Optional[float] = None,
         avg_stream_latency_ms: Optional[float] = None,
         preprocessing_time_ms: Optional[float] = None,
     ):
@@ -211,8 +216,9 @@ class MetricsManager:
             model_id                  : Model identifier
             total_pipeline_latency_ms : End-to-end latency in ms
             tokens_generated          : Number of tokens generated
-            ttft_ms                   : Time to first token in ms (streaming only)
-            avg_stream_latency_ms     : Average inter-token latency in ms (streaming only)
+            ttft_ms                   : Time to first token in ms (from inference start)
+            token_generation_time_ms  : Pure token generation time (first to last token) in ms
+            avg_stream_latency_ms     : Average inter-token latency in ms
             preprocessing_time_ms     : Image encode/resize time in ms (VLM only)
         """
         model_metrics = self._get_or_create(model_id)
@@ -220,6 +226,7 @@ class MetricsManager:
             total_pipeline_latency_ms=total_pipeline_latency_ms,
             tokens_generated=tokens_generated,
             ttft_ms=ttft_ms,
+            token_generation_time_ms=token_generation_time_ms,
             avg_stream_latency_ms=avg_stream_latency_ms,
             preprocessing_time_ms=preprocessing_time_ms,
         )

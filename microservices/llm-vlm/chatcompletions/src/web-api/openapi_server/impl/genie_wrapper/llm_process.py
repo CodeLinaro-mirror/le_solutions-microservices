@@ -228,6 +228,10 @@ const char* vlm_get_last_error(VLMHandle handle);
                 updated_interface += """
 void llm_reset_object(LLMHandle handle);
 """
+            # Ensure single token callback API is present
+            if 'void llm_chat_completion_create(LLMHandle handle, const Query* query, bool streaming' not in updated_interface:
+                # API should already be in header, but add if missing
+                pass
             self.ffi.cdef(updated_interface)
 
             # Load library
@@ -301,35 +305,42 @@ void llm_reset_object(LLMHandle handle);
 
             logger.info(f"[{event_id}] Query prepared, executing LLM...")
 
-            # Define callback
-            @self.ffi.callback("void(const Response *)")
-            def callback(response_ptr):
+            # Define token callback (called for each token AND final token with finish_reason)
+            @self.ffi.callback("void(const TokenResponse *)")
+            def token_callback(token_ptr):
                 try:
-                    resp = response_ptr[0]
-                    choice = resp.choices[0]
-                    msg = choice.message
+                    token = token_ptr[0]
+                    content = self.ffi.string(token.content).decode("utf-8") if token.content else ""
+                    finish_reason = self.ffi.string(token.finish_reason).decode("utf-8") if token.finish_reason else ""
 
-                    content = self.ffi.string(msg.content).decode("utf-8")
-                    finish_reason = self.ffi.string(choice.finish_reason).decode("utf-8")
-
+                    # Handle error finish_reason
                     if finish_reason == "error":
                         self._send_error(event_id, content)
-                    else:
-                        # Send token response
+                        return
+
+                    # Send intermediate tokens (no finish_reason)
+                    if not finish_reason and content:
+                        token_response = InferenceProtocol.create_token_response(event_id, content)
+                        self._send_response(token_response)
+
+                    # Handle final token with finish_reason="stop"
+                    if finish_reason == "stop":
+                        # Send final token content if any
                         if content:
                             token_response = InferenceProtocol.create_token_response(event_id, content)
                             self._send_response(token_response)
 
-                        # Send done if finished
-                        if finish_reason == "stop":
-                            done_response = InferenceProtocol.create_done_response(event_id, finish_reason)
-                            self._send_response(done_response)
+                        # Send done message
+                        done_response = InferenceProtocol.create_done_response(event_id, finish_reason)
+                        self._send_response(done_response)
 
                 except Exception as e:
-                    logger.error(f"[{event_id}] Error in callback: {e}", exc_info=True)
+                    logger.error(f"[{event_id}] Error in token_callback: {e}", exc_info=True)
 
-            # Execute LLM completion (blocking)
-            self.lib.llm_chat_completion_create(self.llm_handle, query, streaming, callback)
+            # Execute LLM completion with single token callback (blocking)
+            self.lib.llm_chat_completion_create(
+                self.llm_handle, query, streaming, token_callback
+            )
 
             logger.info(f"[{event_id}] LLM execution completed")
 

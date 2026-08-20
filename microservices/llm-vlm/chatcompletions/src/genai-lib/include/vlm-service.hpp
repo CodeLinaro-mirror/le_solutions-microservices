@@ -193,7 +193,7 @@ public:
     bool stream;
     char modelSelected[256];
 
-    LLMResponseCallback responseCallback = nullptr;
+    LLMTokenCallback tokenCallback = nullptr;
 
     void vlm_chat_completion_create();   // Execute a VLM request
     void resetPipeline();   // Explicitly reset pipeline state
@@ -258,7 +258,6 @@ private:
 
 
 typedef struct {
-    std::string* responseStr;
     bool* stream;
     VLMObject* vlmObj;
     std::condition_variable* cv;
