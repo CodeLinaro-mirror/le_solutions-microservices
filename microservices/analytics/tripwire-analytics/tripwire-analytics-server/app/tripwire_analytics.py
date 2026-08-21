@@ -128,6 +128,18 @@ def handle_no_db_error():
        # should fail like api
        sys.exit()
 
+def close_db_connection():
+    '''
+    Safely close the module-level db_connection, if open.
+    '''
+    global db_connection
+    if db_connection:
+        try:
+            db_connection.close()
+        except Exception as e:
+            logger.debug(f'Error closing db connection: {e}')
+        db_connection = None
+
 async def connect_to_db():
     '''
     Create a connection to the database if it is not already connected.
@@ -435,7 +447,7 @@ def get_foot_coordinates(person):
     elif bb:
          #logger.info('using bb')
          foot_coords['x'] = (bb.x + bb.width) / 2.0
-         foot_coords['y'] = bb.y + bb.height
+         foot_coords['y'] = min(1, bb.y + bb.height)
     else:
          logger.error(f'Person detected without landmarks or bounding box!')
          foot_coords = None
@@ -449,7 +461,7 @@ def visualize_heatmap(heatmap):
         return
 
     # Define the intensity levels using Unicode block characters
-    intensity_levels = " ¦¦¦¦"
+    intensity_levels = ""
 
     # Function to map the matrix values to intensity levels
     def map_to_intensity(matrix):
@@ -537,7 +549,7 @@ async def update_heatmap_statistics(recent_history):
             foot_coords = get_foot_coordinates(person)
 
             if not foot_coords:
-                continue;
+                continue
 
             # Convert to heatmap array indices
             #logger.debug(f'{foot_coords}')
@@ -1140,17 +1152,15 @@ class TripwireAnalytics():
 
 
     def start_statistics_task(self):
-        statistics_process_task = None
-        statistics_process_task = asyncio.create_task(statistics_task())
-        return statistics_process_task
+        self._statistics_process_task = asyncio.create_task(statistics_task())
+        return self._statistics_process_task
 
     def deinit(self):
-        if statistics_task:
-            statistics_task.cancel()
+        statistics_process_task = getattr(self, '_statistics_process_task', None)
+        if statistics_process_task and not statistics_process_task.done():
+            statistics_process_task.cancel()
 
-        if db_connection:
-            db_connection.close()
-            db_connection = None
+        close_db_connection()
 
     async def run_count_query(self, r : redis.Redis, token, monitor_id, start_time, end_time):
         await run_count_query(r, token, monitor_id, start_time, end_time)
