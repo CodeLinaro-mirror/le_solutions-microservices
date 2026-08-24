@@ -69,6 +69,42 @@ ARG LITERT_LM_VERSION=0.14.0
 ARG BUILD_LITERT_LM_CLI_TOOLS=false
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stage -1: qairt_fetcher
+#
+# Downloads and extracts the QAIRT SDK zip exactly once. litert_builder
+# (build-litert.sh) and builder (fetch-qairt-sdk.sh) both need a copy of the
+# same QAIRT_SDK_VERSION but run in unrelated stages with no shared
+# filesystem — without this, each would independently download the same
+# multi-hundred-MB zip from softwarecenter.qualcomm.com. They instead
+# COPY --from=qairt_fetcher the already-extracted tree; both scripts detect
+# it's already present at their expected path and skip the network fetch.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM --platform=linux/arm64 ubuntu:22.04 AS qairt_fetcher
+
+ARG QAIRT_SDK_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        unzip \
+        ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/qairt-sdk && \
+    cd /opt/qairt-sdk && \
+    i=1; \
+    while [ "$i" -le 10 ]; do \
+        wget -c -t 1 -T 120 --no-verbose -O "v${QAIRT_SDK_VERSION}.zip" \
+            "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_SDK_VERSION}/v${QAIRT_SDK_VERSION}.zip" && break; \
+        echo "Download attempt $i failed, retrying in 15 seconds..."; \
+        sleep 15; \
+        i=$((i + 1)); \
+    done && \
+    [ -f "v${QAIRT_SDK_VERSION}.zip" ] || { echo "ERROR: QAIRT SDK download failed after 10 attempts"; exit 1; } && \
+    unzip "v${QAIRT_SDK_VERSION}.zip" && \
+    rm -f "v${QAIRT_SDK_VERSION}.zip"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: litert_builder
 #
 # Builds LiteRT natively on AArch64 using Bazelisk.
@@ -119,6 +155,14 @@ ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
 ENV LITERT_SRC_DIR=/mnt/work/src/litert
 ENV LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
 ENV QAIRT_LITERT_DIR=/tmp/qairt-litert
+# Persisted as a Dockerfile ENV (not just build-litert.sh's shell export) so it
+# also reaches litert_lm_builder's separate bazel invocation below — that
+# build runs in a different workspace (LITERT_LM_SRC_DIR) with its own bazel
+# output_base, so it can't inherit build-litert.sh's in-process export or its
+# bazel external-repo cache. Without this, LiteRT-LM's QNN-enabled build would
+# fall back to bazel auto-fetching its own hardcoded QAIRT pin, reintroducing
+# the version mismatch against the QAIRT_LITERT_VERSION used elsewhere.
+ENV LITERT_QAIRT_SDK=/tmp/qairt-litert/
 ENV HERMETIC_PYTHON_VERSION=3.10
 ENV PYTHON_BIN_PATH=/usr/bin/python3
 ENV PYTHON_LIB_PATH=/usr/lib/python3/dist-packages
@@ -134,6 +178,11 @@ ENV CLANG_COMPILER_PATH=/usr/bin/clang
 ENV TF_SET_ANDROID_WORKSPACE=0
 ENV TF_DOWNLOAD_CLANG=0
 ENV TF_ENABLE_XLA=0
+
+# Reuse the QAIRT SDK already downloaded/extracted by qairt_fetcher instead
+# of having build-litert.sh fetch its own copy — see the qairt_fetcher stage
+# comment above.
+COPY --from=qairt_fetcher /opt/qairt-sdk ${QAIRT_LITERT_DIR}
 
 COPY qai-forge/scripts/deps/build-litert.sh /tmp/
 RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-litert.sh
@@ -239,6 +288,10 @@ RUN chmod +x /tmp/build-drogon.sh && /tmp/build-drogon.sh && rm /tmp/build-drogo
 # deletes its own download scratch dir. Nothing further to copy here.
 ENV QAIRT_VERSION=${QAIRT_SDK_VERSION}
 ENV QAIRT_DOWNLOAD_DIR=/tmp/qairt-download
+# Reuse the QAIRT SDK already downloaded/extracted by qairt_fetcher instead
+# of having fetch-qairt-sdk.sh fetch its own copy — see the qairt_fetcher
+# stage comment near the top of this file.
+COPY --from=qairt_fetcher /opt/qairt-sdk ${QAIRT_DOWNLOAD_DIR}
 COPY qai-forge/scripts/deps/fetch-qairt-sdk.sh /tmp/
 RUN chmod +x /tmp/fetch-qairt-sdk.sh && /tmp/fetch-qairt-sdk.sh && rm /tmp/fetch-qairt-sdk.sh
 

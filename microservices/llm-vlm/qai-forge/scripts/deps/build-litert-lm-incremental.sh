@@ -9,13 +9,17 @@
 # This matches the exact build logic from QAIServe/Dockerfile litert_lm_builder stage.
 #
 # Environment Variables (must be set to overwrite default values):
-#   LITERT_LM_VERSION=0.13.0
+#   LITERT_LM_VERSION=0.14.0
 #   LITERT_SRC_DIR=/mnt/work/src/litert (from litert_builder stage)
 #   LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 #   LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
 #   BUILD_LITERT_LM_CLI_TOOLS=false  Build the litert-lm / litert-lm-advanced
 #                                     on-device debugging/benchmarking CLI
 #                                     binaries.Set to "true" to build them.
+#   QAIRT_LITERT_DIR=/tmp/qairt-litert  QAIRT SDK dir staged by litert_builder
+#                                         (build-litert.sh); removed at the end
+#                                         of this script since litert_lm_builder
+#                                         is the last stage in the chain to need it.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -eu
@@ -23,11 +27,12 @@ set -eu
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults — used only when a variable isn't already set in the environment
 # ─────────────────────────────────────────────────────────────────────────────
-LITERT_LM_VERSION="${LITERT_LM_VERSION:-0.13.0}"
+LITERT_LM_VERSION="${LITERT_LM_VERSION:-0.14.0}"
 LITERT_SRC_DIR="${LITERT_SRC_DIR:-/mnt/work/src/litert}"
 LITERT_LM_SRC_DIR="${LITERT_LM_SRC_DIR:-/mnt/work/src/litert-lm}"
 LITERT_LM_DEPLOY_DIR="${LITERT_LM_DEPLOY_DIR:-/mnt/work/deploy/usr}"
 BUILD_LITERT_LM_CLI_TOOLS="${BUILD_LITERT_LM_CLI_TOOLS:-true}"
+QAIRT_LITERT_DIR="${QAIRT_LITERT_DIR:-/tmp/qairt-litert}"
 
 echo "=== Building LiteRT-LM v${LITERT_LM_VERSION} (incremental on top of LiteRT) ==="
 
@@ -184,3 +189,14 @@ echo "✓ LiteRT-LM v${LITERT_LM_VERSION} build complete (incremental)"
 echo "  Libraries: ${LITERT_LM_DEPLOY_DIR}/lib"
 echo "  Binaries: ${LITERT_LM_DEPLOY_DIR}/bin"
 echo "  Headers: ${LITERT_LM_DEPLOY_DIR}/include"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cleanup
+#
+# litert_lm_builder is the last stage in the litert_builder -> litert_lm_builder
+# chain that needs the QAIRT SDK staged by build-litert.sh (via QAIRT_LITERT_DIR
+# / LITERT_QAIRT_SDK), so it's safe to remove it here now that both bazel
+# builds are done.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Cleaning up QAIRT SDK staging directory..."
+rm -rf "${QAIRT_LITERT_DIR}"
