@@ -782,17 +782,15 @@ class VehicleAnalytics():
         logger.info(f'Statistics Task Stopped...')
 
     def start_statistics_task(self):
-        statistics_process_task = None
-        statistics_process_task = asyncio.create_task(self.statistics_task())
-        return statistics_process_task
+        self._statistics_process_task = asyncio.create_task(self.statistics_task())
+        return self._statistics_process_task
 
     def deInit(self):
-        if self.statistics_task:
-            self.statistics_task.cancel()
+        statistics_process_task = getattr(self, '_statistics_process_task', None)
+        if statistics_process_task and not statistics_process_task.done():
+            statistics_process_task.cancel()
 
-        if db_connection:
-            db_connection.close()
-            db_connection = None
+        va_db.close_db_connection()
 
     async def run_count_query(self, r : redis.Redis, token, monitor_id, region_id, start_time, end_time):
         # Save the current count statistics in case it needs to be included
