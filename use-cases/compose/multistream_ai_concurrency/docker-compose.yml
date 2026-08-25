@@ -10,12 +10,14 @@ services:
     restart: always
     env_file:
       - /etc/docker/env/qimsdk.env
+    volumes:
+      - ${HOME}/Downloads/qimsdk_samples:/home/qimsdk/Downloads/qimsdk_samples
     command: >
       gst-ai-stream-concurrency
       --num-streams=${NUM_STREAMS:-4}
-      --input=${INPUT_CONFIG:-/etc/media/Draw_1080p_180s_30FPS.mp4}
-      --model=${MODEL_PATH_MULTISTREAM:-/etc/models/yolox-yolo-x-w8a8.tflite}
-      --labels=${LABELS_PATH_MULTISTREAM:-/etc/labels/yolov8n.json}
+      --input=${INPUT_CONFIG:-/home/qimsdk/Downloads/qimsdk_samples/media/Draw_1080p_180s_30FPS.mp4}
+      --model=${MODEL_PATH_MULTISTREAM:-/home/qimsdk/Downloads/qimsdk_samples/models/yolox-yolo-x-w8a8.tflite}
+      --labels=${LABELS_PATH_MULTISTREAM:-/home/qimsdk/Downloads/qimsdk_samples/labels/yolov8n.json}
       --confidence=${CONFIDENCE_MULTISTREAM:-51.0}
     deploy:
       resources:
