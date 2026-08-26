@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Tuple, Union
 from fastapi import HTTPException
 import asyncio
 import base64
+import multiprocessing
+import json
 
 try:
     import numpy as np
@@ -54,16 +56,115 @@ _EXTENSION_TO_BACKEND: Dict[str, type] = {
 }
 
 
+class SubprocessBackendWrapper(EmbeddingBackend):
+    """
+    Generic wrapper to run any backend inside a separate 'spawn' subprocess.
+    """
+    def __init__(self, backend_cls: type, model_path: str, model_id: str):
+        self.backend_cls = backend_cls
+        self.model_path = model_path
+        self.model_id = model_id
+        self.ctx = multiprocessing.get_context("spawn")
+        self.req_queue = self.ctx.Queue()
+        self.res_queue = self.ctx.Queue()
+        self.proc = self.ctx.Process(target=self._worker_loop, args=(self.req_queue, self.res_queue))
+
+        # Temporary bypass for Python's "daemonic processes are not allowed to have children" assertion.
+        # FastAPI worker processes (Uvicorn/Hypercorn/Gunicorn) can be daemonic.
+        current_proc = multiprocessing.current_process()
+        is_daemon = getattr(current_proc, "daemon", False)
+        if is_daemon:
+            current_proc.daemon = False
+        try:
+            self.proc.start()
+        finally:
+            if is_daemon:
+                current_proc.daemon = True
+
+        # Wait for initialization status to propagate any errors cleanly
+        res = self.res_queue.get()
+        if res["status"] == "error":
+            raise RuntimeError(f"Failed to initialize backend in subprocess: {res['error']}")
+
+    def _worker_loop(self, req_queue: multiprocessing.Queue, res_queue: multiprocessing.Queue):
+        try:
+            # We initialize logging in the child process
+            LoggerConfig.initialize()
+            backend = self.backend_cls.from_model_path(self.model_path)
+            res_queue.put({"status": "ok"})
+        except Exception as e:
+            res_queue.put({"status": "error", "error": str(e)})
+            return
+
+        while True:
+            cmd = req_queue.get()
+            op = cmd.get("op")
+            if op == "close":
+                try:
+                    backend.close()
+                except Exception:
+                    pass
+                break
+            elif op == "embed":
+                try:
+                    res = backend.embed_texts(cmd["texts"])
+                    res_queue.put({"status": "ok", "result": res})
+                except Exception as e:
+                    res_queue.put({"status": "error", "error": str(e)})
+            elif op == "encode_tokens":
+                try:
+                    res = backend.encode_tokens(cmd["text"])
+                    res_queue.put({"status": "ok", "result": res})
+                except Exception as e:
+                    res_queue.put({"status": "error", "error": str(e)})
+
+    def _check_alive(self):
+        if not self.proc or not self.proc.is_alive():
+            raise RuntimeError("Backend subprocess died unexpectedly.")
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        self._check_alive()
+        self.req_queue.put({"op": "embed", "texts": texts})
+        res = self.res_queue.get()
+        if res["status"] == "error":
+            raise RuntimeError(res["error"])
+        return res["result"]
+
+    def encode_tokens(self, text: str) -> List[int]:
+        self._check_alive()
+        self.req_queue.put({"op": "encode_tokens", "text": text})
+        res = self.res_queue.get()
+        if res["status"] == "error":
+            raise RuntimeError(res["error"])
+        return res["result"]
+
+    def close(self) -> None:
+        if self.proc and self.proc.is_alive():
+            try:
+                self.req_queue.put({"op": "close"})
+                self.proc.join(timeout=2)
+            except Exception:
+                pass
+            if self.proc.is_alive():
+                self.proc.terminate()
+                self.proc.join()
+        self.proc = None
+
+    @property
+    def backend_lib(self) -> str:
+        return getattr(self.backend_cls, "backend_lib", getattr(self.backend_cls, "snpe_lib", "N/A"))
+
+
 def _backend_factory(model_path: str, model_id: str = "") -> EmbeddingBackend:
     """
     Instantiate the correct :class:`EmbeddingBackend` for *model_path*.
 
-    Selection is based on the requested model_id and file extension:
+    Selection is primarily based on the companion metadata.json runtime,
+    explicit requested model_id, and file extension:
 
     * ``.tflite``  → :class:`NomicEmbedBackend` (LiteRT / TFLite path)
     * ``.bin``     → :class:`SimpleQnnEmbeddingApp` (QNN binary path)
-    * ``.dlc`` (SNPE) → :class:`SimpleSnpeEmbeddingApp` (SNPE binary path)
-    * ``.dlc`` (QNN) → :class:`SimpleQnnEmbeddingApp` (QNN context binary inside DLC)
+    * ``.dlc``     → :class:`SimpleSnpeEmbeddingApp` or :class:`SimpleQnnEmbeddingApp` (depending on metadata.json)
 
     Parameters
     ----------
@@ -85,18 +186,66 @@ def _backend_factory(model_path: str, model_id: str = "") -> EmbeddingBackend:
     _, ext = os.path.splitext(model_path)
     ext = ext.lower()
 
-    if ext == ".dlc":
-        # Force SNPE backend if explicitly requested
+    # 1. Discover runtime and correct file name from metadata.json next to the model file (Primary decision maker)
+    runtime = None
+    model_dir = os.path.dirname(model_path)
+    metadata_path = os.path.join(model_dir, "metadata.json")
+    if os.path.isfile(metadata_path):
+        try:
+            with open(metadata_path, encoding="utf-8") as f:
+                meta = json.load(f)
+                runtime = meta.get("runtime", "").lower()
+                logger.info(f"Discovered runtime {runtime!r} from metadata.json: {metadata_path}")
+
+                # Automatically resolve the correct model file from metadata.json model_files dictionary
+                model_files = meta.get("model_files", {})
+                if model_files:
+                    first_file = list(model_files.keys())[0]
+                    correct_path = os.path.join(model_dir, first_file)
+                    if os.path.isfile(correct_path) and correct_path != model_path:
+                        logger.info(f"Updating model_path to correct file from metadata.json: {correct_path!r}")
+                        model_path = correct_path
+                        _, ext = os.path.splitext(model_path)
+                        ext = ext.lower()
+        except Exception as e:
+            logger.warning(f"Failed to read metadata.json at {metadata_path}: {e}")
+
+    # Fallback checking: If file does not exist, speculative re-mapping
+    if not os.path.exists(model_path):
+        alt_path = None
+        if ext == ".bin":
+            alt_path = model_path.replace(".bin", ".dlc")
+        elif ext == ".dlc":
+            alt_path = model_path.replace(".dlc", ".bin")
+        if alt_path and os.path.exists(alt_path):
+            logger.info(f"Requested path {model_path!r} does not exist, but found alternative path: {alt_path!r}. Switching path.")
+            model_path = alt_path
+            _, ext = os.path.splitext(model_path)
+            ext = ext.lower()
+
+    # 2. Determine backend class using metadata.json runtime first
+    backend_cls = None
+    if runtime is not None:
+        if runtime in ("qnn_dlc", "qnn", "qnn_context_binary"):
+            backend_cls = SimpleQnnEmbeddingApp
+        elif runtime == "snpe":
+            backend_cls = SimpleSnpeEmbeddingApp
+        elif runtime in ("litert", "tflite"):
+            backend_cls = NomicEmbedBackend
+
+    # 3. Fallback to model_id explicit requests if not guided by metadata.json runtime
+    if backend_cls is None:
         if "snpe" in model_id.lower():
-            logger.info(f"Explicit SNPE request for {model_path!r}. Selecting backend {SimpleSnpeEmbeddingApp.__name__!r}.")
-            return SimpleSnpeEmbeddingApp.from_model_path(model_path)
+            backend_cls = SimpleSnpeEmbeddingApp
+        elif "qnn" in model_id.lower():
+            backend_cls = SimpleQnnEmbeddingApp
+        elif "tflite" in model_id.lower() or "litert" in model_id.lower():
+            backend_cls = NomicEmbedBackend
 
-        # Force QNN backend if explicitly requested
-        if "qnn" in model_id.lower():
-            logger.info(f"Explicit QNN request for {model_path!r}. Selecting backend {SimpleQnnEmbeddingApp.__name__!r}.")
-            return SimpleQnnEmbeddingApp.from_model_path(model_path)
+    # 4. Fallback to extension-based defaults if both metadata/model_id are not available
+    if backend_cls is None:
+        backend_cls = _EXTENSION_TO_BACKEND.get(ext)
 
-    backend_cls = _EXTENSION_TO_BACKEND.get(ext)
     if backend_cls is None:
         supported = ", ".join(sorted(_EXTENSION_TO_BACKEND))
         raise ValueError(
@@ -109,93 +258,83 @@ def _backend_factory(model_path: str, model_id: str = "") -> EmbeddingBackend:
 
     logger.info(
         f"Selecting backend {backend_cls.__name__!r} "
-        f"for extension '{ext}' (model: {model_path!r})"
+        f"for model {model_path!r} (model_id: {model_id!r}, runtime: {runtime!r})"
     )
-    return backend_cls.from_model_path(model_path)
+    return SubprocessBackendWrapper(backend_cls, model_path, model_id)
 
 
 # ---------------------------------------------------------------------------
-# Per-model backend cache
+# Object-Oriented Backend Lifecycle Manager (Replaces Global Cache Variables)
 # ---------------------------------------------------------------------------
-# Backend initialisation is expensive:
-#   - NomicEmbedBackend:      loads libLiteRt.so, compiles the TFLite graph,
-#                             allocates DMA tensor buffers.
-#   - SimpleQnnEmbeddingApp:  loads libQnnHtp.so + libQnnSystem.so, creates
-#                             QNN backend/context, deserialises the graph.
-#   - SimpleSnpeEmbeddingApp: loads libSNPE.so, builds SNPE engine from DLC container.
+# Backend initialisation is expensive (DMA buffers, QNN/SNPE engines, model graph compiles).
+# However, Qualcomm's CDSP FastRPC hardware driver context cannot simultaneously host
+# conflicting domains (e.g. SNPE vs QNN/LiteRT) within the same process space.
 #
-# Re-creating the backend on every request adds 200–800 ms of cold-start
-# latency and prevents the HTP hardware from staying warm.
-#
-# We keep one EmbeddingBackend instance per model path/key and serialise
-# concurrent inference calls with a lock so that tensor buffers are never
-# accessed from two threads simultaneously.
+# BackendManager is a clean object-oriented singleton that enforces AT MOST ONE
+# active backend context in memory, completely eliminating FastRPC conflicts
+# and ensuring hardware resources are warm.
 # ---------------------------------------------------------------------------
 
-_backend_cache: Dict[str, EmbeddingBackend] = {}
-_backend_locks: Dict[str, threading.Lock] = {}
-_backend_meta_lock = threading.Lock()
-_last_seen_reload_count = 0
-
-
-def _clear_backend_cache() -> None:
+class BackendManager:
     """
-    Safely close and release hardware resources of all cached backends,
-    then clear the cache structures.
+    Singleton manager for controlling the lifecycle of active embedding backends.
+    Ensures that at most one backend is active at any time to prevent hardware/Ion/CDSP conflicts.
     """
-    global _backend_cache, _backend_locks
-    with _backend_meta_lock:
-        logger.info(f"Clearing model backend cache. Releasing {len(_backend_cache)} cached backend(s).")
-        for cache_key, backend in list(_backend_cache.items()):
+    _instance: Optional[BackendManager] = None
+    _active_backend: Optional[EmbeddingBackend] = None
+    _active_key: Optional[str] = None
+    _lock = threading.Lock()
+    _inference_lock = threading.Lock()
+    _reload_count = 0
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(BackendManager, cls).__new__(cls)
+        return cls._instance
+
+    @classmethod
+    def get_backend(cls, model_path: str, model_id: str) -> EmbeddingBackend:
+        cache_key = f"{model_path}:{model_id}"
+        with cls._lock:
+            # Check for config reload signals
+            current_reload = model_config_manager.get_reload_count()
+            if current_reload != cls._reload_count:
+                logger.info(f"ModelConfigManager reload detected ({cls._reload_count} -> {current_reload}). Clearing active backend.")
+                cls._clear_locked()
+                cls._reload_count = current_reload
+
+            # If the active backend is different, close it first before loading the new one
+            if cls._active_key != cache_key:
+                if cls._active_backend is not None:
+                    logger.info(f"Switching backend from {cls._active_key!r} to {cache_key!r}. Releasing hardware resources.")
+                    cls._clear_locked()
+
+                logger.info(f"Initialising backend: {cache_key!r}")
+                cls._active_backend = _backend_factory(model_path, model_id)
+                cls._active_key = cache_key
+                logger.info(f"Backend {cls._active_backend.__class__.__name__!r} is ready.")
+
+            return cls._active_backend
+
+    @classmethod
+    def get_inference_lock(cls) -> threading.Lock:
+        return cls._inference_lock
+
+    @classmethod
+    def _clear_locked(cls):
+        if cls._active_backend is not None:
+            logger.info(f"Closing and releasing resources for active backend key={cls._active_key!r}")
             try:
-                logger.info(f"Closing and releasing resources for cached backend key={cache_key!r}")
-                backend.close()
+                cls._active_backend.close()
             except Exception as e:
-                logger.warning(f"Error while closing backend key={cache_key!r}: {e}")
-        _backend_cache.clear()
-        _backend_locks.clear()
-        logger.info("Model backend cache cleared successfully.")
+                logger.warning(f"Error while closing backend key={cls._active_key!r}: {e}")
+            cls._active_backend = None
+            cls._active_key = None
 
-
-def _get_backend(model_path: str, model_id: str) -> Tuple[EmbeddingBackend, threading.Lock]:
-    """
-    Return ``(backend, lock)`` for *model_path* and *model_id*, creating them on first call.
-
-    Thread-safe: concurrent callers for the same backend will block
-    until the backend is ready, then all receive the same cached instance.
-
-    Parameters
-    ----------
-    model_path:
-        Absolute path to the model file.
-    model_id:
-        The requested model ID/key to guide backend selection.
-
-    Returns
-    -------
-    Tuple[EmbeddingBackend, threading.Lock]
-        The cached backend instance and its associated inference lock.
-    """
-
-    cache_key = f"{model_path}:{model_id}"
-    # Phase 1: obtain (or create) the per-model lock without holding the
-    # global meta-lock for longer than necessary.
-    with _backend_meta_lock:
-        if cache_key not in _backend_locks:
-            _backend_locks[cache_key] = threading.Lock()
-        lock = _backend_locks[cache_key]
-
-    # Phase 2: create the backend if it does not exist yet.  The per-model
-    # lock serialises concurrent first-time initialisations for the same path.
-    with lock:
-        if cache_key not in _backend_cache:
-            logger.info(f"Initialising backend for model: {model_path!r} (key: {model_id!r})")
-            _backend_cache[cache_key] = _backend_factory(model_path, model_id)
-            logger.info(
-                f"Backend {_backend_cache[cache_key].__class__.__name__!r} "
-                f"ready for model: {model_path!r}"
-            )
-        return _backend_cache[cache_key], lock
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._clear_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -364,28 +503,19 @@ class EmbeddingsApiImpl(BaseEmbeddingsApi):
         ef = normalize_encoding_format(encoding_format)
 
         def _work() -> Tuple[List[Union[List[float], str]], List[int]]:
-            global _last_seen_reload_count
-            current_reload = model_config_manager.get_reload_count()
-            if current_reload != _last_seen_reload_count:
-                logger.info(f"ModelConfigManager reload detected ({_last_seen_reload_count} -> {current_reload}). Clearing backend cache and releasing hardware resources.")
-                _clear_backend_cache()
-                _last_seen_reload_count = current_reload
+            # Retrieve the backend from the BackendManager (handles switches and reload checks automatically)
+            backend = BackendManager.get_backend(model, model_id)
 
-            # Retrieve (or create) the cached backend and its inference lock.
-            # The lock ensures tensor buffers are never accessed concurrently.
-            backend, lock = _get_backend(model, model_id)
-
-            with lock:
+            with BackendManager.get_inference_lock():
                 # Log the active backend and its associated runtime library/context details
-                active_lib = getattr(backend, "backend_lib", "N/A")
+                active_lib = getattr(backend, "backend_lib", getattr(backend, "snpe_lib", "N/A"))
                 logger.info(
                     f"Executing inference on model_id: {model_id!r} "
                     f"using backend class: {backend.__class__.__name__!r} "
                     f"and runtime library: {active_lib!r}"
                 )
 
-                # Both NomicEmbedBackend and SimpleQnnEmbeddingApp implement
-                # EmbeddingBackend, so no branching is needed here.
+                # All backends implement EmbeddingBackend, so no branching is needed here.
                 t_inf0 = time.time()
                 try:
                     vectors: List[List[float]] = backend.embed_texts(inputs)

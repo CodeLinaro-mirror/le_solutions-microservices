@@ -162,18 +162,19 @@ def _proto_eager(dll: ctypes.CDLL) -> Dict[str, Any]:
     return f
 
 
-def _status_to_str(fns: Dict[str, Any], status: int) -> str:
-    get_str = fns.get("LiteRtGetStatusString")
-    if get_str:
-        try:
-            s = get_str(LiteRtStatus(int(status)))
-            return s.decode("utf-8") if s else f"LiteRtStatus({int(status)})"
-        except Exception:
-            pass
+def _status_to_str(fns: Optional[Dict[str, Any]], status: int) -> str:
+    if fns:
+        get_str = fns.get("LiteRtGetStatusString")
+        if get_str:
+            try:
+                s = get_str(LiteRtStatus(int(status)))
+                return s.decode("utf-8") if s else f"LiteRtStatus({int(status)})"
+            except Exception:
+                pass
     return f"LiteRtStatus({int(status)})"
 
 
-def _check_ok(fns: Dict[str, Any], status: int, where: str, verbose: bool = False):
+def _check_ok(fns: Optional[Dict[str, Any]], status: int, where: str, verbose: bool = False):
     if int(status) != 0:
         msg = f"{where} failed: {_status_to_str(fns, status)}"
         _log.error(msg)
@@ -187,6 +188,7 @@ class LiteRtLibProvider:
         # Enforce the exact hardcoded /usr/lib paths to ensure NPU execution
         self.runtime_lib = "/usr/lib/libLiteRt.so"
         _log.info("Loading hardcoded LiteRT runtime library: %r", self.runtime_lib)
+        self.plugins = []
         try:
             import os
             # Pre-load compiler and dispatch plugins globally into the process namespace
@@ -198,7 +200,8 @@ class LiteRtLibProvider:
                 if os.path.exists(path):
                     _log.info("Globally loading hardcoded plugin: %s", path)
                     try:
-                        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                        p_dll = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                        self.plugins.append(p_dll)
                     except Exception as e:
                         _log.warning("Optional plugin load warning: %s: %s", path, e)
 
@@ -210,9 +213,13 @@ class LiteRtLibProvider:
         self.fns = _proto_eager(self.dll)
 
     def get(self, name: str):
+        if self.fns is None:
+            return None
         return self.fns.get(name)
 
     def bind_optional(self, name: str, restype, argtypes):
+        if self.fns is None or self.dll is None:
+            return None
         try:
             fn = getattr(self.dll, name)
             fn.restype = restype
@@ -223,6 +230,8 @@ class LiteRtLibProvider:
             return None
 
     def has_symbol(self, name: str) -> bool:
+        if self.dll is None:
+            return False
         return getattr(self.dll, name, None) is not None
 
 
@@ -233,7 +242,6 @@ class QualcommOptions:
     """
     def __init__(self, provider: LiteRtLibProvider):
         self.p = provider
-        self.fns = provider.fns
         self.handle = c_void_p(None)
 
         self._q_create = self.p.bind_optional(
@@ -251,7 +259,7 @@ class QualcommOptions:
         if not self._q_create:
             raise RuntimeError("LiteRtQualcommOptionsCreate not exported by this runtime.")
         st = self._q_create(byref(self.handle))
-        _check_ok(self.fns, st, "LiteRtQualcommOptionsCreate")
+        _check_ok(self.p.fns, st, "LiteRtQualcommOptionsCreate")
 
     def set_use_htp_preference(self, use_htp: bool = True):
         if self.handle.value is None:
@@ -259,7 +267,7 @@ class QualcommOptions:
         if not self._set_use_htp:
             return
         st = self._set_use_htp(self.handle, bool(use_htp))
-        _check_ok(self.fns, st, "LiteRtQualcommOptionsSetUseHtpPreference")
+        _check_ok(self.p.fns, st, "LiteRtQualcommOptionsSetUseHtpPreference")
 
     def set_htp_performance_mode(self, mode: int):
         if self.handle.value is None:
@@ -267,7 +275,7 @@ class QualcommOptions:
         if not self._set_perf:
             return
         st = self._set_perf(self.handle, int(mode))
-        _check_ok(self.fns, st, "LiteRtQualcommOptionsSetHtpPerformanceMode")
+        _check_ok(self.p.fns, st, "LiteRtQualcommOptionsSetHtpPerformanceMode")
 
     def attach_to_litert_options(self, options_handle: LiteRtOptions):
         if self.handle.value is None:
@@ -275,7 +283,7 @@ class QualcommOptions:
         if not self._add_opaque:
             raise RuntimeError("LiteRtAddOpaqueOptions not exported by runtime.")
         st = self._add_opaque(options_handle, self.handle)
-        _check_ok(self.fns, st, "LiteRtAddOpaqueOptions(Qualcomm)")
+        _check_ok(self.p.fns, st, "LiteRtAddOpaqueOptions(Qualcomm)")
 
 
 @dataclass(frozen=True)
@@ -301,7 +309,6 @@ class LiteRtInterpreter:
         )
         self.debug = debug
         self.p = LiteRtLibProvider(runtime_lib)
-        self.fns = self.p.fns
 
         self.environment = LiteRtEnvironment(None)
         self.model = LiteRtModel(None)
@@ -323,15 +330,15 @@ class LiteRtInterpreter:
         _log.debug("Model file read: %r (%d bytes)", model_path, len(data))
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
 
-        st = self.fns["LiteRtCreateModelFromBuffer"](
+        st = self.p.fns["LiteRtCreateModelFromBuffer"](
             ctypes.cast(buf, c_void_p),
             c_size_t(len(data)),
             byref(self.model),
         )
-        _check_ok(self.fns, st, "LiteRtCreateModelFromBuffer")
+        _check_ok(self.p.fns, st, "LiteRtCreateModelFromBuffer")
 
-        st = self.fns["LiteRtCreateOptions"](byref(self.options))
-        _check_ok(self.fns, st, "LiteRtCreateOptions")
+        st = self.p.fns["LiteRtCreateOptions"](byref(self.options))
+        _check_ok(self.p.fns, st, "LiteRtCreateOptions")
 
         # Match LiteRT run_model's environment construction exactly:
         #   EnvironmentOptions::Tag::kAutoRegisterAccelerators = CPU|NPU for "--accelerator npu"
@@ -358,11 +365,11 @@ class LiteRtInterpreter:
         env_options[2].value.value.str_value = ctypes.cast(self._env_compiler_plugin_dir_buf, c_char_p)
 
         self._env_options = env_options
-        st = self.fns["LiteRtCreateEnvironment"](c_int(3), self._env_options, byref(self.environment))
-        _check_ok(self.fns, st, "LiteRtCreateEnvironment")
+        st = self.p.fns["LiteRtCreateEnvironment"](c_int(3), self._env_options, byref(self.environment))
+        _check_ok(self.p.fns, st, "LiteRtCreateEnvironment")
 
-        st = self.fns["LiteRtSetOptionsHardwareAccelerators"](self.options, c_int(int(hw_mask)))
-        _check_ok(self.fns, st, "LiteRtSetOptionsHardwareAccelerators")
+        st = self.p.fns["LiteRtSetOptionsHardwareAccelerators"](self.options, c_int(int(hw_mask)))
+        _check_ok(self.p.fns, st, "LiteRtSetOptionsHardwareAccelerators")
 
         if compile_on_init:
             _log.debug("Compiling model on init (hw_mask=0x%x)", hw_mask)
@@ -374,7 +381,7 @@ class LiteRtInterpreter:
             "has_qualcomm_options_create": self.p.has_symbol("LiteRtQualcommOptionsCreate"),
             "has_qualcomm_use_htp": self.p.has_symbol("LiteRtQualcommOptionsSetUseHtpPreference"),
             "has_qualcomm_perf_mode": self.p.has_symbol("LiteRtQualcommOptionsSetHtpPerformanceMode"),
-            "has_tensorbuffer_packed_size": self.fns.get("LiteRtGetTensorBufferPackedSize") is not None,
+            "has_tensorbuffer_packed_size": self.p.fns.get("LiteRtGetTensorBufferPackedSize") is not None,
         }
 
     def npu_compiled(self) -> bool:
@@ -382,8 +389,8 @@ class LiteRtInterpreter:
 
     def _create_compiled(self) -> LiteRtCompiledModel:
         tmp = LiteRtCompiledModel(None)
-        st = self.fns["LiteRtCreateCompiledModel"](self.environment, self.model, self.options, byref(tmp))
-        _check_ok(self.fns, st, "LiteRtCreateCompiledModel")
+        st = self.p.fns["LiteRtCreateCompiledModel"](self.environment, self.model, self.options, byref(tmp))
+        _check_ok(self.p.fns, st, "LiteRtCreateCompiledModel")
         return tmp
 
     def _recompile_or_raise(self):
@@ -393,24 +400,24 @@ class LiteRtInterpreter:
         self.compiled = new_compiled
         _log.debug("_recompile_or_raise: new compiled handle obtained")
         try:
-            if old and self.fns.get("LiteRtDestroyCompiledModel"):
-                self.fns["LiteRtDestroyCompiledModel"](old)
+            if old and self.p.fns.get("LiteRtDestroyCompiledModel"):
+                self.p.fns["LiteRtDestroyCompiledModel"](old)
         except Exception:
             pass
 
     def _reset_options(self, hw_mask: int):
         try:
-            if self.options and self.fns.get("LiteRtDestroyOptions"):
-                self.fns["LiteRtDestroyOptions"](self.options)
+            if self.options and self.p.fns.get("LiteRtDestroyOptions"):
+                self.p.fns["LiteRtDestroyOptions"](self.options)
         except Exception:
             pass
 
         self.options = LiteRtOptions(None)
-        st = self.fns["LiteRtCreateOptions"](byref(self.options))
-        _check_ok(self.fns, st, "LiteRtCreateOptions(reset)")
+        st = self.p.fns["LiteRtCreateOptions"](byref(self.options))
+        _check_ok(self.p.fns, st, "LiteRtCreateOptions(reset)")
 
-        st = self.fns["LiteRtSetOptionsHardwareAccelerators"](self.options, c_int(int(hw_mask)))
-        _check_ok(self.fns, st, "LiteRtSetOptionsHardwareAccelerators(reset)")
+        st = self.p.fns["LiteRtSetOptionsHardwareAccelerators"](self.options, c_int(int(hw_mask)))
+        _check_ok(self.p.fns, st, "LiteRtSetOptionsHardwareAccelerators(reset)")
 
         self._last_hw_mask = int(hw_mask)
 
@@ -503,16 +510,16 @@ class LiteRtInterpreter:
         _log.info("LiteRtInterpreter.allocate_tensors: signature_index=%d", signature_index)
         try:
             sig = LiteRtSignature(None)
-            st = self.fns["LiteRtGetModelSignature"](self.model, LiteRtParamIndex(signature_index), byref(sig))
-            _check_ok(self.fns, st, "LiteRtGetModelSignature")
+            st = self.p.fns["LiteRtGetModelSignature"](self.model, LiteRtParamIndex(signature_index), byref(sig))
+            _check_ok(self.p.fns, st, "LiteRtGetModelSignature")
 
             n_in = LiteRtParamIndex(0)
-            st = self.fns["LiteRtGetNumSignatureInputs"](sig, byref(n_in))
-            _check_ok(self.fns, st, "LiteRtGetNumSignatureInputs")
+            st = self.p.fns["LiteRtGetNumSignatureInputs"](sig, byref(n_in))
+            _check_ok(self.p.fns, st, "LiteRtGetNumSignatureInputs")
 
             n_out = LiteRtParamIndex(0)
-            st = self.fns["LiteRtGetNumSignatureOutputs"](sig, byref(n_out))
-            _check_ok(self.fns, st, "LiteRtGetNumSignatureOutputs")
+            st = self.p.fns["LiteRtGetNumSignatureOutputs"](sig, byref(n_out))
+            _check_ok(self.p.fns, st, "LiteRtGetNumSignatureOutputs")
 
             _log.info(
                 "LiteRtInterpreter.allocate_tensors: resolved signature. inputs_count=%d outputs_count=%d",
@@ -524,27 +531,32 @@ class LiteRtInterpreter:
             for i in range(int(n_in.value)):
                 _log.debug("LiteRtInterpreter.allocate_tensors: processing input index %d", i)
                 t = LiteRtTensor(None)
-                st = self.fns["LiteRtGetSignatureInputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
-                _check_ok(self.fns, st, f"LiteRtGetSignatureInputTensorByIndex({i})")
+                _log.debug("allocate_tensors input %d: calling LiteRtGetSignatureInputTensorByIndex", i)
+                st = self.p.fns["LiteRtGetSignatureInputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
+                _check_ok(self.p.fns, st, f"LiteRtGetSignatureInputTensorByIndex({i})")
 
                 ty = LiteRtRankedTensorType(None)
-                st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
-                _check_ok(self.fns, st, f"LiteRtGetRankedTensorType(input {i})")
+                _log.debug("allocate_tensors input %d: calling LiteRtGetRankedTensorType", i)
+                st = self.p.fns["LiteRtGetRankedTensorType"](t, byref(ty))
+                _check_ok(self.p.fns, st, f"LiteRtGetRankedTensorType(input {i})")
 
                 req = LiteRtTensorBufferRequirements(None)
-                st = self.fns["LiteRtGetCompiledModelInputBufferRequirements"](
+                _log.debug("allocate_tensors input %d: calling LiteRtGetCompiledModelInputBufferRequirements", i)
+                st = self.p.fns["LiteRtGetCompiledModelInputBufferRequirements"](
                     self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
                 )
-                _check_ok(self.fns, st, f"LiteRtGetCompiledModelInputBufferRequirements(input {i})")
+                _check_ok(self.p.fns, st, f"LiteRtGetCompiledModelInputBufferRequirements(input {i})")
 
                 buf_sz = c_size_t(0)
-                st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
-                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(input {i})")
+                _log.debug("allocate_tensors input %d: calling LiteRtGetTensorBufferRequirementsBufferSize", i)
+                st = self.p.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
+                _check_ok(self.p.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(input {i})")
                 self._in_req_sizes.append(int(buf_sz.value))
 
                 buf_type = c_int(0)
-                st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
-                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(input {i})")
+                _log.debug("allocate_tensors input %d: calling LiteRtGetTensorBufferRequirementsSupportedTensorBufferType", i)
+                st = self.p.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
+                _check_ok(self.p.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(input {i})")
 
                 _log.debug(
                     "LiteRtInterpreter.allocate_tensors: input %d buffer size=%d type=%d",
@@ -552,34 +564,40 @@ class LiteRtInterpreter:
                 )
 
                 tb = LiteRtTensorBuffer(None)
-                st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
-                _check_ok(self.fns, st, f"LiteRtCreateManagedTensorBuffer(input {i})")
+                _log.debug("allocate_tensors input %d: calling LiteRtCreateManagedTensorBuffer", i)
+                st = self.p.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
+                _check_ok(self.p.fns, st, f"LiteRtCreateManagedTensorBuffer(input {i})")
                 self._in_bufs.append(tb)
 
             for i in range(int(n_out.value)):
                 _log.debug("LiteRtInterpreter.allocate_tensors: processing output index %d", i)
                 t = LiteRtTensor(None)
-                st = self.fns["LiteRtGetSignatureOutputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
-                _check_ok(self.fns, st, f"LiteRtGetSignatureOutputTensorByIndex({i})")
+                _log.debug("allocate_tensors output %d: calling LiteRtGetSignatureOutputTensorByIndex", i)
+                st = self.p.fns["LiteRtGetSignatureOutputTensorByIndex"](sig, LiteRtParamIndex(i), byref(t))
+                _check_ok(self.p.fns, st, f"LiteRtGetSignatureOutputTensorByIndex({i})")
 
                 ty = LiteRtRankedTensorType(None)
-                st = self.fns["LiteRtGetRankedTensorType"](t, byref(ty))
-                _check_ok(self.fns, st, f"LiteRtGetRankedTensorType(output {i})")
+                _log.debug("allocate_tensors output %d: calling LiteRtGetRankedTensorType", i)
+                st = self.p.fns["LiteRtGetRankedTensorType"](t, byref(ty))
+                _check_ok(self.p.fns, st, f"LiteRtGetRankedTensorType(output {i})")
 
                 req = LiteRtTensorBufferRequirements(None)
-                st = self.fns["LiteRtGetCompiledModelOutputBufferRequirements"](
+                _log.debug("allocate_tensors output %d: calling LiteRtGetCompiledModelOutputBufferRequirements", i)
+                st = self.p.fns["LiteRtGetCompiledModelOutputBufferRequirements"](
                     self.compiled, LiteRtParamIndex(signature_index), LiteRtParamIndex(i), byref(req)
                 )
-                _check_ok(self.fns, st, f"LiteRtGetCompiledModelOutputBufferRequirements(output {i})")
+                _check_ok(self.p.fns, st, f"LiteRtGetCompiledModelOutputBufferRequirements(output {i})")
 
                 buf_sz = c_size_t(0)
-                st = self.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
-                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(output {i})")
+                _log.debug("allocate_tensors output %d: calling LiteRtGetTensorBufferRequirementsBufferSize", i)
+                st = self.p.fns["LiteRtGetTensorBufferRequirementsBufferSize"](req, byref(buf_sz))
+                _check_ok(self.p.fns, st, f"LiteRtGetTensorBufferRequirementsBufferSize(output {i})")
                 self._out_req_sizes.append(int(buf_sz.value))
 
                 buf_type = c_int(0)
-                st = self.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
-                _check_ok(self.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(output {i})")
+                _log.debug("allocate_tensors output %d: calling LiteRtGetTensorBufferRequirementsSupportedTensorBufferType", i)
+                st = self.p.fns["LiteRtGetTensorBufferRequirementsSupportedTensorBufferType"](req, c_int(0), byref(buf_type))
+                _check_ok(self.p.fns, st, f"LiteRtGetTensorBufferRequirementsSupportedTensorBufferType(output {i})")
 
                 _log.debug(
                     "LiteRtInterpreter.allocate_tensors: output %d buffer size=%d type=%d",
@@ -587,8 +605,9 @@ class LiteRtInterpreter:
                 )
 
                 tb = LiteRtTensorBuffer(None)
-                st = self.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
-                _check_ok(self.fns, st, f"LiteRtCreateManagedTensorBuffer(output {i})")
+                _log.debug("allocate_tensors output %d: calling LiteRtCreateManagedTensorBuffer", i)
+                st = self.p.fns["LiteRtCreateManagedTensorBuffer"](self.environment, buf_type, byref(ty), buf_sz, byref(tb))
+                _check_ok(self.p.fns, st, f"LiteRtCreateManagedTensorBuffer(output {i})")
                 self._out_bufs.append(tb)
 
             _log.info("LiteRtInterpreter.allocate_tensors: successfully allocated all tensor buffers")
@@ -612,28 +631,28 @@ class LiteRtInterpreter:
             data = data + (b"\x00" * (req - len(data)))
 
         ptr = c_void_p(None)
-        st = self.fns["LiteRtLockTensorBuffer"](self._in_bufs[index], byref(ptr), LiteRtTensorBufferLockMode(lock_mode))
-        _check_ok(self.fns, st, "LiteRtLockTensorBuffer(input)")
+        st = self.p.fns["LiteRtLockTensorBuffer"](self._in_bufs[index], byref(ptr), LiteRtTensorBufferLockMode(lock_mode))
+        _check_ok(self.p.fns, st, "LiteRtLockTensorBuffer(input)")
         ctypes.memmove(ptr, data, len(data))
-        st = self.fns["LiteRtUnlockTensorBuffer"](self._in_bufs[index])
-        _check_ok(self.fns, st, "LiteRtUnlockTensorBuffer(input)")
+        st = self.p.fns["LiteRtUnlockTensorBuffer"](self._in_bufs[index])
+        _check_ok(self.p.fns, st, "LiteRtUnlockTensorBuffer(input)")
 
     def read_output_bytes(self, index: int, lock_mode: int = 0) -> bytes:
-        get_packed = self.fns.get("LiteRtGetTensorBufferPackedSize")
+        get_packed = self.p.fns.get("LiteRtGetTensorBufferPackedSize")
         if get_packed:
             sz = c_size_t(0)
             st = get_packed(self._out_bufs[index], byref(sz))
-            _check_ok(self.fns, st, "LiteRtGetTensorBufferPackedSize")
+            _check_ok(self.p.fns, st, "LiteRtGetTensorBufferPackedSize")
             size = int(sz.value)
         else:
             size = self._out_req_sizes[index]
 
         ptr = c_void_p(None)
-        st = self.fns["LiteRtLockTensorBuffer"](self._out_bufs[index], byref(ptr), LiteRtTensorBufferLockMode(lock_mode))
-        _check_ok(self.fns, st, "LiteRtLockTensorBuffer(output)")
+        st = self.p.fns["LiteRtLockTensorBuffer"](self._out_bufs[index], byref(ptr), LiteRtTensorBufferLockMode(lock_mode))
+        _check_ok(self.p.fns, st, "LiteRtLockTensorBuffer(output)")
         data = ctypes.string_at(ptr, size) if size else b""
-        st = self.fns["LiteRtUnlockTensorBuffer"](self._out_bufs[index])
-        _check_ok(self.fns, st, "LiteRtUnlockTensorBuffer(output)")
+        st = self.p.fns["LiteRtUnlockTensorBuffer"](self._out_bufs[index])
+        _check_ok(self.p.fns, st, "LiteRtUnlockTensorBuffer(output)")
         return data
 
     def invoke(self, signature_index: int = 0):
@@ -643,13 +662,13 @@ class LiteRtInterpreter:
         )
         in_arr = (LiteRtTensorBuffer * len(self._in_bufs))(*self._in_bufs)
         out_arr = (LiteRtTensorBuffer * len(self._out_bufs))(*self._out_bufs)
-        st = self.fns["LiteRtRunCompiledModel"](
+        st = self.p.fns["LiteRtRunCompiledModel"](
             self.compiled,
             LiteRtParamIndex(signature_index),
             c_size_t(len(self._in_bufs)), in_arr,
             c_size_t(len(self._out_bufs)), out_arr,
         )
-        _check_ok(self.fns, st, "LiteRtRunCompiledModel")
+        _check_ok(self.p.fns, st, "LiteRtRunCompiledModel")
         _log.debug("invoke: completed successfully")
 
     def close(self):
@@ -658,38 +677,48 @@ class LiteRtInterpreter:
         _log.info("LiteRtInterpreter.close: releasing all native handles")
         self._closed = True
 
-        destroy_tb = self.fns.get("LiteRtDestroyTensorBuffer")
-        if destroy_tb:
-            for tb in self._in_bufs:
-                try:
-                    if tb:
-                        destroy_tb(tb)
-                except Exception:
-                    pass
-            for tb in self._out_bufs:
-                try:
-                    if tb:
-                        destroy_tb(tb)
-                except Exception:
-                    pass
+        if self.p.fns:
+            destroy_tb = self.p.fns.get("LiteRtDestroyTensorBuffer")
+            if destroy_tb:
+                for tb in self._in_bufs:
+                    try:
+                        if tb:
+                            destroy_tb(tb)
+                    except Exception:
+                        pass
+                for tb in self._out_bufs:
+                    try:
+                        if tb:
+                            destroy_tb(tb)
+                    except Exception:
+                        pass
 
         self._in_bufs, self._out_bufs = [], []
         self._in_req_sizes, self._out_req_sizes = [], []
 
         for destroy_name, attr in [
             ("LiteRtDestroyCompiledModel", "compiled"),
-            ("LiteRtDestroyEnvironment", "environment"),
             ("LiteRtDestroyOptions", "options"),
             ("LiteRtDestroyModel", "model"),
+            ("LiteRtDestroyEnvironment", "environment"),
         ]:
             h = getattr(self, attr, None)
             try:
-                fn = self.fns.get(destroy_name)
+                fn = self.p.fns.get(destroy_name) if self.p.fns else None
                 if fn and h:
                     fn(h)
             except Exception:
                 pass
             setattr(self, attr, None)
+
+        if hasattr(self, "p") and self.p:
+            try:
+                if hasattr(self.p, "close"):
+                    self.p.close()
+            except Exception:
+                pass
+
+        _log.info("END")
 
     def __del__(self):
         try:
