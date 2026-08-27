@@ -81,6 +81,7 @@ services:
       - ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
       - GGML_HEXAGON_MULTI_DEVICE=1
       - GGML_LOG_LEVEL=${GGML_LOG_LEVEL:-1}
+      - LLAMACPP_SOCKET_TIMEOUT_SEC=${LLAMACPP_SOCKET_TIMEOUT_SEC:-180}
 
     volumes:
       # fastrpc reads the device model name from this file to select the

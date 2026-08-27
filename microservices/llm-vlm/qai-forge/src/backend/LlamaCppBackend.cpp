@@ -68,7 +68,9 @@ void LlamaCppBackend::loadModel(const std::string& model_id) {
     LOG_INFO("[LlamaCppBackend] Loading model: " + model_id + " from " + model_path_);
 
     // Start llama-server worker (pass model_id, model_path, and binary_path)
-    worker_port_ = worker_manager_->startWorker(model_id_, model_path_, server_binary_path_, 4096);
+    int context_size = ModelConfigManager::getInstance().getContextSize(model_id_);
+    LOG_INFO("[LlamaCppBackend] Resolved context size: " + std::to_string(context_size));
+    worker_port_ = worker_manager_->startWorker(model_id_, model_path_, server_binary_path_, context_size);
     if (worker_port_ < 0) {
         throw std::runtime_error("Failed to start llama-server worker");
     }
@@ -173,6 +175,26 @@ int LlamaCppBackend::createSocket(const std::string& host, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         throw std::runtime_error("Failed to create socket");
+    }
+
+    // Set socket receive and send timeouts
+    long timeout_sec = 300;
+    const char* timeout_env = std::getenv("LLAMACPP_SOCKET_TIMEOUT_SEC");
+    if (timeout_env && timeout_env[0] != '\0') {
+        try {
+            timeout_sec = std::stol(timeout_env);
+        } catch (...) {
+            LOG_WARN("[LlamaCppBackend] Invalid LLAMACPP_SOCKET_TIMEOUT_SEC value, falling back to 300s");
+        }
+    }
+    struct timeval timeout;
+    timeout.tv_sec = timeout_sec;
+    timeout.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        LOG_WARN("[LlamaCppBackend] Failed to set SO_RCVTIMEO on socket");
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        LOG_WARN("[LlamaCppBackend] Failed to set SO_SNDTIMEO on socket");
     }
 
     struct sockaddr_in addr;

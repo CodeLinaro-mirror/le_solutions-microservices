@@ -31,8 +31,20 @@ GgufMetadataReader::GgufMetadata GgufMetadataReader::readMetadata(const std::str
     // Extract metadata from GGUF header
     // These keys are standard across GGUF files from llama.cpp ecosystem
     result.chatTemplate = extractString(ctx, "tokenizer.chat_template");
-    result.contextLength = static_cast<int32_t>(extractUint32(ctx, "llama.context_length", 4096));
     result.architecture = extractString(ctx, "general.architecture");
+
+    // Read context length using architecture-specific key
+    // Different architectures use different keys: gemma4.context_length, llama.context_length, etc.
+    uint32_t ctx_len = 0;
+    if (!result.architecture.empty()) {
+        std::string arch_key = result.architecture + ".context_length";
+        ctx_len = extractUint32(ctx, arch_key.c_str(), 0);
+    }
+    // Fallback to llama key for backward compatibility with Llama-family models
+    if (ctx_len == 0) {
+        ctx_len = extractUint32(ctx, "llama.context_length", 4096);
+    }
+    result.contextLength = static_cast<int32_t>(ctx_len);
 
     // Mark as valid if we successfully opened the file
     result.isValid = true;

@@ -313,6 +313,18 @@ void ModelConfigManager::scanModelBundles() {
             config.model_type          = "generative";
             config.config_file         = file_path;
             config.context_size        = meta.isValid ? meta.contextLength : 4096;
+
+            // Apply context capping from environment
+            const char* cap_env_gguf = std::getenv("GENAI_CONTEXT_CAPPING");
+            if (cap_env_gguf) {
+                try {
+                    int cap = std::stoi(cap_env_gguf);
+                    if (cap != -1) {
+                        config.context_size = std::min(config.context_size, cap);
+                    }
+                } catch (...) {}
+            }
+
             config.supports_streaming  = true;
             config.supports_vision     = false;
             config.supports_thinking   = false;
@@ -437,7 +449,9 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     if (cap_env) {
         try {
             int cap = std::stoi(cap_env);
-            config.context_size = std::min(config.context_size, cap);
+            if (cap != -1) {
+                config.context_size = std::min(config.context_size, cap);
+            }
         } catch (...) {}
     }
 
@@ -546,7 +560,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
             spec.quant_zero_point = qp.value("zero_point", 0);
         }
     };
-	
+
     if (metadata.contains("input_specs") && metadata["input_specs"].is_array()) {
         for (const auto& spec_json : metadata["input_specs"]) {
             ModelTensorSpec spec;
@@ -872,6 +886,7 @@ void ModelConfigManager::applyContextCapping(json& data, const std::string& bund
     if (!cap_env) return;
     int cap;
     try { cap = std::stoi(cap_env); } catch (...) { return; }
+    if (cap == -1) return;
 
     auto cap_node = [&](json& node, const std::string& node_key) {
         if (!node.is_object()) return;
@@ -956,7 +971,12 @@ int ModelConfigManager::getContextSize(const std::string& model_id) const {
     int size = (it != models_.end()) ? it->second.context_size : 4096;
     const char* cap_env = std::getenv("GENAI_CONTEXT_CAPPING");
     if (cap_env) {
-        try { size = std::min(size, std::stoi(cap_env)); } catch (...) {}
+        try {
+            int cap = std::stoi(cap_env);
+            if (cap != -1) {
+                size = std::min(size, cap);
+            }
+        } catch (...) {}
     }
     return size;
 }
