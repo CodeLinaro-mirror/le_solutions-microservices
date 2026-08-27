@@ -81,6 +81,12 @@ public:
     static bool exists(const std::string& url);
 
     /**
+     * Return Content-Length for an asset URL via HTTP HEAD.
+     * Returns 0 if the server does not provide a positive length.
+     */
+    static int64_t contentLength(const std::string& url);
+
+    /**
      * Resolve the best available URL for a model asset.
      *
      * Tries chipset-specific URL first (if chipset is non-empty), then falls

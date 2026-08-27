@@ -110,13 +110,20 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Downloading QAIRT SDK ${QAIRT_LITERT_VERSION}..."
 mkdir -p "${QAIRT_LITERT_DIR}"
-wget -t 3 -T 120 --no-verbose \
-    -P "${QAIRT_LITERT_DIR}" \
-    "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip"
+QAIRT_ZIP="${QAIRT_LITERT_DIR}/v${QAIRT_LITERT_VERSION}.zip"
+QAIRT_URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip"
+i=1
+while [ "$i" -le 10 ]; do
+    wget -c -t 1 -T 120 --no-verbose -O "${QAIRT_ZIP}" "${QAIRT_URL}" && break
+    echo "Download attempt $i failed, retrying in 15 seconds..."
+    sleep 15
+    i=$((i + 1))
+done
+[ -f "${QAIRT_ZIP}" ] || { echo "ERROR: QAIRT SDK download failed after 10 attempts"; exit 1; }
 
 cd "${QAIRT_LITERT_DIR}"
-unzip "v${QAIRT_LITERT_VERSION}.zip"
-rm -f "v${QAIRT_LITERT_VERSION}.zip"
+unzip "${QAIRT_ZIP}"
+rm -f "${QAIRT_ZIP}"
 
 # Create compatibility symlink
 ln -sf "${QAIRT_LITERT_DIR}/qairt/${QAIRT_LITERT_VERSION}" \

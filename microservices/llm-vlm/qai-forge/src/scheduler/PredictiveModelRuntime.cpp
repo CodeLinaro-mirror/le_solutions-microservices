@@ -6,6 +6,7 @@
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
+#include "qai_forge/utils/UseLock.h"
 #include <stdexcept>
 
 namespace scheduler {
@@ -176,6 +177,7 @@ void PredictiveModelRuntime::loadModelLocked() {
             throw std::runtime_error("Backend health check failed after initialization");
         }
 
+        qai_forge::writeUseLock(model_id_);
         setStateLocked(ModelRuntimeState::Idle);
         LOG_INFO("[PredictiveModelRuntime] Model '" << model_id_
                  << "' loaded successfully (backend: " << backend_->name() << ")");
@@ -205,6 +207,7 @@ void PredictiveModelRuntime::unloadBackend(bool force) {
         if (backend_) {
             backend_->shutdown();
         }
+        qai_forge::removeUseLock(model_id_);
         backend_healthy_ = false;
         LOG_DEBUG("[PredictiveModelRuntime] Backend shutdown completed for model '"
                   << model_id_ << "'");

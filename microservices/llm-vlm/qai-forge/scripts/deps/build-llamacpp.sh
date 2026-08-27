@@ -12,7 +12,7 @@ set -eu
 # ============================================================================
 
 DEPLOY_DIR="${DEPLOY_DIR:-/build/deploy}"
-LLAMACPP_VERSION="${LLAMACPP_VERSION:-b5616}"
+LLAMACPP_VERSION="${LLAMACPP_VERSION:-b10182}"
 LLAMACPP_SRC_DIR="${LLAMACPP_SRC_DIR:-/build/llama.cpp}"
 LLAMACPP_INSTALL_DIR="${LLAMACPP_INSTALL_DIR:-/build/llamacpp-install}"
 

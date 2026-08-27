@@ -91,7 +91,10 @@ set(SERVER_SOURCES
     # Admin model management (admin-only, requires X-Admin-Token)
     src/controllers/AdminController.cpp
     src/admin/AiHubClient.cpp
+    src/admin/DiskSpaceGuard.cpp
     src/admin/GenieXClient.cpp
+    src/admin/HfDirectClient.cpp
+    src/admin/ModelAssetLock.cpp
     src/admin/ModelFetchJob.cpp
 
     # OIP v2 — model discovery (GET /v1/models, GET /v2/models, GET /v2/models/{model})

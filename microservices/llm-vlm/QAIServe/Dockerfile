@@ -89,6 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         patch \
         pkg-config \
         file \
+        patchelf \
         default-jdk-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -146,7 +147,10 @@ ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
 
 COPY qai-forge/scripts/deps/build-litert-lm-incremental.sh /tmp/
-RUN chmod +x /tmp/build-litert-lm-incremental.sh && /tmp/build-litert-lm-incremental.sh && rm /tmp/build-litert-lm-incremental.sh
+COPY qai-forge/scripts/deps/build-rust-wrappers.sh /tmp/
+RUN chmod +x /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh && \
+    /tmp/build-litert-lm-incremental.sh && \
+    rm /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: Builder
