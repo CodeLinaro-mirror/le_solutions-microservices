@@ -93,6 +93,43 @@ json convert_vlm_content_text_parts(const json& content) {
     return parts;
 }
 
+std::string text_runtime_content(const json& content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return content.is_null() ? std::string() : content.dump();
+    }
+
+    std::ostringstream text;
+    bool first = true;
+    for (const auto& part : content) {
+        std::string part_text;
+        if (part.is_string()) {
+            part_text = part.get<std::string>();
+        } else if (part.is_object()) {
+            std::string type = part.value("type", "");
+            if (is_vlm_image_type(type)) {
+                continue;
+            }
+            if (type == "input_text" || type == "text"
+                || type == "output_text" || part.contains("text")) {
+                part_text = part.value("text", "");
+            }
+        }
+
+        if (part_text.empty()) {
+            continue;
+        }
+        if (!first) {
+            text << "\n";
+        }
+        text << part_text;
+        first = false;
+    }
+    return text.str();
+}
+
 void attach_image_to_message(json& message, const std::string& image_url) {
     if (image_url.empty() || !message.is_object()) {
         return;
@@ -244,6 +281,45 @@ json input_to_messages(const json& input, const std::string& system_prompt) {
     }
 
     return messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages(const json& messages) {
+    json runtime_messages = json::array();
+    if (!messages.is_array()) {
+        return runtime_messages;
+    }
+
+    for (const auto& message : messages) {
+        if (!message.is_object()) {
+            continue;
+        }
+
+        json runtime_message = message;
+        bool has_tool_calls =
+            runtime_message.contains("tool_calls")
+            && runtime_message["tool_calls"].is_array()
+            && !runtime_message["tool_calls"].empty();
+        bool is_tool_result =
+            runtime_message.value("role", "") == "tool"
+            && runtime_message.contains("tool_call_id");
+
+        if (runtime_message.contains("content")) {
+            runtime_message["content"] =
+                text_runtime_content(runtime_message["content"]);
+        }
+
+        std::string content = runtime_message.value("content", "");
+        // Image-only text-runtime messages drop out; tool exchanges must stay paired.
+        if (content.empty() && !has_tool_calls && !is_tool_result) {
+            continue;
+        }
+        runtime_messages.push_back(std::move(runtime_message));
+    }
+
+    return runtime_messages;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
