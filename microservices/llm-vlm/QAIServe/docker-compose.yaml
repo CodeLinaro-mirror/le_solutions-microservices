@@ -88,6 +88,7 @@ services:
       - GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
       - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
       - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
+      - MODEL_RESIDENCY_TTL_SECONDS=${MODEL_RESIDENCY_TTL_SECONDS:-600}
 
       # QNN Predictive AI worker
       - QNN_WORKER_BINARY=/usr/bin/qnn-inference-worker

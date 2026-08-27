@@ -10,6 +10,7 @@ find_package(qai_forge REQUIRED)
 find_package(CURL REQUIRED)
 find_package(libzip REQUIRED)
 find_package(Protobuf REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # gRPC's own CMake package (gRPCConfig.cmake) unconditionally expects an
@@ -102,8 +103,16 @@ set(SERVER_SOURCES
     src/oip/OipBinaryParser.cpp
     src/oip/MultipartParser.cpp
 
+    # Chat Completions endpoint (OpenAI-compatible API)
+    src/ChatCompletionUtils.cpp
+    src/ChatCompletionStore.cpp
+    src/controllers/ChatCompletionsController.cpp
+
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
+    src/ResponseStore.cpp
+    src/ResponsesCompactionService.cpp
+    src/TokenBudgetUtils.cpp
 
     # MCP Layer 1.5 — client infrastructure
     src/mcp/McpStdioClient.cpp
@@ -170,6 +179,7 @@ target_link_libraries(qaiserve PRIVATE
     gRPC::grpc++
     protobuf::libprotobuf
     ${GENIEX_LIB}
+    OpenSSL::Crypto
     # dlopen/dlsym/dlclose for PostprocRegistry's runtime plugin loading.
     ${CMAKE_DL_LIBS}
 )

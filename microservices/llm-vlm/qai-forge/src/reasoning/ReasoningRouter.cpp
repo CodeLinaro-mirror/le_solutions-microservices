@@ -179,10 +179,21 @@ void ReasoningRouter::emitThinkingChunk(const std::string& text,
         std::string truncation_msg = "\n[Thinking truncated]\n";
         full_thinking_ += truncation_msg;
 
+        StreamChunk truncation_chunk;
+        truncation_chunk.id = session_id_;
+        truncation_chunk.model = model_id_;
+        truncation_chunk.reasoning_content = truncation_msg;
+        results.push_back(truncation_chunk);
+
+        // Redirect the fragment that tripped the budget into the answer channel
+        // instead of discarding it. In blocking mode, route() is called once with
+        // the entire remaining response as a single fragment, so dropping it here
+        // would leave the answer empty.
         StreamChunk chunk;
         chunk.id = session_id_;
         chunk.model = model_id_;
-        chunk.reasoning_content = truncation_msg;
+        chunk.content_delta = text;
+        full_answer_ += text;
         results.push_back(chunk);
 
         // Force router out of thinking channel

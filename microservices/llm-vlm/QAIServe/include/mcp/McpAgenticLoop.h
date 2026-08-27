@@ -11,7 +11,7 @@
 // handles the entire multi-step interaction internally.
 //
 // Loop algorithm:
-//   1. Submit request to ChatOrchestrator with MCP tools (as function format)
+//   1. Submit request to ModelScheduler with MCP tools
 //   2. If finish_reason == "tool_calls":
 //        a. For each tool_call in the response:
 //             - Resolve server via McpClientRegistry
@@ -29,7 +29,7 @@
 //     response.output_text.delta     — for each token in the final answer
 //
 // Layer boundary:
-//   McpAgenticLoop calls ChatOrchestrator::handleBlocking() (Layer 2).
+//   McpAgenticLoop calls ModelScheduler for model inference.
 //   It never touches InferenceWorkerManager directly.
 //   It is called by ResponsesController (Layer 1).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,7 +83,8 @@ public:
      * @throws McpException   on tool call failure (if stop_on_tool_error=true)
      */
     McpLoopResult run(const CreateChatCompletionRequest& base_request,
-                       const json& mcp_tools);
+                       const json& mcp_tools,
+                       const std::string& response_id = "");
 
     // ── Streaming variant ─────────────────────────────────────────────────────
 
