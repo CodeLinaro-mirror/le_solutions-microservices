@@ -5,6 +5,7 @@
 
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/InferenceScheduler.h"
 #include "qai_forge/scheduler/ToolChainTable.h"
 #include "qai_forge/utils/Logger.h"
@@ -133,7 +134,7 @@ int httpStatusForSubmitStatus(scheduler::SubmitStatus status) {
         case scheduler::SubmitStatus::REJECTED_TOOL_RESPONSE_TIMEOUT:
             return 408;
         case scheduler::SubmitStatus::REJECTED_QUEUE_FULL:
-            return 429;
+            return 503;
         case scheduler::SubmitStatus::REJECTED_ADMISSION_TIMEOUT:
         case scheduler::SubmitStatus::REJECTED_SHUTTING_DOWN:
             return 503;
@@ -357,12 +358,55 @@ struct QaiForge::Impl {
         const std::string job_id = request.request_id.empty()
             ? generatedPredictiveJobId()
             : request.request_id;
-        scheduler::PredictiveScheduleMetadata metadata{
+        scheduler::PredictiveJobContext context{
             job_id,
             request.model,
+            request,
+        };
+
+        auto promise =
+            std::make_shared<std::promise<TensorInferenceResponse>>();
+        auto future = promise->get_future();
+        auto callback_mutex = std::make_shared<std::mutex>();
+        auto completed = std::make_shared<bool>(false);
+
+        scheduler::PredictiveCallbacks callbacks;
+        callbacks.on_complete =
+            [promise, callback_mutex, completed](
+                const TensorInferenceResponse& response) {
+                setPromiseOnce(
+                    promise,
+                    callback_mutex,
+                    completed,
+                    [&response](std::promise<TensorInferenceResponse>& value) {
+                        value.set_value(response);
+                    });
+            };
+        callbacks.on_error =
+            [promise, callback_mutex, completed](const GenAIException& error) {
+                setPromiseOnce(
+                    promise,
+                    callback_mutex,
+                    completed,
+                    [&error](std::promise<TensorInferenceResponse>& value) {
+                        value.set_exception(std::make_exception_ptr(error));
+                    });
+            };
+
+        scheduler::PredictiveJobPtr job =
+            BackendFactory::createPredictiveOrchestrator()->createJob(
+                std::move(context),
+                std::move(callbacks));
+        scheduler::PredictiveScheduleMetadata metadata{
+            job->job_id,
+            job->model_id,
         };
         scheduler::PredictiveRuntimeHandle handle = scheduler_.reserve(metadata);
-        return handle.submit(request);
+        const scheduler::SubmitResult result = handle.submit(job);
+        if (!result.accepted()) {
+            throw submitErrorToException(result);
+        }
+        return future.get();
     }
 
     void start() {

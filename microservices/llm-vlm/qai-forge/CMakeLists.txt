@@ -210,6 +210,7 @@ set(QAI_FORGE_SOURCES
     # Orchestration (Layer 2)
     src/orchestration/GenieOrchestrator.cpp
     src/orchestration/LiteRTLMOrchestrator.cpp
+    src/orchestration/PredictiveOrchestrator.cpp
 
     # Reasoning (Layer 2)
     src/reasoning/ReasoningRouter.cpp

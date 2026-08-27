@@ -59,7 +59,7 @@ struct ModelConfig {
 
     // Model type from metadata.json "model_type" field.
     // "generative"   — LLM/VLM models (routed to GenerativeOrchestrator)
-    // "predictive" — classification/detection/segmentation (routed to PredictiveAIOrchestrator)
+    // "predictive" — classification/detection/segmentation (routed to PredictiveOrchestrator)
     // Defaults to "generative" for backward compatibility with existing bundles.
     std::string model_type = "generative";
 

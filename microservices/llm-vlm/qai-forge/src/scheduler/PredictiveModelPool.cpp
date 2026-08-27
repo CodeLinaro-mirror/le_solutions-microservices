@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/scheduler/PredictiveModelPool.h"
-#include "qai_forge/scheduler/EvictionPolicy.h"
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/backend/IInferenceBackend.h"
 #include "qai_forge/InternalDTOs.h"
@@ -21,7 +20,6 @@ PredictiveModelPool::PredictiveModelPool(
     : config_(std::move(config))
     , factory_(std::move(factory))
     , runtime_events_(std::move(runtime_events))
-    , eviction_policy_(std::make_unique<EvictionPolicy>())
 {
     // Use default factory if none provided
     if (!factory_) {
@@ -78,41 +76,50 @@ PredictiveModelRuntime* PredictiveModelPool::reserve(
     return it->second.runtime.get();
 }
 
-TensorInferenceResponse PredictiveModelPool::submit(
+SubmitResult PredictiveModelPool::submit(
     PredictiveModelRuntime* runtime,
-    const TensorInferenceRequest& request) {
-    if (!runtime) {
-        throw GenAIException(
-            GenAIErrorCode::INTERNAL_ERROR,
-            "Predictive submit is missing its reserved runtime",
-            500);
+    PredictiveJobPtr job) {
+    if (!runtime || !job) {
+        return SubmitResult{
+            SubmitStatus::REJECTED_MODEL_NOT_FOUND,
+            job ? job->job_id : std::string{},
+            "Predictive submit is missing its job or reserved runtime",
+        };
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = runtimes_.find(request.model);
+        if (shutdown_requested_) {
+            return SubmitResult{
+                SubmitStatus::REJECTED_SHUTTING_DOWN,
+                job->job_id,
+                "PredictiveModelPool is shutting down",
+            };
+        }
+
+        auto it = runtimes_.find(job->model_id);
         if (it == runtimes_.end() || it->second.runtime.get() != runtime) {
-            throw GenAIException(
-                GenAIErrorCode::INVALID_REQUEST,
+            return SubmitResult{
+                SubmitStatus::REJECTED_MODEL_NOT_FOUND,
+                job->job_id,
                 "Reserved predictive runtime does not match model '" +
-                    request.model + "'",
-                400);
+                    job->model_id + "'",
+            };
+        }
+        if (!runtime->enqueue(job, config_.max_queue_depth_per_model)) {
+            return SubmitResult{
+                SubmitStatus::REJECTED_QUEUE_FULL,
+                job->job_id,
+                "Predictive queue is full for model '" + job->model_id + "'",
+            };
         }
     }
 
-    TensorInferenceResponse response = runtime->infer(request);
-
-    // Update last_used_at timestamp
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = runtimes_.find(request.model);
-        if (it != runtimes_.end()) {
-            it->second.last_used_at = std::chrono::steady_clock::now();
-            it->second.idle_since.reset();
-        }
-    }
-
-    return response;
+    return SubmitResult{
+        SubmitStatus::QUEUED,
+        job->job_id,
+        "queued",
+    };
 }
 
 void PredictiveModelPool::releaseReservation(
@@ -143,24 +150,24 @@ ModelPoolSnapshot PredictiveModelPool::snapshot() const {
     for (const auto& [model_id, record] : runtimes_) {
         ModelPoolRuntimeSnapshot runtime_snap;
         runtime_snap.model_id = model_id;
-        runtime_snap.state = record.runtime->state();
+        const ModelRuntimeSnapshot detailed = record.runtime->snapshot();
+        runtime_snap.state = detailed.state;
         runtime_snap.active_reserved =
             record.reservation_count > 0 ||
+            detailed.queue.total() > 0 ||
+            detailed.has_running_job ||
             (runtime_snap.state != ModelRuntimeState::NotResident &&
              runtime_snap.state != ModelRuntimeState::Stopped &&
              runtime_snap.state != ModelRuntimeState::Failed);
         runtime_snap.reservation_count = record.reservation_count;
-        runtime_snap.last_used_at = record.last_used_at;
-        runtime_snap.idle_since = record.idle_since;
-        runtime_snap.healthy = (runtime_snap.state == ModelRuntimeState::Idle ||
-                                runtime_snap.state == ModelRuntimeState::Running);
-
-        // Get detailed snapshot from runtime
-        if (record.runtime) {
-            auto rt_snap = record.runtime->snapshot();
-            runtime_snap.has_running_job = rt_snap.has_running_job;
-            runtime_snap.healthy = rt_snap.healthy;
+        runtime_snap.queue = detailed.queue;
+        runtime_snap.has_running_job = detailed.has_running_job;
+        runtime_snap.running_job_id = detailed.running_job_id;
+        runtime_snap.last_used_at = record.runtime->lastUsedAt();
+        if (runtime_snap.state == ModelRuntimeState::Idle) {
+            runtime_snap.idle_since = runtime_snap.last_used_at;
         }
+        runtime_snap.healthy = detailed.healthy;
 
         snap.runtimes.push_back(runtime_snap);
     }
@@ -226,9 +233,11 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
     std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> candidates;
     for (const auto& [model_id, record] : runtimes_) {
         // Only evict idle models
-        if (record.runtime->state() == ModelRuntimeState::Idle &&
+        const ModelRuntimeSnapshot snapshot = record.runtime->snapshot();
+        if (snapshot.state == ModelRuntimeState::Idle &&
+            snapshot.queue.total() == 0 &&
             record.reservation_count == 0) {
-            candidates.emplace_back(model_id, record.last_used_at);
+            candidates.emplace_back(model_id, record.runtime->lastUsedAt());
         }
     }
 
@@ -268,28 +277,19 @@ void PredictiveModelPool::evictIdleModels() {
     std::vector<std::string> to_evict;
 
     for (auto& [model_id, record] : runtimes_) {
-        if (record.runtime->state() != ModelRuntimeState::Idle) {
-            // Not idle right now (e.g. Running/Loading) — any previously
-            // recorded idle_since is stale.
-            record.idle_since.reset();
+        const ModelRuntimeSnapshot snapshot = record.runtime->snapshot();
+        if (snapshot.state != ModelRuntimeState::Idle ||
+            snapshot.queue.total() > 0) {
             continue;
         }
 
         if (record.reservation_count > 0) {
-            record.idle_since.reset();
             continue;
         }
 
-        // Update idle_since if model just became idle
-        if (!record.idle_since) {
-            record.idle_since = now;
-            continue;
-        }
-
-        // Check if model has been idle too long
         const auto idle_duration =
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - *record.idle_since);
+                now - record.runtime->lastUsedAt());
 
         if (idle_duration >= config_.idle_timeout) {
             LOG_INFO("[PredictiveModelPool] Model '" << model_id
@@ -330,19 +330,19 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
         throw;
     }
 
-    // No state-change callback: PredictiveModelRuntime has no executor thread,
-    // so every transition happens synchronously on the caller's thread inside
-    // a call the pool itself made. The pool queries live state via
-    // record.runtime->state() instead of caching a mirrored copy.
+    // The pool queries runtime state directly instead of mirroring it through
+    // callbacks, which avoids callback re-entry while the pool mutex is held.
     auto runtime = std::make_unique<PredictiveModelRuntime>(
-        model_id, std::move(backend), runtime_events_);
+        model_id,
+        std::move(backend),
+        BackendFactory::createPredictiveOrchestrator(),
+        runtime_events_);
 
     runtime->start();
 
     // Insert into map
     RuntimeRecord record;
     record.runtime = std::move(runtime);
-    record.last_used_at = std::chrono::steady_clock::now();
 
     auto [it, inserted] = runtimes_.emplace(model_id, std::move(record));
     if (!inserted) {
@@ -359,11 +359,13 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
 size_t PredictiveModelPool::activeModelCount() const {
     size_t count = 0;
     for (const auto& [model_id, record] : runtimes_) {
-        const ModelRuntimeState state = record.runtime->state();
+        const ModelRuntimeSnapshot snapshot = record.runtime->snapshot();
         if (record.reservation_count > 0 ||
-            (state != ModelRuntimeState::NotResident &&
-             state != ModelRuntimeState::Stopped &&
-             state != ModelRuntimeState::Failed)) {
+            snapshot.queue.total() > 0 ||
+            snapshot.has_running_job ||
+            (snapshot.state != ModelRuntimeState::NotResident &&
+             snapshot.state != ModelRuntimeState::Stopped &&
+             snapshot.state != ModelRuntimeState::Failed)) {
             ++count;
         }
     }

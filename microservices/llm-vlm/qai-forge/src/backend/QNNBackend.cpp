@@ -82,7 +82,6 @@ TensorInferenceResponse QNNBackend::infer(const TensorInferenceRequest& request)
     if (had_error)
         throw std::runtime_error("QNNBackend::infer failed: " + error_msg);
 
-    result.stats.backend_name = "QNN";
     return result;
 }
 

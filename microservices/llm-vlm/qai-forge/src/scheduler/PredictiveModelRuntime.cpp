@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/scheduler/PredictiveModelRuntime.h"
+
 #include "qai_forge/backend/IInferenceBackend.h"
-#include "qai_forge/InternalDTOs.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
+
+#include <chrono>
+#include <cstdlib>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 
 namespace scheduler {
 
@@ -48,133 +53,157 @@ private:
     bool acquired_ = false;
 };
 
+GenAIException stoppedError(const std::string& model_id) {
+    return GenAIException(
+        GenAIErrorCode::HARDWARE_UNAVAILABLE,
+        "Predictive runtime for model '" + model_id + "' is shutting down",
+        503);
+}
+
+GenAIException executionError(const std::string& model_id,
+                              const std::exception& error) {
+    return GenAIException(
+        GenAIErrorCode::INFERENCE_FAILED,
+        "Inference failed for model '" + model_id + "': " + error.what(),
+        500);
+}
+
+void waitForDspMemoryReclaim(const std::string& model_id,
+                             bool stop_requested) {
+    const char* value = std::getenv("MODEL_LOAD_FAILURE_DELAY_MS");
+    long delay_ms = 2000;
+    if (value && value[0] != '\0') {
+        try {
+            delay_ms = std::stol(value);
+        } catch (...) {
+        }
+    }
+
+    if (delay_ms <= 0 || stop_requested) {
+        return;
+    }
+
+    LOG_INFO("[PredictiveModelRuntime] Waiting " << delay_ms
+             << "ms after backend teardown for DSP memory reclaim: model="
+             << model_id);
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+}
+
 } // namespace
 
 PredictiveModelRuntime::PredictiveModelRuntime(
     std::string model_id,
     std::unique_ptr<IInferenceBackend> backend,
+    std::shared_ptr<PredictiveOrchestrator> orchestrator,
     ModelRuntimeEvents events)
-    : model_id_(std::move(model_id))
-    , backend_(std::move(backend))
-    , events_(std::move(events))
-    , last_used_at_(std::chrono::steady_clock::now())
-{
+    : model_id_(std::move(model_id)),
+      backend_(std::move(backend)),
+      orchestrator_(std::move(orchestrator)),
+      events_(std::move(events)) {
+    if (model_id_.empty()) {
+        throw std::invalid_argument(
+            "PredictiveModelRuntime requires a non-empty model id");
+    }
     if (!backend_) {
         throw std::invalid_argument(
-            "PredictiveModelRuntime: backend cannot be null");
+            "PredictiveModelRuntime requires a backend");
+    }
+    if (!orchestrator_) {
+        throw std::invalid_argument(
+            "PredictiveModelRuntime requires an orchestrator");
     }
 }
 
 PredictiveModelRuntime::~PredictiveModelRuntime() {
-    try {
-        stop(true);
-    } catch (const std::exception& e) {
-        LOG_ERROR("[PredictiveModelRuntime] Exception in destructor for model '"
-                  << model_id_ << "': " << e.what());
-    }
+    stop(true);
 }
 
 void PredictiveModelRuntime::start() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (started_) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (started_) {
+            return;
+        }
+        stop_requested_ = false;
+        state_ = ModelRuntimeState::NotResident;
+        started_ = true;
+        try {
+            executor_thread_ =
+                std::thread(&PredictiveModelRuntime::executorLoop, this);
+        } catch (...) {
+            started_ = false;
+            throw;
+        }
     }
-    started_ = true;
-    setStateLocked(ModelRuntimeState::NotResident);
-    LOG_INFO("[PredictiveModelRuntime] Started runtime for model '" << model_id_ << "'");
+    notifyStateChanged(ModelRuntimeState::NotResident);
+    LOG_INFO("[PredictiveModelRuntime] Started executor: model=" << model_id_);
 }
 
-TensorInferenceResponse PredictiveModelRuntime::infer(
-    const TensorInferenceRequest& request) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!started_) {
-        throw GenAIException(
-            GenAIErrorCode::INTERNAL_ERROR,
-            "PredictiveModelRuntime not started for model '" + model_id_ + "'",
-            500);
+bool PredictiveModelRuntime::enqueue(PredictiveJobPtr job,
+                                     size_t max_queue_depth) {
+    if (!job) {
+        throw std::invalid_argument(
+            "PredictiveModelRuntime::enqueue received null job");
     }
 
-    if (stop_requested_) {
-        throw GenAIException(
-            GenAIErrorCode::INTERNAL_ERROR,
-            "PredictiveModelRuntime is shutting down for model '" + model_id_ + "'",
-            503);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!started_ || stop_requested_) {
+            return false;
+        }
+        if (max_queue_depth > 0 && queue_.size() >= max_queue_depth) {
+            return false;
+        }
+        queue_.push_back(std::move(job));
     }
-
-    // Load model if not yet resident, and retry a previously failed load
-    // (otherwise a model stays permanently stuck in Failed after one bad
-    // attempt, surfacing a misleading "not in Idle state" 503 forever).
-    if (state_ == ModelRuntimeState::NotResident ||
-        state_ == ModelRuntimeState::Failed) {
-        loadModelLocked();
-    }
-
-    // Verify model is ready
-    if (state_ != ModelRuntimeState::Idle) {
-        throw GenAIException(
-            GenAIErrorCode::INTERNAL_ERROR,
-            "Model '" + model_id_ + "' is not in Idle state (current: " +
-                std::to_string(static_cast<int>(state_)) + ")",
-            503);
-    }
-
-    // Run inference
-    setStateLocked(ModelRuntimeState::Running);
-    last_used_at_ = std::chrono::steady_clock::now();
-
-    TensorInferenceResponse response;
-    try {
-        LOG_DEBUG("[PredictiveModelRuntime] Running inference for model '"
-                  << model_id_ << "' (request_id: " << request.request_id << ")");
-
-        response = backend_->infer(request);
-        backend_healthy_ = true;
-
-        LOG_DEBUG("[PredictiveModelRuntime] Inference completed for model '"
-                  << model_id_ << "' (latency: " << response.stats.latency_ms << " ms)");
-
-    } catch (const std::exception& e) {
-        backend_healthy_ = false;
-        setStateLocked(ModelRuntimeState::Failed);
-        LOG_ERROR("[PredictiveModelRuntime] Inference failed for model '"
-                  << model_id_ << "': " << e.what());
-        throw GenAIException(
-            GenAIErrorCode::INFERENCE_FAILED,
-            "Inference failed for model '" + model_id_ + "': " + e.what(),
-            500);
-    }
-
-    setStateLocked(ModelRuntimeState::Idle);
-    return response;
+    cv_.notify_one();
+    return true;
 }
 
 void PredictiveModelRuntime::stop(bool force) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!started_) {
-        return;
+    (void)force;
+    std::deque<PredictiveJobPtr> queued;
+    bool should_join = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!started_ && state_ == ModelRuntimeState::Stopped) {
+            return;
+        }
+        stop_requested_ = true;
+        queued.swap(queue_);
+        should_join = executor_thread_.joinable();
     }
 
-    stop_requested_ = true;
-    LOG_INFO("[PredictiveModelRuntime] Stopping runtime for model '"
-             << model_id_ << "' (force=" << force << ")");
+    cv_.notify_all();
+    failJobs(std::move(queued), stoppedError(model_id_));
+    if (should_join) {
+        executor_thread_.join();
+    }
 
-    unloadBackend(force);
-    started_ = false;
-    setStateLocked(ModelRuntimeState::Stopped);
+    setState(ModelRuntimeState::Evicting);
+    if (unloadBackend()) {
+        waitForDspMemoryReclaim(model_id_, false);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        started_ = false;
+        running_job_.reset();
+    }
+    setState(ModelRuntimeState::Stopped);
+    LOG_INFO("[PredictiveModelRuntime] Stopped executor: model=" << model_id_);
 }
 
 ModelRuntimeSnapshot PredictiveModelRuntime::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    ModelRuntimeSnapshot snap;
-    snap.model_id = model_id_;
-    snap.state = state_;
-    snap.has_running_job = (state_ == ModelRuntimeState::Running);
-    snap.healthy = backend_healthy_;
-    // Predictive runtimes don't have queues, so queue fields remain default
-    return snap;
+    ModelRuntimeSnapshot snapshot;
+    snapshot.model_id = model_id_;
+    snapshot.state = state_;
+    snapshot.queue.new_request = queue_.size();
+    snapshot.has_running_job = static_cast<bool>(running_job_);
+    snapshot.running_job_id = running_job_ ? running_job_->job_id : std::string{};
+    snapshot.healthy = backend_healthy_;
+    return snapshot;
 }
 
 ModelRuntimeState PredictiveModelRuntime::state() const {
@@ -186,17 +215,102 @@ std::string PredictiveModelRuntime::modelId() const {
     return model_id_;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Private methods
-// ─────────────────────────────────────────────────────────────────────────────
+std::chrono::steady_clock::time_point
+PredictiveModelRuntime::lastUsedAt() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_used_at_;
+}
 
-void PredictiveModelRuntime::loadModelLocked() {
-    LOG_INFO("[PredictiveModelRuntime] Loading model '" << model_id_ << "'");
-    setStateLocked(ModelRuntimeState::Loading);
+void PredictiveModelRuntime::executorLoop() {
+    while (true) {
+        PredictiveJobPtr job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this]() {
+                return stop_requested_ || !queue_.empty();
+            });
+            if (stop_requested_) {
+                break;
+            }
+            job = std::move(queue_.front());
+            queue_.pop_front();
+            running_job_ = job;
+            last_used_at_ = std::chrono::steady_clock::now();
+        }
+
+        try {
+            ensureModelLoaded();
+            setState(ModelRuntimeState::Running);
+            TensorInferenceResponse response =
+                orchestrator_->execute(*job, *backend_);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                running_job_.reset();
+                last_used_at_ = std::chrono::steady_clock::now();
+            }
+            setState(ModelRuntimeState::Idle);
+            notifyComplete(job, response);
+        } catch (const GenAIException& error) {
+            const ModelRuntimeState failed_state = state();
+            if (failed_state != ModelRuntimeState::Failed) {
+                if (error.http_status >= 500) {
+                    recoverBackend();
+                } else {
+                    setState(ModelRuntimeState::Idle);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                running_job_.reset();
+                last_used_at_ = std::chrono::steady_clock::now();
+            }
+            notifyError(job, error);
+        } catch (const std::exception& error) {
+            recoverBackend();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                running_job_.reset();
+                last_used_at_ = std::chrono::steady_clock::now();
+            }
+            notifyError(job, executionError(model_id_, error));
+        } catch (...) {
+            recoverBackend();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                running_job_.reset();
+                last_used_at_ = std::chrono::steady_clock::now();
+            }
+            notifyError(
+                job,
+                GenAIException(
+                    GenAIErrorCode::INFERENCE_FAILED,
+                    "Inference failed for model '" + model_id_ + "'",
+                    500));
+        }
+    }
+}
+
+void PredictiveModelRuntime::ensureModelLoaded() {
+    bool needs_cleanup = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_) {
+            throw stoppedError(model_id_);
+        }
+        if (state_ == ModelRuntimeState::Idle && backend_healthy_ &&
+            backend_->isHealthy()) {
+            return;
+        }
+        needs_cleanup = backend_started_;
+    }
+
+    if (needs_cleanup && unloadBackend()) {
+        waitForDspMemoryReclaim(model_id_, false);
+    }
+    setState(ModelRuntimeState::Loading);
 
     try {
-        // Resolve model file path from ModelConfigManager
-        const auto* config =
+        const ModelConfig* config =
             ModelConfigManager::getInstance().getModelConfig(model_id_);
         if (!config) {
             throw GenAIException(
@@ -205,82 +319,146 @@ void PredictiveModelRuntime::loadModelLocked() {
                 404);
         }
 
-        const std::string model_file = config->config_file;
-        LOG_DEBUG("[PredictiveModelRuntime] Initializing backend for model '"
-                  << model_id_ << "' (file: " << model_file << ")");
-
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            backend_started_ = true;
+        }
         ScopedLoadPermit load_permit(events_);
-        backend_->initialize(model_id_, model_file);
+        backend_->initialize(model_id_, config->config_file);
         load_permit.release();
-        backend_healthy_ = backend_->isHealthy();
-
-        if (!backend_healthy_) {
-            throw std::runtime_error("Backend health check failed after initialization");
+        if (!backend_->isHealthy()) {
+            throw std::runtime_error(
+                "Backend health check failed after initialization");
         }
 
         qai_forge::writeUseLock(model_id_);
-        setStateLocked(ModelRuntimeState::Idle);
-        LOG_INFO("[PredictiveModelRuntime] Model '" << model_id_
-                 << "' loaded successfully (backend: " << backend_->name() << ")");
-
-    } catch (const std::exception& e) {
-        backend_healthy_ = false;
-        setStateLocked(ModelRuntimeState::Failed);
-        LOG_ERROR("[PredictiveModelRuntime] Failed to load model '"
-                  << model_id_ << "': " << e.what());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            use_lock_written_ = true;
+            backend_healthy_ = true;
+            last_used_at_ = std::chrono::steady_clock::now();
+        }
+        setState(ModelRuntimeState::Idle);
+        LOG_INFO("[PredictiveModelRuntime] Backend loaded: model=" << model_id_
+                 << " backend=" << backend_->name());
+    } catch (const GenAIException&) {
+        if (unloadBackend()) {
+            bool stopping = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping = stop_requested_;
+            }
+            waitForDspMemoryReclaim(model_id_, stopping);
+        }
+        setState(ModelRuntimeState::Failed);
+        throw;
+    } catch (const std::exception& error) {
+        if (unloadBackend()) {
+            bool stopping = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping = stop_requested_;
+            }
+            waitForDspMemoryReclaim(model_id_, stopping);
+        }
+        setState(ModelRuntimeState::Failed);
         throw GenAIException(
             GenAIErrorCode::INTERNAL_ERROR,
-            "Failed to load model '" + model_id_ + "': " + e.what(),
+            "Failed to load model '" + model_id_ + "': " + error.what(),
             500);
     }
 }
 
-void PredictiveModelRuntime::unloadBackend(bool force) {
-    if (state_ == ModelRuntimeState::NotResident ||
-        state_ == ModelRuntimeState::Stopped) {
-        return;
+bool PredictiveModelRuntime::unloadBackend() {
+    bool should_unload = false;
+    bool remove_use_lock = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        should_unload = backend_started_;
+        remove_use_lock = use_lock_written_;
+        backend_started_ = false;
+        use_lock_written_ = false;
+        backend_healthy_ = false;
     }
-
-    LOG_INFO("[PredictiveModelRuntime] Unloading model '" << model_id_ << "'");
-    setStateLocked(ModelRuntimeState::Evicting);
+    if (!should_unload) {
+        return false;
+    }
 
     try {
-        if (backend_) {
-            backend_->shutdown();
-        }
-        qai_forge::removeUseLock(model_id_);
-        backend_healthy_ = false;
-        LOG_DEBUG("[PredictiveModelRuntime] Backend shutdown completed for model '"
-                  << model_id_ << "'");
-    } catch (const std::exception& e) {
-        LOG_ERROR("[PredictiveModelRuntime] Error during backend shutdown for model '"
-                  << model_id_ << "': " << e.what());
+        backend_->shutdown();
+    } catch (const std::exception& error) {
+        LOG_ERROR("[PredictiveModelRuntime] Backend shutdown failed: model="
+                  << model_id_ << " message=\"" << error.what() << "\"");
     }
+    if (remove_use_lock) {
+        qai_forge::removeUseLock(model_id_);
+    }
+    return true;
 }
 
-void PredictiveModelRuntime::setStateLocked(ModelRuntimeState new_state) {
-    if (state_ == new_state) {
-        return;
+void PredictiveModelRuntime::recoverBackend() {
+    if (unloadBackend()) {
+        bool stopping = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping = stop_requested_;
+        }
+        waitForDspMemoryReclaim(model_id_, stopping);
     }
+    setState(ModelRuntimeState::Failed);
+}
 
-    const auto old_state = state_;
-    state_ = new_state;
-
-    LOG_DEBUG("[PredictiveModelRuntime] State transition for model '"
-              << model_id_ << "': " << static_cast<int>(old_state)
-              << " -> " << static_cast<int>(new_state));
-
-    notifyStateChanged(new_state);
+void PredictiveModelRuntime::setState(ModelRuntimeState state) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == state) {
+            return;
+        }
+        state_ = state;
+    }
+    notifyStateChanged(state);
 }
 
 void PredictiveModelRuntime::notifyStateChanged(ModelRuntimeState state) {
-    if (events_.on_state_changed) {
-        try {
-            events_.on_state_changed(model_id_, state);
-        } catch (const std::exception& e) {
-            LOG_ERROR("[PredictiveModelRuntime] Exception in state change callback: "
-                      << e.what());
-        }
+    if (!events_.on_state_changed) {
+        return;
+    }
+    try {
+        events_.on_state_changed(model_id_, state);
+    } catch (...) {
+    }
+}
+
+void PredictiveModelRuntime::failJobs(
+    std::deque<PredictiveJobPtr> jobs,
+    const GenAIException& error) {
+    while (!jobs.empty()) {
+        PredictiveJobPtr job = std::move(jobs.front());
+        jobs.pop_front();
+        notifyError(job, error);
+    }
+}
+
+void PredictiveModelRuntime::notifyComplete(
+    const PredictiveJobPtr& job,
+    const TensorInferenceResponse& response) {
+    if (!job || !job->callbacks.on_complete) {
+        return;
+    }
+    try {
+        job->callbacks.on_complete(response);
+    } catch (...) {
+    }
+}
+
+void PredictiveModelRuntime::notifyError(const PredictiveJobPtr& job,
+                                         const GenAIException& error) {
+    if (!job || !job->callbacks.on_error) {
+        return;
+    }
+    try {
+        job->callbacks.on_error(error);
+    } catch (...) {
     }
 }
 

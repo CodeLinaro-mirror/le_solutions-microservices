@@ -110,7 +110,6 @@ TensorInferenceResponse LiteRTBackend::infer(const TensorInferenceRequest& reque
     if (had_error)
         throw std::runtime_error("LiteRTBackend::infer failed: " + error_msg);
 
-    result.stats.backend_name = "LiteRT";
     return result;
 }
 

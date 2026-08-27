@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/scheduler/PredictiveModelRuntime.h"
+#include "qai_forge/scheduler/PredictiveJob.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/dto/TensorDTOs.h"
@@ -16,14 +17,12 @@
 
 namespace scheduler {
 
-class EvictionPolicy;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // PredictiveModelPool — Manages warm predictive model residency
 //
 // Similar to WarmModelPool but for predictive AI models (classification,
 // detection, segmentation). Key differences:
-//   - No job queuing — infer() is synchronous
+//   - One bounded FIFO per model; public infer() remains synchronous
 //   - No tool-chain leases — predictive models are stateless
 //   - Simpler lifecycle — no activation/drain coordination
 //
@@ -35,7 +34,7 @@ class EvictionPolicy;
 //
 // Concurrency model:
 //   - Different models run concurrently (each in its own PredictiveModelRuntime)
-//   - Same model requests are serialized (by PredictiveModelRuntime's mutex)
+//   - Same-model requests are serialized by that runtime's executor thread
 //
 // Example:
 //   Request A: mobilenet-v3 (QNN)  → PredictiveModelRuntime A → runs concurrently
@@ -67,9 +66,9 @@ public:
     /** @brief Reserve a predictive runtime without passing request payload. */
     PredictiveModelRuntime* reserve(const std::string& model_id);
 
-    /** @brief Run synchronous inference on the reserved runtime. */
-    TensorInferenceResponse submit(PredictiveModelRuntime* runtime,
-                                   const TensorInferenceRequest& request);
+    /** @brief Submit a job to the reserved runtime's bounded FIFO. */
+    SubmitResult submit(PredictiveModelRuntime* runtime,
+                        PredictiveJobPtr job);
 
     /** @brief Release one pending runtime reservation. */
     void releaseReservation(PredictiveModelRuntime* runtime) noexcept;
@@ -82,8 +81,8 @@ public:
     /**
      * Stop the pool and unload all models.
      *
-     * @param force  If true, abort in-flight inference immediately.
-     *               If false, wait for in-flight inference to complete.
+     * @param force  Preserved for API symmetry; predictive inference cannot be
+     *               interrupted, so both modes wait for in-flight work.
      */
     void stop(bool force = false);
 
@@ -91,9 +90,6 @@ private:
     struct RuntimeRecord {
         std::unique_ptr<PredictiveModelRuntime> runtime;
         size_t reservation_count = 0;
-        std::chrono::steady_clock::time_point last_used_at =
-            std::chrono::steady_clock::now();
-        std::optional<std::chrono::steady_clock::time_point> idle_since;
     };
 
     void evictIfNeeded(const std::string& model_id_to_load);
@@ -106,8 +102,6 @@ private:
     WarmModelPoolConfig config_;
     PredictiveBackendFactory factory_;
     ModelRuntimeEvents runtime_events_;
-    std::unique_ptr<EvictionPolicy> eviction_policy_;
-
     mutable std::mutex mutex_;
     bool shutdown_requested_ = false;
     std::unordered_map<std::string, RuntimeRecord> runtimes_;

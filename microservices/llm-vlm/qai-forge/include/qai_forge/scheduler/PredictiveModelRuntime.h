@@ -3,55 +3,32 @@
 
 #pragma once
 
+#include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
-#include "qai_forge/dto/TensorDTOs.h"
+#include "qai_forge/scheduler/PredictiveJob.h"
+
 #include <chrono>
-#include <functional>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 class IInferenceBackend;
 
 namespace scheduler {
 
-// Reuse ModelRuntimeState from ModelRuntime.h
-// Reuse ModelRuntimeSnapshot structure (subset of fields used)
-// Reuse ModelRuntimeEvents for state change notifications
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PredictiveModelRuntime — Owns one predictive model's backend lifecycle
-//
-// Similar to ModelRuntime but for tensor inference (classification, detection,
-// segmentation). Key differences:
-//   - No job queue — infer() is synchronous and blocks until complete
-//   - No executor thread — each infer() call runs in the caller's thread
-//   - Concurrent requests for the same model are serialized via mutex
-//   - Different models can run concurrently (handled at pool level)
-//
-// Lifecycle:
-//   1. Construct with model_id + owned IInferenceBackend
-//   2. start() — transitions to NotResident (ready to load)
-//   3. First infer() call triggers backend.initialize() → Loading → Idle
-//   4. Subsequent infer() calls reuse the loaded model
-//   5. stop() — unloads the model and shuts down the backend
-//
-// Thread safety: All public methods are thread-safe. Multiple threads may call
-// infer() concurrently; they will be serialized via the internal mutex.
-// ─────────────────────────────────────────────────────────────────────────────
+// Owns one predictive model's bounded FIFO and backend lifecycle. One executor
+// thread performs cold load and inference serially for that model.
 class PredictiveModelRuntime {
 public:
-    /**
-     * Construct a runtime for the given model.
-     *
-     * @param model_id  Model identifier (from ModelConfig)
-     * @param backend   Owned IInferenceBackend instance (QNN, SNPE, LiteRT)
-     * @param events    Optional callbacks for state changes
-     */
-    PredictiveModelRuntime(std::string model_id,
-                           std::unique_ptr<IInferenceBackend> backend,
-                           ModelRuntimeEvents events = {});
-
+    PredictiveModelRuntime(
+        std::string model_id,
+        std::unique_ptr<IInferenceBackend> backend,
+        std::shared_ptr<PredictiveOrchestrator> orchestrator,
+        ModelRuntimeEvents events = {});
     ~PredictiveModelRuntime();
 
     PredictiveModelRuntime(const PredictiveModelRuntime&) = delete;
@@ -59,75 +36,52 @@ public:
     PredictiveModelRuntime(PredictiveModelRuntime&&) = delete;
     PredictiveModelRuntime& operator=(PredictiveModelRuntime&&) = delete;
 
-    /**
-     * Start the runtime (transitions to NotResident state).
-     * Must be called before infer().
-     */
     void start();
+    bool enqueue(PredictiveJobPtr job, size_t max_queue_depth);
 
-    /**
-     * Run synchronous tensor inference.
-     *
-     * If the model is not yet loaded (NotResident), this will:
-     *   1. Transition to Loading
-     *   2. Call backend.initialize(model_id, model_file)
-     *   3. Transition to Idle
-     *   4. Run inference
-     *
-     * If the model is already loaded (Idle), this will:
-     *   1. Transition to Running
-     *   2. Call backend.infer(request)
-     *   3. Transition back to Idle
-     *   4. Return the response
-     *
-     * Thread safety: Multiple concurrent calls are serialized via mutex.
-     *
-     * @param request  Input tensors + model ID + output names
-     * @return         Output tensors + inference stats
-     * @throws GenAIException on model load failure or inference error
-     */
-    TensorInferenceResponse infer(const TensorInferenceRequest& request);
-
-    /**
-     * Stop the runtime and unload the model.
-     *
-     * @param force  If true, abort immediately even if inference is running.
-     *               If false, wait for any in-flight inference to complete.
-     */
+    // IInferenceBackend cannot interrupt a running infer(), so force=true still
+    // joins the executor and waits for in-flight work before backend teardown.
     void stop(bool force = false);
 
-    /**
-     * Get a snapshot of the current runtime state.
-     * Used by PredictiveModelPool for eviction decisions.
-     */
     ModelRuntimeSnapshot snapshot() const;
-
-    /**
-     * Get the current state.
-     */
     ModelRuntimeState state() const;
-
-    /**
-     * Get the model ID.
-     */
     std::string modelId() const;
+    std::chrono::steady_clock::time_point lastUsedAt() const;
 
 private:
-    void loadModelLocked();
-    void unloadBackend(bool force);
-    void setStateLocked(ModelRuntimeState new_state);
+    void executorLoop();
+    void ensureModelLoaded();
+    bool unloadBackend();
+    void recoverBackend();
+    void setState(ModelRuntimeState state);
     void notifyStateChanged(ModelRuntimeState state);
+    void failJobs(std::deque<PredictiveJobPtr> jobs,
+                  const GenAIException& error);
+
+    static void notifyComplete(const PredictiveJobPtr& job,
+                               const TensorInferenceResponse& response);
+    static void notifyError(const PredictiveJobPtr& job,
+                            const GenAIException& error);
 
     const std::string model_id_;
     std::unique_ptr<IInferenceBackend> backend_;
+    std::shared_ptr<PredictiveOrchestrator> orchestrator_;
     ModelRuntimeEvents events_;
 
     mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread executor_thread_;
+    std::deque<PredictiveJobPtr> queue_;
+    PredictiveJobPtr running_job_;
+
     bool started_ = false;
     bool stop_requested_ = false;
+    bool backend_started_ = false;
+    bool use_lock_written_ = false;
     ModelRuntimeState state_ = ModelRuntimeState::NotResident;
     bool backend_healthy_ = false;
-    std::chrono::steady_clock::time_point last_used_at_;
+    std::chrono::steady_clock::time_point last_used_at_ =
+        std::chrono::steady_clock::now();
 };
 
 } // namespace scheduler
