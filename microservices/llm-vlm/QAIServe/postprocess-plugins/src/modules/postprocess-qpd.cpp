@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 using PostprocessUtils::Detection;
@@ -56,11 +57,57 @@ std::string PersonDetPostprocess::process(
     const std::vector<OutputTensor>& raw,
     const RequestConfig&             cfg) const {
 
-    // Fixed tensor order (see pluginInfo() below)
-    const OutputTensor& scores    = raw[0];
-    const OutputTensor& bboxes    = raw[1];
-    const OutputTensor& landmarks = raw[2];
-    const OutputTensor& lmkscores = raw[3];
+    // matchLayout() only validated the model's *declared* output_specs
+    // against pluginInfo().layouts before inference ran — it says nothing
+    // about how many tensors the inference backend actually returned in
+    // `raw`. A worker-side short return would make raw[1..3] below
+    // undefined behavior instead of a catchable exception, so check here.
+    if (raw.size() < 4 || cfg.output_specs.size() < 4) {
+        throw std::runtime_error(
+            "person_detect_qpd expects 4 output tensors (scores, bboxes, "
+            "landmarks, lmkscores), got " + std::to_string(raw.size()));
+    }
+
+    // `raw` arrives in whatever order the SNPE/QNN graph declares its
+    // outputs — the backend requests all outputs unfiltered, so this is the
+    // model's native graph order, which is NOT guaranteed to match the
+    // positional order of cfg.output_specs (from the model bundle's
+    // metadata.json) that matchLayout() validated against pluginInfo()
+    // below. Identify each tensor by its distinctive channel count (the one
+    // supported layout's last dim: 3/12/34/17) instead of trusting raw[0..3]
+    // positionally — a mismatch here previously caused readFloat() to read
+    // past a tensor's actual data buffer and segfault the whole process.
+    auto findByChannels = [&](int64_t channels) -> const OutputTensor* {
+        for (const auto& t : raw) {
+            if (!t.shape.empty() && t.shape.back() == channels) return &t;
+        }
+        return nullptr;
+    };
+
+    const OutputTensor* scores_p    = findByChannels(3);
+    const OutputTensor* bboxes_p    = findByChannels(12);
+    const OutputTensor* landmarks_p = findByChannels(34);
+    const OutputTensor* lmkscores_p = findByChannels(17);
+    if (!scores_p || !bboxes_p || !landmarks_p || !lmkscores_p) {
+        throw std::runtime_error(
+            "person_detect_qpd: could not identify scores/bboxes/landmarks/"
+            "lmkscores tensors by shape among the " + std::to_string(raw.size()) +
+            " output tensors returned by the backend");
+    }
+    if (scores_p->shape.size() != 4 || bboxes_p->shape.size() != 4 ||
+        landmarks_p->shape.size() != 4 || lmkscores_p->shape.size() != 4) {
+        throw std::runtime_error(
+            "person_detect_qpd: expected all 4 output tensors to be rank-4 "
+            "[1,H,W,C], got ranks " + std::to_string(scores_p->shape.size()) + "/" +
+            std::to_string(bboxes_p->shape.size()) + "/" +
+            std::to_string(landmarks_p->shape.size()) + "/" +
+            std::to_string(lmkscores_p->shape.size()));
+    }
+
+    const OutputTensor& scores    = *scores_p;
+    const OutputTensor& bboxes    = *bboxes_p;
+    const OutputTensor& landmarks = *landmarks_p;
+    const OutputTensor& lmkscores = *lmkscores_p;
 
     const float scores_scale    = cfg.output_specs[0].quant_scale;
     const int32_t scores_zp     = cfg.output_specs[0].quant_zero_point;

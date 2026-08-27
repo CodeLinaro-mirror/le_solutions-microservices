@@ -38,6 +38,8 @@ struct QNNTensorSpec {
     std::string              name;   // tensor name from the model
     std::vector<uint32_t>    shape;  // tensor dimensions
     int                      dtype;  // Qnn_DataType_t value
+    std::string              dtype_str; // KFServing v2 string, e.g. "FP32"/"UINT8"
+    size_t                   bytes;  // total tensor size in bytes (shape * elem width)
     float                    scale;  // quantization scale (0.0 if not quantized)
     int32_t                  offset; // quantization offset (0 if not quantized)
 };
