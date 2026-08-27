@@ -5,6 +5,7 @@
 
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
+#include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 
@@ -58,8 +59,6 @@ struct ModelRuntimeAdmissionSnapshot {
 struct ModelRuntimeEvents {
     std::function<void(const std::string& model_id, ModelRuntimeState state)>
         on_state_changed;
-    std::function<void()> acquire_load_permit;
-    std::function<void()> release_load_permit;
 };
 
 // Owns one model's queue and resident backend lifecycle.
@@ -76,6 +75,8 @@ public:
                  std::unique_ptr<IGenerativeBackend> backend,
                  std::shared_ptr<IGenerativeOrchestrator> orchestrator,
                  std::shared_ptr<ConversationMemoryCoordinator> coordinator,
+                 std::shared_ptr<ModelLoadCoordinator> load_coordinator,
+                 long model_memory_mb,
                  ModelRuntimeEvents events = {});
     ~ModelRuntime();
 
@@ -87,6 +88,7 @@ public:
     void start();
     void enqueue(GenerativeJobPtr job);
     bool activate();
+    bool activate(ModelLoadCoordinator::LoadReservation reservation);
     CancelResult cancel(const std::string& job_id);
     void requestDrain();
     void failQueued(const GenAIException& error);
@@ -130,8 +132,10 @@ private:
     std::unique_ptr<IGenerativeBackend> backend_;
     std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     std::unique_ptr<PostTurnWorker> post_turn_worker_;
     ModelRuntimeEvents events_;
+    long model_memory_mb_ = 4096;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -141,6 +145,7 @@ private:
     bool stop_requested_ = false;
     bool force_stop_ = false;
     bool activation_requested_ = false;
+    ModelLoadCoordinator::LoadReservation pending_load_reservation_;
     DrainMode drain_mode_ = DrainMode::None;
     std::chrono::milliseconds new_request_aging_threshold_ =
         std::chrono::seconds(30);

@@ -18,41 +18,6 @@ namespace scheduler {
 
 namespace {
 
-class ScopedLoadPermit {
-public:
-    explicit ScopedLoadPermit(const ModelRuntimeEvents& events)
-        : release_(events.release_load_permit) {
-        if (events.acquire_load_permit) {
-            events.acquire_load_permit();
-            acquired_ = true;
-        }
-    }
-
-    ~ScopedLoadPermit() {
-        release();
-    }
-
-    ScopedLoadPermit(const ScopedLoadPermit&) = delete;
-    ScopedLoadPermit& operator=(const ScopedLoadPermit&) = delete;
-
-    void release() noexcept {
-        if (!acquired_) {
-            return;
-        }
-        acquired_ = false;
-        if (release_) {
-            try {
-                release_();
-            } catch (...) {
-            }
-        }
-    }
-
-private:
-    std::function<void()> release_;
-    bool acquired_ = false;
-};
-
 GenAIException stoppedError(const std::string& model_id) {
     return GenAIException(
         GenAIErrorCode::HARDWARE_UNAVAILABLE,
@@ -70,7 +35,7 @@ GenAIException executionError(const std::string& model_id,
 
 void waitForDspMemoryReclaim(const std::string& model_id,
                              bool stop_requested) {
-    const char* value = std::getenv("MODEL_LOAD_FAILURE_DELAY_MS");
+    const char* value = std::getenv("DSP_RECLAIM_DELAY_MS");
     long delay_ms = 2000;
     if (value && value[0] != '\0') {
         try {
@@ -95,10 +60,14 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     std::string model_id,
     std::unique_ptr<IInferenceBackend> backend,
     std::shared_ptr<PredictiveOrchestrator> orchestrator,
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator,
+    long model_memory_mb,
     ModelRuntimeEvents events)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
+      load_coordinator_(std::move(load_coordinator)),
+      model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 512),
       events_(std::move(events)) {
     if (model_id_.empty()) {
         throw std::invalid_argument(
@@ -111,6 +80,10 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     if (!orchestrator_) {
         throw std::invalid_argument(
             "PredictiveModelRuntime requires an orchestrator");
+    }
+    if (!load_coordinator_) {
+        throw std::invalid_argument(
+            "PredictiveModelRuntime requires a model load coordinator");
     }
 }
 
@@ -181,8 +154,11 @@ void PredictiveModelRuntime::stop(bool force) {
     }
 
     setState(ModelRuntimeState::Evicting);
-    if (unloadBackend()) {
-        waitForDspMemoryReclaim(model_id_, false);
+    {
+        auto reclaim = load_coordinator_->beginReclaim(model_id_);
+        if (unloadBackend()) {
+            waitForDspMemoryReclaim(model_id_, false);
+        }
     }
 
     {
@@ -304,68 +280,101 @@ void PredictiveModelRuntime::ensureModelLoaded() {
         needs_cleanup = backend_started_;
     }
 
-    if (needs_cleanup && unloadBackend()) {
-        waitForDspMemoryReclaim(model_id_, false);
+    if (needs_cleanup) {
+        setState(ModelRuntimeState::Evicting);
+        auto reclaim = load_coordinator_->beginReclaim(model_id_);
+        if (unloadBackend()) {
+            waitForDspMemoryReclaim(model_id_, false);
+        }
     }
-    setState(ModelRuntimeState::Loading);
 
-    try {
-        const ModelConfig* config =
-            ModelConfigManager::getInstance().getModelConfig(model_id_);
-        if (!config) {
-            throw GenAIException(
-                GenAIErrorCode::MODEL_NOT_FOUND,
-                "Model '" + model_id_ + "' not found in ModelConfigManager",
-                404);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            backend_started_ = true;
-        }
-        ScopedLoadPermit load_permit(events_);
-        backend_->initialize(model_id_, config->config_file);
-        load_permit.release();
-        if (!backend_->isHealthy()) {
-            throw std::runtime_error(
-                "Backend health check failed after initialization");
-        }
-
-        qai_forge::writeUseLock(model_id_);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            use_lock_written_ = true;
-            backend_healthy_ = true;
-            last_used_at_ = std::chrono::steady_clock::now();
-        }
-        setState(ModelRuntimeState::Idle);
-        LOG_INFO("[PredictiveModelRuntime] Backend loaded: model=" << model_id_
-                 << " backend=" << backend_->name());
-    } catch (const GenAIException&) {
-        if (unloadBackend()) {
-            bool stopping = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping = stop_requested_;
-            }
-            waitForDspMemoryReclaim(model_id_, stopping);
-        }
-        setState(ModelRuntimeState::Failed);
-        throw;
-    } catch (const std::exception& error) {
-        if (unloadBackend()) {
-            bool stopping = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping = stop_requested_;
-            }
-            waitForDspMemoryReclaim(model_id_, stopping);
-        }
+    const ModelConfig* config =
+        ModelConfigManager::getInstance().getModelConfig(model_id_);
+    if (!config) {
         setState(ModelRuntimeState::Failed);
         throw GenAIException(
-            GenAIErrorCode::INTERNAL_ERROR,
-            "Failed to load model '" + model_id_ + "': " + error.what(),
-            500);
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id_ + "' not found in ModelConfigManager",
+            404);
+    }
+
+    constexpr size_t kMaxLoadAttempts = 2;
+    for (size_t attempt = 1; attempt <= kMaxLoadAttempts; ++attempt) {
+        ModelLoadCoordinator::LoadReservation reservation;
+        try {
+            reservation =
+                load_coordinator_->acquire(model_id_, model_memory_mb_);
+        } catch (const GenAIException&) {
+            setState(ModelRuntimeState::Failed);
+            throw;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_requested_) {
+                reservation.release();
+                throw stoppedError(model_id_);
+            }
+        }
+        setState(ModelRuntimeState::Loading);
+
+        auto cleanup_failed_attempt = [this, &reservation]() {
+            setState(ModelRuntimeState::Evicting);
+            auto reclaim = load_coordinator_->beginReclaim(
+                model_id_,
+                std::move(reservation));
+            if (unloadBackend()) {
+                bool stopping = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    stopping = stop_requested_;
+                }
+                waitForDspMemoryReclaim(model_id_, stopping);
+            }
+        };
+
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                backend_started_ = true;
+            }
+            LOG_INFO("[PredictiveModelRuntime] Loading backend: model="
+                     << model_id_ << " attempt=" << attempt
+                     << "/" << kMaxLoadAttempts);
+            backend_->initialize(model_id_, config->config_file);
+            if (!backend_->isHealthy()) {
+                throw std::runtime_error(
+                    "Backend health check failed after initialization");
+            }
+
+            reservation.release();
+            qai_forge::writeUseLock(model_id_);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                use_lock_written_ = true;
+                backend_healthy_ = true;
+                last_used_at_ = std::chrono::steady_clock::now();
+            }
+            setState(ModelRuntimeState::Idle);
+            LOG_INFO("[PredictiveModelRuntime] Backend loaded: model="
+                     << model_id_ << " backend=" << backend_->name());
+            return;
+        } catch (const GenAIException&) {
+            cleanup_failed_attempt();
+            if (attempt == kMaxLoadAttempts) {
+                setState(ModelRuntimeState::Failed);
+                throw;
+            }
+        } catch (const std::exception& error) {
+            cleanup_failed_attempt();
+            if (attempt == kMaxLoadAttempts) {
+                setState(ModelRuntimeState::Failed);
+                throw GenAIException(
+                    GenAIErrorCode::INTERNAL_ERROR,
+                    "Failed to load model '" + model_id_ + "': " + error.what(),
+                    500);
+            }
+        }
     }
 }
 
@@ -397,13 +406,17 @@ bool PredictiveModelRuntime::unloadBackend() {
 }
 
 void PredictiveModelRuntime::recoverBackend() {
-    if (unloadBackend()) {
-        bool stopping = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping = stop_requested_;
+    setState(ModelRuntimeState::Evicting);
+    {
+        auto reclaim = load_coordinator_->beginReclaim(model_id_);
+        if (unloadBackend()) {
+            bool stopping = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping = stop_requested_;
+            }
+            waitForDspMemoryReclaim(model_id_, stopping);
         }
-        waitForDspMemoryReclaim(model_id_, stopping);
     }
     setState(ModelRuntimeState::Failed);
 }

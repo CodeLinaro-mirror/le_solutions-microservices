@@ -81,12 +81,15 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
                              ModelRuntimePairFactory runtime_factory,
                              ModelRuntimeEvents runtime_events,
                              std::shared_ptr<ConversationMemoryCoordinator>
-                                 memory_coordinator)
+                                 memory_coordinator,
+                             std::shared_ptr<ModelLoadCoordinator>
+                                 load_coordinator)
     : config_(config),
       runtime_factory_(runtime_factory ? std::move(runtime_factory)
                                        : defaultRuntimeFactory()),
       runtime_events_(std::move(runtime_events)),
       memory_coordinator_(std::move(memory_coordinator)),
+      load_coordinator_(std::move(load_coordinator)),
       eviction_policy_(std::make_unique<EvictionPolicy>()) {
     if (!runtime_factory_) {
         throw std::invalid_argument("WarmModelPool requires a runtime factory");
@@ -94,6 +97,12 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
     if (!memory_coordinator_) {
         memory_coordinator_ =
             std::make_shared<ConversationMemoryCoordinator>();
+    }
+    if (!load_coordinator_) {
+        owns_load_coordinator_ = true;
+        load_coordinator_ =
+            std::make_shared<ModelLoadCoordinator>(config_.memory_headroom_mb);
+        load_coordinator_->start();
     }
     if (config_.blocked_admission_timeout.count() <= 0) {
         config_.blocked_admission_timeout = std::chrono::seconds(30);
@@ -313,8 +322,7 @@ bool WarmModelPool::openToolLease(const std::string& model_id,
                  << " ttl_ms="
                  << effectiveTtl(ttl, config_.tool_response_timeout).count());
         if (record.state == ModelRuntimeState::Running ||
-            record.state == ModelRuntimeState::Draining ||
-            record.state == ModelRuntimeState::Evicting) {
+            record.state == ModelRuntimeState::Draining) {
             runtime_to_reactivate = record.runtime.get();
         }
         event_pending_ = true;
@@ -447,6 +455,9 @@ void WarmModelPool::stop(bool force) {
                       event_thread_.get_id() != std::this_thread::get_id();
     }
 
+    if (owns_load_coordinator_) {
+        load_coordinator_->shutdown();
+    }
     cv_.notify_one();
 
     if (should_join) {
@@ -475,7 +486,7 @@ void WarmModelPool::eventLoop() {
 
         if (!actions.empty()) {
             lock.unlock();
-            applyActions(actions);
+            applyActions(std::move(actions));
             lock.lock();
             continue;
         }
@@ -526,8 +537,17 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
         }
 
         PoolActionType pool_type = PoolActionType::Activate;
+        ModelLoadCoordinator::LoadReservation load_reservation;
         switch (action.type) {
             case EvictionPolicyActionType::Activate:
+                load_reservation = load_coordinator_->tryAcquire(
+                    action.model_id,
+                    modelMemoryMb(action.model_id));
+                if (!load_reservation) {
+                    LOG_INFO("[WarmModelPool] Shared load admission changed; keeping model queued: model="
+                             << action.model_id);
+                    continue;
+                }
                 it->second.active_reserved = true;
                 it->second.eviction_requested = false;
                 pool_type = PoolActionType::Activate;
@@ -545,6 +565,7 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
             pool_type,
             action.model_id,
             it->second.runtime.get(),
+            std::move(load_reservation),
         });
         LOG_INFO("[WarmModelPool] Planned action: action="
                  << actionToString(static_cast<int>(pool_type))
@@ -558,8 +579,8 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
     return actions;
 }
 
-void WarmModelPool::applyActions(const std::vector<PoolAction>& actions) {
-    for (const PoolAction& action : actions) {
+void WarmModelPool::applyActions(std::vector<PoolAction> actions) {
+    for (PoolAction& action : actions) {
         if (!action.runtime) {
             continue;
         }
@@ -567,7 +588,8 @@ void WarmModelPool::applyActions(const std::vector<PoolAction>& actions) {
         if (action.type == PoolActionType::Activate) {
             LOG_INFO("[WarmModelPool] Applying action: activate model="
                      << action.model_id);
-            if (!action.runtime->activate()) {
+            if (!action.runtime->activate(
+                    std::move(action.load_reservation))) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 auto it = runtimes_.find(action.model_id);
                 if (it != runtimes_.end()) {
@@ -695,6 +717,8 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
         std::move(pair.backend),
         std::move(pair.orchestrator),
         memory_coordinator_,
+        load_coordinator_,
+        modelMemoryMb(model_id),
         std::move(events));
     runtime->start();
 
@@ -722,7 +746,7 @@ size_t WarmModelPool::activeReservedCountLocked() const {
 }
 
 long WarmModelPool::availableMemoryMb() const {
-    return SystemResourceManager::getInstance().getAvailableMemoryMb();
+    return load_coordinator_->availableMemoryMb();
 }
 
 long WarmModelPool::modelMemoryMb(const std::string& model_id) const {

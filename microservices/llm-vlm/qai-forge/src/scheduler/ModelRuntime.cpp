@@ -98,9 +98,9 @@ bool shouldRecoverBackend(const GenAIException& error) {
 // attempted right after teardown can fail with e.g. "fastrpc memory map
 // failed" / "[LlmEngine] Failed to create dialog", since the previous
 // worker's mappings haven't been reclaimed yet.
-// Default: 2000ms. Override: MODEL_LOAD_FAILURE_DELAY_MS env var.
+// Default: 2000ms. Override: DSP_RECLAIM_DELAY_MS env var.
 void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
-    const long delay_ms = parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
+    const long delay_ms = parseLongEnv("DSP_RECLAIM_DELAY_MS", 2000);
     if (delay_ms > 0 && !stop_requested) {
         LOG_INFO("[ModelRuntime] Waiting " << delay_ms
                  << "ms after backend teardown for DSP memory reclaim: model="
@@ -108,54 +108,22 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
     }
 }
-
-class ScopedLoadPermit {
-public:
-    explicit ScopedLoadPermit(const ModelRuntimeEvents& events)
-        : release_(events.release_load_permit) {
-        if (events.acquire_load_permit) {
-            events.acquire_load_permit();
-            acquired_ = true;
-        }
-    }
-
-    ~ScopedLoadPermit() {
-        release();
-    }
-
-    ScopedLoadPermit(const ScopedLoadPermit&) = delete;
-    ScopedLoadPermit& operator=(const ScopedLoadPermit&) = delete;
-
-    void release() noexcept {
-        if (!acquired_) {
-            return;
-        }
-        acquired_ = false;
-        if (release_) {
-            try {
-                release_();
-            } catch (...) {
-            }
-        }
-    }
-
-private:
-    std::function<void()> release_;
-    bool acquired_ = false;
-};
-
 } // namespace
 
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<IGenerativeBackend> backend,
                      std::shared_ptr<IGenerativeOrchestrator> orchestrator,
                      std::shared_ptr<ConversationMemoryCoordinator> coordinator,
+                     std::shared_ptr<ModelLoadCoordinator> load_coordinator,
+                     long model_memory_mb,
                      ModelRuntimeEvents events)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
       memory_coordinator_(std::move(coordinator)),
+      load_coordinator_(std::move(load_coordinator)),
       events_(std::move(events)),
+      model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 4096),
       new_request_aging_threshold_(queueAgingThresholdFromEnv()),
       cancel_grace_period_(cancelGracePeriodFromEnv()) {
     if (model_id_.empty()) {
@@ -170,6 +138,10 @@ ModelRuntime::ModelRuntime(std::string model_id,
     if (!memory_coordinator_) {
         throw std::invalid_argument(
             "ModelRuntime requires a conversation memory coordinator");
+    }
+    if (!load_coordinator_) {
+        throw std::invalid_argument(
+            "ModelRuntime requires a model load coordinator");
     }
     post_turn_worker_ = std::make_unique<PostTurnWorker>(
         model_id_,
@@ -241,14 +213,56 @@ bool ModelRuntime::activate() {
                 setStateLocked(ModelRuntimeState::Idle, state_events);
                 should_notify = true;
             }
-        } else if (state_ == ModelRuntimeState::Evicting) {
-            activation_requested_ = true;
-            drain_mode_ = DrainMode::None;
-            should_notify = true;
         } else {
+            LOG_WARN("[ModelRuntime] Cold activation requires a load reservation: model="
+                     << model_id_ << " state=" << stateToString(state_));
+            return false;
+        }
+    }
+
+    notifyStateChanges(state_events);
+    if (should_notify) {
+        cv_.notify_one();
+    }
+    return true;
+}
+
+bool ModelRuntime::activate(
+    ModelLoadCoordinator::LoadReservation reservation) {
+    if (!reservation) {
+        return false;
+    }
+
+    std::vector<ModelRuntimeState> state_events;
+    bool should_notify = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == ModelRuntimeState::Stopped || stop_requested_) {
+            LOG_WARN("[ModelRuntime] Reserved activation ignored because runtime is stopping: model="
+                     << model_id_ << " state=" << stateToString(state_));
+            return false;
+        }
+
+        if (state_ == ModelRuntimeState::NotResident ||
+            state_ == ModelRuntimeState::Failed) {
+            pending_load_reservation_ = std::move(reservation);
             activation_requested_ = true;
             drain_mode_ = DrainMode::None;
+            backend_healthy_ = false;
+            setStateLocked(ModelRuntimeState::Loading, state_events);
             should_notify = true;
+        } else if (state_ == ModelRuntimeState::Loading ||
+                   state_ == ModelRuntimeState::Idle ||
+                   state_ == ModelRuntimeState::Running ||
+                   state_ == ModelRuntimeState::PostTurn ||
+                   state_ == ModelRuntimeState::Draining) {
+            drain_mode_ = DrainMode::None;
+            if (state_ == ModelRuntimeState::Draining && !running_job_) {
+                setStateLocked(ModelRuntimeState::Idle, state_events);
+                should_notify = true;
+            }
+        } else {
+            return false;
         }
     }
 
@@ -323,6 +337,10 @@ void ModelRuntime::requestDrain() {
             return;
         }
 
+        if (state_ == ModelRuntimeState::Loading) {
+            return;
+        }
+
         activation_requested_ = false;
         if (state_ == ModelRuntimeState::NotResident ||
             state_ == ModelRuntimeState::Failed) {
@@ -350,6 +368,7 @@ void ModelRuntime::failQueued(const GenAIException& error) {
 void ModelRuntime::stop(bool force) {
     stopCancelWatchdog();
 
+    ModelLoadCoordinator::LoadReservation pending_load_reservation;
     std::string running_job_id;
     bool post_turn_active = false;
     bool should_join = false;
@@ -365,6 +384,8 @@ void ModelRuntime::stop(bool force) {
             stop_requested_ = true;
             force_stop_ = force_stop_ || force;
             activation_requested_ = false;
+            pending_load_reservation =
+                std::move(pending_load_reservation_);
             drain_mode_ = DrainMode::None;
 
             if (force && running_job_) {
@@ -379,6 +400,7 @@ void ModelRuntime::stop(bool force) {
         }
     }
 
+    pending_load_reservation.release();
     notifyStateChanges(state_events);
 
     if (!was_started) {
@@ -442,6 +464,7 @@ void ModelRuntime::executorLoop() {
         bool should_load = false;
         bool should_unload = false;
         bool should_reload_unhealthy = false;
+        ModelLoadCoordinator::LoadReservation initial_load_reservation;
         GenerativeJobPtr job;
         std::vector<ModelRuntimeState> state_events;
 
@@ -466,11 +489,10 @@ void ModelRuntime::executorLoop() {
             }
 
             if (activation_requested_ &&
-                (state_ == ModelRuntimeState::NotResident ||
-                 state_ == ModelRuntimeState::Failed)) {
+                state_ == ModelRuntimeState::Loading) {
                 activation_requested_ = false;
-                backend_healthy_ = false;
-                setStateLocked(ModelRuntimeState::Loading, state_events);
+                initial_load_reservation =
+                    std::move(pending_load_reservation_);
                 should_load = true;
             } else if (drain_mode_ == DrainMode::Normal &&
                        (state_ == ModelRuntimeState::Idle ||
@@ -481,15 +503,9 @@ void ModelRuntime::executorLoop() {
             } else if (state_ == ModelRuntimeState::Idle) {
                 if (!queue_.empty() &&
                     (!backend_healthy_ || !backend_ || !backend_->isHealthy())) {
-                    // Backend died while sitting idle (e.g. drained/reloaded by
-                    // WarmModelPool for another model). Don't hand the queued
-                    // job a guaranteed 503 � fail over to Failed so the reload
-                    // path below picks it back up and the job gets served once
-                    // the backend is healthy again, instead of being popped and
-                    // rejected here.
                     backend_healthy_ = false;
                     should_reload_unhealthy = true;
-                    setStateLocked(ModelRuntimeState::Failed, state_events);
+                    setStateLocked(ModelRuntimeState::Evicting, state_events);
                 } else {
                     promoteAgedJobs();
                     job = queue_.pop();
@@ -506,69 +522,166 @@ void ModelRuntime::executorLoop() {
         if (should_reload_unhealthy) {
             LOG_WARN("[ModelRuntime] Backend unhealthy with queued work while idle;"
                      " forcing reload: model=" << model_id_);
-            unloadBackend(/*force=*/true);
-            waitForDspMemoryReclaim(model_id_, stop_requested_);
-            activate();
+            {
+                auto reclaim = load_coordinator_->beginReclaim(model_id_);
+                unloadBackend(/*force=*/true);
+                waitForDspMemoryReclaim(model_id_, stop_requested_);
+            }
+            std::vector<ModelRuntimeState> reload_events;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!stop_requested_) {
+                    setStateLocked(ModelRuntimeState::Failed, reload_events);
+                }
+            }
+            notifyStateChanges(reload_events);
             continue;
         }
 
         if (should_load) {
-            try {
-                LOG_INFO("[ModelRuntime] Loading backend: model=" << model_id_);
-                ScopedLoadPermit load_permit(events_);
-                backend_->loadModel(model_id_);
-                load_permit.release();
-                LOG_INFO("[ModelRuntime] Backend loaded: model=" << model_id_);
-                // Write use lock so DELETE is blocked while model is in memory
-                qai_forge::writeUseLock(model_id_);
-                std::vector<ModelRuntimeState> load_events;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (!stop_requested_) {
-                        backend_healthy_ = true;
-                        setStateLocked(ModelRuntimeState::Idle, load_events);
+            constexpr size_t kMaxLoadAttempts = 2;
+            for (size_t attempt = 1; attempt <= kMaxLoadAttempts; ++attempt) {
+                ModelLoadCoordinator::LoadReservation reservation;
+                if (attempt == 1) {
+                    reservation = std::move(initial_load_reservation);
+                } else {
+                    try {
+                        reservation = load_coordinator_->acquire(
+                            model_id_, model_memory_mb_);
+                    } catch (const GenAIException& error) {
+                        if (!stop_requested_) {
+                            failQueued(error);
+                        }
+                        break;
                     }
                 }
-                notifyStateChanges(load_events);
-                cv_.notify_one();
-            } catch (const GenAIException& error) {
-                LOG_ERROR("[ModelRuntime] Backend load failed: model=" << model_id_
-                          << " status=" << error.http_status
-                          << " message=\"" << error.message << "\"");
-                // Force-kill the worker subprocess (SIGKILL) so the kernel
-                // reclaims all its file descriptors and DSP SMMU mappings.
-                unloadBackend(/*force=*/true);
-                waitForDspMemoryReclaim(model_id_, stop_requested_);
-                std::vector<ModelRuntimeState> failure_events;
+
+                if (!reservation) {
+                    if (!stop_requested_) {
+                        std::vector<ModelRuntimeState> failure_events;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            setStateLocked(
+                                ModelRuntimeState::Failed,
+                                failure_events);
+                        }
+                        notifyStateChanges(failure_events);
+                        failQueued(loadFailureError(
+                            model_id_,
+                            std::runtime_error(
+                                "Model activation lost its load reservation")));
+                    }
+                    break;
+                }
+
+                bool load_cancelled = false;
+                std::vector<ModelRuntimeState> loading_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    backend_healthy_ = false;
-                    setStateLocked(ModelRuntimeState::Failed, failure_events);
+                    load_cancelled = stop_requested_;
+                    if (!load_cancelled && attempt > 1) {
+                        setStateLocked(
+                            ModelRuntimeState::Loading,
+                            loading_events);
+                    }
                 }
-                notifyStateChanges(failure_events);
-                failQueued(error);
-            } catch (const std::exception& error) {
-                LOG_ERROR("[ModelRuntime] Backend load failed: model=" << model_id_
-                          << " message=\"" << error.what() << "\"");
-                // Force-kill the worker subprocess (SIGKILL).
-                unloadBackend(/*force=*/true);
-                waitForDspMemoryReclaim(model_id_, stop_requested_);
-                std::vector<ModelRuntimeState> failure_events;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    backend_healthy_ = false;
-                    setStateLocked(ModelRuntimeState::Failed, failure_events);
+                if (load_cancelled) {
+                    reservation.release();
+                    break;
                 }
-                notifyStateChanges(failure_events);
-                failQueued(loadFailureError(model_id_, error));
+                notifyStateChanges(loading_events);
+
+                auto handle_load_failure =
+                    [this, attempt, &reservation](const GenAIException& error) {
+                        std::vector<ModelRuntimeState> eviction_events;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            backend_healthy_ = false;
+                            if (!stop_requested_) {
+                                setStateLocked(
+                                    ModelRuntimeState::Evicting,
+                                    eviction_events);
+                            }
+                        }
+                        notifyStateChanges(eviction_events);
+
+                        {
+                            auto reclaim = load_coordinator_->beginReclaim(
+                                model_id_,
+                                std::move(reservation));
+                            unloadBackend(/*force=*/true);
+                            waitForDspMemoryReclaim(
+                                model_id_, stop_requested_);
+                        }
+
+                        std::vector<ModelRuntimeState> recovery_events;
+                        bool retry = false;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (!stop_requested_ && attempt < kMaxLoadAttempts) {
+                                retry = true;
+                            } else if (!stop_requested_) {
+                                setStateLocked(
+                                    ModelRuntimeState::Failed,
+                                    recovery_events);
+                            }
+                        }
+                        notifyStateChanges(recovery_events);
+                        if (!retry && !stop_requested_) {
+                            failQueued(error);
+                        }
+                        return retry;
+                    };
+
+                try {
+                    LOG_INFO("[ModelRuntime] Loading backend: model="
+                             << model_id_ << " attempt=" << attempt
+                             << "/" << kMaxLoadAttempts);
+                    backend_->loadModel(model_id_);
+                    reservation.release();
+                    LOG_INFO("[ModelRuntime] Backend loaded: model=" << model_id_);
+                    qai_forge::writeUseLock(model_id_);
+                    std::vector<ModelRuntimeState> load_events;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (!stop_requested_) {
+                            backend_healthy_ = true;
+                            setStateLocked(ModelRuntimeState::Idle, load_events);
+                        }
+                    }
+                    notifyStateChanges(load_events);
+                    cv_.notify_one();
+                    break;
+                } catch (const GenAIException& error) {
+                    LOG_ERROR("[ModelRuntime] Backend load failed: model="
+                              << model_id_ << " attempt=" << attempt
+                              << "/" << kMaxLoadAttempts
+                              << " status=" << error.http_status
+                              << " message=\"" << error.message << "\"");
+                    if (!handle_load_failure(error)) {
+                        break;
+                    }
+                } catch (const std::exception& error) {
+                    LOG_ERROR("[ModelRuntime] Backend load failed: model="
+                              << model_id_ << " attempt=" << attempt
+                              << "/" << kMaxLoadAttempts
+                              << " message=\"" << error.what() << "\"");
+                    if (!handle_load_failure(
+                            loadFailureError(model_id_, error))) {
+                        break;
+                    }
+                }
             }
             continue;
         }
 
         if (should_unload) {
             LOG_INFO("[ModelRuntime] Unloading backend: model=" << model_id_);
-            unloadBackend(false);
-            waitForDspMemoryReclaim(model_id_, stop_requested_);
+            {
+                auto reclaim = load_coordinator_->beginReclaim(model_id_);
+                unloadBackend(false);
+                waitForDspMemoryReclaim(model_id_, stop_requested_);
+            }
             std::vector<ModelRuntimeState> unload_events;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -653,7 +766,7 @@ void ModelRuntime::executorLoop() {
             if (recover_backend || cancel_force_killed) {
                 backend_healthy_ = false;
                 if (!stop_requested_) {
-                    setStateLocked(ModelRuntimeState::Failed, complete_events);
+                    setStateLocked(ModelRuntimeState::Evicting, complete_events);
                 }
             } else if (!stop_requested_ && !post_turn_started) {
                 setStateLocked(
@@ -672,8 +785,19 @@ void ModelRuntime::executorLoop() {
                          ? "cancel watchdog force-kill"
                          : "execution failure")
                      << ": model=" << model_id_ << " job=" << job->job_id);
-            unloadBackend(true);
-            waitForDspMemoryReclaim(model_id_, stop_requested_);
+            {
+                auto reclaim = load_coordinator_->beginReclaim(model_id_);
+                unloadBackend(true);
+                waitForDspMemoryReclaim(model_id_, stop_requested_);
+            }
+            std::vector<ModelRuntimeState> failure_events;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!stop_requested_) {
+                    setStateLocked(ModelRuntimeState::Failed, failure_events);
+                }
+            }
+            notifyStateChanges(failure_events);
         }
 
         cv_.notify_one();
@@ -695,7 +819,11 @@ void ModelRuntime::executorLoop() {
     }
 
     notifyStateChanges(exit_events);
-    unloadBackend(force_unload);
+    {
+        auto reclaim = load_coordinator_->beginReclaim(model_id_);
+        unloadBackend(force_unload);
+        waitForDspMemoryReclaim(model_id_, stop_requested_);
+    }
     failQueued(stoppedError(model_id_));
 
     std::vector<ModelRuntimeState> stopped_events;

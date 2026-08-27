@@ -5,6 +5,7 @@
 
 #include "qai_forge/utils/Logger.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -52,13 +53,6 @@ std::chrono::milliseconds parseSecondsEnv(
     return parsed > 0 ? std::chrono::seconds(parsed) : fallback;
 }
 
-InferenceSchedulerConfig normalizeConfig(InferenceSchedulerConfig config) {
-    if (config.max_concurrent_model_loads == 0) {
-        config.max_concurrent_model_loads = 1;
-    }
-    return config;
-}
-
 InferenceSchedulerConfig configFromEnvironment() {
     InferenceSchedulerConfig config;
     const size_t max_active_models = parseSizeEnv(
@@ -80,10 +74,7 @@ InferenceSchedulerConfig configFromEnvironment() {
     config.predictive_pool_config.max_queue_depth_per_model = parseSizeEnv(
         "MAX_QUEUE_DEPTH_PER_MODEL",
         config.predictive_pool_config.max_queue_depth_per_model);
-    config.max_concurrent_model_loads = parseSizeEnv(
-        "MAX_CONCURRENT_MODEL_LOADS",
-        config.max_concurrent_model_loads);
-    return normalizeConfig(std::move(config));
+    return config;
 }
 
 void validateMetadata(const std::string& job_id,
@@ -262,33 +253,24 @@ InferenceScheduler::InferenceScheduler(
     InferenceSchedulerConfig config,
     ModelRuntimePairFactory generative_factory,
     PredictiveBackendFactory predictive_factory)
-    : config_(normalizeConfig(std::move(config))),
-      max_concurrent_model_loads_(config_.max_concurrent_model_loads),
+    : config_(std::move(config)),
       memory_coordinator_(
           std::make_shared<ConversationMemoryCoordinator>()),
+      model_load_coordinator_(std::make_shared<ModelLoadCoordinator>(
+          std::max(config_.generative_pool_config.memory_headroom_mb,
+                   config_.predictive_pool_config.memory_headroom_mb))),
       generative_pool_(
           config_.generative_pool_config,
           std::move(generative_factory),
-          loadEvents(this),
-          memory_coordinator_),
+          {},
+          memory_coordinator_,
+          model_load_coordinator_),
       predictive_pool_(
           config_.predictive_pool_config,
           std::move(predictive_factory),
-          loadEvents(this)) {
-    LOG_INFO("[InferenceScheduler] Configured: max_concurrent_model_loads="
-             << max_concurrent_model_loads_);
-}
-
-ModelRuntimeEvents InferenceScheduler::loadEvents(
-    InferenceScheduler* scheduler) {
-    ModelRuntimeEvents events;
-    events.acquire_load_permit = [scheduler]() {
-        scheduler->acquireLoadPermit();
-    };
-    events.release_load_permit = [scheduler]() {
-        scheduler->releaseLoadPermit();
-    };
-    return events;
+          {},
+          model_load_coordinator_) {
+    LOG_INFO("[InferenceScheduler] Configured shared model load coordinator");
 }
 
 InferenceScheduler::~InferenceScheduler() {
@@ -306,6 +288,10 @@ void InferenceScheduler::start() {
         return;
     }
     shutdown_requested_ = false;
+    model_load_coordinator_->setCapacityChangedCallback([this]() {
+        generative_pool_.checkpoint();
+    });
+    model_load_coordinator_->start();
     store_worker_.start();
     generative_pool_.start();
     started_ = true;
@@ -381,10 +367,11 @@ void InferenceScheduler::shutdown(bool force) {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_requested_ = true;
     }
-    load_cv_.notify_all();
+    model_load_coordinator_->shutdown();
 
     generative_pool_.stop(force);
     predictive_pool_.stop(force);
+    model_load_coordinator_->setCapacityChangedCallback({});
     memory_coordinator_->cancelPending();
     store_worker_.stop(force);
 
@@ -398,31 +385,6 @@ void InferenceScheduler::shutdown(bool force) {
 
 void InferenceScheduler::stop(bool force) {
     shutdown(force);
-}
-
-void InferenceScheduler::acquireLoadPermit() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    load_cv_.wait(lock, [this]() {
-        return shutdown_requested_ ||
-               active_model_loads_ < max_concurrent_model_loads_;
-    });
-    if (shutdown_requested_) {
-        throw GenAIException(
-            GenAIErrorCode::HARDWARE_UNAVAILABLE,
-            "Inference scheduler is shutting down before model load",
-            503);
-    }
-    ++active_model_loads_;
-}
-
-void InferenceScheduler::releaseLoadPermit() noexcept {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (active_model_loads_ > 0) {
-            --active_model_loads_;
-        }
-    }
-    load_cv_.notify_one();
 }
 
 } // namespace scheduler

@@ -6,6 +6,7 @@
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/GenerativeJob.h"
+#include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/PredictiveModelPool.h"
 #include "qai_forge/scheduler/StoreWorker.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
@@ -40,7 +41,6 @@ inline WarmModelPoolConfig defaultPredictivePoolConfig() {
 struct InferenceSchedulerConfig {
     WarmModelPoolConfig generative_pool_config;
     WarmModelPoolConfig predictive_pool_config = defaultPredictivePoolConfig();
-    size_t max_concurrent_model_loads = 1;
 };
 
 class GenerativeRuntimeHandle {
@@ -139,20 +139,14 @@ public:
     void stop(bool force = false);
 
 private:
-    static ModelRuntimeEvents loadEvents(InferenceScheduler* scheduler);
-    void acquireLoadPermit();
-    void releaseLoadPermit() noexcept;
-
     InferenceSchedulerConfig config_;
-    size_t max_concurrent_model_loads_ = 1;
 
     mutable std::mutex mutex_;
-    std::condition_variable load_cv_;
-    size_t active_model_loads_ = 0;
     bool started_ = false;
     bool shutdown_requested_ = false;
 
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
+    std::shared_ptr<ModelLoadCoordinator> model_load_coordinator_;
     StoreWorker store_worker_;
     WarmModelPool generative_pool_;
     PredictiveModelPool predictive_pool_;

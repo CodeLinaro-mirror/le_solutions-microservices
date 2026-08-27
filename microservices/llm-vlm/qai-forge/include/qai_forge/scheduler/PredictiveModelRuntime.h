@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
+#include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
 #include "qai_forge/scheduler/PredictiveJob.h"
 
@@ -28,6 +29,8 @@ public:
         std::string model_id,
         std::unique_ptr<IInferenceBackend> backend,
         std::shared_ptr<PredictiveOrchestrator> orchestrator,
+        std::shared_ptr<ModelLoadCoordinator> load_coordinator,
+        long model_memory_mb,
         ModelRuntimeEvents events = {});
     ~PredictiveModelRuntime();
 
@@ -66,7 +69,9 @@ private:
     const std::string model_id_;
     std::unique_ptr<IInferenceBackend> backend_;
     std::shared_ptr<PredictiveOrchestrator> orchestrator_;
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     ModelRuntimeEvents events_;
+    long model_memory_mb_ = 512;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;

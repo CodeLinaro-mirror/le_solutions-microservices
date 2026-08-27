@@ -54,7 +54,9 @@ public:
      */
     explicit PredictiveModelPool(WarmModelPoolConfig config,
                                  PredictiveBackendFactory factory = {},
-                                 ModelRuntimeEvents runtime_events = {});
+                                 ModelRuntimeEvents runtime_events = {},
+                                 std::shared_ptr<ModelLoadCoordinator>
+                                     load_coordinator = {});
 
     ~PredictiveModelPool();
 
@@ -102,6 +104,8 @@ private:
     WarmModelPoolConfig config_;
     PredictiveBackendFactory factory_;
     ModelRuntimeEvents runtime_events_;
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
+    bool owns_load_coordinator_ = false;
     mutable std::mutex mutex_;
     bool shutdown_requested_ = false;
     std::unordered_map<std::string, RuntimeRecord> runtimes_;
