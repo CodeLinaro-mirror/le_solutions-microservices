@@ -485,7 +485,8 @@ void AdminController::deleteModel(const HttpRequestPtr& req,
             json metadata = json::parse(f);
             std::string mid = metadata.value("model_id", "");
             std::string rt  = metadata.value("runtime", "genie");
-            if ((mid + "-" + rt) == model_id) {
+            std::string prec = metadata.value("precision", "float");
+            if ((mid + "-" + rt + "-" + prec) == model_id) {
                 bundle_to_delete = entry.path().string();
                 break;
             }

@@ -121,14 +121,22 @@ void ModelConfigManager::scanModelBundles() {
                 }
 
                 ModelConfig config = parseMetadataJson(metadata, bundle_path, processed_dir);
-                // Model ID convention: "{model_id}-{runtime}"
-                // e.g. "qwen3_4b_instruct_2507-genie", "nomic_embed_text-qnn_dlc"
+                // Model ID convention: "{model_id}-{runtime}-{precision}"
+                // e.g. "qwen3_4b_instruct_2507-genie-w4a16", "nomic_embed_text-qnn_dlc-float"
                 std::string runtime_str = metadata.value("runtime", "genie");
-                config.id = model_id + "-" + runtime_str;
+                std::string precision_str = metadata.value("precision", "float");
+                config.id = model_id + "-" + runtime_str + "-" + precision_str;
+
+                if (new_models.count(config.id)) {
+                    LOG_WARN("[ModelConfigManager] Duplicate model id '" << config.id
+                             << "' — skipping bundle " << bundle_name
+                             << " (already loaded from a previous bundle)");
+                    continue;
+                }
                 new_models[config.id] = std::move(config);
 
-                if (new_default.empty()) new_default = model_id + "-" + runtime_str;
-                LOG_INFO("[ModelConfigManager] Loaded model: " << model_id + "-" + runtime_str
+                if (new_default.empty()) new_default = config.id;
+                LOG_INFO("[ModelConfigManager] Loaded model: " << config.id
                          << " from " << bundle_name);
 
             } catch (const std::exception& e) {
@@ -159,6 +167,12 @@ void ModelConfigManager::scanModelBundles() {
                         config.config_file = processed_dir + "/" + fs::path(orig_config).filename().string();
                     }
 
+                    if (new_models.count(model_id)) {
+                        LOG_WARN("[ModelConfigManager] Duplicate model id '" << model_id
+                                 << "' — skipping legacy entry in bundle " << bundle_name
+                                 << " (already loaded from a previous bundle)");
+                        continue;
+                    }
                     new_models[model_id] = std::move(config);
                     if (new_default.empty()) new_default = model_id;
                     LOG_INFO("[ModelConfigManager] Loaded legacy model: " << model_id);
@@ -185,6 +199,12 @@ void ModelConfigManager::scanModelBundles() {
                     continue;
                 }
                 std::string geniex_id = config.id;
+                if (new_models.count(geniex_id)) {
+                    LOG_WARN("[ModelConfigManager] Duplicate model id '" << geniex_id
+                             << "' — skipping GenieX bundle " << bundle_name
+                             << " (already loaded from a previous bundle)");
+                    continue;
+                }
                 new_models[geniex_id] = std::move(config);
 
                 if (new_default.empty()) new_default = geniex_id;
