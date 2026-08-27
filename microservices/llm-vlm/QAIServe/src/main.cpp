@@ -7,6 +7,7 @@
 #include "qai_forge/QaiForge.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
+#include "postproc/PostprocRegistry.h"
 #include "tools/DateTimeTool.h"
 #include "tools/CalculatorTool.h"
 #include "grpc/ChatServiceImpl.h"
@@ -17,6 +18,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+
+// Default postprocess plugins dir, overridable via env vars
+static const char* kDefaultBuiltinPluginsDir = "/usr/lib/postproc_plugins";
+static const char* kDefaultClientPluginsDir = "/mnt/work/plugins";
 
 int main() {
     // Step 1: Drop privileges before any threads or sockets are opened.
@@ -74,6 +79,24 @@ int main() {
             // returns false until scanModelBundles() is called at least once.
             ModelConfigManager::getInstance().scanModelBundles();
             std::cout << "[main] Model bundles scanned." << std::endl;
+
+            // ── Step 3a-2: Load postprocess plugins ─────────────────────────
+            // Built-in plugins first (baked into the image), then any client-supplied
+            // plugins mounted at POSTPROC_PLUGINS_DIR — a client plugin whose
+            // name collides with a built-in is skipped.
+            auto& postproc_registry = PostprocRegistry::getInstance();
+            const char* builtin_env = std::getenv("POSTPROC_BUILTIN_PLUGINS_DIR");
+            const std::string builtin_dir =
+                (builtin_env && builtin_env[0] != '\0')
+                    ? builtin_env
+                    : kDefaultBuiltinPluginsDir;
+            postproc_registry.loadDirectory(builtin_dir);
+            const char* client_env = std::getenv("POSTPROC_PLUGINS_DIR");
+            const std::string client_dir =
+                (client_env && client_env[0] != '\0')
+                    ? client_env
+                    : kDefaultClientPluginsDir;
+            postproc_registry.loadDirectory(client_dir);
 
             qai_forge::QaiForge::getInstance().start();
             std::cout << "[main] Inference engine started." << std::endl;

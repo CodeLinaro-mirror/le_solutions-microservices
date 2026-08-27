@@ -592,12 +592,15 @@ RUN cmake -S /build/QAIServe -B /build/QAIServe/build \
 # Strips debug symbols from:
 #   - All executables in bin/ (our server + worker binaries)
 #   - Our own compiled .so files (Drogon, trantor, qai_forge, fastrpc)
+#   - Built-in postprocess plugin .so files 
 # Deliberately skips ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ — those are Hexagon DSP
 # blobs compiled for the DSP core, not ARM64; stripping them would corrupt them.
 # Vendor QAIRT .so files are already stripped release binaries; strip is a no-op.
 RUN find ${DEPLOY_DIR}/usr/bin -type f \
         -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
     find ${DEPLOY_DIR}/usr/lib -maxdepth 1 -type f -name "*.so*" \
+        -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
+    find ${DEPLOY_DIR}/usr/lib/postproc_plugins -maxdepth 1 -type f -name "*.so" \
         -exec strip --strip-unneeded {} \; 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -746,6 +749,8 @@ COPY --from=stager /export /
 # Set environment defaults
 ENV QAISERVE_PORT=9002
 ENV GENAI_MODELS_DIR=/mnt/work/models
+ENV POSTPROC_BUILTIN_PLUGINS_DIR=/usr/lib/postproc_plugins
+ENV POSTPROC_PLUGINS_DIR=/mnt/work/plugins
 ENV GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
 ENV GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
 ENV QNN_WORKER_BINARY=/usr/bin/qnn-inference-worker
