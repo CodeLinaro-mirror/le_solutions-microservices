@@ -694,11 +694,9 @@ void ModelRuntime::runJob(InferenceJob& job) {
         return;
     }
 
-    // Build the response_history: use job's history if use_response_history is
-    // set, otherwise pass an empty array (orchestrator creates a fresh session).
-    const json& response_history =
-        job.use_response_history ? job.response_history : json::array();
-
+    static const SchedulerInvokeOptions kDefaultInvokeOptions;
+    const SchedulerInvokeOptions& invoke_options = job.invoke_options
+        ? *job.invoke_options : kDefaultInvokeOptions;
     // Build the stream callback: non-null for streaming jobs, null for blocking.
     OrchestratorStreamCallback stream_callback = nullptr;
     std::string finish_reason = "stop";
@@ -733,7 +731,7 @@ void ModelRuntime::runJob(InferenceJob& job) {
 
         StandardResponse response = orchestrator_->execute(
             job.request,
-            response_history,
+            invoke_options,
             *backend_,
             stream_callback,
             cancel_requested);

@@ -5,6 +5,8 @@
 
 #include <string>
 #include <optional>
+#include <cstddef>
+#include <unordered_map>
 #include <vector>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -49,6 +51,13 @@ struct ToolCallChunk : BaseResponseChunk {
 /**
  * A complete non-streaming response.
  */
+struct ConversationMemoryUpdate {
+    std::string summary_content;
+    int summary_token_count = 0;
+    std::unordered_map<std::string, std::string> facts;
+    std::size_t evicted_message_count = 0;
+};
+
 struct StandardResponse : BaseResponseChunk {
     std::string role;
     std::optional<std::string> content;
@@ -59,6 +68,7 @@ struct StandardResponse : BaseResponseChunk {
     int completion_tokens = 0;
     int total_tokens = 0;
     int reasoning_tokens = 0;  // Thinking tokens generated (for output_tokens_details)
+    std::optional<ConversationMemoryUpdate> updated_conversation_memory;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

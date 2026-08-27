@@ -34,6 +34,10 @@ scheduler::SchedulerInvokeOptions toSchedulerOptions(
     sched.allow_tool_chain_fallback = opts.allow_tool_chain_fallback;
     sched.use_response_history    = opts.use_response_history;
     sched.response_history        = opts.response_history;
+    sched.summary_content         = opts.summary_content;
+    sched.summary_token_count     = opts.summary_token_count;
+    sched.facts                   = opts.facts;
+    sched.evicted_message_count   = opts.evicted_message_count;
     sched.kind                    = kind;
     sched.skip_summarization_middleware = true;
     return sched;

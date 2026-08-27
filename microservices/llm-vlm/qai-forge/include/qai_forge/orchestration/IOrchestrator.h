@@ -10,6 +10,10 @@
 
 using json = nlohmann::ordered_json;
 
+namespace scheduler {
+struct SchedulerInvokeOptions;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IOrchestrator — Stateless inference orchestration interface
 //
@@ -56,14 +60,14 @@ public:
     /**
      * Execute one inference turn.
      *
-     * Creates a transient ConversationSession seeded from response_history,
+     * Creates a transient ConversationSession seeded from invoke options,
      * builds the context prompt, runs inference on the supplied backend, and
      * returns the result. The session is discarded after the call — the caller
      * (ResponseStore / HTTP layer) owns persistent state.
      *
      * @param request          Chat completion request (model, messages, params).
-     * @param response_history Ancestor messages from ResponseStore (empty for
-     *                         root responses or in-process embedding).
+     * @param options          Scheduler invoke options, including response
+     *                         history and conversation memory.
      * @param backend          The backend instance to run inference on.
      *                         Owned by ModelRuntime; must outlive this call.
      * @param callback         Stream callback. Pass nullptr for blocking mode.
@@ -79,7 +83,7 @@ public:
      */
     virtual StandardResponse execute(
         const CreateChatCompletionRequest& request,
-        const json& response_history,
+        const scheduler::SchedulerInvokeOptions& options,
         IGenerativeBackend& backend,
         OrchestratorStreamCallback callback,
         std::function<bool()> cancel) = 0;

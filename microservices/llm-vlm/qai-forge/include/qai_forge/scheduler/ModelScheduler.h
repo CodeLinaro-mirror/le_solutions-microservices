@@ -30,19 +30,6 @@ struct ModelSchedulerConfig {
     std::chrono::milliseconds checkpoint_interval = std::chrono::seconds(1);
 };
 
-struct SchedulerInvokeOptions {
-    std::string response_id;
-    std::string previous_response_id;
-    std::string session_id;
-    JobKind kind = JobKind::HTTP_NON_STREAMING;
-    JobPriority priority = JobPriority::NEW_REQUEST;
-    bool tool_output_submission = false;
-    bool allow_tool_chain_fallback = false;
-    bool skip_summarization_middleware = false;
-    bool use_response_history = false;
-    json response_history = json::array();
-};
-
 // Public scheduler facade.
 //
 // It owns request-level semantics such as tool-chain continuity and delegates
@@ -63,15 +50,15 @@ public:
     void start();
     StandardResponse runBlocking(
         const CreateChatCompletionRequest& request,
-        const SchedulerInvokeOptions& options = {});
+        SchedulerInvokeOptions options = {});
     StandardResponse runStreaming(
         const CreateChatCompletionRequest& request,
         std::function<void(const StreamChunk&)> callback,
-        const SchedulerInvokeOptions& options = {});
+        SchedulerInvokeOptions options = {});
     void runStreamingAsync(
         const CreateChatCompletionRequest& request,
         qai_forge::StreamCallbacks callbacks,
-        const SchedulerInvokeOptions& options = {});
+        SchedulerInvokeOptions options = {});
     bool cancelResponse(const std::string& response_id);
     SubmitResult submit(InferenceJobPtr job);
     CancelResult cancel(const std::string& job_id);

@@ -5,9 +5,11 @@
 
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/dto/TensorDTOs.h"
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QaiForge — Unified inference facade
@@ -56,6 +58,12 @@ struct GenerateOptions {
     // Response history (Responses API — ancestor messages from ResponseStore)
     bool use_response_history = false;
     json response_history = json::array();
+
+    // Generic conversation memory used to seed orchestrator prompt slots.
+    std::string summary_content;
+    int summary_token_count = 0;
+    std::unordered_map<std::string, std::string> facts;
+    std::size_t evicted_message_count = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

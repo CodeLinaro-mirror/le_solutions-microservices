@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
+#include "qai_forge/scheduler/InferenceJob.h"
 #include "qai_forge/utils/Logger.h"
 
 #include <sstream>
@@ -74,12 +75,15 @@ bool LiteRTLMOrchestrator::initMetadataIfNeeded(IGenerativeBackend& backend) {
 
 StandardResponse LiteRTLMOrchestrator::execute(
     const CreateChatCompletionRequest& request,
-    const json& response_history,
+    const scheduler::SchedulerInvokeOptions& options,
     IGenerativeBackend& backend,
     OrchestratorStreamCallback callback,
     std::function<bool()> cancel)
 {
     // Merge response_history into the request messages for context
+    static const json kEmptyResponseHistory = json::array();
+    const json& response_history = options.use_response_history
+        ? options.response_history : kEmptyResponseHistory;
     CreateChatCompletionRequest merged_request = request;
     if (!response_history.is_null() && response_history.is_array()
             && !response_history.empty()) {

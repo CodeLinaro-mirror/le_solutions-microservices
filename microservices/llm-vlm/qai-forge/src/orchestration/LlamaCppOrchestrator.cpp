@@ -5,6 +5,7 @@
 
 #include "qai_forge/orchestration/LlamaCppOrchestrator.h"
 #include "qai_forge/backend/LlamaCppBackend.h"
+#include "qai_forge/scheduler/InferenceJob.h"
 #include "qai_forge/utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -24,7 +25,7 @@ std::string generateEventId() {
 
 StandardResponse LlamaCppOrchestrator::execute(
     const CreateChatCompletionRequest& request,
-    const json& response_history,
+    const scheduler::SchedulerInvokeOptions& options,
     IGenerativeBackend& backend,
     OrchestratorStreamCallback callback,
     std::function<bool()> cancel) {
@@ -36,6 +37,9 @@ StandardResponse LlamaCppOrchestrator::execute(
     }
 
     // Merge response_history into request.messages
+    static const json kEmptyResponseHistory = json::array();
+    const json& response_history = options.use_response_history
+        ? options.response_history : kEmptyResponseHistory;
     json merged_messages = json::array();
     if (response_history.is_array()) {
         for (const auto& msg : response_history) {

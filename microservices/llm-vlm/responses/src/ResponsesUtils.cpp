@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <random>
 #include <regex>
+#include <vector>
 
 namespace ResponsesUtils {
 namespace {
@@ -129,6 +130,30 @@ std::string text_runtime_content(const json& content) {
     return text.str();
 }
 
+bool build_text_runtime_message(const json& message, json& runtime_message) {
+    if (!message.is_object()) {
+        return false;
+    }
+
+    runtime_message = message;
+    runtime_message.erase("_thinking_content");
+    bool has_tool_calls =
+        runtime_message.contains("tool_calls")
+        && runtime_message["tool_calls"].is_array()
+        && !runtime_message["tool_calls"].empty();
+    bool is_tool_result =
+        runtime_message.value("role", "") == "tool"
+        && runtime_message.contains("tool_call_id");
+
+    if (runtime_message.contains("content")) {
+        runtime_message["content"] =
+            text_runtime_content(runtime_message["content"]);
+    }
+
+    std::string content = runtime_message.value("content", "");
+    return !content.empty() || has_tool_calls || is_tool_result;
+}
+
 void attach_image_to_message(json& message, const std::string& image_url) {
     if (image_url.empty() || !message.is_object()) {
         return;
@@ -181,35 +206,6 @@ std::string generate_response_id() {
     std::ostringstream oss;
     oss << "resp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
     return oss.str();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// generate_compaction_id
-// ─────────────────────────────────────────────────────────────────────────────
-std::string generate_compaction_id() {
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << "cmp_" << std::hex << std::setw(16) << std::setfill('0') << rng();
-    return oss.str();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// inject_summary_into_instructions
-// ─────────────────────────────────────────────────────────────────────────────
-std::string inject_summary_into_instructions(
-    const std::string& instructions,
-    const std::string& applied_summary) {
-    if (applied_summary.empty()) {
-        return instructions;
-    }
-
-    std::string result = instructions;
-    if (!result.empty()) {
-        result += "\n\n";
-    }
-    result += "Previous conversation summary:\n";
-    result += applied_summary;
-    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,31 +288,39 @@ json build_text_runtime_messages(const json& messages) {
     }
 
     for (const auto& message : messages) {
-        if (!message.is_object()) {
-            continue;
+        json runtime_message;
+        if (build_text_runtime_message(message, runtime_message)) {
+            runtime_messages.push_back(std::move(runtime_message));
         }
+    }
 
-        json runtime_message = message;
-        runtime_message.erase("_thinking_content");
-        bool has_tool_calls =
-            runtime_message.contains("tool_calls")
-            && runtime_message["tool_calls"].is_array()
-            && !runtime_message["tool_calls"].empty();
-        bool is_tool_result =
-            runtime_message.value("role", "") == "tool"
-            && runtime_message.contains("tool_call_id");
+    return runtime_messages;
+}
 
-        if (runtime_message.contains("content")) {
-            runtime_message["content"] =
-                text_runtime_content(runtime_message["content"]);
+// ─────────────────────────────────────────────────────────────────────────────
+// build_text_runtime_messages_with_sources
+// ─────────────────────────────────────────────────────────────────────────────
+json build_text_runtime_messages_with_sources(
+    const json& messages,
+    const std::vector<std::string>& message_source_ids,
+    std::vector<std::string>& runtime_message_source_ids) {
+    json runtime_messages = json::array();
+    runtime_message_source_ids.clear();
+    if (!messages.is_array()) {
+        return runtime_messages;
+    }
+
+    std::size_t index = 0;
+    for (const auto& message : messages) {
+        json runtime_message;
+        if (build_text_runtime_message(message, runtime_message)) {
+            runtime_messages.push_back(std::move(runtime_message));
+            runtime_message_source_ids.push_back(
+                index < message_source_ids.size()
+                    ? message_source_ids[index]
+                    : std::string());
         }
-
-        std::string content = runtime_message.value("content", "");
-        // Image-only text-runtime messages drop out; tool exchanges must stay paired.
-        if (content.empty() && !has_tool_calls && !is_tool_result) {
-            continue;
-        }
-        runtime_messages.push_back(std::move(runtime_message));
+        ++index;
     }
 
     return runtime_messages;

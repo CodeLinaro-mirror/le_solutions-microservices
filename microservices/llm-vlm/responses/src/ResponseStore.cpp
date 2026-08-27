@@ -5,55 +5,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace {
-
-struct SummaryPathMatch {
-    bool ok = false;
-    std::size_t branch_head_index = 0;
-    std::size_t watermark_index = 0;
-};
-
-int depthFromRoot(std::size_t path_size, std::size_t head_to_root_index) {
-    return static_cast<int>(path_size - 1 - head_to_root_index);
-}
-
-bool ancestorOrEqual(std::size_t possible_ancestor_index,
-                     std::size_t possible_descendant_index) {
-    return possible_ancestor_index >= possible_descendant_index;
-}
-
-SummaryPathMatch matchSummaryOnPath(
-    const CompactionSummary& summary,
-    const std::unordered_map<std::string, std::size_t>& index_by_id) {
-    SummaryPathMatch match;
-
-    auto branch_it = index_by_id.find(summary.branch_head_response_id);
-    auto watermark_it = index_by_id.find(summary.summarized_until_response_id);
-    if (branch_it == index_by_id.end() || watermark_it == index_by_id.end()) {
-        return match;
-    }
-
-    if (!ancestorOrEqual(watermark_it->second, branch_it->second)) {
-        return match;
-    }
-
-    match.ok = true;
-    match.branch_head_index = branch_it->second;
-    match.watermark_index = watermark_it->second;
-    return match;
-}
-
-ApplyCompactionResult makeApplyError(int http_status,
-                                     const std::string& error_message) {
-    ApplyCompactionResult result;
-    result.ok = false;
-    result.applied = false;
-    result.http_status = http_status;
-    result.error_message = error_message;
-    return result;
-}
 
 std::string publicStatusFor(StoredResponseStatus status) {
     switch (status) {
@@ -94,6 +50,63 @@ BeginResponseResult ResponseStore::beginResponse(
             "Response " + response_id + " already exists");
     }
 
+    BuildCandidateResult candidate =
+        buildCandidateMessagesLocked(previous_response_id, request_messages);
+    return beginResponseFromCandidateLocked(
+        response_id,
+        model,
+        previous_response_id,
+        input_items,
+        request_messages,
+        metadata,
+        std::move(candidate),
+        ttl_seconds);
+}
+
+BeginResponseResult ResponseStore::beginResponseFromCandidate(
+    const std::string& response_id,
+    const std::string& model,
+    const std::string& previous_response_id,
+    const ResponseStoreJson& input_items,
+    const ResponseStoreJson& request_messages,
+    const ResponseStoreJson& metadata,
+    BuildCandidateResult candidate,
+    int ttl_seconds) {
+    std::lock_guard<std::mutex> lock(mu_);
+    return beginResponseFromCandidateLocked(
+        response_id,
+        model,
+        previous_response_id,
+        input_items,
+        request_messages,
+        metadata,
+        std::move(candidate),
+        ttl_seconds);
+}
+
+BeginResponseResult ResponseStore::beginResponseFromCandidateLocked(
+    const std::string& response_id,
+    const std::string& model,
+    const std::string& previous_response_id,
+    const ResponseStoreJson& input_items,
+    const ResponseStoreJson& request_messages,
+    const ResponseStoreJson& metadata,
+    BuildCandidateResult candidate,
+    int ttl_seconds) {
+    if (responses_by_id_.find(response_id) != responses_by_id_.end()) {
+        return makeBeginError(
+            409,
+            "Response " + response_id + " already exists");
+    }
+    if (!candidate.ok) {
+        return makeBeginError(candidate.http_status, candidate.error_message);
+    }
+    if (candidate.current_request_messages != request_messages) {
+        return makeBeginError(
+            409,
+            "Candidate request messages do not match response request messages");
+    }
+
     std::string session_id;
     if (!previous_response_id.empty()) {
         auto parent_it = responses_by_id_.find(previous_response_id);
@@ -117,7 +130,20 @@ BeginResponseResult ResponseStore::beginResponse(
                     + " is not continuable");
         }
         session_id = parent.session_id;
+        if (candidate.session_id != session_id) {
+            return makeBeginError(
+                409,
+                "Candidate session does not match previous response");
+        }
     } else {
+        if (!candidate.session_id.empty()
+            || !candidate.ancestor_messages.empty()
+            || !candidate.ancestor_message_response_ids.empty()
+            || candidate.conversation_memory.has_value()) {
+            return makeBeginError(
+                409,
+                "Candidate does not match response lineage");
+        }
         session_id = "rsess_" + response_id;
     }
 
@@ -151,36 +177,17 @@ BeginResponseResult ResponseStore::beginResponse(
         children_by_response_id_[previous_response_id].push_back(response_id);
     }
 
-    BuildCandidateResult walk =
-        buildCandidateMessagesLocked(previous_response_id, request_messages);
-    if (!walk.ok) {
-        responses_by_id_.erase(response_id);
-        session.response_ids.erase(response_id);
-        if (session.response_ids.empty()) {
-            sessions_by_id_.erase(session_id);
-        }
-        if (!previous_response_id.empty()) {
-            auto children_it = children_by_response_id_.find(previous_response_id);
-            if (children_it != children_by_response_id_.end()) {
-                auto& children = children_it->second;
-                children.erase(
-                    std::remove(children.begin(), children.end(), response_id),
-                    children.end());
-                if (children.empty()) {
-                    children_by_response_id_.erase(children_it);
-                }
-            }
-        }
-        return makeBeginError(walk.http_status, walk.error_message);
-    }
-
     BeginResponseResult result;
     result.ok = true;
     result.response_id = response_id;
     result.session_id = session_id;
     result.created_at = now;
-    result.ancestor_messages = walk.ancestor_messages;
-    result.current_request_messages = walk.current_request_messages;
+    result.ancestor_messages = std::move(candidate.ancestor_messages);
+    result.ancestor_message_response_ids =
+        std::move(candidate.ancestor_message_response_ids);
+    result.current_request_messages =
+        std::move(candidate.current_request_messages);
+    result.conversation_memory = std::move(candidate.conversation_memory);
     return result;
 }
 
@@ -189,7 +196,8 @@ bool ResponseStore::completeResponse(
     const ResponseStoreJson& assistant_messages,
     const ResponseStoreJson& output_items,
     const ResponseStoreJson& response_object,
-    const ResponseStoreJson& usage) {
+    const ResponseStoreJson& usage,
+    const std::optional<StoredConversationMemory>& memory_update) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = responses_by_id_.find(response_id);
     if (it == responses_by_id_.end()
@@ -203,6 +211,7 @@ bool ResponseStore::completeResponse(
     response.output_items = output_items;
     response.response_object = response_object;
     response.usage = usage;
+    response.conversation_memory = memory_update;
     response.error = nullptr;
     response.incomplete_details = nullptr;
     response.status = StoredResponseStatus::Completed;
@@ -342,9 +351,6 @@ DeleteCascadeResult ResponseStore::deleteCascade(
         }
     }
 
-    std::unordered_set<std::string> erased_set(subtree.begin(), subtree.end());
-    std::unordered_set<std::string> affected_session_ids;
-
     for (const auto& id : subtree) {
         auto it = responses_by_id_.find(id);
         if (it == responses_by_id_.end()) {
@@ -352,7 +358,6 @@ DeleteCascadeResult ResponseStore::deleteCascade(
         }
 
         std::string session_id = it->second.session_id;
-        affected_session_ids.insert(session_id);
         std::string parent_id = it->second.previous_response_id;
         if (!parent_id.empty()) {
             auto parent_children_it = children_by_response_id_.find(parent_id);
@@ -378,24 +383,6 @@ DeleteCascadeResult ResponseStore::deleteCascade(
         }
 
         responses_by_id_.erase(it);
-    }
-
-    for (const auto& session_id : affected_session_ids) {
-        auto session_it = sessions_by_id_.find(session_id);
-        if (session_it == sessions_by_id_.end()) {
-            continue;
-        }
-
-        auto& compactions = session_it->second.compactions;
-        compactions.erase(
-            std::remove_if(
-                compactions.begin(),
-                compactions.end(),
-                [&erased_set](const CompactionSummary& summary) {
-                    return erased_set.find(summary.branch_head_response_id)
-                        != erased_set.end();
-                }),
-            compactions.end());
     }
 
     DeleteCascadeResult result;
@@ -442,128 +429,6 @@ std::vector<ExpiredResponse> ResponseStore::expireStaleInProgress(int now_unix) 
     }
 
     return expired;
-}
-
-ApplyCompactionResult ResponseStore::applyCompaction(
-    const std::string& session_id,
-    const CompactionSummary& summary) {
-    std::lock_guard<std::mutex> lock(mu_);
-
-    if (session_id.empty()) {
-        return makeApplyError(400, "session_id is required");
-    }
-    if (summary.compaction_id.empty()) {
-        return makeApplyError(400, "compaction_id is required");
-    }
-    if (summary.summarized_until_response_id.empty()
-        || summary.branch_head_response_id.empty()) {
-        return makeApplyError(
-            400,
-            "summarized_until_response_id and branch_head_response_id are required");
-    }
-
-    auto session_it = sessions_by_id_.find(session_id);
-    if (session_it == sessions_by_id_.end()) {
-        return makeApplyError(404, "Session " + session_id + " not found");
-    }
-
-    auto head_it = responses_by_id_.find(summary.branch_head_response_id);
-    if (head_it == responses_by_id_.end()) {
-        return makeApplyError(
-            404,
-            "Branch head " + summary.branch_head_response_id + " not found");
-    }
-    if (head_it->second.session_id != session_id) {
-        return makeApplyError(
-            400,
-            "Branch head " + summary.branch_head_response_id
-                + " is not in session " + session_id);
-    }
-
-    std::vector<std::string> path_ids;
-    std::string cursor = summary.branch_head_response_id;
-    while (!cursor.empty()) {
-        auto it = responses_by_id_.find(cursor);
-        if (it == responses_by_id_.end()) {
-            return makeApplyError(404, "Response " + cursor + " not found");
-        }
-
-        const StoredResponse& response = it->second;
-        if (response.session_id != session_id) {
-            return makeApplyError(
-                400,
-                "Response " + cursor + " is not in session " + session_id);
-        }
-        if (response.status == StoredResponseStatus::InProgress) {
-            return makeApplyError(
-                409,
-                "Response " + cursor + " is still in progress");
-        }
-        if (response.status != StoredResponseStatus::Completed) {
-            return makeApplyError(
-                404,
-                "Response " + cursor + " is not continuable");
-        }
-
-        path_ids.push_back(cursor);
-        cursor = response.previous_response_id;
-    }
-
-    std::unordered_map<std::string, std::size_t> index_by_id;
-    for (std::size_t i = 0; i < path_ids.size(); ++i) {
-        index_by_id[path_ids[i]] = i;
-    }
-
-    SummaryPathMatch new_match = matchSummaryOnPath(summary, index_by_id);
-    if (!new_match.ok) {
-        return makeApplyError(
-            400,
-            "Compaction summary does not match the requested branch");
-    }
-
-    int new_branch_depth =
-        depthFromRoot(path_ids.size(), new_match.branch_head_index);
-    int new_watermark_depth =
-        depthFromRoot(path_ids.size(), new_match.watermark_index);
-
-    auto& compactions = session_it->second.compactions;
-    for (auto it = compactions.begin(); it != compactions.end();) {
-        SummaryPathMatch old_match = matchSummaryOnPath(*it, index_by_id);
-        if (!old_match.ok) {
-            ++it;
-            continue;
-        }
-
-        int old_branch_depth =
-            depthFromRoot(path_ids.size(), old_match.branch_head_index);
-        int old_watermark_depth =
-            depthFromRoot(path_ids.size(), old_match.watermark_index);
-
-        bool existing_is_equal_or_deeper =
-            old_branch_depth > new_branch_depth
-            || (old_branch_depth == new_branch_depth
-                && old_watermark_depth >= new_watermark_depth);
-        if (existing_is_equal_or_deeper) {
-            ApplyCompactionResult result;
-            result.ok = true;
-            result.applied = false;
-            result.http_status = 200;
-            result.compaction_id = it->compaction_id;
-            return result;
-        }
-
-        it = compactions.erase(it);
-    }
-
-    compactions.push_back(summary);
-    session_it->second.last_activity_at = currentUnixTime();
-
-    ApplyCompactionResult result;
-    result.ok = true;
-    result.applied = true;
-    result.http_status = 200;
-    result.compaction_id = summary.compaction_id;
-    return result;
 }
 
 std::optional<StoredResponse> ResponseStore::getResponse(
@@ -654,60 +519,46 @@ BuildCandidateResult ResponseStore::buildCandidateMessagesLocked(
         cursor = response.previous_response_id;
     }
 
-    const CompactionSummary* selected_summary = nullptr;
-    SummaryPathMatch selected_match;
-    auto session_it = sessions_by_id_.find(result.session_id);
-    if (session_it != sessions_by_id_.end()) {
-        for (const auto& summary : session_it->second.compactions) {
-            SummaryPathMatch match = matchSummaryOnPath(summary, index_by_id);
-            if (!match.ok) {
-                continue;
-            }
-
-            if (!selected_summary) {
-                selected_summary = &summary;
-                selected_match = match;
-                continue;
-            }
-
-            int branch_depth =
-                depthFromRoot(path.size(), match.branch_head_index);
-            int selected_branch_depth =
-                depthFromRoot(path.size(), selected_match.branch_head_index);
-            int watermark_depth =
-                depthFromRoot(path.size(), match.watermark_index);
-            int selected_watermark_depth =
-                depthFromRoot(path.size(), selected_match.watermark_index);
-
-            bool is_better =
-                branch_depth > selected_branch_depth
-                || (branch_depth == selected_branch_depth
-                    && watermark_depth > selected_watermark_depth)
-                || (branch_depth == selected_branch_depth
-                    && watermark_depth == selected_watermark_depth
-                    && summary.created_at > selected_summary->created_at);
-            if (is_better) {
-                selected_summary = &summary;
-                selected_match = match;
-            }
+    std::optional<std::size_t> watermark_index;
+    for (const StoredResponse* response : path) {
+        if (!response->conversation_memory.has_value()) {
+            continue;
         }
-    }
 
-    if (selected_summary) {
-        result.applied_compaction_id = selected_summary->compaction_id;
-        result.applied_summary = selected_summary->summary_text;
-        result.summary_tokens = selected_summary->summary_tokens;
+        const StoredConversationMemory& memory =
+            response->conversation_memory.value();
+        if (memory.summarized_until_response_id.empty()) {
+            result.conversation_memory = memory;
+            break;
+        }
+
+        auto watermark_it =
+            index_by_id.find(memory.summarized_until_response_id);
+        if (watermark_it == index_by_id.end()) {
+            continue;
+        }
+
+        result.conversation_memory = memory;
+        watermark_index = watermark_it->second;
+        break;
     }
 
     for (std::size_t i = path.size(); i > 0; --i) {
         std::size_t path_index = i - 1;
-        if (selected_summary && path_index >= selected_match.watermark_index) {
+        if (watermark_index.has_value()
+            && path_index >= watermark_index.value()) {
             continue;
         }
-        appendMessages(result.ancestor_messages,
-                       path[path_index]->request_messages);
-        appendMessages(result.ancestor_messages,
-                       path[path_index]->assistant_messages);
+        appendMessagesWithSource(
+            result.ancestor_messages,
+            result.ancestor_message_response_ids,
+            path[path_index]->request_messages,
+            path[path_index]->response_id);
+        appendMessagesWithSource(
+            result.ancestor_messages,
+            result.ancestor_message_response_ids,
+            path[path_index]->assistant_messages,
+            path[path_index]->response_id);
     }
 
     return result;
@@ -726,17 +577,22 @@ int ResponseStore::currentUnixTime() {
         / 1000000000LL);
 }
 
-void ResponseStore::appendMessages(ResponseStoreJson& destination,
-                                   const ResponseStoreJson& messages) {
+void ResponseStore::appendMessagesWithSource(
+    ResponseStoreJson& destination,
+    std::vector<std::string>& destination_response_ids,
+    const ResponseStoreJson& messages,
+    const std::string& response_id) {
     if (messages.is_array()) {
         for (const auto& message : messages) {
             destination.push_back(message);
+            destination_response_ids.push_back(response_id);
         }
         return;
     }
 
     if (!messages.is_null()) {
         destination.push_back(messages);
+        destination_response_ids.push_back(response_id);
     }
 }
 

@@ -25,34 +25,11 @@ struct ContextBudgetResult {
     bool tool_response_dominates = false;
 };
 
-struct SummarizationTriggerResult {
-    bool should_summarize = false;
-    int context_size = 0;
-    int input_tokens = 0;
-    int output_reservation_tokens = 0;
-    int projected_tokens = 0;
-    int threshold_tokens = 0;
-};
-
 int estimate_tokens(const std::string& text);
 
 int estimate_multimodal_content_tokens(const TokenBudgetJson& content);
 
 int estimate_tool_response_tokens(const TokenBudgetJson& messages);
-
-std::string render_candidate_prompt(
-    const std::string& model,
-    const TokenBudgetJson& ancestor_messages,
-    const TokenBudgetJson& current_messages,
-    const std::string& instructions,
-    const TokenBudgetJson& tools);
-
-int count_input_tokens(
-    const std::string& model,
-    const TokenBudgetJson& ancestor_messages,
-    const TokenBudgetJson& current_messages,
-    const std::string& instructions,
-    const TokenBudgetJson& tools);
 
 ContextBudgetResult resolve_context_budget(
     const std::string& model,
@@ -63,15 +40,5 @@ ContextBudgetResult resolve_context_budget(
     std::optional<int> requested_max_output_tokens);
 
 int default_max_output_tokens(int context_size);
-
-int summary_max_output_tokens(int context_size);
-
-SummarizationTriggerResult evaluate_summarization_trigger(
-    const std::string& model,
-    const TokenBudgetJson& ancestor_messages,
-    const TokenBudgetJson& current_messages,
-    const std::string& instructions,
-    const TokenBudgetJson& tools,
-    int max_output_tokens);
 
 } // namespace TokenBudgetUtils
