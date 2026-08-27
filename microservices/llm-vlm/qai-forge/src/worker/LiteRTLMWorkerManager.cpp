@@ -209,7 +209,9 @@ void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
         ModelConfigManager::getInstance().updateLiteRTLMMetadata(
             model_id,
             metadata_.max_context_length,
-            metadata_.jinja_template);
+            metadata_.jinja_template,
+            metadata_.tool_call_delimiter,
+            metadata_.tool_response_delimiter);
     } else {
         // Fallback: use defaults if metadata probe didn't work
         LOG_WARN("[LiteRTLMWorkerManager] Metadata not received from worker — using defaults");

@@ -5,7 +5,7 @@
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 
-#include "qai_forge/orchestration/IOrchestrator.h"
+#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include "qai_forge/InternalDTOs.h"
 #include <nlohmann/json.hpp>
 #include <string>
@@ -17,7 +17,7 @@ namespace qai_forge {
 /**
  * @brief Stateless orchestrator for llama.cpp backend
  *
- * Implements IOrchestrator interface with backend injection pattern.
+ * Implements IGenerativeOrchestrator with backend injection.
  * The backend is passed as a parameter to execute() — this orchestrator
  * does NOT store a backend reference.
  *
@@ -32,7 +32,7 @@ namespace qai_forge {
  *
  * Pattern follows LiteRTLMOrchestrator implementation.
  */
-class LlamaCppOrchestrator : public IOrchestrator {
+class LlamaCppOrchestrator : public IGenerativeOrchestrator {
 public:
     LlamaCppOrchestrator() = default;
     ~LlamaCppOrchestrator() override = default;
@@ -41,7 +41,7 @@ public:
      * Execute one inference turn.
      *
      * The backend is injected as a parameter — this orchestrator does NOT
-     * store a backend reference. This follows the stateless IOrchestrator
+     * store a backend reference. This follows the stateless orchestrator
      * pattern where ModelRuntime owns the backend and passes it per call.
      *
      * @param request          Chat completion request (model, messages, params)
@@ -51,12 +51,13 @@ public:
      * @param cancel           Cancellation predicate
      * @return                 StandardResponse with content, tool_calls, usage
      */
+    scheduler::GenerativeJobPtr createJob(
+        scheduler::GenerativeJobContext context,
+        scheduler::GenerativeCallbacks callbacks) const override;
+
     StandardResponse execute(
-        const CreateChatCompletionRequest& request,
-        const scheduler::SchedulerInvokeOptions& options,
-        IGenerativeBackend& backend,
-        OrchestratorStreamCallback callback,
-        std::function<bool()> cancel) override;
+        scheduler::GenerativeJob& job,
+        IGenerativeBackend& backend) const override;
 
 private:
     /**
@@ -67,7 +68,7 @@ private:
      */
     json buildChatCompletionsRequest(
         const CreateChatCompletionRequest& request,
-        const json& merged_messages);
+        json merged_messages) const;
 
     /**
      * @brief Parse SSE chunk and invoke callback
@@ -83,14 +84,14 @@ private:
      */
     void handleSseChunk(
         const std::string& sse_chunk,
-        OrchestratorStreamCallback callback,
+        const std::function<void(const StreamChunk&)>& callback,
         const std::string& event_id,
         const std::string& model,
         std::string& accumulated_content,
         json& accumulated_tool_calls,
         std::string& finish_reason,
         int& prompt_tokens,
-        int& completion_tokens);
+        int& completion_tokens) const;
 
     /**
      * @brief Build StandardResponse from accumulated data
@@ -110,7 +111,7 @@ private:
         const json& accumulated_tool_calls,
         const std::string& finish_reason,
         int prompt_tokens,
-        int completion_tokens);
+        int completion_tokens) const;
 };
 
 } // namespace qai_forge

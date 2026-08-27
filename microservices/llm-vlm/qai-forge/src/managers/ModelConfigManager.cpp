@@ -1177,7 +1177,9 @@ std::string ModelConfigManager::getModelType(const std::string& model_id) const 
 
 void ModelConfigManager::updateLiteRTLMMetadata(const std::string& model_id,
                                                  int max_context_length,
-                                                 const std::string& jinja_template) {
+                                                 const std::string& jinja_template,
+                                                 const std::string& tool_call_delimiter,
+                                                 const std::string& tool_response_delimiter) {
     std::unique_lock lock(mutex_);
     auto it = models_.find(model_id);
     if (it == models_.end()) {
@@ -1187,6 +1189,14 @@ void ModelConfigManager::updateLiteRTLMMetadata(const std::string& model_id,
     it->second.context_size = max_context_length;
     if (!jinja_template.empty()) {
         it->second.chat_template["jinja_template"] = jinja_template;
+    }
+    if (!tool_call_delimiter.empty()) {
+        it->second.chat_template["tool_call_delimiter"] =
+            tool_call_delimiter;
+    }
+    if (!tool_response_delimiter.empty()) {
+        it->second.chat_template["tool_response_delimiter"] =
+            tool_response_delimiter;
     }
     LOG_INFO("[ModelConfigManager] Updated LiteRT-LM metadata for " << model_id
              << ": ctx=" << max_context_length

@@ -394,6 +394,41 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
     is_active_ = false;
 }
 
+void InferenceWorkerManager::executeStructuredRequest(
+    const std::string& event_id,
+    const json& messages,
+    const json& tools,
+    bool streaming,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    int top_k,
+    float presence_penalty,
+    float frequency_penalty,
+    TokenCallback on_token,
+    DoneCallback on_done,
+    ErrorCallback on_error) {
+    waitForPendingReset();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_active_ = true;
+
+    json execute_cmd = InferenceProtocol::createStructuredExecuteCommand(
+        event_id,
+        messages,
+        tools,
+        streaming,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        presence_penalty,
+        frequency_penalty);
+    sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
+
+    is_active_ = false;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // sendReset — Called by Layer 2's ConcurrencyMiddleware (not by Layer 3 itself)
 // ─────────────────────────────────────────────────────────────────────────────

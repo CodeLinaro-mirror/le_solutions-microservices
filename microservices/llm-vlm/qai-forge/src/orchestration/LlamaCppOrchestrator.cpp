@@ -5,7 +5,6 @@
 
 #include "qai_forge/orchestration/LlamaCppOrchestrator.h"
 #include "qai_forge/backend/LlamaCppBackend.h"
-#include "qai_forge/scheduler/InferenceJob.h"
 #include "qai_forge/utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -23,12 +22,52 @@ std::string generateEventId() {
 }
 } // anonymous namespace
 
+scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
+    scheduler::GenerativeJobContext context,
+    scheduler::GenerativeCallbacks callbacks) const {
+    json merged_messages = json::array();
+    if (context.caller.use_response_history &&
+        context.caller.response_history.is_array()) {
+        for (auto& message : context.caller.response_history) {
+            merged_messages.push_back(std::move(message));
+        }
+    }
+    if (context.request.messages.is_array()) {
+        for (auto& message : context.request.messages) {
+            merged_messages.push_back(std::move(message));
+        }
+    }
+
+    scheduler::LlamaCppPreparedRequest prepared;
+    prepared.chat_completions_body =
+        buildChatCompletionsRequest(
+            context.request, std::move(merged_messages));
+    prepared.chat_completions_body["stream"] =
+        static_cast<bool>(callbacks.on_token);
+    if (callbacks.on_token) {
+        prepared.chat_completions_body["stream_options"] =
+            {{"include_usage", true}};
+    }
+
+    auto job = std::make_shared<scheduler::GenerativeJob>();
+    job->response_id = context.caller.response_id.empty()
+        ? context.job_id : std::move(context.caller.response_id);
+    job->session_id = context.request.user.value_or(context.job_id);
+    job->job_id = std::move(context.job_id);
+    job->model_id = std::move(context.model_id);
+    job->tool_chain_id = std::move(context.tool_chain_id);
+    job->kind = context.kind;
+    job->priority = context.priority;
+    job->prepared = std::move(prepared);
+    job->skip_post_turn_summarization =
+        context.skip_post_turn_summarization;
+    job->callbacks = std::move(callbacks);
+    return job;
+}
+
 StandardResponse LlamaCppOrchestrator::execute(
-    const CreateChatCompletionRequest& request,
-    const scheduler::SchedulerInvokeOptions& options,
-    IGenerativeBackend& backend,
-    OrchestratorStreamCallback callback,
-    std::function<bool()> cancel) {
+    scheduler::GenerativeJob& job,
+    IGenerativeBackend& backend) const {
 
     // Cast to LlamaCppBackend to access HTTP methods
     auto* llama_backend = dynamic_cast<LlamaCppBackend*>(&backend);
@@ -36,33 +75,14 @@ StandardResponse LlamaCppOrchestrator::execute(
         throw std::runtime_error("LlamaCppOrchestrator requires LlamaCppBackend");
     }
 
-    // Merge response_history into request.messages
-    static const json kEmptyResponseHistory = json::array();
-    const json& response_history = options.use_response_history
-        ? options.response_history : kEmptyResponseHistory;
-    json merged_messages = json::array();
-    if (response_history.is_array()) {
-        for (const auto& msg : response_history) {
-            merged_messages.push_back(msg);
-        }
+    const auto* prepared =
+        std::get_if<scheduler::LlamaCppPreparedRequest>(&job.prepared);
+    if (!prepared) {
+        throw std::runtime_error(
+            "LlamaCppOrchestrator received a non-llama.cpp prepared request");
     }
-    if (request.messages.is_array()) {
-        for (const auto& msg : request.messages) {
-            merged_messages.push_back(msg);
-        }
-    }
-
-    // Build OpenAI chat completions request
-    json chat_request = buildChatCompletionsRequest(request, merged_messages);
-
-    // Determine streaming mode
-    bool streaming = callback != nullptr;
-    chat_request["stream"] = streaming;
-
-    // Request token usage in streaming responses
-    if (streaming) {
-        chat_request["stream_options"] = {{"include_usage", true}};
-    }
+    const json& chat_request = prepared->chat_completions_body;
+    const bool streaming = static_cast<bool>(job.callbacks.on_token);
 
     // Generate event ID for this request
     std::string event_id = generateEventId();
@@ -79,13 +99,14 @@ StandardResponse LlamaCppOrchestrator::execute(
         llama_backend->httpPostStreaming("/v1/chat/completions", chat_request,
             [&](const std::string& sse_chunk) {
                 // Check cancellation
-                if (cancel && cancel()) {
+                if (job.isCancelled()) {
                     return;
                 }
 
                 try {
                     // Parse SSE chunk and invoke callback
-                    handleSseChunk(sse_chunk, callback, event_id, request.model,
+                    handleSseChunk(sse_chunk, job.callbacks.on_token, event_id,
+                                 job.model_id,
                                  accumulated_content, accumulated_tool_calls,
                                  finish_reason, prompt_tokens, completion_tokens);
                 } catch (const std::exception& e) {
@@ -131,18 +152,18 @@ StandardResponse LlamaCppOrchestrator::execute(
     }
 
     // Build and return StandardResponse
-    return buildStandardResponse(event_id, request.model,
+    return buildStandardResponse(event_id, job.model_id,
                                 accumulated_content, accumulated_tool_calls,
                                 finish_reason, prompt_tokens, completion_tokens);
 }
 
 json LlamaCppOrchestrator::buildChatCompletionsRequest(
     const CreateChatCompletionRequest& request,
-    const json& merged_messages) {
+    json merged_messages) const {
 
     json chat_request = json::object();
     chat_request["model"] = request.model;
-    chat_request["messages"] = merged_messages;
+    chat_request["messages"] = std::move(merged_messages);
 
     // Add generation parameters
     int max_tokens = request.max_completion_tokens.value_or(0);
@@ -177,14 +198,14 @@ json LlamaCppOrchestrator::buildChatCompletionsRequest(
 
 void LlamaCppOrchestrator::handleSseChunk(
     const std::string& sse_chunk,
-    OrchestratorStreamCallback callback,
+    const std::function<void(const StreamChunk&)>& callback,
     const std::string& event_id,
     const std::string& model,
     std::string& accumulated_content,
     json& accumulated_tool_calls,
     std::string& finish_reason,
     int& prompt_tokens,
-    int& completion_tokens) {
+    int& completion_tokens) const {
 
     // Parse SSE format: "data: {...}\n\n"
     if (sse_chunk.find("data: [DONE]") != std::string::npos) {
@@ -308,7 +329,7 @@ StandardResponse LlamaCppOrchestrator::buildStandardResponse(
     const json& accumulated_tool_calls,
     const std::string& finish_reason,
     int prompt_tokens,
-    int completion_tokens) {
+    int completion_tokens) const {
 
     StandardResponse response;
     response.id = event_id;
