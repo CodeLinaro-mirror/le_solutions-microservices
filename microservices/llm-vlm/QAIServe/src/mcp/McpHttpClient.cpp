@@ -278,9 +278,12 @@ std::string McpHttpClient::httpPost(const std::string& path,
              << "Host: " << host_ << ":" << port_ << "\r\n"
              << "Content-Type: application/json\r\n"
              << "Content-Length: " << body.size() << "\r\n"
-             << "Accept: application/json\r\n"
-             << "Connection: close\r\n"
-             << "\r\n"
+             << "Accept: application/json, text/event-stream\r\n"
+             << "Connection: close\r\n";
+    if (!session_id_.empty()) {
+        http_req << "mcp-session-id: " << session_id_ << "\r\n";
+    }
+    http_req << "\r\n"
              << body;
 
     std::string req_str = http_req.str();
@@ -296,11 +299,16 @@ std::string McpHttpClient::httpPost(const std::string& path,
         sent += n;
     }
 
-    // Read response
+    // Read response with timeout
     std::string response;
     char buf[4096];
     auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::milliseconds(timeout_ms);
+    bool headers_complete = false;
+    bool is_sse = false;
+    size_t header_end_pos = std::string::npos;
+    size_t content_length = 0;
+    bool has_content_length = false;
 
     while (true) {
         auto now = std::chrono::steady_clock::now();
@@ -323,16 +331,90 @@ std::string McpHttpClient::httpPost(const std::string& path,
         if (n <= 0) break;
         buf[n] = '\0';
         response += buf;
+
+        // Check if we have complete headers
+        if (!headers_complete) {
+            header_end_pos = response.find("\r\n\r\n");
+            if (header_end_pos != std::string::npos) {
+                headers_complete = true;
+                // Parse headers
+                std::string headers = response.substr(0, header_end_pos);
+                is_sse = (headers.find("content-type: text/event-stream") != std::string::npos);
+
+                // Parse Content-Length
+                size_t cl_pos = headers.find("content-length: ");
+                if (cl_pos != std::string::npos) {
+                    size_t cl_start = cl_pos + 16;
+                    size_t cl_end = headers.find("\r\n", cl_start);
+                    if (cl_end != std::string::npos) {
+                        std::string cl_str = headers.substr(cl_start, cl_end - cl_start);
+                        content_length = std::stoull(cl_str);
+                        has_content_length = true;
+                    }
+                }
+
+                // Extract mcp-session-id if present (set by initialize response)
+                size_t sid_pos = headers.find("mcp-session-id: ");
+                if (sid_pos != std::string::npos) {
+                    size_t sid_start = sid_pos + 16;
+                    size_t sid_end = headers.find("\r\n", sid_start);
+                    if (sid_end != std::string::npos) {
+                        session_id_ = headers.substr(sid_start, sid_end - sid_start);
+                    }
+                }
+            }
+        }
+
+        // Check if we've received complete body based on Content-Length
+        if (headers_complete && has_content_length) {
+            size_t body_size = response.size() - (header_end_pos + 4);
+            if (body_size >= content_length) {
+                // Received complete response, stop reading
+                break;
+            }
+        }
+
+        // For SSE: scan body on every iteration (handles multi-packet responses)
+        if (headers_complete && is_sse) {
+            size_t body_start = header_end_pos + 4;
+            std::string body = response.substr(body_start);
+
+            // Look for "data: " line (SSE format: "data: <json>\n")
+            size_t data_pos = body.find("data: ");
+            if (data_pos != std::string::npos) {
+                size_t json_start = data_pos + 6; // after "data: "
+                size_t json_end = body.find("\n", json_start);
+                if (json_end != std::string::npos) {
+                    // Found complete SSE event, extract JSON and close
+                    close(sock);
+                    return body.substr(json_start, json_end - json_start);
+                }
+            }
+        }
     }
     close(sock);
 
-    // Extract HTTP body (after \r\n\r\n)
-    auto pos = response.find("\r\n\r\n");
-    if (pos == std::string::npos) {
+    // Parse response
+    if (header_end_pos == std::string::npos) {
         throw McpException(config_.name, -1,
             "Malformed HTTP response (no header/body separator)");
     }
-    return response.substr(pos + 4);
+
+    std::string body_str = response.substr(header_end_pos + 4);
+
+    // For SSE responses, extract JSON from "data: <json>" line
+    if (is_sse) {
+        size_t data_pos = body_str.find("data: ");
+        if (data_pos != std::string::npos) {
+            size_t json_start = data_pos + 6; // after "data: "
+            size_t json_end = body_str.find("\n", json_start);
+            if (json_end != std::string::npos) {
+                return body_str.substr(json_start, json_end - json_start);
+            }
+        }
+    }
+
+    return body_str;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

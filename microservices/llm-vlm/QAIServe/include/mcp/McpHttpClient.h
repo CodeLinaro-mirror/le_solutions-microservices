@@ -76,4 +76,7 @@ private:
 
     // JSON-RPC request ID counter
     int next_id_ = 1;
+
+    // MCP session ID (returned by initialize, required on subsequent requests)
+    std::string session_id_;
 };
