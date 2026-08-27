@@ -7,7 +7,7 @@
 #include "qai_forge/utils/Logger.h"
 
 // llama.cpp GGUF header API
-#include <ggml/include/gguf.h>
+#include <gguf.h>
 
 #include <cstring>
 
