@@ -13,6 +13,7 @@
 // Routes:
 //   POST   /admin/models/fetch              — Start async AI Hub download
 //   GET    /admin/models/fetch/{job_id}     — Poll download progress
+//   POST   /admin/models/reload             — Rescan models directory (hot reload)
 //   GET    /admin/models                    — List installed models
 //   GET    /admin/models/{model_id}         — Get single model metadata
 //   DELETE /admin/models/{model_id}         — Remove a model
@@ -34,6 +35,11 @@ public:
         // GET /admin/models/fetch/{job_id} — poll download progress
         ADD_METHOD_TO(AdminController::getFetchJob,
                       "/admin/models/fetch/{1}", Get, Options);
+
+        // POST /admin/models/reload — rescan models directory (hot reload)
+        // Useful after manually adb-pushing model files to the models directory.
+        ADD_METHOD_TO(AdminController::reloadModels,
+                      "/admin/models/reload", Post, Options);
 
         // GET /admin/models/versions — list available AI Hub versions
         // NOTE: registered before /admin/models/{model_id} to avoid
@@ -141,6 +147,19 @@ public:
     void deleteModel(const HttpRequestPtr& req,
                      std::function<void(const HttpResponsePtr&)>&& callback,
                      const std::string& model_id);
+
+    /**
+     * POST /admin/models/reload
+     *
+     * Rescans the models directory and hot-reloads the model registry.
+     * Use this after manually pushing model files to the models directory
+     * without going through the Admin fetch API.
+     *
+     * Returns 200 with the updated model list:
+     *   { "reloaded": true, "models": [...] }
+     */
+    void reloadModels(const HttpRequestPtr& req,
+                      std::function<void(const HttpResponsePtr&)>&& callback);
 
     /**
      * GET /admin/models/versions

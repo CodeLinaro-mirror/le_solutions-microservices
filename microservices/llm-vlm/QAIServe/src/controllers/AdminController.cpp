@@ -375,6 +375,30 @@ void AdminController::getFetchJob(const HttpRequestPtr& req,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /admin/models/reload
+// ─────────────────────────────────────────────────────────────────────────────
+void AdminController::reloadModels(const HttpRequestPtr& req,
+                                    std::function<void(const HttpResponsePtr&)>&& callback) {
+    if (!checkAuth(req, callback)) return;
+
+    ModelConfigManager::getInstance().scanModelBundles();
+
+    auto models = ModelConfigManager::getInstance().getAvailableModels();
+    json arr = json::array();
+    for (const auto& m : models) {
+        arr.push_back({
+            {"id",              m.id},
+            {"model_name",      m.display_name},
+            {"runtime",         m.runtime},
+            {"model_type",      m.model_type},
+            {"supports_vision", m.supports_vision},
+            {"context_size",    m.context_size},
+            {"memory_mb",       m.memory_requirement_mb}
+        });
+    }
+    callback(jsonResp({{"reloaded", true}, {"models", arr}}));
+}
+
 // GET /admin/models
 // ─────────────────────────────────────────────────────────────────────────────
 void AdminController::listModels(const HttpRequestPtr& req,
@@ -438,7 +462,9 @@ void AdminController::deleteModel(const HttpRequestPtr& req,
 
     const ModelConfig* m = ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!m) {
-        callback(errorResp("Model not found: " + model_id, k404NotFound));
+        callback(jsonResp({{"deleted", model_id},
+                           {"message", "model not found, nothing to delete"}},
+                          k200OK));
         return;
     }
 
@@ -467,10 +493,45 @@ void AdminController::deleteModel(const HttpRequestPtr& req,
     }
 
     if (bundle_to_delete.empty()) {
-        callback(errorResp(
-            "Model directory not found on disk for: " + model_id,
-            k404NotFound));
+        // metadata.json not found — fallback for GGUF/bare-file bundles.
+        // config_file points directly to the .gguf file; its parent directory
+        // is the bundle directory. Verify it lives somewhere under models_dir.
+        fs::path cfg(m->config_file);
+        fs::path candidate = cfg.parent_path();
+        fs::path models_path(models_dir);
+        // Ensure candidate is under models_dir and is not models_dir itself
+        std::string cand_str = candidate.string();
+        std::string mdir_str = models_path.string();
+        if (!cand_str.empty() &&
+            cand_str.size() > mdir_str.size() &&
+            cand_str.substr(0, mdir_str.size()) == mdir_str) {
+            bundle_to_delete = cand_str;
+        }
+    }
+
+    if (bundle_to_delete.empty()) {
+        // Still not found — rescan to sync in-memory registry and report
+        ModelConfigManager::getInstance().scanModelBundles();
+        callback(jsonResp({{"deleted", model_id},
+                           {"message", "model not found on disk, nothing to delete"}},
+                          k200OK));
         return;
+    }
+
+    // Safety check: bundle_to_delete must be under models_dir and not models_dir itself
+    {
+        std::string b = fs::path(bundle_to_delete).lexically_normal().string();
+        std::string m = fs::path(models_dir).lexically_normal().string();
+        if (b == m || b.size() <= m.size() ||
+            b.substr(0, m.size()) != m ||
+            b[m.size()] != '/') {
+            LOG_ERROR << "[AdminController] Refusing to delete unsafe path: " << b
+                      << " (models_dir=" << m << ")";
+            callback(errorResp("Unsafe delete path rejected: " + b,
+                               k500InternalServerError));
+            return;
+        }
+        LOG_INFO << "[AdminController] Will delete bundle: " << b;
     }
 
     // Remove the bundle directory
