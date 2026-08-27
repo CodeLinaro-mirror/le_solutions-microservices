@@ -102,21 +102,21 @@ void GenIEBackend::unloadModel(bool force) {
     LOG_INFO("[GenIEBackend] unloadModel: model=" << current_model_id_
              << ", force=" << (force ? "true" : "false"));
 
+    // Always use SIGKILL (terminateWorker(true)) to ensure the kernel's QNN driver
+    // exit handler reclaims all contexts cleanly. The worker's graceful shutdown
+    // (SIGTERM) can trigger buggy cleanup code that calls QnnDevice_free before
+    // freeing all QNN contexts, leaving the DSP in a bad state that prevents
+    // subsequent workers from initializing ("Failed to create dialog" error).
+    // SIGKILL prevents the buggy cleanup from running and lets the kernel reclaim
+    // QNN resources cleanly via the driver's process-exit handler.
+
     if (vlm_worker_) {
-        if (force) {
-            vlm_worker_->terminateWorker(true);
-        } else {
-            vlm_worker_->shutdown();
-        }
+        vlm_worker_->terminateWorker(true);
         vlm_worker_.reset();
     }
 
     if (llm_worker_) {
-        if (force) {
-            llm_worker_->terminateWorker(true);
-        } else {
-            llm_worker_->shutdown();
-        }
+        llm_worker_->terminateWorker(true);
         llm_worker_.reset();
     }
 
