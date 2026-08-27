@@ -237,7 +237,8 @@ bool responseHasToolCalls(const StandardResponse& response) {
 struct QaiForge::Impl {
     explicit Impl(QaiForgeConfig config = configFromEnvironment())
         : config_(std::move(config)),
-          scheduler_(scheduler::InferenceScheduler::getInstance()) {}
+          scheduler_(scheduler::InferenceScheduler::getInstance()),
+          memory_coordinator_(scheduler_.memoryCoordinator()) {}
 
     ~Impl() {
         shutdown(false);
@@ -453,6 +454,18 @@ struct QaiForge::Impl {
         return result.cancelled();
     }
 
+    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
+        const std::string& memory_key) {
+        return scheduler_.awaitConversationMemory(memory_key);
+    }
+
+    bool enqueueStoreTask(std::string idempotency_key,
+                          std::function<void()> task) {
+        return scheduler_.enqueueStoreTask(
+            std::move(idempotency_key),
+            std::move(task));
+    }
+
 private:
     scheduler::GenerativeJobContext prepareContext(
         const CreateChatCompletionRequest& request,
@@ -469,7 +482,7 @@ private:
         context.caller = options;
         context.kind = kind;
         context.priority = scheduler::JobPriority::NEW_REQUEST;
-        context.skip_post_turn_summarization = true;
+        context.skip_post_turn_summarization = false;
 
         const std::string response_id = options.response_id.empty()
             ? context.job_id
@@ -554,6 +567,46 @@ private:
             !options.previous_response_id.empty()) {
             context.priority = scheduler::JobPriority::SESSION_CONT;
         }
+
+        const std::string final_session_id =
+            context.request.user.value_or(session_id);
+        const bool has_explicit_memory_keys =
+            !context.caller.conversation_memory_read_key.empty() ||
+            !context.caller.conversation_memory_write_key.empty();
+        const std::string conversation_memory_read_key =
+            has_explicit_memory_keys
+                ? context.caller.conversation_memory_read_key
+                : final_session_id;
+        context.conversation_memory_write_key =
+            !context.caller.conversation_memory_write_key.empty()
+                ? context.caller.conversation_memory_write_key
+                : final_session_id;
+        ConversationMemoryUpdate input_memory;
+        input_memory.summary_content = context.caller.summary_content;
+        input_memory.summary_token_count = context.caller.summary_token_count;
+        input_memory.facts = context.caller.facts;
+        input_memory.evicted_message_count =
+            context.caller.evicted_message_count;
+        if (!conversation_memory_read_key.empty()) {
+            memory_coordinator_->seedIfAbsent(
+                conversation_memory_read_key,
+                input_memory);
+            memory_coordinator_->awaitReady(conversation_memory_read_key);
+            const std::optional<ConversationMemoryUpdate> committed_memory =
+                memory_coordinator_->committedSnapshot(
+                    conversation_memory_read_key);
+            if (committed_memory.has_value()) {
+                context.caller.summary_content =
+                    committed_memory->summary_content;
+                context.caller.summary_token_count =
+                    committed_memory->summary_token_count;
+                context.caller.facts = committed_memory->facts;
+                if (!context.caller.response_history_is_pruned) {
+                    context.caller.evicted_message_count =
+                        committed_memory->evicted_message_count;
+                }
+            }
+        }
         return context;
     }
 
@@ -562,12 +615,15 @@ private:
         scheduler::GenerativeCallbacks callbacks) {
         const std::string model_id = context.model_id;
         const std::string tool_chain_id = context.tool_chain_id;
+        const std::string conversation_memory_key =
+            context.conversation_memory_write_key;
         try {
             scheduler::GenerativeJobPtr job =
                 BackendFactory::createGenerativeOrchestratorForModel(
                     model_id)
                     ->createJob(
                         std::move(context), std::move(callbacks));
+            job->conversation_memory_key = conversation_memory_key;
             wrapCallbacks(*job);
             return job;
         } catch (...) {
@@ -722,6 +778,8 @@ private:
 
     QaiForgeConfig config_;
     scheduler::InferenceScheduler& scheduler_;
+    std::shared_ptr<scheduler::ConversationMemoryCoordinator>
+        memory_coordinator_;
     scheduler::ToolChainTable tool_chains_;
 
     std::mutex maintenance_mutex_;
@@ -772,6 +830,18 @@ void QaiForge::shutdown(bool force) {
 
 bool QaiForge::cancel(const std::string& response_id) {
     return impl_->cancel(response_id);
+}
+
+std::optional<ConversationMemoryUpdate> QaiForge::awaitConversationMemory(
+    const std::string& memory_key) {
+    return impl_->awaitConversationMemory(memory_key);
+}
+
+bool QaiForge::enqueueStoreTask(std::string idempotency_key,
+                               std::function<void()> task) {
+    return impl_->enqueueStoreTask(
+        std::move(idempotency_key),
+        std::move(task));
 }
 
 } // namespace qai_forge

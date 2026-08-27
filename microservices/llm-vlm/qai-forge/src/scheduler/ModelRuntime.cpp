@@ -5,6 +5,7 @@
 
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/scheduler/PostTurnWorker.h"
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
 
@@ -44,6 +45,8 @@ const char* stateToString(ModelRuntimeState state) {
             return "idle";
         case ModelRuntimeState::Running:
             return "running";
+        case ModelRuntimeState::PostTurn:
+            return "post_turn";
         case ModelRuntimeState::Draining:
             return "draining";
         case ModelRuntimeState::Evicting:
@@ -146,10 +149,12 @@ private:
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<IGenerativeBackend> backend,
                      std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+                     std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                      ModelRuntimeEvents events)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
+      memory_coordinator_(std::move(coordinator)),
       events_(std::move(events)),
       new_request_aging_threshold_(queueAgingThresholdFromEnv()),
       cancel_grace_period_(cancelGracePeriodFromEnv()) {
@@ -162,6 +167,18 @@ ModelRuntime::ModelRuntime(std::string model_id,
     if (!orchestrator_) {
         throw std::invalid_argument("ModelRuntime requires an orchestrator");
     }
+    if (!memory_coordinator_) {
+        throw std::invalid_argument(
+            "ModelRuntime requires a conversation memory coordinator");
+    }
+    post_turn_worker_ = std::make_unique<PostTurnWorker>(
+        model_id_,
+        *backend_,
+        orchestrator_,
+        memory_coordinator_,
+        [this]() {
+            finishPostTurn();
+        });
 }
 
 ModelRuntime::~ModelRuntime() {
@@ -182,7 +199,14 @@ void ModelRuntime::start() {
         cancel_watchdog_shutdown_ = false;
     }
     started_ = true;
-    executor_thread_ = std::thread(&ModelRuntime::executorLoop, this);
+    post_turn_worker_->start();
+    try {
+        executor_thread_ = std::thread(&ModelRuntime::executorLoop, this);
+    } catch (...) {
+        started_ = false;
+        post_turn_worker_->stop(true);
+        throw;
+    }
     LOG_INFO("[ModelRuntime] Started executor: model=" << model_id_
              << " cancel_grace_ms=" << cancel_grace_period_.count());
 }
@@ -210,6 +234,7 @@ bool ModelRuntime::activate() {
         if (state_ == ModelRuntimeState::Loading ||
             state_ == ModelRuntimeState::Idle ||
             state_ == ModelRuntimeState::Running ||
+            state_ == ModelRuntimeState::PostTurn ||
             state_ == ModelRuntimeState::Draining) {
             drain_mode_ = DrainMode::None;
             if (state_ == ModelRuntimeState::Draining && !running_job_) {
@@ -326,6 +351,7 @@ void ModelRuntime::stop(bool force) {
     stopCancelWatchdog();
 
     std::string running_job_id;
+    bool post_turn_active = false;
     bool should_join = false;
     bool was_started = false;
     std::vector<ModelRuntimeState> state_events;
@@ -345,6 +371,8 @@ void ModelRuntime::stop(bool force) {
                 running_job_id = running_job_->job_id;
                 running_job_->cancel();
             }
+            post_turn_active = force &&
+                               state_ == ModelRuntimeState::PostTurn;
 
             should_join = executor_thread_.joinable() &&
                           executor_thread_.get_id() != std::this_thread::get_id();
@@ -357,7 +385,7 @@ void ModelRuntime::stop(bool force) {
         return;
     }
 
-    if (force && !running_job_id.empty()) {
+    if (force && (!running_job_id.empty() || post_turn_active)) {
         try {
             backend_->terminateWorker(/*force=*/true);
         } catch (...) {
@@ -422,7 +450,9 @@ void ModelRuntime::executorLoop() {
             cv_.wait(lock, [this]() {
                 return stop_requested_ ||
                        activation_requested_ ||
-                       drain_mode_ != DrainMode::None ||
+                       (drain_mode_ != DrainMode::None &&
+                        (state_ == ModelRuntimeState::Idle ||
+                         state_ == ModelRuntimeState::Draining)) ||
                        (state_ == ModelRuntimeState::Idle && !queue_.empty());
             });
 
@@ -443,7 +473,8 @@ void ModelRuntime::executorLoop() {
                 setStateLocked(ModelRuntimeState::Loading, state_events);
                 should_load = true;
             } else if (drain_mode_ == DrainMode::Normal &&
-                       isResidentState(state_)) {
+                       (state_ == ModelRuntimeState::Idle ||
+                        state_ == ModelRuntimeState::Draining)) {
                 drain_mode_ = DrainMode::None;
                 setStateLocked(ModelRuntimeState::Evicting, state_events);
                 should_unload = true;
@@ -570,13 +601,14 @@ void ModelRuntime::executorLoop() {
         }
 
         bool recover_backend = false;
+        bool post_turn_started = false;
         try {
             LOG_INFO("[ModelRuntime] Running job: model=" << model_id_
                      << " job=" << job->job_id
                      << " priority=" << static_cast<int>(job->priority)
                      << " stream="
                      << (job->callbacks.on_token ? "true" : "false"));
-            runJob(*job);
+            post_turn_started = runJob(*job);
             LOG_INFO("[ModelRuntime] Job run returned: model=" << model_id_
                      << " job=" << job->job_id);
         } catch (const GenAIException& error) {
@@ -623,7 +655,7 @@ void ModelRuntime::executorLoop() {
                 if (!stop_requested_) {
                     setStateLocked(ModelRuntimeState::Failed, complete_events);
                 }
-            } else if (!stop_requested_) {
+            } else if (!stop_requested_ && !post_turn_started) {
                 setStateLocked(
                     drain_mode_ != DrainMode::None ? ModelRuntimeState::Draining
                                                    : ModelRuntimeState::Idle,
@@ -648,10 +680,15 @@ void ModelRuntime::executorLoop() {
     }
 
     bool force_unload = false;
-    std::vector<ModelRuntimeState> exit_events;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         force_unload = force_stop_;
+    }
+    post_turn_worker_->stop(force_unload);
+
+    std::vector<ModelRuntimeState> exit_events;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (isResidentState(state_)) {
             setStateLocked(ModelRuntimeState::Evicting, exit_events);
         }
@@ -690,7 +727,7 @@ size_t ModelRuntime::promoteAgedJobs() {
     return promoted;
 }
 
-void ModelRuntime::runJob(GenerativeJob& job) {
+bool ModelRuntime::runJob(GenerativeJob& job) {
     if (!backend_healthy_ || !backend_ || !backend_->isHealthy()) {
         throw GenAIException(
             GenAIErrorCode::HARDWARE_UNAVAILABLE,
@@ -714,7 +751,7 @@ void ModelRuntime::runJob(GenerativeJob& job) {
 
     if (job.isCancelled()) {
         notify_cancelled();
-        return;
+        return false;
     }
     std::string finish_reason = "stop";
     std::string response_id = job.session_id;
@@ -752,8 +789,10 @@ void ModelRuntime::runJob(GenerativeJob& job) {
 
         if (job.isCancelled()) {
             notify_cancelled();
-            return;
+            return false;
         }
+
+        const bool post_turn_started = beginPostTurn(job, response);
 
         if (job.callbacks.on_complete) {
             if (response.id.empty()) {
@@ -762,7 +801,12 @@ void ModelRuntime::runJob(GenerativeJob& job) {
             if (response.finish_reason.empty()) {
                 response.finish_reason = finish_reason;
             }
-            job.callbacks.on_complete(response);
+            try {
+                job.callbacks.on_complete(response);
+            } catch (...) {
+                LOG_WARN("[ModelRuntime] Completion callback threw: job="
+                         << job.job_id << " model=" << model_id_);
+            }
         }
 
         if (streaming) {
@@ -774,16 +818,101 @@ void ModelRuntime::runJob(GenerativeJob& job) {
                      << job.job_id << " model=" << model_id_
                      << " finish_reason=" << response.finish_reason);
         }
+        return post_turn_started;
     } catch (...) {
         job.callbacks.on_token = original_on_token;
         if (job.isCancelled()) {
             notify_cancelled();
-            return;
+            return false;
         }
         LOG_WARN("[ModelRuntime] Execution threw: job=" << job.job_id
                  << " model=" << model_id_);
         throw;
     }
+}
+
+bool ModelRuntime::beginPostTurn(
+    GenerativeJob& job,
+    const StandardResponse& response) {
+    std::optional<PostTurnTask> task;
+    try {
+        task = orchestrator_->createPostTurnTask(job, response);
+    } catch (const std::exception& error) {
+        LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
+                 << model_id_ << " session=" << job.session_id
+                 << " message=\"" << error.what() << "\"");
+        return false;
+    } catch (...) {
+        LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
+                 << model_id_ << " session=" << job.session_id
+                 << " message=<unknown>");
+        return false;
+    }
+    if (!task.has_value()) {
+        return false;
+    }
+    if (task->input.conversation_memory_key.empty()) {
+        task->input.conversation_memory_key = task->input.session_id;
+    }
+    const std::string conversation_memory_key =
+        task->input.conversation_memory_key;
+    if (!memory_coordinator_->beginPostTurn(conversation_memory_key)) {
+        LOG_WARN("[ModelRuntime] Post-turn already pending; using committed memory: model="
+                 << model_id_ << " session=" << task->input.session_id);
+        return false;
+    }
+    const std::string session_id = task->input.session_id;
+
+    std::vector<ModelRuntimeState> state_events;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_) {
+            memory_coordinator_->publish(
+                conversation_memory_key,
+                MemoryReadyResult::Status::Cancelled);
+            return false;
+        }
+        running_job_.reset();
+        setStateLocked(ModelRuntimeState::PostTurn, state_events);
+    }
+    notifyStateChanges(state_events);
+
+    try {
+        if (post_turn_worker_->enqueue(std::move(task.value()))) {
+            return true;
+        }
+    } catch (const std::exception& error) {
+        LOG_WARN("[ModelRuntime] Failed to enqueue post-turn work: model="
+                 << model_id_ << " session=" << session_id
+                 << " message=\"" << error.what() << "\"");
+    } catch (...) {
+        LOG_WARN("[ModelRuntime] Failed to enqueue post-turn work: model="
+                 << model_id_ << " session=" << session_id
+                 << " message=<unknown>");
+    }
+
+    memory_coordinator_->publish(
+        conversation_memory_key,
+        MemoryReadyResult::Status::Failed);
+    finishPostTurn();
+    return false;
+}
+
+void ModelRuntime::finishPostTurn() {
+    std::vector<ModelRuntimeState> state_events;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != ModelRuntimeState::PostTurn) {
+            return;
+        }
+        setStateLocked(
+            stop_requested_ || drain_mode_ != DrainMode::None
+                ? ModelRuntimeState::Draining
+                : ModelRuntimeState::Idle,
+            state_events);
+    }
+    notifyStateChanges(state_events);
+    cv_.notify_one();
 }
 
 void ModelRuntime::armCancelWatchdog(const std::string& job_id) {
@@ -946,6 +1075,7 @@ bool ModelRuntime::isResidentState(ModelRuntimeState state) {
     return state == ModelRuntimeState::Loading ||
            state == ModelRuntimeState::Idle ||
            state == ModelRuntimeState::Running ||
+           state == ModelRuntimeState::PostTurn ||
            state == ModelRuntimeState::Draining ||
            state == ModelRuntimeState::Evicting;
 }

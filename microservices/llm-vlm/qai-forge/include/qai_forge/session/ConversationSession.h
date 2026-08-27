@@ -10,6 +10,7 @@
 #include <chrono>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
@@ -78,6 +79,12 @@ struct ConversationSession {
     // Add a message to history. Returns the index of the added message.
     size_t addMessage(const json& message) {
         messages.push_back(message);
+        last_activity = std::chrono::system_clock::now();
+        return messages.size() - 1;
+    }
+
+    size_t addMessage(json&& message) {
+        messages.push_back(std::move(message));
         last_activity = std::chrono::system_clock::now();
         return messages.size() - 1;
     }

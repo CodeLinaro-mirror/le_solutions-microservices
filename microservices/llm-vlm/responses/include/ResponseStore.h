@@ -202,6 +202,11 @@ public:
         const std::optional<StoredConversationMemory>& memory_update =
             std::nullopt);
 
+    /** @brief Idempotently attach asynchronously prepared conversation memory. */
+    bool updateConversationMemory(
+        const std::string& response_id,
+        const StoredConversationMemory& memory_update);
+
     /**
      * @brief Mark an InProgress response as Failed.
      */

@@ -21,12 +21,24 @@ struct GenerativeCallbacks {
     std::function<void()> on_cancelled;
 };
 
+struct PostTurnInput {
+    std::string session_id;
+    std::string conversation_memory_key;
+    json request_messages = json::array();
+};
+
+struct PostTurnTask {
+    PostTurnInput input;
+    StandardResponse response;
+};
+
 struct GenerativeJob {
     std::string job_id;
     std::string model_id;
     std::string response_id;
     std::string session_id;
     std::string tool_chain_id;
+    std::string conversation_memory_key;
 
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::NEW_REQUEST;

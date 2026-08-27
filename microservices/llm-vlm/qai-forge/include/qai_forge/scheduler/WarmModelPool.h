@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/scheduler/CancelResult.h"
+#include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
 #include "qai_forge/scheduler/SubmitResult.h"
 #include "qai_forge/backend/BackendFactory.h"
@@ -66,7 +67,9 @@ class WarmModelPool {
 public:
     explicit WarmModelPool(WarmModelPoolConfig config,
                            ModelRuntimePairFactory runtime_factory = {},
-                           ModelRuntimeEvents runtime_events = {});
+                           ModelRuntimeEvents runtime_events = {},
+                           std::shared_ptr<ConversationMemoryCoordinator>
+                               memory_coordinator = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -142,6 +145,7 @@ private:
     WarmModelPoolConfig config_;
     ModelRuntimePairFactory runtime_factory_;
     ModelRuntimeEvents runtime_events_;
+    std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

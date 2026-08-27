@@ -1326,7 +1326,9 @@ void ResponsesController::createResponse(
 
     qai_forge::GenerateOptions invoke_options;
     invoke_options.response_id = response_id;
-    invoke_options.session_id = response_id;
+    invoke_options.session_id = begin.session_id;
+    invoke_options.conversation_memory_read_key = previous_response_id;
+    invoke_options.conversation_memory_write_key = response_id;
     invoke_options.use_response_history = true;
     invoke_options.response_history = runtime_ancestor_messages;
     if (current_turn_has_tool_response(begin.current_request_messages)

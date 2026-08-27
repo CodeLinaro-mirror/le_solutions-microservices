@@ -62,25 +62,6 @@ ConversationMemoryUpdate makeConversationMemoryUpdate(
     return update;
 }
 
-std::shared_ptr<ConversationSession> makePreparedSession(
-    const scheduler::GenerativeJob& job,
-    const scheduler::GeniePreparedRequest& prepared) {
-    auto session = std::make_shared<ConversationSession>(job.session_id);
-    session->summary_content = prepared.input_memory.summary_content;
-    session->summary_token_count = prepared.input_memory.summary_token_count;
-    session->facts = prepared.input_memory.facts;
-    session->evicted_message_count =
-        prepared.input_memory.evicted_message_count;
-    if (prepared.conversation_messages.is_array()) {
-        for (const auto& message : prepared.conversation_messages) {
-            if (message.is_object()) {
-                session->addMessage(message);
-            }
-        }
-    }
-    return session;
-}
-
 std::string renderToolCallsForPrompt(const json& tool_calls) {
     if (!tool_calls.is_array() || tool_calls.empty()) {
         return "";
@@ -341,9 +322,9 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     session.evicted_message_count = context.caller.evicted_message_count;
     if (context.caller.use_response_history &&
         context.caller.response_history.is_array()) {
-        for (const auto& message : context.caller.response_history) {
+        for (auto& message : context.caller.response_history) {
             if (message.is_object()) {
-                session.addMessage(message);
+                session.addMessage(std::move(message));
             }
         }
     }
@@ -409,21 +390,25 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     }
     prepared.tools = std::move(request.tools).value_or(json::array());
     prepared.input_memory = makeConversationMemoryUpdate(session);
-    prepared.conversation_messages = json::array();
-    for (const auto& message : session.messages) {
-        prepared.conversation_messages.push_back(message);
-    }
-    for (const auto& message : request.messages) {
-        if (message.is_object()) {
-            prepared.conversation_messages.push_back(message);
-        }
-    }
     if (is_vlm) {
         prepared.vision.lifetime =
             std::make_shared<ImageUtils::TempFileGuard>(
                 preprocessImagesToTempFiles(
                     request.messages, context.model_id));
         prepared.vision.paths = prepared.vision.lifetime->paths;
+    }
+    prepared.conversation_messages = json::array();
+    auto& conversation_messages =
+        prepared.conversation_messages.get_ref<json::array_t&>();
+    conversation_messages.reserve(
+        session.messages.size() + request.messages.size());
+    for (auto& message : session.messages) {
+        conversation_messages.push_back(std::move(message));
+    }
+    for (auto& message : request.messages) {
+        if (message.is_object()) {
+            conversation_messages.push_back(std::move(message));
+        }
     }
 
     auto job = std::make_shared<scheduler::GenerativeJob>();
@@ -461,7 +446,6 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     scheduler::GenerativeJob& job,
     const scheduler::GeniePreparedRequest& prepared,
     IGenerativeBackend& backend) const {
-    auto session = makePreparedSession(job, prepared);
     const bool is_vlm =
         ModelConfigManager::getInstance().supportsVision(job.model_id);
     const auto& generation = prepared.generation;
@@ -474,7 +458,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     if (is_vlm) {
         LOG_INFO("[GenieOrchestrator] Blocking VLM execution: model="
                  << job.model_id
-                 << " session=" << session->session_id
+                 << " session=" << job.session_id
                  << " images=" << prepared.vision.paths.size());
         backend.generateVlm(
             event_id,
@@ -526,7 +510,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
 
     if (had_error) {
         LOG_ERROR("[GenieOrchestrator] Blocking inference failed: model="
-                  << job.model_id << " session=" << session->session_id
+                  << job.model_id << " session=" << job.session_id
                   << " message=\"" << error_msg << "\"");
         throw GenAIException(GenAIErrorCode::INFERENCE_FAILED, error_msg, 500);
     }
@@ -534,7 +518,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     if (job.isCancelled()) {
         LOG_WARN("[GenieOrchestrator] Blocking inference cancelled before commit: model="
                  << job.model_id
-                 << " session=" << session->session_id);
+                 << " session=" << job.session_id);
         return StandardResponse{};
     }
 
@@ -543,7 +527,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     int reasoning_token_count = 0;
     if (generation.use_reasoning) {
         ReasoningRouter router(
-            session->session_id,
+            job.session_id,
             job.model_id,
             generation.thinking_start_tag,
             generation.thinking_end_tag,
@@ -563,33 +547,12 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     if (job.isCancelled()) {
         LOG_WARN("[GenieOrchestrator] Blocking inference cancelled before session update: model="
                  << job.model_id
-                 << " session=" << session->session_id);
+                 << " session=" << job.session_id);
         return StandardResponse{};
     }
 
-    json assistant_msg = {{"role", "assistant"}, {"content", answer_content}};
-    if (!thinking_content.empty()) {
-        assistant_msg["_thinking_content"] = thinking_content;
-    }
-    session->addMessage(assistant_msg);
-
-    // ── Post-turn memory management (LLM only, complete turns only) ───────────
-    // Runs synchronously before returning so the next turn's prompt is fully
-    // prepared (summary + facts updated) before the response is returned.
-    // Skipped for VLM (no KV save/restore) and tool-call turns (turn not done).
-    std::optional<ConversationMemoryUpdate> updated_conversation_memory;
-    if (!is_vlm && tool_calls.empty()) {
-        try {
-            postTurnProcessing(*session, job.model_id, backend);
-            updated_conversation_memory = makeConversationMemoryUpdate(*session);
-        } catch (const std::exception& e) {
-            LOG_WARN("[GenieOrchestrator] Post-turn processing failed (non-fatal): "
-                     << e.what());
-        }
-    }
-
     StandardResponse response;
-    response.id = session->session_id;
+    response.id = job.session_id;
     response.model = job.model_id;
     response.role = "assistant";
     response.content = answer_content;
@@ -611,9 +574,11 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    response.updated_conversation_memory = std::move(updated_conversation_memory);
+    if (!is_vlm && tool_calls.empty()) {
+        response.updated_conversation_memory = prepared.input_memory;
+    }
     LOG_INFO("[GenieOrchestrator] Blocking inference completed: model="
-             << job.model_id << " session=" << session->session_id
+             << job.model_id << " session=" << job.session_id
              << " finish_reason=" << response.finish_reason
              << " tool_calls="
              << (response.tool_calls.has_value() ? response.tool_calls.value().size() : 0)
@@ -626,20 +591,19 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     scheduler::GenerativeJob& job,
     const scheduler::GeniePreparedRequest& prepared,
     IGenerativeBackend& backend) const {
-    auto session = makePreparedSession(job, prepared);
     const bool is_vlm =
         ModelConfigManager::getInstance().supportsVision(job.model_id);
     const auto& generation = prepared.generation;
     auto& callback = job.callbacks.on_token;
 
     StreamChunk role_chunk;
-    role_chunk.id = session->session_id;
+    role_chunk.id = job.session_id;
     role_chunk.model = job.model_id;
     role_chunk.role = "assistant";
     callback(role_chunk);
 
     ReasoningRouter router(
-        session->session_id,
+        job.session_id,
         job.model_id,
         generation.thinking_start_tag,
         generation.thinking_end_tag,
@@ -654,7 +618,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     if (is_vlm) {
         LOG_INFO("[GenieOrchestrator] Streaming VLM execution: model="
                  << job.model_id
-                 << " session=" << session->session_id
+                 << " session=" << job.session_id
                  << " images=" << prepared.vision.paths.size());
         backend.generateVlm(
             event_id,
@@ -667,10 +631,10 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             generation.top_k,
             generation.presence_penalty,
             generation.frequency_penalty,
-            [&session, &job, &callback, &full_response]
+            [&job, &callback, &full_response]
             (const IPCTokenEvent& token) {
                 StreamChunk chunk;
-                chunk.id = session->session_id;
+                chunk.id = job.session_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
                 full_response += token.content;
@@ -695,12 +659,12 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             generation.presence_penalty,
             generation.frequency_penalty,
             generation.use_reasoning,
-            [&generation, &router, &session, &job, &callback, &full_response]
+            [&generation, &router, &job, &callback, &full_response]
             (const IPCTokenEvent& token) {
                 if (generation.use_reasoning) {
                     auto chunks = router.route(token.content);
                     for (auto& chunk : chunks) {
-                        chunk.id = session->session_id;
+                        chunk.id = job.session_id;
                         chunk.model = job.model_id;
                         callback(chunk);
                         if (chunk.content_delta.has_value()) {
@@ -711,7 +675,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
                 }
 
                 StreamChunk chunk;
-                chunk.id = session->session_id;
+                chunk.id = job.session_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
                 full_response += token.content;
@@ -731,7 +695,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
 
     if (had_error) {
         LOG_ERROR("[GenieOrchestrator] Streaming inference failed: model="
-                  << job.model_id << " session=" << session->session_id
+                  << job.model_id << " session=" << job.session_id
                   << " message=\"" << error_msg << "\"");
         throw GenAIException(GenAIErrorCode::INFERENCE_FAILED, error_msg, 500);
     }
@@ -739,7 +703,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     if (job.isCancelled()) {
         LOG_WARN("[GenieOrchestrator] Streaming inference cancelled before commit: model="
                  << job.model_id
-                 << " session=" << session->session_id);
+                 << " session=" << job.session_id);
         return StandardResponse{};
     }
 
@@ -758,38 +722,14 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
         tool_calls = adapter.parseToolCalls(answer_content);
     }
 
-    if (generation.use_reasoning) {
-        json assistant_msg =
-            {{"role", "assistant"}, {"content", answer_content}};
-        if (!thinking_content.empty()) {
-            assistant_msg["_thinking_content"] = thinking_content;
-        }
-        session->addMessage(assistant_msg);
-    } else {
-        session->addMessage(
-            {{"role", "assistant"}, {"content", answer_content}});
-    }
-
-    // ── Post-turn memory management (LLM only, complete turns only) ───────────
-    std::optional<ConversationMemoryUpdate> updated_conversation_memory;
-    if (!is_vlm && tool_calls.empty()) {
-        try {
-            postTurnProcessing(*session, job.model_id, backend);
-            updated_conversation_memory = makeConversationMemoryUpdate(*session);
-        } catch (const std::exception& e) {
-            LOG_WARN("[GenieOrchestrator] Post-turn processing failed (non-fatal): "
-                     << e.what());
-        }
-    }
-
     StreamChunk finish_chunk;
-    finish_chunk.id = session->session_id;
+    finish_chunk.id = job.session_id;
     finish_chunk.model = job.model_id;
     finish_chunk.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
     callback(finish_chunk);
 
     StandardResponse response;
-    response.id = session->session_id;
+    response.id = job.session_id;
     response.model = job.model_id;
     response.role = "assistant";
     response.content = answer_content;
@@ -811,12 +751,72 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    response.updated_conversation_memory = std::move(updated_conversation_memory);
+    if (!is_vlm && tool_calls.empty()) {
+        response.updated_conversation_memory = prepared.input_memory;
+    }
     LOG_INFO("[GenieOrchestrator] Streaming inference completed: model="
-             << job.model_id << " session=" << session->session_id
+             << job.model_id << " session=" << job.session_id
              << " finish_reason=" << response.finish_reason
              << " response_chars=" << answer_content.size());
     return response;
+}
+
+std::optional<scheduler::PostTurnTask>
+GenieOrchestrator::createPostTurnTask(
+    scheduler::GenerativeJob& job,
+    const StandardResponse& response) const {
+    auto* prepared =
+        std::get_if<scheduler::GeniePreparedRequest>(&job.prepared);
+    if (!prepared || job.skip_post_turn_summarization ||
+        !prepared->vision.paths.empty() ||
+        (response.tool_calls.has_value() &&
+         !response.tool_calls.value().empty())) {
+        return std::nullopt;
+    }
+
+    scheduler::PostTurnTask task;
+    task.input.session_id = job.session_id;
+    task.input.conversation_memory_key =
+        job.conversation_memory_key.empty()
+            ? job.session_id
+            : job.conversation_memory_key;
+    task.input.request_messages =
+        std::move(prepared->conversation_messages);
+    task.response = response;
+    return task;
+}
+
+ConversationMemoryUpdate GenieOrchestrator::executePostTurn(
+    scheduler::PostTurnTask& task,
+    const ConversationMemoryUpdate& committed_memory,
+    IGenerativeBackend& backend) const {
+    ConversationSession session(task.input.session_id);
+    session.summary_content = committed_memory.summary_content;
+    session.summary_token_count = committed_memory.summary_token_count;
+    session.facts = committed_memory.facts;
+    session.evicted_message_count = committed_memory.evicted_message_count;
+
+    if (task.input.request_messages.is_array()) {
+        for (auto& message : task.input.request_messages) {
+            if (message.is_object()) {
+                session.addMessage(std::move(message));
+            }
+        }
+    }
+
+    json assistant_message = {
+        {"role", "assistant"},
+        {"content", task.response.content.value_or("")},
+    };
+    if (task.response.reasoning_content.has_value() &&
+        !task.response.reasoning_content.value().empty()) {
+        assistant_message["_thinking_content"] =
+            task.response.reasoning_content.value();
+    }
+    session.addMessage(assistant_message);
+
+    postTurnProcessing(session, task.response.model, backend);
+    return makeConversationMemoryUpdate(session);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
