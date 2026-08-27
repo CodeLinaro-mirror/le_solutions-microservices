@@ -9,7 +9,9 @@
 #   3. Add target user to those supplementary groups dynamically
 #   4. Drop privileges to the target user and exec the container command
 
+import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -35,6 +37,14 @@ def main():
             print(f"[entrypoint] Found {dev} owned by host GID {gid}", flush=True)
             supplementary_gids.add(gid)
 
+    # Detect GID of /usr/share/qcom (bind-mounted from host) so the process
+    # inherits the same group access as seen on the host.
+    qcom_share = "/usr/share/qcom"
+    qcom_gid = get_gid(qcom_share)
+    if qcom_gid is not None:
+        print(f"[entrypoint] Found {qcom_share} owned by host GID {qcom_gid}", flush=True)
+        supplementary_gids.add(qcom_gid)
+
     # 2. Detect target UID/GID from models directory, or fallback to 10000
     TARGET_UID = 10000
     TARGET_GID = 10000
@@ -52,6 +62,29 @@ def main():
 
     # 3. Drop privileges dynamically
     if os.getuid() == 0:
+        # Fix device permissions so the dropped-privilege process can open them.
+        # Mirrors the `chmod 666 /dev/fastrpc* /dev/dma_heap/*` done in the
+        # reference compose command block.
+        for pattern in ["/dev/fastrpc*", "/dev/dma_heap/*"]:
+            for dev_path in glob.glob(pattern):
+                try:
+                    os.chmod(dev_path, 0o666)
+                    print(f"[entrypoint] Set permissions 666 on {dev_path}", flush=True)
+                except OSError as e:
+                    print(f"[entrypoint] WARNING: Could not chmod {dev_path}: {e}", flush=True)
+
+        # Deploy the baked fastrpc DSP config into /usr/share/qcom/conf.d/ now
+        # that the bind-mount is in place, while we still have root privileges.
+        fastrpc_src = "/etc/fastrpc/hexagon-dsp-binaries.yaml"
+        fastrpc_dst_dir = "/usr/share/qcom/conf.d"
+        if os.path.isfile(fastrpc_src) and os.path.isdir(qcom_share):
+            try:
+                os.makedirs(fastrpc_dst_dir, exist_ok=True)
+                shutil.copy2(fastrpc_src, fastrpc_dst_dir)
+                print(f"[entrypoint] Deployed {fastrpc_src} -> {fastrpc_dst_dir}/", flush=True)
+            except OSError as e:
+                print(f"[entrypoint] WARNING: Could not deploy fastrpc config: {e}", flush=True)
+
         print(f"[entrypoint] Dropping privileges from root to UID {TARGET_UID} / GID {TARGET_GID}...", flush=True)
         try:
             os.setgroups(list(supplementary_gids))

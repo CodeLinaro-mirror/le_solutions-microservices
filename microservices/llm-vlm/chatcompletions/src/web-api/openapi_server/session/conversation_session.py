@@ -7,9 +7,7 @@ Each session has a stable chat completion ID and stores messages in OpenAI forma
 Events reference indices into the shared message history.
 """
 
-import json
-import hashlib
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from openapi_server.events.conversation_event import ConversationEvent, EventType
@@ -77,7 +75,91 @@ class ConversationSession:
         self.system_prompt_tokens = 0
         self.system_prompt_content = ""
 
+        # ── Memory slots (MemGPT-inspired) ────────────────────────────────────
+        # Slot 3: Core memory — LLM-extracted facts, persisted across eviction cycles
+        self.facts: dict = {}
+        # Tracks which turn each fact was last updated (for LRU eviction)
+        self.facts_last_updated: dict = {}
+
+        # Eviction tracking — messages removed from history queue, pending summarization
+        # These are excluded from the history queue when building the next turn's prompt.
+        # Cleared after post-turn summarization completes.
+        self.eviction_batch: list = []
+
         logger.info(f"Created session {chat_completion_id} for user {user_id}")
+
+    @staticmethod
+    def _message_value(message: Any, key: str, default=None):
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return getattr(message, key, default)
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text' or 'text' in item:
+                        text = item.get('text', '')
+                        if text is not None:
+                            parts.append(text if isinstance(text, str) else str(text))
+                    elif item:
+                        parts.append(str(item))
+                    continue
+
+                text = getattr(item, 'text', None)
+                parts.append(str(text) if text is not None else str(item))
+
+            return "\n".join(part for part in parts if part)
+
+        return str(content)
+
+    @classmethod
+    def get_leading_system_prompt(cls, messages: List[Dict]) -> str:
+        """Return the leading request system prompt, if present."""
+        if not messages:
+            return ""
+
+        first_message = messages[0]
+        if cls._message_value(first_message, 'role') != 'system':
+            return ""
+
+        return cls._content_to_text(cls._message_value(first_message, 'content', ''))
+
+    def _set_system_prompt_content(self, content: Any) -> None:
+        from openapi_server.session.token_counter import TokenCounter
+
+        self.system_prompt_content = self._content_to_text(content)
+        self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
+        logger.info(
+            f"Session {self.session_id}: System prompt updated "
+            f"({self.system_prompt_tokens} tokens)"
+        )
+
+    def sync_system_prompt_from_request(self, messages: List[Dict]) -> bool:
+        """
+        Update the active session system prompt from the latest request.
+
+        Only the leading request system prompt is considered active.
+        Requests without a leading system prompt leave the current session
+        prompt intact.
+        """
+        request_system_prompt = self.get_leading_system_prompt(messages)
+        if not request_system_prompt:
+            return False
+
+        if request_system_prompt == self.system_prompt_content:
+            return False
+
+        self._set_system_prompt_content(request_system_prompt)
+        return True
 
     def add_message(self, message: Dict, compact_images: bool = True) -> int:
         """
@@ -90,14 +172,6 @@ class ConversationSession:
         Returns:
             Index of the added message
         """
-        # Track system prompt tokens for new summarization formula
-        if message.get('role') == 'system':
-            from openapi_server.session.token_counter import TokenCounter
-            content = message.get('content', '')
-            self.system_prompt_content = content if isinstance(content, str) else str(content)
-            self.system_prompt_tokens = TokenCounter.estimate_tokens(self.system_prompt_content)
-            logger.info(f"Session {self.session_id}: System prompt updated ({self.system_prompt_tokens} tokens)")
-
         self.messages.append(message)
         if compact_images and self._message_contains_base64_image(message):
             self._compact_historical_base64_images()
@@ -607,5 +681,88 @@ class ConversationSession:
 
         logger.info(f"Session {self.session_id}: Successfully cancelled event {event.event_id}")
         return True
+
+    # ── Memory helper methods ─────────────────────────────────────────────────
+
+    def get_post_summary_messages(self) -> list:
+        """
+        Return all session messages that are eligible for the history queue:
+        - Occurred after the last summarization point
+        - Not in the current eviction batch
+        - Not system messages
+        - Not tool-only assistant messages (no content, only tool_calls)
+
+        These are the messages that will be filled into Slot 5 (history queue)
+        when building the next turn's prompt.
+        """
+        eviction_ids = {id(m) for m in self.eviction_batch}
+        result = []
+        for msg in self.messages:
+            if id(msg) in eviction_ids:
+                continue
+            role = msg.get('role', '')
+            if role == 'system':
+                continue
+            if role == 'assistant':
+                has_content = msg.get('content') not in (None, '')
+                if msg.get('tool_calls') and not has_content:
+                    continue
+            result.append(msg)
+        return result
+
+    def format_facts(self) -> str:
+        """
+        Format the facts dict as a compact single-line string for Slot 3 injection.
+        Returns empty string if no facts are stored.
+
+        Example output:
+            [Memory] user_name=Alice; project=REST API; language=Python
+        """
+        if not self.facts:
+            return ""
+        pairs = "; ".join(f"{k}={v}" for k, v in self.facts.items())
+        return f"[Memory] {pairs}"
+
+    def update_facts(self, new_facts: dict, turn_number: int) -> None:
+        """
+        Merge new facts into the fact store.
+        New values override existing ones for the same key.
+        New keys are added. Keys are never deleted (facts don't un-happen).
+
+        Args:
+            new_facts: Dict of key-value fact pairs extracted from the conversation.
+            turn_number: Current turn number, used for LRU eviction tracking.
+        """
+        for k, v in new_facts.items():
+            if isinstance(k, str) and isinstance(v, str):
+                self.facts[k] = v
+                self.facts_last_updated[k] = turn_number
+        logger.debug(
+            f"Session {self.session_id}: Updated facts store "
+            f"({len(new_facts)} new/updated, {len(self.facts)} total)"
+        )
+
+    def enforce_facts_ceiling(self, ceiling_tokens: int) -> None:
+        """
+        Evict least-recently-updated facts when the formatted facts string
+        exceeds ceiling_tokens. Uses LRU eviction: oldest-updated facts are
+        removed first.
+
+        Args:
+            ceiling_tokens: Maximum token budget for the facts slot.
+        """
+        from openapi_server.session.token_counter import TokenCounter
+        while self.facts and TokenCounter.estimate_tokens(self.format_facts()) > ceiling_tokens:
+            # Find the key with the smallest (oldest) last_updated turn number
+            oldest_key = min(
+                self.facts_last_updated,
+                key=lambda k: self.facts_last_updated.get(k, 0)
+            )
+            del self.facts[oldest_key]
+            del self.facts_last_updated[oldest_key]
+            logger.debug(
+                f"Session {self.session_id}: Evicted fact '{oldest_key}' (LRU, "
+                f"{len(self.facts)} facts remaining)"
+            )
 
     # Removed unused summarization methods as they are now handled directly in TextConversationEvent

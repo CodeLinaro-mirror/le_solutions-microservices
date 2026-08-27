@@ -544,18 +544,54 @@ QnnSystemProfile_freeSerializationTargetFn_t = CFUNCTYPE(
     ctypes.c_int, c_void_p)
 
 
-import ctypes
-from ctypes import (
-    c_void_p, c_uint64, c_uint32, c_int, c_char_p, POINTER, Structure, CFUNCTYPE
-)
+_LIBC = ctypes.CDLL(None)
+_LIBC_VSNPRINTF = _LIBC.vsnprintf
+_LIBC_VSNPRINTF.restype = c_int
+_LIBC_VSNPRINTF.argtypes = [c_char_p, c_size_t, c_char_p, c_void_p]
 
-# Simple core log callback (prints formatted string if provided)
+
+def _decode_log_format(fmt: c_char_p) -> str:
+    if not fmt:
+        return ""
+    try:
+        return ctypes.cast(fmt, c_char_p).value.decode(errors="replace")
+    except Exception:
+        return "<fmt decode error>"
+
+
+def _format_log_message(fmt: c_char_p, va_list_ptr: c_void_p) -> str:
+    raw_format = _decode_log_format(fmt)
+    if not raw_format:
+        return raw_format
+
+    va_addr = ctypes.cast(va_list_ptr, c_void_p).value if va_list_ptr else None
+    if not va_addr:
+        return raw_format
+
+    try:
+        fmt_bytes = raw_format.encode("utf-8", errors="replace")
+    except Exception:
+        return raw_format
+
+    try:
+        # A va_list should not be reused after formatting, so use one sufficiently
+        # large buffer and make a single vsnprintf call.
+        buffer = ctypes.create_string_buffer(8192)
+        written = _LIBC_VSNPRINTF(buffer, len(buffer), fmt_bytes, va_list_ptr)
+        if written < 0:
+            return raw_format
+
+        message = buffer.value.decode("utf-8", errors="replace")
+        if written >= len(buffer):
+            return f"{message}... [truncated]"
+        return message
+    except Exception:
+        return raw_format
+
+
 @QnnLog_Callback_t
 def CORE_LOG_CB(fmt: c_char_p, level: int, timestamp: int, va_list_ptr: c_void_p):
-    try:
-        s = fmt.decode(errors="replace") if fmt else ""
-    except Exception:
-        s = "<fmt decode error>"
+    s = _format_log_message(fmt, va_list_ptr)
     # Level mapping: 0=ERROR,1=WARN,2=INFO,3=DEBUG,4=VERBOSE (typical)
     level_names = {
         0: "ERROR",

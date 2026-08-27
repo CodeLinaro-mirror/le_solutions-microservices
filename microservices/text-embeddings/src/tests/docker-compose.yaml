@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  embeddings-test:
+    build:
+      context: ..
+      dockerfile: tests/test.Dockerfile
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ../web-api:/app/web-api
+    command: pytest /app/web-api/tests -v

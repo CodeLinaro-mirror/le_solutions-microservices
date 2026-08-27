@@ -47,6 +47,11 @@ class VisionConversationEvent(ConversationEvent):
         config_manager = ModelConfigManager()
         self.context_size = config_manager.get_context_size(model_id)
 
+        # Default max completion tokens when the client does not specify.
+        # Capped at 50% of context_size when the client requests a larger value.
+        from openapi_server.impl.constant import DEFAULT_MAX_COMPLETION_TOKENS
+        self.default_max_completion_tokens = DEFAULT_MAX_COMPLETION_TOKENS
+
         logger.info(f"Created VisionConversationEvent {event_id} for model {model_id} (context: {self.context_size})")
 
     async def execute_turn(self, request_data) -> dict:
@@ -60,14 +65,109 @@ class VisionConversationEvent(ConversationEvent):
         4. Return response (streaming or non-streaming)
         """
         try:
-            # Build raw_json from session messages for VLM handler
-            # The VLM handler needs this to extract images and text
-            # IMPORTANT: Pass session_id so VLM responses use the correct chat completion ID
+            # ── Pre-flight: check combined image + text token budget ──────────
+            # The VLM pipeline accumulates image tokens (from the vision encoder)
+            # and text tokens (from the text tokenizer) before submitting to the
+            # LLM (text generator), which has a fixed context_size limit.
+            # We must check: image_tokens + text_tokens + output_reserve ≤ context_size
+            #
+            # Image token count is deterministic: all images are letterboxed to
+            # 512×342 before patching, producing exactly 864 tokens per image
+            # (see image_preprocessor.get_image_token_count()).
+            from openapi_server.utils.image_preprocessor import get_image_token_count
+            from openapi_server.impl.constant import (
+                MAX_COMPLETION_SAFETY_MARGIN,
+                ErrorMessages,
+                HttpStatusCodes,
+                ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+            )
+            from fastapi import HTTPException as _HTTPException
+
+            # Build raw_messages first — this is exactly what gets sent to the VLM
+            # subprocess. Since VLM is stateless per inference, raw_messages represents
+            # the complete input for this turn and is the correct set to count tokens for.
+            raw_messages = [
+                msg for msg in self.session.messages
+                if msg.get('role') != 'system'
+            ]
+            if self.session.system_prompt_content:
+                raw_messages.insert(0, {
+                    'role': 'system',
+                    'content': self.session.system_prompt_content,
+                })
+
+            # Count images and text tokens from raw_messages (what the VLM will actually see)
+            image_count = 0
+            for msg in raw_messages:
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get('type') == 'image_url':
+                            image_count += 1
+
+            from openapi_server.impl.constant import IMAGE_TOKEN_ESTIMATION_RATIO
+            tokens_per_image = get_image_token_count(0, 0)  # 864 raw patches (fixed)
+            # Apply estimation ratio to account for preprocessing optimizations
+            # that reduce actual tokens consumed vs raw patch count.
+            # Default 0.7: 864 * 0.7 = 604 estimated tokens per image.
+            image_tokens = int(image_count * tokens_per_image * IMAGE_TOKEN_ESTIMATION_RATIO)
+
+            # Estimate text tokens from non-system raw messages
+            text_tokens = sum(
+                TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+                for msg in raw_messages
+                if msg.get('role') != 'system'
+            )
+
+            # Use a fixed DEFAULT_MAX_COMPLETION_TOKENS reservation for the
+            # pre-flight guard (same logic as _check_user_query_length in LLM).
+            # This ensures the model always has a minimum breather space to
+            # respond, regardless of what the client requested.
+            output_reserve = self.default_max_completion_tokens
+            total_input = image_tokens + text_tokens
+            available = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
+
+            if total_input > available:
+                raise _HTTPException(
+                    status_code=HttpStatusCodes.BAD_REQUEST,
+                    detail={
+                        "message": ErrorMessages.VLM_QUERY_TOO_LONG.format(
+                            total_tokens=total_input,
+                            image_tokens=image_tokens,
+                            text_tokens=text_tokens,
+                            available=available,
+                            context_size=self.context_size,
+                            output_tokens=output_reserve,
+                        ),
+                        "type": "invalid_request_error",
+                        "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                        "param": "messages",
+                    },
+                )
+
+            # Cap max_completion_tokens at whatever budget remains after the
+            # prompt is assembled.  This mirrors the silent-cap behaviour of
+            # _resolve_max_completion_tokens() in TextConversationEvent so that
+            # clients requesting more tokens than available simply get fewer
+            # tokens rather than a 400 error.
+            requested_max = getattr(request_data, 'max_completion_tokens', None)
+            available_for_response = max(0, self.context_size - total_input - MAX_COMPLETION_SAFETY_MARGIN)
+            if requested_max is not None and requested_max > available_for_response:
+                logger.debug(
+                    f"Event {self.event_id}: VLM max_completion_tokens={requested_max} "
+                    f"exceeds available={available_for_response} — capping silently"
+                )
+                effective_max_completion = available_for_response
+            else:
+                effective_max_completion = requested_max
+
+            # raw_messages already built above — pass to VLM handler
+
             raw_json = {
-                'messages': self.session.messages,
+                'messages': raw_messages,
                 'model': self.model_id,
                 'stream': getattr(request_data, 'stream', False),
-                'max_completion_tokens': getattr(request_data, 'max_completion_tokens', None),
+                'max_completion_tokens': effective_max_completion,
                 'temperature': getattr(request_data, 'temperature', None),
                 'top_p': getattr(request_data, 'top_p', None),
                 'top_k': getattr(request_data, 'top_k', None),
@@ -141,6 +241,13 @@ class VisionConversationEvent(ConversationEvent):
             self.is_cancelled = True
             raise
         except Exception as e:
+            # Re-raise HTTPException so it propagates as the correct HTTP status code
+            # (e.g. 400 for context_length_exceeded) rather than being swallowed and
+            # returned as HTTP 500 by the outer handler.
+            from fastapi import HTTPException as _FastAPIHTTPException
+            if isinstance(e, _FastAPIHTTPException):
+                raise
+
             logger.error(f"Event {self.event_id}: VLM execution failed: {e}")
             self.terminate_handle(force=True)
             self.fail_turn(e)

@@ -53,11 +53,14 @@ class TextConversationEvent(ConversationEvent):
         config_manager = ModelConfigManager()
         self.context_size = config_manager.get_context_size(model_id)
 
-        # Determine max completion tokens fallback from context size
-        self.default_max_completion_tokens = int(self.context_size * 0.5)
+        # Default max completion tokens when the client does not specify.
+        # Capped at 50% of context_size when the client requests a larger value.
+        from openapi_server.impl.constant import DEFAULT_MAX_COMPLETION_TOKENS
+        self.default_max_completion_tokens = DEFAULT_MAX_COMPLETION_TOKENS
 
         # Flag to track if we need to inject summary
         self.inject_summary = False
+        self.force_rebuild = False
 
         # Retry configuration
         self.retry_count = 0
@@ -77,38 +80,15 @@ class TextConversationEvent(ConversationEvent):
         Return True when the next execute_request() will run on a clean KV cache
         and therefore must treat the prompt as self-contained.
 
-        Non-ADHOC Trip 2 tool continuations intentionally return False: they
-        continue on top of the active event's live KV state.
+        With universal reset (KV cache reset after every inference), every new
+        turn starts from a clean KV cache. The only exception is Trip 2 of a
+        tool continuation, which uses the live KV cache from Trip 1.
         """
-        from openapi_server.impl.constant import ADHOC_MODE
-
-        if ADHOC_MODE:
-            return True
-
-        llm_manager = LLMProcessManager.get_instance()
-        process = getattr(llm_manager, "process", None)
-        if not process or process.poll() is not None:
-            return True
-
-        current_model = getattr(llm_manager, "current_model", None)
-        if current_model and current_model != self.model_id:
-            return True
-
-        current_session_id = getattr(llm_manager, "current_session_id", None)
-        if current_session_id and current_session_id != self.session.session_id:
-            return True
-
-        if self._is_tool_calling:
+        # Trip 2 tool continuation: KV cache from Trip 1 is still live
+        if self._is_tool_calling and not self._tool_response_received:
             return False
-
-        if self.inject_summary:
-            return True
-
-        previous_event = self.session.get_last_completed_event()
-        if not previous_event:
-            return True
-
-        return previous_event.model_id != self.model_id
+        # All other cases: always rebuild from clean KV cache
+        return True
 
     def _cap_cache_usage_tokens(self, started_from_clean_kv: Optional[bool] = None) -> float:
         """
@@ -134,6 +114,97 @@ class TextConversationEvent(ConversationEvent):
 
         return cached
 
+    def _check_user_query_length(
+        self,
+        current_turn_messages: list,
+        requested_max_completion: Optional[int],
+    ) -> None:
+        """
+        Pre-assembly guard: reject immediately if the user's current turn messages
+        are too large to fit in the available input budget, given the current
+        session memory state (facts, summary, system prompt).
+
+        This check fires BEFORE prompt assembly so the client gets an immediate
+        HTTP 400 with a precise, actionable message — including exactly how many
+        tokens their message is and how many tokens are available — without
+        touching the inference subprocess.
+
+        The error message includes a breakdown of what is consuming the input
+        budget (system prompt, conversation memory, summary, output reservation)
+        so the user understands why the limit is what it is.
+
+        This is particularly important for RAG use cases where large document
+        chunks are included in the user message.
+
+        Args:
+            current_turn_messages:    Messages belonging to the current turn.
+            requested_max_completion: Caller's requested max_completion_tokens.
+        """
+        from openapi_server.impl.constant import (
+            HttpStatusCodes,
+            ErrorMessages,
+            MAX_COMPLETION_SAFETY_MARGIN,
+            MIN_USEFUL_COMPLETION_TOKENS,
+            ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+        )
+
+        # Estimate current turn token cost (exclude system messages — handled separately)
+        current_turn_tokens = sum(
+            TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+            + 4  # role/separator overhead per message
+            for msg in current_turn_messages
+            if msg.get('role') != 'system'
+        )
+        if current_turn_tokens == 0:
+            return
+
+        # Compute output reservation.
+        # Use a fixed DEFAULT_MAX_COMPLETION_TOKENS reservation regardless of what
+        # the client requested.  This guard is only meant to prevent prompts so
+        # large that the model has no room to respond at all; the actual per-request
+        # cap is enforced later in _resolve_max_completion_tokens() which silently
+        # clamps the requested value to whatever budget remains after assembly.
+        output_reserve = self.default_max_completion_tokens
+        input_budget = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
+
+        # Estimate tokens consumed by fixed slots (system prompt, facts, summary)
+        system_tokens = TokenCounter.estimate_tokens(
+            getattr(self.session, 'system_prompt_content', None) or ""
+        )
+        facts_text = self.session.format_facts() if hasattr(self.session, 'format_facts') else ""
+        facts_tokens = TokenCounter.estimate_tokens(facts_text) if facts_text else 0
+        summary_tokens = TokenCounter.estimate_tokens(
+            getattr(self.session, 'summary_content', None) or ""
+        )
+
+        # Add per-message overhead for each fixed slot that is present
+        fixed_overhead = 0
+        if system_tokens > 0:
+            fixed_overhead += system_tokens + 4
+        if facts_tokens > 0:
+            fixed_overhead += facts_tokens + 4
+        if summary_tokens > 0:
+            fixed_overhead += summary_tokens + 4
+
+        # Maximum tokens available for the user's current turn message
+        max_query_tokens = max(0, input_budget - fixed_overhead - MIN_USEFUL_COMPLETION_TOKENS)
+
+        if current_turn_tokens > max_query_tokens:
+            raise HTTPException(
+                status_code=HttpStatusCodes.BAD_REQUEST,
+                detail={
+                    "message": ErrorMessages.USER_QUERY_TOO_LONG.format(
+                        query_tokens=current_turn_tokens,
+                        max_query_tokens=max_query_tokens,
+                        context_size=self.context_size,
+                        output_tokens=output_reserve,
+                    ),
+                    "type": "invalid_request_error",
+                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
+                    "param": "messages",
+                },
+            )
+
     def _resolve_max_completion_tokens(self, request_data, prompt_content: str):
         """
         Validate max_completion_tokens against the computed cap. Raises 400 on
@@ -146,14 +217,24 @@ class TextConversationEvent(ConversationEvent):
             ErrorMessages,
             MIN_USEFUL_COMPLETION_TOKENS,
             MAX_COMPLETION_SAFETY_MARGIN,
+            TOKEN_ESTIMATION_BUFFER_RATIO,
             ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
         )
 
         started_from_clean_kv = self._is_rebuild_path()
         prompt_tokens = TokenCounter.estimate_tokens(prompt_content or "")
         cached_context_tokens = self._cap_cache_usage_tokens(started_from_clean_kv)
+
+        # Add a configurable estimation buffer (default 10%) to account for the
+        # discrepancy between the character-based heuristic and the actual tokenizer.
+        # Without this buffer, prompts that are slightly over the context window may
+        # pass the check (because the heuristic underestimates for dense content such
+        # as code, JSON, or non-English text) and cause silent truncation.
+        estimation_buffer = int(prompt_tokens * TOKEN_ESTIMATION_BUFFER_RATIO)
+
         cap = max(int(
-            self.context_size - cached_context_tokens - prompt_tokens - MAX_COMPLETION_SAFETY_MARGIN
+            self.context_size - cached_context_tokens - prompt_tokens
+            - MAX_COMPLETION_SAFETY_MARGIN - estimation_buffer
         ), 0)
 
         logger.info(
@@ -201,22 +282,14 @@ class TextConversationEvent(ConversationEvent):
             )
 
         if requested is not None and requested > cap:
-            template = (
-                ErrorMessages.CONTEXT_LENGTH_EXCEEDED_TOOL_RESPONSE
-                if tool_response_dominates
-                else ErrorMessages.CONTEXT_LENGTH_EXCEEDED
+            # Silently cap at the available budget instead of rejecting.
+            # The pre-assembly guard (_check_user_query_length) already ensures
+            # the prompt fits; here we just give the model whatever room remains.
+            logger.debug(
+                f"Event {self.event_id}: max_completion_tokens={requested} exceeds "
+                f"available cap={cap} — capping silently"
             )
-            raise HTTPException(
-                status_code=HttpStatusCodes.BAD_REQUEST,
-                detail={
-                    "message": template.format(
-                        requested=requested, cap=cap, context_size=self.context_size,
-                    ),
-                    "type": "invalid_request_error",
-                    "code": ERROR_CODE_CONTEXT_LENGTH_EXCEEDED,
-                    "param": "max_completion_tokens",
-                },
-            )
+            return cap, prompt_tokens, started_from_clean_kv
 
         if requested is not None:
             return requested, prompt_tokens, started_from_clean_kv
@@ -374,6 +447,19 @@ class TextConversationEvent(ConversationEvent):
                         prior_session_messages.append(copy.deepcopy(msg))
                     if prior_session_messages:
                         adhoc_summary_messages = prior_session_messages
+
+                # Pre-assembly user query length guard.
+                # Reject immediately if the current turn messages are too large
+                # to fit in the available input budget given the current session
+                # memory state (facts, summary, system prompt). This fires before
+                # prompt assembly and subprocess interaction, giving the client a
+                # precise HTTP 400 with the exact token limit and a breakdown of
+                # what is consuming the budget.
+                self._check_user_query_length(
+                    current_conversation_messages,
+                    requested_max_completion,
+                )
+
             # 1. Summarization Check
             if not self._is_tool_calling and not self._tool_response_received:
                 max_completion_target = requested_max_completion or self.default_max_completion_tokens
@@ -429,6 +515,7 @@ class TextConversationEvent(ConversationEvent):
                 request_data=request_data,
                 handle_borrowed=getattr(self, 'handle_borrowed', False),
                 inject_summary=self.inject_summary,
+                rebuild_with_history=self.force_rebuild,
                 is_tool_calling=self._is_tool_calling,
                 tool_response_received=self._tool_response_received,
                 include_tools=True
@@ -523,6 +610,18 @@ class TextConversationEvent(ConversationEvent):
             else:
                 self.assistant_message = response_content
                 logger.info(f"Event {self.event_id}: Turn completed successfully")
+
+                # Post-turn processing for non-streaming complete turns.
+                # Reset KV cache after inference, then run eviction/summarization/facts.
+                # This runs synchronously here (before returning) so the session is
+                # fully prepared for the next turn before the DSP lock is released.
+                self._reset_handle()
+                try:
+                    await self._post_turn_processing()
+                except Exception as _ptp_err:
+                    logger.error(
+                        f"Event {self.event_id}: post-turn processing error (non-streaming): {_ptp_err}"
+                    )
 
                 return {
                     "response": response_content,
@@ -638,12 +737,14 @@ class TextConversationEvent(ConversationEvent):
                     completion_tokens += 1
                     full_response_content.append(token)
 
-                    # Tool call detection buffering
+                    # Tool call detection buffering.
+                    # Detect both generic JSON format (starts with '{') and
+                    # Qwen native format (starts with '<tool_call>').
                     if not tool_check_completed:
                         tool_check_buffer.append(token)
                         current_text = "".join(tool_check_buffer).lstrip()
                         if current_text:
-                            if current_text.startswith('{'):
+                            if current_text.startswith('{') or current_text.startswith('<tool_call'):
                                 is_potential_tool_call = True
                                 tool_check_completed = True
                                 logger.info(f"Event {self.event_id}: Potential tool call detected in stream")
@@ -852,9 +953,43 @@ class TextConversationEvent(ConversationEvent):
                                 logger.error(f"Event {self.event_id}: Error terminating handle on unexpected exit: {_term_err}")
                         self.fail_turn(stream_failure or Exception("Stream aborted or failed"))
 
-                # *** KEY CHANGE: Release DSP lock HERE (in inference producer), not in network generator ***
-                # This ensures the lock is released as soon as inference is done,
-                # regardless of how fast the client reads the HTTP stream.
+                # ── Post-turn processing (while DSP lock is still held) ────────
+                # Run eviction, summarization, and fact extraction BEFORE releasing
+                # the DSP lock. This ensures the next turn's prompt is fully
+                # prepared (summary + facts updated) before the lock is released.
+                # Only runs for complete turns (not tool call Trip 1, not cancelled).
+                if (stream_outcome == "success"
+                        and not self._is_tool_calling
+                        and not self.is_cancelled):
+                    # Reset KV cache after user turn inference (universal reset)
+                    self._reset_handle()
+                    # Run post-turn memory management.
+                    # asyncio.shield() prevents client disconnection from
+                    # interrupting _post_turn_processing() mid-execution.
+                    # Without shielding, a client disconnect cancels the
+                    # producer_task while the summary/facts inference is running,
+                    # leaving the subprocess in an inconsistent state and causing
+                    # the next request to hang on "Waiting for eager background
+                    # RESET to complete...".
+                    try:
+                        await asyncio.shield(self._post_turn_processing())
+                    except asyncio.CancelledError:
+                        # Client disconnected during post-turn processing.
+                        # _post_turn_processing() is shielded and will complete
+                        # independently. Suppress the CancelledError so the
+                        # finally block can fire the completion callback cleanly.
+                        logger.info(
+                            f"Event {self.event_id}: client disconnected during "
+                            "post-turn processing — shielded task will complete independently"
+                        )
+                    except Exception as _ptp_err:
+                        logger.error(
+                            f"Event {self.event_id}: post-turn processing error: {_ptp_err}"
+                        )
+
+                # ── Release DSP lock ──────────────────────────────────────────
+                # Fires AFTER post-turn processing so the next request sees
+                # updated summary and facts immediately.
                 if self._completion_callback:
                     logger.info(f"Event {self.event_id}: Triggering completion callback from inference producer")
                     try:
@@ -926,6 +1061,42 @@ class TextConversationEvent(ConversationEvent):
             "is_streaming": True
         }
 
+    def _is_tool_call_loop(self, new_tool_calls) -> bool:
+        """
+        Detect if any of new_tool_calls is a repeated call with identical
+        (name, arguments) that has already appeared ≥ 2 times in this event.
+
+        Legitimate chained tool calling uses different arguments each time
+        (e.g. different line ranges for read_source). A loop is when the exact
+        same (name, arguments) pair is requested again after already being
+        answered.
+        """
+        call_counts: dict = {}
+        for idx in self.message_indices:
+            if idx >= len(self.session.messages):
+                continue
+            msg = self.session.messages[idx]
+            if msg.get('role') != 'assistant':
+                continue
+            tool_calls = msg.get('tool_calls') or []
+            for tc in tool_calls:
+                # Handle both Pydantic model objects and plain dicts
+                if hasattr(tc, 'function'):
+                    name = tc.function.name or ''
+                    args = tc.function.arguments or ''
+                else:
+                    fn = tc.get('function', {})
+                    name = fn.get('name', '')
+                    args = fn.get('arguments', '')
+                key = (name, str(args))
+                call_counts[key] = call_counts.get(key, 0) + 1
+
+        for tc in new_tool_calls:
+            key = (tc.function.name or '', str(tc.function.arguments or ''))
+            if call_counts.get(key, 0) >= 2:
+                return True
+        return False
+
     async def continue_with_tool_response(self, tool_response: str, request_data) -> dict:
         """Continue turn after receiving tool response."""
         try:
@@ -936,20 +1107,68 @@ class TextConversationEvent(ConversationEvent):
 
             logger.info(f"Event {self.event_id}: Generating final answer after tool call")
 
-            # Build Prompt
-            import copy
-            context_messages = copy.deepcopy(self.session.get_event_messages(self))
+            # ── Minimal prompt for tool continuation ──────────────────────────
+            # Use a focused task + tool-result prompt instead of the full
+            # slot-based conversation history.  The full history approach
+            # consumes ~1500 tokens when tool responses contain raw source code,
+            # leaving too little room for the generated answer given that Trip 1
+            # tokens are already resident in the KV cache (cached_context).
+            #
+            # Minimal structure:
+            #   system  — session's original system prompt (preserves agent-
+            #             specific output format instructions, e.g. "Output ONLY
+            #             valid JSON array" for the Pruner agent)
+            #   user    — original task + tool result + answer instruction
+            #
+            # We use session.system_prompt_content (set by
+            # sync_system_prompt_from_request() BEFORE inject_tool_instructions()
+            # runs) so the tool-call block is NOT included — we want a final
+            # answer, not another tool call.
+            #
+            # This cuts the Trip 2 prompt from ~1500 tokens to ~700 tokens,
+            # freeing ~800 tokens for the LLM to generate the final answer.
+            system_content = (
+                getattr(self.session, 'system_prompt_content', None)
+                or "You are a helpful coding assistant."
+            )
 
-            if hasattr(request_data, 'tools') and request_data.tools:
-                if any(m.get('role') == 'system' for m in context_messages):
-                    context_messages = ToolHandler.inject_tool_instructions(context_messages, request_data.tools)
+            original_task_full = next(
+                (
+                    self.session.messages[idx].get('content', '')
+                    for idx in self.message_indices
+                    if idx < len(self.session.messages)
+                    and self.session.messages[idx].get('role') == 'user'
+                ),
+                "",
+            )
 
-            # Filter existing tools and append new result
-            prompt_messages = [msg for msg in context_messages if msg.get('role', '') != 'tool']
-            prompt_messages.append({
-                "role": "user",
-                "content": f"{tool_response}\n\nBased on the tool result above, please provide a helpful response."
-            })
+            # Truncate the original task to avoid blowing the context window.
+            # Agent user messages can be large (e.g. the Pruner includes full
+            # navigator observations).  We keep the first ~300 tokens which
+            # always contains the task description and key constraints.
+            _MAX_TASK_TOKENS = 300
+            _task_tokens = TokenCounter.estimate_tokens(original_task_full)
+            if _task_tokens > _MAX_TASK_TOKENS:
+                # Rough truncation: 1 token ≈ 4 chars
+                original_task = original_task_full[: _MAX_TASK_TOKENS * 4] + "..."
+                logger.debug(
+                    f"Event {self.event_id}: Truncated original task "
+                    f"from {_task_tokens} to ~{_MAX_TASK_TOKENS} tokens for minimal prompt"
+                )
+            else:
+                original_task = original_task_full
+
+            prompt_messages = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task: {original_task}\n\n"
+                        f"Tool result:\n{tool_response}\n\n"
+                        "Please provide your response now."
+                    ),
+                },
+            ]
 
             formatted_content = CommonUtils.build_chat_prompt(
                 model_id=self.model_id,
@@ -990,13 +1209,103 @@ class TextConversationEvent(ConversationEvent):
             self._cap_prompt_tokens_total += prompt_tokens
             self._cap_completion_tokens_total += TokenCounter.estimate_tokens(final_response or "")
 
+            # ── Chained tool call detection ───────────────────────────────────
+            # Some smaller LLMs (e.g. Qwen 4B) respond to a tool result by
+            # immediately requesting another tool call instead of producing a
+            # final answer.  Detect this here so the service can keep the event
+            # in tool-calling state and return finish_reason="tool_calls" to the
+            # client, rather than leaking the raw JSON as finish_reason="stop".
+            chained_tool_calls = ToolHandler.parse_tool_response(final_response)
+            if chained_tool_calls:
+                if not self._is_tool_call_loop(chained_tool_calls):
+                    # Normal chained call — different arguments, allow it
+                    self._is_tool_calling = True
+                    self._pending_tool_calls = chained_tool_calls
+                    self._tool_response_received = False  # reset for next trip
+                    logger.info(
+                        f"Event {self.event_id}: Chained tool calling initiated "
+                        f"({len(chained_tool_calls)} call(s))"
+                    )
+                    return {
+                        "response": chained_tool_calls,
+                        "finish_reason": "tool_calls",
+                        "needs_tool_response": True,
+                        "turn_complete": False,
+                    }
+                else:
+                    # Loop detected — same (name, arguments) called ≥ 2 times.
+                    # Re-run inference with an explicit stop instruction so the
+                    # LLM produces a useful final answer instead of looping.
+                    loop_tool_name = chained_tool_calls[0].function.name
+                    logger.warning(
+                        f"Event {self.event_id}: Tool call loop detected "
+                        f"('{loop_tool_name}' repeated with identical arguments) — "
+                        "forcing final answer"
+                    )
+                    # Replace the last user message with a stop instruction
+                    if prompt_messages and prompt_messages[-1].get('role') == 'user':
+                        prompt_messages[-1] = {
+                            "role": "user",
+                            "content": (
+                                f"{tool_response}\n\n"
+                                "You have already retrieved this information. "
+                                "Please provide your final answer now without calling any more tools."
+                            ),
+                        }
+                    forced_content = CommonUtils.build_chat_prompt(
+                        model_id=self.model_id,
+                        messages=prompt_messages,
+                        include_assistant_prefix=True,
+                        has_vision=False,
+                    )
+                    try:
+                        forced_max, _, _ = self._resolve_max_completion_tokens(
+                            request_data, forced_content
+                        )
+                    except HTTPException:
+                        # Context too full even for the forced prompt — use fallback
+                        forced_max = 256
+                    forced_tokens = []
+                    async for token in llm_manager.execute_request(
+                        event_id=self.event_id,
+                        session_id=self.session.session_id,
+                        model=self.model_id,
+                        prompt=forced_content,
+                        streaming=False,
+                        max_tokens=forced_max,
+                        temperature=request_data.temperature or QUERY_CONST.DEFAULT_TEMPERATURE,
+                        top_p=request_data.top_p or QUERY_CONST.DEFAULT_TOP_P,
+                        top_k=getattr(request_data, 'top_k', QUERY_CONST.DEFAULT_TOP_K),
+                        presence_penalty=request_data.presence_penalty or QUERY_CONST.DEFAULT_PRESENCE_PENALTY,
+                        frequency_penalty=request_data.frequency_penalty or QUERY_CONST.DEFAULT_FREQUENCY_PENALTY,
+                    ):
+                        forced_tokens.append(token)
+                    forced_response = "".join(forced_tokens).strip()
+                    # If the LLM is still calling tools, use a safe fallback
+                    if not forced_response or ToolHandler.parse_tool_response(forced_response):
+                        forced_response = (
+                            "I have gathered the necessary information from the codebase."
+                        )
+                    final_response = forced_response
+                    # Fall through to the normal turn-complete path below
+
             self.assistant_message = final_response
             self._is_tool_calling = False
 
             logger.info(f"Event {self.event_id}: Turn completed after tool calling")
 
-            # Explicitly trigger completion callback to release DSP lock
-            # because tool continuation bypasses the streaming generator
+            # Post-turn processing for tool continuation complete turns.
+            # Reset KV cache after Trip 2 inference, then run eviction/summarization/facts.
+            # This runs before releasing the DSP lock so the next turn is fully prepared.
+            self._reset_handle()
+            try:
+                await self._post_turn_processing()
+            except Exception as _ptp_err:
+                logger.error(
+                    f"Event {self.event_id}: post-turn processing error (tool continuation): {_ptp_err}"
+                )
+
+            # Release DSP lock after post-turn processing completes
             if self._completion_callback:
                 try:
                     await self._completion_callback(self.event_id, EventState.COMPLETED)
@@ -1023,39 +1332,89 @@ class TextConversationEvent(ConversationEvent):
         except Exception as e:
             return await self._handle_error(e, request_data)
 
-    async def generate_summary(self, max_summary_tokens: int, messages_to_summarize: Optional[list] = None, include_history_in_prompt: bool = True) -> tuple:
-        """Generate a summary of the conversation using LLMProcessManager."""
+    async def generate_summary(
+        self,
+        max_summary_tokens: int,
+        messages_to_summarize: Optional[list] = None,
+        include_history_in_prompt: bool = True,
+    ) -> tuple:
+        """
+        Generate a structured summary of the conversation using LLMProcessManager.
 
-        source_messages = messages_to_summarize if messages_to_summarize is not None else self.session.messages
-        relevant_messages = [msg for msg in source_messages if msg.get('role', '') != 'tool']
+        Improvements over the previous implementation:
+        - Removed the 4-message cap: summarizes the full eviction batch
+        - Uses a structured prompt that preserves facts, tasks, key exchanges,
+          and open items — not just a generic narrative recap
+        - Prepends prior summary for continuity (accumulated rolling summary)
+        - Token-budget-aware: limits input to 50% of context window
 
-        if len(relevant_messages) > 4:
-            relevant_messages = relevant_messages[-4:]
+        Args:
+            max_summary_tokens:      Maximum tokens for the generated summary.
+            messages_to_summarize:   Messages to summarize. Defaults to session.messages.
+            include_history_in_prompt: Legacy parameter, kept for call-site compat.
 
-        context_parts = []
+        Returns:
+            Tuple of (summary_text, summary_token_count).
+        """
+        from openapi_server.impl.constant import STRUCTURED_SUMMARY_PROMPT
+
+        source_messages = (
+            messages_to_summarize
+            if messages_to_summarize is not None
+            else self.session.messages
+        )
+        # Exclude tool messages — they are verbose and rarely useful in summaries
+        relevant_messages = [
+            msg for msg in source_messages if msg.get('role', '') != 'tool'
+        ]
+
+        if not relevant_messages:
+            return "", 0
+
+        # If a prior summary exists, prepend it so the new summary is a
+        # continuation rather than an independent snapshot of the batch.
+        if getattr(self.session, 'summary_content', None):
+            prior_summary_msg = {
+                "role": "system",
+                "content": f"[Prior summary: {self.session.summary_content}]",
+            }
+            relevant_messages = [prior_summary_msg] + relevant_messages
+
+        # Build conversation text, token-budget-aware.
+        # Limit input to 50% of context to leave room for the summary prompt itself.
+        input_budget = int(self.context_size * 0.5)
+        conversation_parts = []
+        accumulated = 0
         for msg in relevant_messages:
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-
-            content_text = content if isinstance(content, str) else ' '.join(i.get('text', '') for i in content if isinstance(i, dict) and i.get('type') == 'text')
+            role = msg.get('role', '').capitalize()
+            content = msg.get('content', '') or ''
+            if isinstance(content, list):
+                content = ' '.join(
+                    i.get('text', '') for i in content
+                    if isinstance(i, dict) and i.get('type') == 'text'
+                )
             tool_call_text = " [Tool Calls]" if msg.get('tool_calls') else ""
+            line = f"{role}: {content}{tool_call_text}"
+            line_tokens = TokenCounter.estimate_tokens(line)
+            if accumulated + line_tokens > input_budget:
+                break
+            conversation_parts.append(line)
+            accumulated += line_tokens
 
-            if content_text or tool_call_text:
-                context_parts.append(f"{role.capitalize()}: {content_text}{tool_call_text}")
+        if not conversation_parts:
+            return "", 0
 
-        summary_prompt = (
-            f"Below is a conversation that needs to be summarized:\n\n{chr(10).join(context_parts)}\n\n"
-            f"Please provide a concise summary of the conversation above. The summary should be no more than {max_summary_tokens} tokens. "
-            "Focus on the key points and maintain chronological order."
-        ) if include_history_in_prompt else (
-            f"Please provide a concise summary of the conversation above. The summary should be no more than {max_summary_tokens} tokens. Focus on the key points."
+        conversation_text = "\n".join(conversation_parts)
+        summary_prompt = STRUCTURED_SUMMARY_PROMPT.format(
+            max_tokens=max_summary_tokens,
+            conversation=conversation_text,
         )
 
         formatted_prompt = CommonUtils.build_chat_prompt(
             model_id=self.model_id,
             messages=[{"role": "user", "content": summary_prompt}],
             include_assistant_prefix=True,
-            has_vision=False
+            has_vision=False,
         )
 
         llm_manager = LLMProcessManager.get_instance()
@@ -1068,15 +1427,232 @@ class TextConversationEvent(ConversationEvent):
             prompt=formatted_prompt,
             streaming=False,
             max_tokens=max_summary_tokens,
-            temperature=0.3
+            temperature=0.3,
         ):
             accumulated_tokens.append(token)
 
-        summary_text = "".join(accumulated_tokens)
+        summary_text = "".join(accumulated_tokens).strip()
         summary_tokens = TokenCounter.estimate_tokens(summary_text)
 
-        logger.info(f"Generated summary: {len(summary_text)} chars, {summary_tokens} tokens")
+        logger.info(
+            f"Event {self.event_id}: summary generated — "
+            f"{len(relevant_messages)} messages → {summary_tokens} tokens"
+        )
         return summary_text, summary_tokens
+
+    async def _extract_facts(self, messages_to_extract: list) -> None:
+        """
+        Extract persistent facts from a batch of messages using the LLM.
+
+        Called as part of post-turn processing after an eviction batch has been
+        summarized. Updates session.facts with newly extracted key-value pairs.
+
+        The LLM is asked to return a JSON object of short string key-value pairs
+        representing persistent facts (names, goals, decisions, constraints, etc.).
+        New facts override existing ones for the same key; keys are never deleted.
+
+        Args:
+            messages_to_extract: Messages to extract facts from (eviction batch).
+        """
+        import re as _re
+        from openapi_server.impl.constant import FACT_EXTRACTION_PROMPT, SLOT_FACTS_CEILING
+
+        relevant = [
+            msg for msg in messages_to_extract
+            if msg.get('role') in ('user', 'assistant')
+        ]
+        if not relevant:
+            return
+
+        # Build conversation text for the extraction prompt
+        conversation_parts = []
+        for msg in relevant:
+            role = msg.get('role', '').capitalize()
+            content = msg.get('content', '') or ''
+            if isinstance(content, list):
+                content = ' '.join(
+                    i.get('text', '') for i in content
+                    if isinstance(i, dict) and i.get('type') == 'text'
+                )
+            if content:
+                conversation_parts.append(f"{role}: {content}")
+
+        if not conversation_parts:
+            return
+
+        prompt_text = FACT_EXTRACTION_PROMPT.format(
+            conversation="\n".join(conversation_parts)
+        )
+
+        formatted_prompt = CommonUtils.build_chat_prompt(
+            model_id=self.model_id,
+            messages=[{"role": "user", "content": prompt_text}],
+            include_assistant_prefix=True,
+            has_vision=False,
+        )
+
+        llm_manager = LLMProcessManager.get_instance()
+        tokens = []
+
+        async for token in llm_manager.execute_request(
+            event_id=f"{self.event_id}-facts",
+            session_id=self.session.session_id,
+            model=self.model_id,
+            prompt=formatted_prompt,
+            streaming=False,
+            max_tokens=150,
+            temperature=0.0,
+        ):
+            tokens.append(token)
+
+        raw = "".join(tokens).strip()
+
+        # Parse JSON from the response (model may add surrounding text)
+        new_facts = {}
+        try:
+            new_facts = json.loads(raw)
+        except json.JSONDecodeError:
+            match = _re.search(r'\{[^{}]*\}', raw, _re.DOTALL)
+            if match:
+                try:
+                    new_facts = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if new_facts and isinstance(new_facts, dict):
+            turn_number = len(self.session.events)
+            self.session.update_facts(new_facts, turn_number)
+            self.session.enforce_facts_ceiling(SLOT_FACTS_CEILING)
+            logger.info(
+                f"Event {self.event_id}: extracted {len(new_facts)} facts "
+                f"({len(self.session.facts)} total in store)"
+            )
+        else:
+            logger.debug(f"Event {self.event_id}: no facts extracted from batch")
+
+    async def _post_turn_processing(self) -> None:
+        """
+        Post-turn memory management: eviction, summarization, and fact extraction.
+
+        Called after every complete turn (not tool continuations) while the DSP
+        lock is still held. This ensures the next turn's prompt is fully prepared
+        before the lock is released.
+
+        Sequence:
+          1. Compute history token usage (includes the just-completed turn)
+          2. If over eviction threshold: identify oldest messages to evict
+          3. Mark eviction batch in session (excluded from next turn's history queue)
+          4. Summarize eviction batch → update session.summary_content
+          5. Reset KV cache after summarization inference
+          6. Extract facts from eviction batch → update session.facts
+          7. Reset KV cache after fact extraction inference
+          8. Clear eviction batch (messages now represented by summary)
+        """
+        from openapi_server.impl.constant import (
+            HISTORY_EVICTION_THRESHOLD,
+            HISTORY_EVICTION_TARGET,
+            MAX_COMPLETION_SAFETY_MARGIN,
+        )
+
+        try:
+            # Compute slot ceilings proportional to context size so that small-context
+            # models (e.g. 2048 tokens) still have a non-zero history budget.
+            # Each slot is capped at its absolute ceiling but also at a fraction of
+            # the available input budget to prevent fixed overheads from consuming
+            # the entire context on small models.
+            output_reserve = int(self.context_size * 0.5)
+            input_budget = self.context_size - output_reserve - MAX_COMPLETION_SAFETY_MARGIN
+
+            # Slot fractions: system=12%, tools=14%, facts=14%, summary=20% of input budget
+            # These fractions sum to 60%, leaving 40% for history.
+            slot_system  = min(int(input_budget * 0.12), 256)
+            slot_tools   = min(int(input_budget * 0.14), 300)
+            slot_facts   = min(int(input_budget * 0.14), 300)
+            slot_summary = min(int(input_budget * 0.20), 400)
+
+            fixed_overhead = slot_system + slot_tools + slot_facts + slot_summary
+            history_budget = max(input_budget - fixed_overhead, 0)
+
+            logger.debug(
+                f"Event {self.event_id}: post-turn budget — "
+                f"context={self.context_size}, input={input_budget}, "
+                f"fixed={fixed_overhead} (sys={slot_system} tools={slot_tools} "
+                f"facts={slot_facts} summary={slot_summary}), "
+                f"history={history_budget}"
+            )
+
+            # Get all post-summary messages (excludes eviction batch and system msgs)
+            history_messages = self.session.get_post_summary_messages()
+            if not history_messages:
+                return
+
+            current_tokens = sum(
+                TokenCounter.estimate_tokens_for_multimodal_content(m.get('content', '')) + 4
+                for m in history_messages
+            )
+
+            if current_tokens <= history_budget * HISTORY_EVICTION_THRESHOLD:
+                logger.debug(
+                    f"Event {self.event_id}: post-turn — no eviction needed "
+                    f"({current_tokens}/{history_budget} tokens, "
+                    f"threshold={HISTORY_EVICTION_THRESHOLD:.0%})"
+                )
+                return
+
+            # Identify eviction batch: remove oldest messages until under target
+            target_tokens = int(history_budget * HISTORY_EVICTION_TARGET)
+            eviction_batch = []
+            remaining = list(history_messages)
+
+            while remaining and current_tokens > target_tokens:
+                msg = remaining.pop(0)
+                msg_tokens = (
+                    TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
+                    + 4
+                )
+                eviction_batch.append(msg)
+                current_tokens -= msg_tokens
+
+            if not eviction_batch:
+                return
+
+            logger.info(
+                f"Event {self.event_id}: post-turn eviction — "
+                f"{len(eviction_batch)} messages evicted, "
+                f"target={target_tokens} tokens"
+            )
+
+            # Mark eviction batch in session so next turn's history queue excludes them
+            self.session.eviction_batch = eviction_batch
+
+            # Summarize eviction batch.
+            # execute_request() inside generate_summary() handles the KV cache reset
+            # via the eager background reset mechanism — no explicit _reset_handle()
+            # call is needed here (it would cause a double reset).
+            summary_text, summary_tokens = await self.generate_summary(
+                max_summary_tokens=slot_summary,
+                messages_to_summarize=eviction_batch,
+            )
+            if summary_text:
+                self.session.summary_content = summary_text
+                self.session.summary_token_count = summary_tokens
+                self.summarization_performed = True
+                logger.info(
+                    f"Event {self.event_id}: post-turn summary updated "
+                    f"({summary_tokens} tokens)"
+                )
+
+            # Extract facts from eviction batch.
+            # Same: execute_request() inside _extract_facts() handles the reset.
+            await self._extract_facts(eviction_batch)
+
+            # Clear eviction batch — messages are now represented by the summary
+            self.session.eviction_batch = []
+
+        except Exception as e:
+            logger.error(f"Event {self.event_id}: post-turn processing failed: {e}")
+            # Always clear eviction batch on failure to avoid stale exclusions
+            self.session.eviction_batch = []
 
     async def _handle_error(self, error: Exception, request_data) -> dict:
         """

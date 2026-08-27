@@ -28,6 +28,43 @@ SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD = 1.3  # 1.3x multiplier for system prompt 
 # Max completion tokens multiplier: Reduces weight of max_completion_tokens
 SUMMARIZATION_MAX_COMPLETION_MULTIPLIER = 0.5  # 50% weight for max_completion tokens
 
+# ── Prompt slot ceilings (tokens) ─────────────────────────────────────────────
+# Hard token ceilings for each named slot in the assembled prompt.
+# These ensure no single slot can crowd out the history queue.
+SLOT_SYSTEM_CEILING        = int(os.getenv("SLOT_SYSTEM_CEILING", "256"))
+SLOT_TOOLS_CEILING         = int(os.getenv("SLOT_TOOLS_CEILING", "300"))
+SLOT_FACTS_CEILING         = int(os.getenv("SLOT_FACTS_CEILING", "300"))
+SLOT_SUMMARY_CEILING       = int(os.getenv("SLOT_SUMMARY_CEILING", "400"))
+
+# ── Post-turn processing (eviction) ───────────────────────────────────────────
+# Trigger eviction when history token usage exceeds this fraction of history budget
+HISTORY_EVICTION_THRESHOLD = float(os.getenv("HISTORY_EVICTION_THRESHOLD", "0.85"))
+# Target usage after eviction (fraction of history budget)
+HISTORY_EVICTION_TARGET    = float(os.getenv("HISTORY_EVICTION_TARGET", "0.75"))
+
+# ── Structured summarization prompt ───────────────────────────────────────────
+STRUCTURED_SUMMARY_PROMPT = (
+    "Summarize this conversation. Your summary will be used as context for future turns.\n"
+    "Preserve:\n"
+    "1. FACTS: Names, preferences, constraints, decisions\n"
+    "2. TASK: What the user is trying to accomplish\n"
+    "3. KEY EXCHANGES: Important questions asked and answers given\n"
+    "4. OPEN ITEMS: Unresolved topics\n\n"
+    "Write a compact paragraph. Maximum {max_tokens} tokens.\n\n"
+    "Conversation:\n{conversation}\n\nSummary:"
+)
+
+# ── Fact extraction prompt ─────────────────────────────────────────────────────
+# NOTE: {{}} is escaped braces — produces literal {} in the formatted string.
+FACT_EXTRACTION_PROMPT = (
+    "Extract persistent facts from this conversation. "
+    "Return ONLY a JSON object with short string keys and values.\n"
+    "Include: names, goals, decisions, constraints, preferences, current state.\n"
+    "If a fact was established then contradicted, keep only the latest value.\n"
+    "If no facts found, return {{}}.\n\n"
+    "Conversation:\n{conversation}\n\nJSON:"
+)
+
 # --- Max completion tokens cap (context overflow prevention) ---
 # Safety margin subtracted from the hard cap to absorb estimator error,
 # BOS/EOS markers, and chat template overhead not explicitly tracked.
@@ -35,6 +72,29 @@ MAX_COMPLETION_SAFETY_MARGIN = 64
 
 # Reject requests that would leave too little space for a meaningful answer.
 MIN_USEFUL_COMPLETION_TOKENS = 64
+
+# Token estimation buffer: fraction of prompt_tokens added to the cap calculation
+# to account for the discrepancy between the character-based heuristic and the
+# actual tokenizer. A 10% buffer means the service treats a 1000-token estimate
+# as 1100 tokens, reducing the risk of silent truncation on dense content
+# (code, JSON, non-English text) where the heuristic underestimates.
+TOKEN_ESTIMATION_BUFFER_RATIO = float(os.getenv("TOKEN_ESTIMATION_BUFFER_RATIO", "0.10"))
+
+# Default max completion tokens when the client does not specify max_completion_tokens
+# or max_tokens. Used as the output reservation ceiling in both the pre-assembly query
+# length guard (_check_user_query_length) and the prompt assembler (_build_complete_prompt_context).
+# The assembler uses min(requested, DEFAULT_MAX_COMPLETION_TOKENS) so clients requesting
+# fewer tokens get a proportionally larger input budget, while clients requesting more
+# are capped at this value for budget accounting purposes.
+# Override via DEFAULT_MAX_COMPLETION_TOKENS env variable.
+DEFAULT_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_MAX_COMPLETION_TOKENS", "512"))
+
+# Fraction of raw image token count to use for VLM budget estimation.
+# The raw patch count (864 for a 512×342 image) may overestimate the actual tokens
+# consumed by the LLM after preprocessing optimizations (patch merging, compression).
+# Set below 1.0 to allow requests that would otherwise be incorrectly rejected.
+# Default 0.7 means 864 raw patches → 604 estimated tokens per image.
+IMAGE_TOKEN_ESTIMATION_RATIO = float(os.getenv("IMAGE_TOKEN_ESTIMATION_RATIO", "0.7"))
 
 class HttpStatusCodes:
     """
@@ -176,6 +236,21 @@ class ErrorMessages:
         "The combined prompt and tool response consume nearly the entire {context_size}-token context window. "
         "Only {cap} tokens remain for the response, which is below the minimum useful size. "
         "Please shorten your prompt or return a smaller tool response."
+    )
+    USER_QUERY_TOO_LONG = (
+        "The model has a {context_size}-token context window. "
+        "Your message is approximately {query_tokens} tokens, but only {max_query_tokens} tokens "
+        "are available for user input after reserving space for response output ({output_tokens} tokens) "
+        "and other internal settings. "
+        "Please shorten your message and retry."
+    )
+    VLM_QUERY_TOO_LONG = (
+        "The model has a {context_size}-token context window. "
+        "Your request is approximately {total_tokens} tokens "
+        "(image: {image_tokens}, text: {text_tokens}), but only {available} tokens "
+        "are available after reserving space for response output ({output_tokens} tokens) "
+        "and other internal settings. "
+        "Please use shorter text and retry."
     )
 
 class LLMServiceKeys:

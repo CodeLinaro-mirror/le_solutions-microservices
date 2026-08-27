@@ -26,7 +26,6 @@ from openapi_server.session.conversation_session import ConversationSession
 from openapi_server.session.conversation_utils import ConversationUtils
 from openapi_server.events.text_conversation_event import TextConversationEvent
 from openapi_server.events.vision_conversation_event import VisionConversationEvent
-from openapi_server.session.tool_handler import ToolHandler
 from openapi_server.utils.image_validator import has_image_content
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.impl.constant import (
@@ -72,6 +71,24 @@ class EventBasedChatHandler:
         for idx in sorted(message_indices, reverse=True):
             if idx < len(session.messages):
                 session.messages.pop(idx)
+
+    @staticmethod
+    def _new_non_system_messages_for_session(session, messages: List[Dict]) -> List[Dict]:
+        """
+        Return only request messages not already represented in session history.
+
+        System prompts are synchronized separately, so they must not shift the
+        continuation slice when a later request changes system prompt count.
+        """
+        incoming_non_system_messages = [
+            message for message in messages
+            if message.get('role') != 'system'
+        ]
+        existing_non_system_count = sum(
+            1 for message in session.messages
+            if message.get('role') != 'system'
+        )
+        return incoming_non_system_messages[existing_non_system_count:]
 
     @staticmethod
     def _rollback_new_turn_preflight(
@@ -223,12 +240,17 @@ class EventBasedChatHandler:
             else:
                 # New turn - calculate new messages based on session state
                 if is_new:
-                    # New session - add all messages
-                    new_messages = messages
+                    # New session - store only non-system messages
+                    new_messages = EventBasedChatHandler._new_non_system_messages_for_session(
+                        session,
+                        messages
+                    )
                 else:
                     # Existing session - only add new messages not in session history
-                    existing_count = len(session.messages)
-                    new_messages = messages[existing_count:]
+                    new_messages = EventBasedChatHandler._new_non_system_messages_for_session(
+                        session,
+                        messages
+                    )
 
             # Validate we have messages to process
             if not new_messages:
@@ -241,8 +263,10 @@ class EventBasedChatHandler:
                         f"cancelling active event to allow retry"
                     )
                     if session.cancel_active_event():
-                        existing_count = len(session.messages)
-                        new_messages = messages[existing_count:]
+                        new_messages = EventBasedChatHandler._new_non_system_messages_for_session(
+                            session,
+                            messages
+                        )
 
                 if not new_messages:
                     raise HTTPException(400, "No new messages to process")
@@ -288,7 +312,39 @@ class EventBasedChatHandler:
                     )
                     raise
 
-                if result['turn_complete']:
+                if result['finish_reason'] == 'tool_calls':
+                    # ── Chained tool call ─────────────────────────────────────
+                    # The LLM responded to the tool result with another tool call
+                    # instead of a final answer (common with smaller models).
+                    # Register the new tool call so the client can send the next
+                    # tool result back, exactly as in the new-turn path.
+                    chained_tool_calls = result['response']
+
+                    assistant_msg = {
+                        'role': 'assistant',
+                        'content': None,
+                        'tool_calls': chained_tool_calls,
+                    }
+                    assistant_idx = session.add_message(assistant_msg)
+                    current_event.message_indices.append(assistant_idx)
+
+                    # Re-register with the tool calling map so the next tool
+                    # response can be routed back to this session.
+                    user_message_indices = [
+                        idx for idx in current_event.message_indices
+                        if session.messages[idx].get('role') == 'user'
+                    ]
+                    user_messages = [session.messages[idx] for idx in user_message_indices]
+                    event_hash = ConversationUtils.calculate_hash_for_specific_messages(user_messages)
+                    session_mgr.register_tool_calling_event(event_hash, session.session_id)
+                    current_event.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
+
+                    logger.info(
+                        f"Chained tool call registered for session {session.session_id} "
+                        f"(hash={event_hash[:8]}...)"
+                    )
+
+                elif result['turn_complete']:
                     # Add assistant response to session
                     assistant_msg = {
                         'role': 'assistant',
@@ -332,11 +388,21 @@ class EventBasedChatHandler:
                 previous_model = session.current_model
                 previous_system_prompt_content = session.system_prompt_content
                 previous_system_prompt_tokens = session.system_prompt_tokens
+                system_prompt_changed = session.sync_system_prompt_from_request(messages)
                 event = session.create_event(
                     model_id=requested_model,
                     new_messages=new_messages,
                     is_tool_continuation=False
                 )
+
+                if (
+                    system_prompt_changed
+                    and not ADHOC_MODE
+                    and isinstance(event, TextConversationEvent)
+                    and session.events
+                ):
+                    event.force_rebuild = True
+                    event._reset_handle()
 
                 # Update legacy user_message field
                 user_msgs = [m for m in new_messages if m.get('role') == 'user']
@@ -350,16 +416,6 @@ class EventBasedChatHandler:
                 if completion_callback:
                     event.register_completion_callback(completion_callback)
                     logger.info(f"✓ Registered completion callback on event {event.event_id} BEFORE execution")
-
-                # Handle tool instructions if tools provided
-                if request_data.tools and len(request_data.tools) > 0:
-                    logger.info(f"Function calling enabled with {len(request_data.tools)} tools")
-                    modified_request = request_data.model_copy(deep=True)
-                    modified_request.messages = ToolHandler.inject_tool_instructions(
-                        modified_request.messages,
-                        request_data.tools
-                    )
-                    request_data = modified_request
 
                 # Execute turn (now async) with error handling
                 try:

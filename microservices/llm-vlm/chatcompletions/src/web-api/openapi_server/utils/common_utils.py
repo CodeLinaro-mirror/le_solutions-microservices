@@ -192,6 +192,33 @@ class CommonUtils:
             return template['assistant_prefix']
 
     @staticmethod
+    def _content_to_text(content) -> str:
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text' or 'text' in item:
+                        text = item.get('text', '')
+                        if text is not None:
+                            parts.append(text if isinstance(text, str) else str(text))
+                    elif item:
+                        parts.append(str(item))
+                    continue
+
+                text = getattr(item, 'text', None)
+                parts.append(str(text) if text is not None else str(item))
+
+            return "\n".join(part for part in parts if part)
+
+        return str(content)
+
+    @staticmethod
     def build_chat_prompt(
         model_id: str,
         messages: list,
@@ -222,7 +249,6 @@ class CommonUtils:
 
         # Extract or use default system prompt
         system_prompt = template.get('default_system_prompt', 'You are a helpful assistant.')
-        has_explicit_system = False
 
         for msg in messages:
             # Handle both dict and object (e.g. from Pydantic model)
@@ -234,9 +260,10 @@ class CommonUtils:
                 content = getattr(msg, 'content', '')
 
             if role == 'system':
-                system_prompt = content
-                has_explicit_system = True
-                break
+                content_text = CommonUtils._content_to_text(content)
+                if content_text:
+                    system_prompt = content_text
+                    break
 
         # Add system message if requested
         if add_system_prompt:

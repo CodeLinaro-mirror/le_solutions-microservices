@@ -1,0 +1,16 @@
+# Audio device requirements (microphone + speaker support)
+# Only installed when INSTALL_PULSE_AUDIO=true
+# Requires PulseAudio/PortAudio system libraries to be present at runtime
+
+sounddevice==0.4.6 \
+    --hash=sha256:5de768ba6fe56ad2b5aaa2eea794b76b73e427961c95acad2ee2ed7f866a4b20
+
+# For sound device
+cffi==1.17.1 \
+    --hash=sha256:da95af8214998d77a98cc14e3a3bd00aa191526343078b530ceb0bd710fb48a5 \
+    --hash=sha256:706510fe141c86a69c8ddc029c7910003a17353970cff3b904ff0686a5927683 # debian
+
+# cffi dependency
+pycparser==2.22 \
+    --hash=sha256:491c8be9c040f5390f5bf44a5b07752bd07f56edf992381b05c701439eec10f6 \
+    --hash=sha256:c3702b6d3dd8c7abc1afa565d7e63d53a1d0bd86cdc24edd75470f4de499cfcc

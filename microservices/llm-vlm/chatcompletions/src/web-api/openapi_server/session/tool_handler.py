@@ -15,66 +15,131 @@ LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
 
 class ToolHandler:
+
     @staticmethod
-    def format_tools_for_prompt(tools: List[ChatCompletionTool]) -> str:
+    def format_tools_for_prompt(
+        tools: List[ChatCompletionTool],
+        ceiling_tokens: int = None,
+        model_id: str = None,
+    ) -> str:
         """
-        Convert tools to a text format that the model can understand.
-        Creates instructions for the LLM on how to use tools.
+        Convert tools to a compact text format the model can understand.
+
+        Uses a three-level truncation strategy to stay within ceiling_tokens:
+          Level 1: Compact signature format with parameter descriptions (~35-60 tokens/tool)
+          Level 2: Compact format without parameter descriptions, truncated function descriptions
+          Level 3: Drop tools from end of list until under ceiling
 
         Args:
             tools: List of ChatCompletionTool objects
+            ceiling_tokens: Hard token ceiling for the entire tools block.
+                           Defaults to SLOT_TOOLS_CEILING from constants.
+            model_id: Reserved for future model-specific format selection (currently unused).
 
         Returns:
-            Formatted string describing the tools and usage instructions
+            Formatted string describing the tools and usage instructions,
+            guaranteed to be within ceiling_tokens.
         """
         if not tools:
             return ""
 
-        tools_text = "\n\n--- TOOL USAGE GUIDELINES ---\n\n"
-        tools_text += "IMPORTANT: You can ONLY use the tools explicitly listed below. "
-        tools_text += "If no relevant tool is available for the user's request, respond with text instead of calling any function. "
-        tools_text += "Do NOT output a JSON object with empty tool_calls. If no tool is needed, simply output the plain text response. "
-        tools_text += "Never invent or hallucinate function names that are not in the tools list. "
-        tools_text += "If the available tools cannot directly help with the user request, do not call any tool and reply with plain text instead.\n"
+        from openapi_server.impl.constant import SLOT_TOOLS_CEILING
+        from openapi_server.session.token_counter import TokenCounter
+        ceiling = ceiling_tokens if ceiling_tokens is not None else SLOT_TOOLS_CEILING
 
-        tools_text += "\n--- AVAILABLE TOOLS ---\n\n"
-        tools_text += (
-            "You have access to the following tools. To use a tool, respond with a JSON object in this exact format:\n\n"
+        # Fixed header: usage instructions (always included).
+        # IMPORTANT: Use {...} as the arguments placeholder — NOT a concrete key-value
+        # example like {"param": "value"}. A concrete example causes the model to copy
+        # the placeholder key name literally (e.g. outputting {"param": "Turin"} instead
+        # of {"location": "Turin"}). The {...} form is clearly a placeholder and the
+        # model correctly substitutes the real parameter names from the tool signature.
+        header = (
+            "\n\n--- TOOLS ---\n"
+            "You have access to the following tools. When the user's request requires "
+            "information that a tool can provide, you MUST call the appropriate tool.\n"
+            "To call a tool, respond ONLY with this JSON (no other text before or after):\n"
+            '{"tool_calls": [{"type": "function", "function": {"name": "TOOL_NAME", "arguments": {...}}}]}\n'
+            "Replace TOOL_NAME with the tool name and {...} with the actual arguments as JSON "
+            "using the parameter names shown in the tool signature below.\n"
+            "If no tool is needed to answer the question, respond with plain text only "
+            "(do NOT output JSON).\n\n"
         )
-        tools_text += (
-            '{\n  "tool_calls": [{\n    "type": "function",\n    "function": {\n      "name": "tool_name",\n'
-            '      "arguments": {\n        "param": "value"\n      }\n    }\n  }]\n}\n\n'
-        )
-        tools_text += "Available tools:\n\n"
 
-        for i, tool in enumerate(tools, 1):
-            func = tool.function
-            tools_text += f"{i}. {func.name}\n"
+        def _build_signature(func, include_param_desc: bool) -> str:
+            """Build compact function signature: name(param*: type, ...) → description"""
+            params = func.parameters or {}
+            props = params.get("properties", {}) if isinstance(params, dict) else {}
+            required = params.get("required", []) if isinstance(params, dict) else []
+            sig_parts = []
+            for pname, pdef in props.items():
+                ptype = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
+                marker = "*" if pname in required else ""
+                if include_param_desc and isinstance(pdef, dict):
+                    pdesc = pdef.get("description", "")
+                    if pdesc:
+                        sig_parts.append(f"{pname}{marker}: {ptype} ({pdesc[:40]})")
+                        continue
+                sig_parts.append(f"{pname}{marker}: {ptype}")
+            return f"{func.name}({', '.join(sig_parts)})"
 
-            if func.description:
-                tools_text += f"   Description: {func.description}\n"
+        def _render(tool_list: list, include_param_desc: bool, truncate_desc: bool) -> str:
+            lines = []
+            for tool in tool_list:
+                func = tool.function
+                sig = _build_signature(func, include_param_desc)
+                desc = func.description or ""
+                if truncate_desc and len(desc) > 60:
+                    desc = desc[:57] + "..."
+                lines.append(f"- {sig} → {desc}")
+            return header + "\n".join(lines)
 
-            if func.parameters:
-                try:
-                    params_str = json.dumps(func.parameters, indent=2)
-                    tools_text += f"   Parameters: {params_str}\n"
-                except Exception as e:
-                    logger.warning(f"Failed to format parameters for {func.name}: {e}")
-                    tools_text += f"   Parameters: {func.parameters}\n"
+        # Level 1: compact with parameter descriptions
+        text = _render(list(tools), include_param_desc=True, truncate_desc=False)
+        if TokenCounter.estimate_tokens(text) <= ceiling:
+            return text
 
-            tools_text += "\n"
+        # Level 2: compact without parameter descriptions, truncated function descriptions
+        text = _render(list(tools), include_param_desc=False, truncate_desc=True)
+        if TokenCounter.estimate_tokens(text) <= ceiling:
+            return text
 
-        return tools_text
+        # Level 3: drop tools from end until under ceiling
+        tool_list = list(tools)
+        while tool_list:
+            text = _render(tool_list, include_param_desc=False, truncate_desc=True)
+            if TokenCounter.estimate_tokens(text) <= ceiling:
+                if len(tool_list) < len(tools):
+                    dropped_names = [t.function.name for t in tools[len(tool_list):]]
+                    logger.warning(
+                        f"Tool instructions exceed budget ({ceiling} tokens): "
+                        f"dropped tools {dropped_names}"
+                    )
+                return text
+            tool_list.pop()
 
-    def inject_tool_instructions(messages: List[Any], tools: List[ChatCompletionTool]) -> List[Any]:
+        # Fallback: header only (no tools fit)
+        logger.warning(f"No tools fit within budget ({ceiling} tokens): returning header only")
+        return header
+
+    @staticmethod
+    def inject_tool_instructions(
+        messages: List[Any],
+        tools: List[ChatCompletionTool],
+        model_id: str = None,
+    ) -> List[Any]:
         """
         Inject tool instructions into the messages.
         - If a system message exists: append tool instructions to it
         - If no system message: create one with tool instructions
 
+        Handles both Pydantic model objects (from request parsing) and plain
+        dicts (from session history). Always creates new system messages as
+        plain dicts to avoid AttributeError when downstream code calls .get().
+
         Args:
-            messages: List of message objects
+            messages: List of message objects (Pydantic models or dicts)
             tools: List of ChatCompletionTool objects
+            model_id: Reserved for future model-specific format selection (currently unused).
 
         Returns:
             Modified list of messages with tool instructions
@@ -82,24 +147,42 @@ class ToolHandler:
         if not tools:
             return messages
 
-        tool_instructions = ToolHandler.format_tools_for_prompt(tools)
+        tool_instructions = ToolHandler.format_tools_for_prompt(tools, model_id=model_id)
 
-        # Check if first message is a system message
-        has_system_msg = messages and hasattr(messages[0], 'role') and messages[0].role == "system"
+        # Check if first message is a system message.
+        # Support both Pydantic objects (.role attribute) and dicts (['role'] key).
+        def _get_role(msg) -> str:
+            if isinstance(msg, dict):
+                return msg.get('role', '')
+            return getattr(msg, 'role', '')
+
+        def _get_content(msg) -> str:
+            if isinstance(msg, dict):
+                return msg.get('content') or ''
+            return getattr(msg, 'content', '') or ''
+
+        def _set_content(msg, content: str):
+            if isinstance(msg, dict):
+                msg['content'] = content
+            else:
+                msg.content = content
+
+        has_system_msg = bool(messages) and _get_role(messages[0]) == "system"
 
         if has_system_msg:
-            # Append to existing system message
-            existing_content = messages[0].content or ""
-            messages[0].content = f"{existing_content}{tool_instructions}"
+            # Append to existing system message (works for both Pydantic and dict)
+            existing_content = _get_content(messages[0])
+            _set_content(messages[0], f"{existing_content}{tool_instructions}")
             logger.info("Appended tool instructions to existing system message")
         else:
-            # Create new system message with tool instructions
-            from openapi_server.models.chat_completion_request_system_message import ChatCompletionRequestSystemMessage
-
-            system_msg = ChatCompletionRequestSystemMessage(
-                role="system",
-                content=f"You are a helpful assistant.{tool_instructions}"
-            )
+            # Create new system message as a plain dict.
+            # Using a Pydantic ChatCompletionRequestSystemMessage here causes
+            # AttributeError in text_conversation_event.py which calls .get()
+            # on messages (dict method, not available on Pydantic objects).
+            system_msg = {
+                "role": "system",
+                "content": f"You are a helpful assistant.{tool_instructions}"
+            }
             messages.insert(0, system_msg)
             logger.info("Created new system message with tool instructions")
 
@@ -109,7 +192,8 @@ class ToolHandler:
     def parse_tool_response(response_text: str) -> Optional[List[ChatCompletionMessageToolCall]]:
         """
         Parse model response to detect if it wants to call a function.
-        Looks for JSON patterns that indicate function calls in OpenAI format.
+        Looks for JSON patterns that indicate function calls in OpenAI format,
+        as well as the <tool_call> XML format used by some model variants.
 
         Args:
             response_text: The text response from the model
@@ -130,6 +214,13 @@ class ToolHandler:
                     tool_calls_data = parsed["tool_calls"]
                     if isinstance(tool_calls_data, list) and len(tool_calls_data) > 0:
                         return ToolHandler._convert_to_tool_calls(tool_calls_data)
+                    # Empty tool_calls array — model signalled "no tool needed" in JSON form.
+                    # Return None so the caller treats this as a regular text response.
+                    if isinstance(tool_calls_data, list) and len(tool_calls_data) == 0:
+                        logger.debug(
+                            "Model returned empty tool_calls array — treating as no-tool response"
+                        )
+                        return None
 
             except json.JSONDecodeError:
                 pass
@@ -169,6 +260,59 @@ class ToolHandler:
                         return ToolHandler._convert_to_tool_calls(tool_calls_data)
                 except json.JSONDecodeError:
                     pass
+
+            # Strategy 4: Handle {"type": "function", "function": {"name": ..., "arguments": ...}}
+            # This is the format the model sometimes outputs directly.
+            try:
+                stripped = response_text.strip()
+                parsed = json.loads(stripped)
+                if (isinstance(parsed, dict)
+                        and parsed.get("type") == "function"
+                        and "function" in parsed):
+                    func_data = parsed["function"]
+                    tool_calls_data = [{
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": func_data,
+                    }]
+                    func_name = func_data.get("name", "unknown")
+                    logger.info(f"Detected function call (Strategy 4 - type/function): {func_name}")
+                    return ToolHandler._convert_to_tool_calls(tool_calls_data)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+            # Strategy 5: <tool_call> XML format
+            # Some model variants respond with:
+            #   <tool_call>
+            #   {"name": "func_name", "arguments": {"param": "value"}}
+            #   </tool_call>
+            tool_call_xml_pattern = r'<tool_call>\s*([\s\S]*?)\s*</tool_call>'
+            xml_matches = re.findall(tool_call_xml_pattern, response_text)
+            if xml_matches:
+                tool_calls_data = []
+                for match_text in xml_matches:
+                    try:
+                        parsed = json.loads(match_text.strip())
+                        if isinstance(parsed, dict) and 'name' in parsed:
+                            tool_calls_data.append({
+                                "id": f"call_{uuid.uuid4().hex[:24]}",
+                                "type": "function",
+                                "function": {
+                                    "name": parsed.get("name", ""),
+                                    "arguments": parsed.get("arguments", {})
+                                }
+                            })
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            f"Failed to parse <tool_call> content as JSON: {match_text[:100]}"
+                        )
+                if tool_calls_data:
+                    func_names = [tc["function"]["name"] for tc in tool_calls_data]
+                    logger.info(
+                        f"Detected {len(tool_calls_data)} tool call(s) "
+                        f"(Strategy 5 - <tool_call> XML): {func_names}"
+                    )
+                    return ToolHandler._convert_to_tool_calls(tool_calls_data)
 
         except Exception as e:
             logger.warning(f"Error parsing tool response: {e}")
@@ -309,7 +453,8 @@ class ToolHandler:
             '"name"',
             '"arguments"',
             '{"type"',
-            '"type": "function"'
+            '"type": "function"',
+            '<tool_call>',
         ]
 
         response_lower = response_text.lower()

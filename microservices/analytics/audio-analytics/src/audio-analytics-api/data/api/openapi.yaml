@@ -1,0 +1,1514 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+openapi: "3.0.3"
+info:
+  title: "Audio Analytics API"
+  version: "1.0.0"
+  description: |
+    REST API providing AI-powered audio processing: speech recognition (ASR),
+    text translation (T2T), and speech synthesis (TTS).
+
+    ## Services
+
+    | Service | Endpoint prefix | Description |
+    |---------|----------------|-------------|
+    | ASR | `/transcriptions/` | Whisper-based speech-to-text (file or live WebSocket streaming) |
+    | T2T | `/translations/` | Opus/NLLB text translation (batch supported) |
+    | TTS | `/tts/` | MeloTTS speech synthesis; returns raw PCM audio |
+
+    ## Audio formats (ASR input)
+    - WAV, 16-bit PCM; 16 kHz mono recommended; max 25 MB
+
+    ## TTS output
+    - Supported sample rates: 44100, 22050, 16000 Hz (auto-resampled)
+
+    ## WebSocket streaming sequence
+
+    ```
+    App                                           Server
+     |===POST /transcriptions/create================>|
+     |<==200 {session_id, state: asr_initialized}====|
+     |
+     |===WS /stream=================================>|
+     |<==  {state: connection_established}===========|
+     |
+     |===WS {transcriptions_session_audio} (loop)===>|
+     |<===WS {transcript.event,     speech_start}====|
+     |<===WS {transcript.text.delta, ...}============|  (zero or more)
+     |<===WS {transcript.event,     speech_end}======|
+     |<===WS {transcript.text.done,  ...}============|
+     |
+     |===POST /transcriptions/close=================>|  (after transcript.text.done)
+    ```
+
+    ## Authentication
+    None required.
+
+
+
+  contact:
+    name: "Qualcomm Support Forums"
+    url: "https://mysupport.qualcomm.com/supportforums/s/"
+  license:
+    name: "BSD-3-Clause-Clear"
+    url: "https://opensource.org/licenses/BSD-3-Clause-Clear"
+
+servers:
+  - url: "http://{device-ip}:{device-port}/audio-analytics/v1/api"
+    description: "Audio Analytics API Server"
+    variables:
+      device-ip:
+        description: "IP address and port of the host device running the Audio Analytics API"
+        default: "localhost"
+      device-port:
+        default: "8085"
+
+
+tags:
+  - name: "Health"
+    description: "Service health and status endpoints"
+  - name: "Transcriptions"
+    description: "Speech-to-text audio transcription (ASR)"
+  - name: "Translations"
+    description: "Text-to-text translation between languages"
+  - name: "TTS"
+    description: "Text-to-speech synthesis"
+  - name: "WebSocket"
+    description: "Real-time streaming communication"
+
+security: []
+
+paths:
+  /kpi:
+    get:
+      tags: ["Health"]
+      summary: "Get service KPIs"
+      description: "Returns the KPIs"
+      operationId: "getKPIs"
+      x-swagger-router-controller: Health
+      responses:
+        "200":
+          description: "KPIs"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KPIResponse"
+              example:
+                status: "ok"
+                uptime: 12345
+                active_sessions: 2
+                version: "1.0.0"
+        "503":
+          description: "Service is unavailable or unhealthy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: "Server is down or overloaded"
+                  type: "service_unavailable"
+                  param: null
+                  code: null
+    
+  /health:
+    get:
+      tags: ["Health"]
+      summary: "Check service health"
+      description: "Returns the current health status, uptime, active session count, and version."
+      operationId: "healthCheck"
+      x-swagger-router-controller: Health
+      responses:
+        "200":
+          description: "Service is healthy and operational"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: "ok"
+                uptime: 12345
+                active_sessions: 2
+                version: "1.0.0"
+        "503":
+          description: "Service is unavailable or unhealthy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: "Server is down or overloaded"
+                  type: "service_unavailable"
+                  param: null
+                  code: null
+
+  /transcriptions/devices:
+    get:
+      tags: ["Transcriptions"]
+      summary: "List available audio input (recording) devices"
+      description: "Returns available audio input devices (microphones) on the host system."
+      operationId: "listTranscriptionDevices"
+      x-swagger-router-controller: TranscriptionsDevices
+      responses:
+        "200":
+          description: "List of available audio input devices"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AudioInputDevice"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /transcriptions/models:
+    get:
+      tags: ["Transcriptions"]
+      summary: "List available ASR models"
+      description: "Returns available ASR models with capabilities and supported parameters."
+      operationId: "listTranscriptionModels"
+      x-swagger-router-controller: TranscriptionsModels
+      responses:
+        "200":
+          description: "List of available ASR models"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ASRModel"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /transcriptions/create:
+    post:
+      tags: ["Transcriptions"]
+      summary: "Transcribe audio to text"
+      description: |
+        Transcribes audio input into text. Supports three modes:
+        
+        ## 1. File Upload (Non-Streaming)
+        Upload an audio file and receive the complete transcription in a single response.
+        
+        **Request:**
+        - Content-Type: `multipart/form-data`
+        - Include `file`, `model`, `stream=false`
+        
+        **Response:**
+        - Complete transcription text
+        - Detected language
+        
+        ## 2. File Upload (Streaming Results)
+        Upload an audio file and receive partial transcription results via WebSocket.
+        
+        **Request:**
+        - Content-Type: `multipart/form-data`
+        - Include `file`, `model`, `stream=true`
+        
+        **Response:**
+        - Initial acknowledgment with `session_id`
+        - Partial results via WebSocket (`transcript.text.delta`)
+        - Final result via WebSocket (`transcript.text.done`)
+        
+        ## 3. Live Audio Streaming
+        Stream audio chunks in real-time via WebSocket.
+
+        **Request:**
+        - Content-Type: `application/json`
+        - Include `model`, `stream=true` (no file)
+
+        **Response:**
+        - Session ID for WebSocket connection
+        - Send audio chunks via WebSocket
+        - Receive events and partial results in real-time
+
+        ## Event Sequence (Live Streaming with VAD)
+
+        When streaming live audio with VAD/EPD enabled, the server emits the
+        following sequence of WebSocket messages for each utterance:
+
+        1. **`transcript.event` / `speech_start`** — speech first detected by VAD
+           ```json
+           { "session_id": "session123", "type": "transcript.event", "state": "speech_start" }
+           ```
+        2. **`transcript.text.delta`** — zero or more partial transcription results
+           ```json
+           { "session_id": "session123", "text": "Partial text...", "language": "en", "type": "transcript.text.delta", "state": "transcription" }
+           ```
+        3. **`transcript.event` / `speech_end`** — end-of-speech detected by VAD/EPD
+           ```json
+           { "session_id": "session123", "type": "transcript.event", "state": "speech_end" }
+           ```
+        4. **`transcript.text.done`** — final transcription for the utterance
+           ```json
+           { "session_id": "session123", "text": "Complete utterance text.", "language": "en", "type": "transcript.text.done", "state": "transcription" }
+           ```
+
+        After step 4 the engine resets and listens for the next utterance.
+        The session remains open until the client calls `/transcriptions/close`.
+        The client may also call `/transcriptions/flush` at any time to force
+        immediate processing of buffered audio.
+
+        **Important - Session Timeout:**
+        When streaming audio, if no audio data is sent for a period of time (session timeout),
+        the session will automatically close and the final transcription will be sent. This
+        prevents sessions from remaining open indefinitely when audio streaming has stopped.
+        
+        ## Supported Audio Formats
+        - WAV (recommended)
+        
+        ## Sample Rates
+        - 16000 Hz (recommended)
+        - Automatic resampling available
+        
+        ## Parameters
+        You can include additional parameters for fine-tuning:
+        - `sampling_rate`: Target sample rate (e.g., "16000")
+        - `channels`: Number of audio channels (e.g., "1" for mono)
+        
+      operationId: "createTranscription"
+      x-swagger-router-controller: TranscriptionsCreate
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CreateTranscriptionRequest"
+            examples:
+              file_sync:
+                summary: "File upload (non-streaming)"
+                value:
+                  model: "whisper-small"
+                  file: "(binary audio data)"
+                  stream: false
+                  language: "en"
+                  parameters:
+                    - key: "sampling_rate"
+                      value: "16000"
+                    - key: "channels"
+                      value: "1"
+              file_stream:
+                summary: "File upload (streaming results)"
+                value:
+                  model: "whisper-small"
+                  file: "(binary audio data)"
+                  stream: true
+                  language: "en"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTranscriptionRequest"
+            example:
+              model: "whisper-small"
+              stream: true
+              language: "en"
+      responses:
+        "200":
+          description: "Transcription request accepted"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/TranscriptionResponse"
+                  - $ref: "#/components/schemas/TranscriptionSessionResponse"
+              examples:
+                non_streaming:
+                  summary: "Non-streaming response"
+                  value:
+                    text: "The transcribed text from the audio file."
+                    language: "en"
+                    type: "transcript.text.done"
+                streaming:
+                  summary: "Streaming session created"
+                  value:
+                    session_id: "session123"
+        "400":
+          description: "Bad request - invalid input"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /transcriptions/close:
+    post:
+      tags: ["Transcriptions"]
+      summary: "Close active transcription session"
+      description: |
+        Ends the current transcription session and releases server resources.
+
+        Call this after receiving `transcript.text.done` to cleanly close the session.
+        Sessions are also automatically closed after a period of inactivity.
+      operationId: "closeTranscription"
+      x-swagger-router-controller: TranscriptionsClose
+      responses:
+        "200":
+          description: "Session closed successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "closed"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+
+  /transcriptions/flush:
+    post:
+      tags: ["Transcriptions"]
+      summary: "Flush buffered audio and force immediate transcription"
+      description: |
+        Forces the ASR engine to process any audio currently buffered in the
+        VAD/silence-detection pipeline and emit a transcription result
+        immediately, without waiting for the next speech-end event.
+
+        Use this endpoint when you want to retrieve a partial result mid-stream
+        (e.g. the user pressed a "done speaking" button) without fully closing
+        the session.
+
+        The session remains open after a flush and can continue receiving audio.
+      operationId: "flushTranscription"
+      x-swagger-router-controller: TranscriptionsFlush
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session_id:
+                  type: string
+                  description: "Session ID to flush. If omitted, the only active session is used."
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: "Flush triggered successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "flushed"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /translations/models:
+    get:
+      tags: ["Translations"]
+      summary: "List available translation models"
+      description: "Returns available translation models with supported language pairs and parameters."
+      operationId: "listTranslationModels"
+      x-swagger-router-controller: TranslationsModels
+      responses:
+        "200":
+          description: "List of available translation models"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TranslationModel"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /translations/translate:
+    post:
+      tags: ["Translations"]
+      summary: "Translate text between languages"
+      description: |
+        Translates text from a source language to a target language.
+        
+        ## Features
+        - Batch translation (multiple texts in one request)
+        - Automatic language detection (if source not specified)
+        - Custom parameters for fine-tuning
+        
+        ## Supported Languages
+        Query `/translations/models` to see available language pairs.
+        
+        ## Example Request
+        ```json
+        {
+          "text": ["Hello world", "How are you?"],
+          "model": "opus-en-es",
+          "source_language": "en",
+          "target_language": "es"
+        }
+        ```
+        
+        ## Example Response
+        ```json
+        {
+          "translations": [
+            {
+              "translated_text": "Hola mundo",
+              "target_language": "es",
+              "source_language": "en"
+            },
+            {
+              "translated_text": "¿Cómo estás?",
+              "target_language": "es",
+              "source_language": "en"
+            }
+          ]
+        }
+        ```
+      operationId: "translateText"
+      x-swagger-router-controller: TranslationsTranslate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TranslationRequest"
+            example:
+              text: ["Hello world", "How are you?"]
+              model: "opus-en-es"
+              source_language: "en"
+              target_language: "es"
+      responses:
+        "200":
+          description: "Translation successful"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranslationResponse"
+        "400":
+          description: "Bad request - invalid input"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /translations/close:
+    post:
+      tags: ["Translations"]
+      summary: "Close active translation session"
+      description: "Ends the current translation session and releases server resources."
+      operationId: "closeTranslation"
+      x-swagger-router-controller: TranslationsClose
+      responses:
+        "200":
+          description: "Session closed successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "closed"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /tts/devices:
+    get:
+      tags: ["TTS"]
+      summary: "List available audio output (playback) devices"
+      description: "Returns available audio output devices (speakers) on the host system."
+      operationId: "listTTSDevices"
+      x-swagger-router-controller: TTSDevices
+      responses:
+        "200":
+          description: "List of available audio output devices"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AudioOutputDevice"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /tts/models:
+    get:
+      tags: ["TTS"]
+      summary: "List available TTS models and voices"
+      description: |
+        Returns available TTS models with voices, capabilities, and supported sample rates.
+        Filter by language using the `language` query parameter.
+      operationId: "listTTSModels"
+      x-swagger-router-controller: TTSModels
+      parameters:
+        - name: language
+          in: query
+          required: false
+          description: "Filter by ISO 639-1 language code (e.g., 'en' for English)"
+          schema:
+            type: string
+            example: "en"
+      responses:
+        "200":
+          description: "List of available TTS models"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TTSModel"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /tts/synthesize:
+    post:
+      tags: ["TTS"]
+      summary: "Synthesize speech from text"
+      description: |
+        Converts text into spoken audio using text-to-speech synthesis.
+        
+        ## Features
+        - Multiple voices and languages
+        - Configurable sample rate (44100, 22050, 16000 Hz)
+        - Automatic resampling
+        - Streaming audio output (chunked transfer encoding)
+        
+        ## Sample Rate
+        The TTS engine outputs audio at 44100 Hz by default. If you specify a different
+        `sample_rate`, the audio will be automatically resampled to match your request.
+        
+        ## Example Request
+        ```json
+        {
+          "text": "Hello, how are you today?",
+          "model": "melo-tts-en",
+          "language": "en",
+          "voice": "default",
+          "sample_rate": 44100
+        }
+        ```
+        
+        ## Response
+        The response is binary PCM audio data (raw audio, not WAV format) streamed using HTTP chunked
+        transfer encoding. To play the audio, you'll need to convert it to WAV format using the
+        provided `pcm_to_wav.py` script:
+        ```bash
+        python pcm_to_wav.py speech.pcm speech.wav --rate 44100 --channels 1 --bits 16
+        ```
+        
+        ## Supported Parameters
+        Check model capabilities via `/tts/models` to see which parameters are supported:
+        - `gender`: Voice gender (if supported)
+        - `style`: Speaking style (if supported)
+        - `sample_rate`: Output sample rate (if supported)
+        - `parameters`: Additional fine-tuning options
+      operationId: "synthesizeSpeech"
+      x-swagger-router-controller: TTSSynthesize
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SynthesizeRequest"
+            example:
+              text: "Hello, how are you today?"
+              model: "melo-tts-en"
+              language: "en"
+              voice: "default"
+              sample_rate: 44100,
+              output_speaker: false
+      responses:
+        "200":
+          description: "Speech synthesized successfully"
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+                description: "WAV audio data"
+        "400":
+          description: "Bad request - invalid input"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /tts/close:
+    post:
+      tags: ["TTS"]
+      summary: "Close active text-to-speech session"
+      description: "Ends the current TTS session and releases server resources."
+      operationId: "closeTTS"
+      x-swagger-router-controller: TTSClose
+      responses:
+        "200":
+          description: "Session closed successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "closed"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /tts/cancel:
+    post:
+      tags: ["TTS"]
+      summary: "Cancel an active text-to-speech playback"
+      description: "Immediately stops an in-progress TTS synthesis or playback. The session remains open."
+      operationId: "cancelTTS"
+      x-swagger-router-controller: TTSCancel
+      responses:
+        "200":
+          description: "Session cancelled successfully"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "cancelled"
+        "500":
+          description: "Internal server error"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /stream:
+    get:
+      tags: ["WebSocket"]
+      summary: "Upgrade to WebSocket for real-time streaming"
+      description: |
+        Upgrades the HTTP connection to a WebSocket for real-time audio streaming.
+        
+        ## Usage
+        
+        1. Create a transcription session with `stream=true`
+        2. Connect to this WebSocket endpoint
+        3. Send audio chunks as JSON messages
+        4. Receive transcription results in real-time
+        
+        ## Client → Server (Audio Chunks)
+        ```json
+        {
+          "message_type": "transcriptions_session_audio",
+          "message_source": "audio_analytics_api",
+          "session_id": "session123",
+          "type": "input_audio",
+          "data": "<BASE64_ENCODED_AUDIO>"
+        }
+        ```
+
+        ## Server → Client (Event Sequence per Utterance)
+
+        **1. Speech detected:**
+        ```json
+        { "session_id": "session123", "type": "transcript.event", "state": "speech_start" }
+        ```
+
+        **2. Partial transcription (zero or more):**
+        ```json
+        { "session_id": "session123", "text": "Partial transcription text", "language": "en", "type": "transcript.text.delta", "state": "transcription" }
+        ```
+
+        **3. End of speech detected:**
+        ```json
+        { "session_id": "session123", "type": "transcript.event", "state": "speech_end" }
+        ```
+
+        **4. Final transcription:**
+        ```json
+        { "session_id": "session123", "text": "Complete transcription text.", "language": "en", "type": "transcript.text.done", "state": "transcription" }
+        ```
+
+        After step 4 the engine resets and listens for the next utterance.
+        The session stays open until the client calls `/transcriptions/close`.
+        
+        ## Connection
+        - Protocol: WebSocket (ws:// or wss://)
+        - URL: `ws://<host>:8085/stream`
+        - Requires prior session creation via `/transcriptions/create`
+      operationId: "streamAudioWebSocket"
+      x-swagger-router-controller: Stream
+      responses:
+        "101":
+          description: "Switching Protocols - WebSocket connection established"
+        "400":
+          description: "Bad request - invalid WebSocket upgrade"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: "Session not found"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      description: "Service health status information"
+      properties:
+        status:
+          type: string
+          description: "Health status indicator"
+          enum: ["ok", "degraded", "error"]
+          example: "ok"
+        uptime:
+          type: integer
+          description: "Service uptime in seconds"
+          example: 12345
+        active_sessions:
+          type: integer
+          description: "Number of currently active transcription sessions"
+          example: 2
+        version:
+          type: string
+          description: "Service version identifier"
+          example: "1.0.0"
+      required:
+        - status
+    
+    KPIResponse:
+      type: object
+      description: "Server key performance indicators"
+      properties:
+        uptime:
+          type: integer
+          description: "Server uptime in seconds since last start"
+          example: 3600
+        active_service:
+          type: string
+          nullable: true
+          description: "Currently active service (ASR, T2T, or TTS), or null if idle"
+          example: "ASR"
+        asr_active_sessions:
+          type: integer
+          description: "Number of active ASR streaming sessions"
+          example: 2
+        tts_queue_depth:
+          type: integer
+          description: "Number of TTS synthesis requests pending in the queue"
+          example: 0
+        asr_models:
+          type: array
+          items:
+            type: string
+          description: "Available ASR model names"
+          example: ["whisper-small-en", "whisper-base"]
+        t2t_models:
+          type: array
+          items:
+            type: string
+          description: "Available translation model names"
+          example: ["opus-mt-en-fr"]
+        tts_models:
+          type: array
+          items:
+            type: string
+          description: "Available TTS model names"
+          example: ["melo-tts-en"]
+      required:
+        - uptime
+
+    ErrorResponse:
+      type: object
+      description: "Standard error response structure"
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+              description: "Human-readable error message"
+              example: "Invalid request, missing 'file' parameter"
+            type:
+              type: string
+              description: "Error type or category"
+              example: "invalid_request_error"
+            param:
+              type: string
+              nullable: true
+              description: "Parameter related to the error (if applicable)"
+              example: "file"
+            code:
+              type: string
+              nullable: true
+              description: "Error code (if applicable)"
+              example: null
+          required:
+            - message
+            - type
+      required:
+        - error
+
+    ASRModel:
+      type: object
+      description: "Automatic Speech Recognition model information"
+      properties:
+        name:
+          type: string
+          description: "Unique model identifier"
+          example: "whisper-small"
+        display_name:
+          type: string
+          description: "Human-readable model name"
+          example: "Whisper Small"
+        version:
+          type: string
+          description: "Model version"
+          example: "1.0.0"
+        description:
+          type: string
+          description: "Model description"
+          example: "OpenAI Whisper small model for general speech recognition"
+        capabilities:
+          type: object
+          description: "Model capabilities"
+          properties:
+            streaming:
+              type: boolean
+              description: "Supports streaming transcription"
+            file_based:
+              type: boolean
+              description: "Supports file-based transcription"
+            real_time:
+              type: boolean
+              description: "Supports real-time processing"
+            language_detection:
+              type: boolean
+              description: "Can automatically detect language"
+            confidence_scores:
+              type: boolean
+              description: "Provides confidence scores"
+        parameters:
+          type: object
+          description: "Model parameters and constraints"
+          properties:
+            max_file_size_mb:
+              type: integer
+              description: "Maximum file size in megabytes"
+            supported_formats:
+              type: array
+              items:
+                type: string
+              description: "Supported audio formats"
+            sample_rates:
+              type: array
+              items:
+                type: integer
+              description: "Supported sample rates in Hz"
+            chunk_duration_ms:
+              type: integer
+              description: "Chunk duration for streaming in milliseconds"
+      required:
+        - name
+
+    CreateTranscriptionRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          description: "ID of the ASR model to use"
+          example: "whisper-small"
+        file:
+          type: string
+          format: binary
+          description: "Audio file to transcribe (for file-based transcription)"
+        language:
+          type: string
+          description: "ISO 639-1 language code (e.g., 'en' for English). If omitted, language may be auto-detected."
+          example: "en"
+        stream:
+          oneOf:
+            - type: string
+            - type: boolean
+          default: false
+          description: "If true, results will be streamed via WebSocket. If false, complete transcription returned in response."
+          example: false
+        channels:
+          oneOf:
+            - type: integer
+            - type: string
+              pattern: '^\d+$'
+          description: "Number of audio channels in the input stream (1=mono, 2=stereo). Takes priority over the channels key inside the parameters array."
+          example: 1
+        parameters:
+          description: "Additional parameters for transcription (e.g., sampling_rate, channels)"
+          oneOf:
+            - type: string
+              description: "JSON string of parameters (for multipart/form-data)"
+            - type: object
+              additionalProperties: {}
+              description: "Object with parameters (for application/json)"
+            - type: array
+              items:
+                $ref: "#/components/schemas/KeyValueParam"
+              description: "Array of key-value pairs (for multipart/form-data)"
+          example: "[{\"key\": \"sampling_rate\", \"value\": \"16000\"}, {\"key\": \"channels\", \"value\": \"1\"}, {\"key\": \"server_timeout\", \"value\": \"60\"}]"
+      required:
+        - model
+
+    TranscriptionResponse:
+      type: object
+      description: "Transcription result (non-streaming)"
+      properties:
+        text:
+          type: string
+          description: "The transcribed text"
+          example: "The sky is blue and the sun is shining."
+        language:
+          type: string
+          description: "Detected or specified language (ISO 639-1 code)"
+          example: "en"
+        language_name:
+          type: string
+          description: "Detected language full name as returned by the ASR engine"
+          example: "English"
+        type:
+          type: string
+          description: "Result type"
+          enum:
+            - "transcript.text.done"
+            - "transcript.text.delta"
+          example: "transcript.text.done"
+        session_id:
+          type: string
+          description: "Session identifier (if applicable)"
+          example: "session123"
+      required:
+        - text
+
+    TranscriptionSessionResponse:
+      type: object
+      description: "Transcription session created (streaming)"
+      properties:
+        session_id:
+          type: string
+          description: "Unique session identifier for WebSocket connection"
+          example: "session123"
+      required:
+        - session_id
+
+    TranscriptionStreamResponse:
+      type: object
+      description: |
+        Streaming transcription result or event delivered via WebSocket.
+
+        The `type` field determines the kind of message:
+        - `transcript.event` — a VAD/EPD lifecycle event (`state` = `speech_start` or `speech_end`)
+        - `transcript.text.delta` — a partial (incremental) transcription result
+        - `transcript.text.done` — the final transcription for the current utterance
+
+        **Full event sequence per utterance:**
+        1. `transcript.event` with `state: speech_start`
+        2. Zero or more `transcript.text.delta` messages
+        3. `transcript.event` with `state: speech_end`
+        4. `transcript.text.done` with the complete utterance text
+      properties:
+        session_id:
+          type: string
+          description: "Session identifier"
+          example: "session123"
+        text:
+          type: string
+          description: "Transcribed text (partial or complete). Present on transcript.text.delta and transcript.text.done. For transcript.event messages this field contains the event name (speech_start or speech_end)."
+          example: "The sky is blue"
+        language:
+          type: string
+          description: "Detected language (ISO 639-1 code). Present on transcription messages."
+          example: "en"
+        language_name:
+          type: string
+          description: "Detected language full name as returned by the ASR engine. Present on transcription messages."
+          example: "English"
+        type:
+          type: string
+          description: "Message type"
+          enum:
+            - "transcript.event"
+            - "transcript.text.delta"
+            - "transcript.text.done"
+          example: "transcript.text.delta"
+        state:
+          type: string
+          description: "State context. For transcript.event: speech_start or speech_end. For transcription messages: transcription."
+          enum:
+            - "speech_start"
+            - "speech_end"
+            - "transcription"
+          example: "transcription"
+      required:
+        - type
+
+    TranslationModel:
+      type: object
+      description: "Translation model information"
+      properties:
+        name:
+          type: string
+          description: "Unique model identifier"
+          example: "opus-en-zh"
+        display_name:
+          type: string
+          description: "Human-readable model name"
+          example: "English to Chinese"
+        version:
+          type: string
+          description: "Model version"
+          example: "1.0.0"
+        description:
+          type: string
+          description: "Model description"
+          example: "Translation from English to Chinese using Opus"
+        source_language:
+          type: object
+          description: "Source language information"
+          properties:
+            code:
+              type: string
+              description: "ISO 639-1 language code"
+              example: "en"
+            name:
+              type: string
+              description: "Language name"
+              example: "English"
+          required:
+            - code
+            - name
+        target_language:
+          type: object
+          description: "Target language information"
+          properties:
+            code:
+              type: string
+              description: "ISO 639-1 language code"
+              example: "zh"
+            name:
+              type: string
+              description: "Language name"
+              example: "Chinese"
+          required:
+            - code
+            - name
+        capabilities:
+          type: object
+          description: "Model capabilities"
+          properties:
+            batch_translation:
+              type: boolean
+              description: "Supports batch translation"
+            language_detection:
+              type: boolean
+              description: "Can automatically detect source language"
+            formality_control:
+              type: boolean
+              description: "Supports formality level control"
+        parameters:
+          type: object
+          description: "Model parameters and constraints"
+          properties:
+            max_text_length:
+              type: integer
+              description: "Maximum text length per request"
+            max_batch_size:
+              type: integer
+              description: "Maximum number of texts in batch"
+      required:
+        - name
+
+    TranslationRequest:
+      type: object
+      description: "Translation request"
+      properties:
+        text:
+          type: array
+          items:
+            type: string
+          description: "Array of text strings to translate"
+          example:
+            - "Hello world"
+            - "How are you?"
+        model:
+          type: string
+          description: "Translation model ID"
+          example: "opus-en-es"
+        source_language:
+          type: string
+          description: "Source language code (ISO 639-1). If omitted, may be auto-detected."
+          example: "en"
+        target_language:
+          type: string
+          description: "Target language code (ISO 639-1)"
+          example: "es"
+        parameters:
+          description: "Optional parameters for translation"
+          oneOf:
+            - type: object
+              additionalProperties: {}
+            - type: array
+              items:
+                $ref: "#/components/schemas/KeyValueParam"
+          example:
+            - key: "formality"
+              value: "informal"
+      required:
+        - text
+        - model
+        - target_language
+
+    TranslationResponse:
+      type: object
+      description: "Translation result"
+      properties:
+        translations:
+          type: array
+          items:
+            type: object
+            properties:
+              translated_text:
+                type: string
+                description: "Translated text"
+                example: "Hola mundo"
+              target_language:
+                type: string
+                description: "Target language code"
+                example: "es"
+              source_language:
+                type: string
+                description: "Source language code (detected or specified)"
+                example: "en"
+            required:
+              - translated_text
+          description: "Array of translation results (same order as input)"
+      required:
+        - translations
+
+    TTSModel:
+      type: object
+      description: "Text-to-speech model information"
+      properties:
+        name:
+          type: string
+          description: "Unique model identifier"
+          example: "melo-tts-en"
+        display_name:
+          type: string
+          description: "Human-readable model name"
+          example: "MeloTTS English"
+        version:
+          type: string
+          description: "Model version"
+          example: "1.0.0"
+        description:
+          type: string
+          description: "Model description"
+          example: "MeloTTS text-to-speech model with English support"
+        voices:
+          type: array
+          items:
+            $ref: "#/components/schemas/TTSVoice"
+          description: "Available voices for this model"
+        capabilities:
+          type: object
+          description: "Model capabilities"
+          properties:
+            supports_gender:
+              type: boolean
+              description: "Supports gender selection"
+            supports_style:
+              type: boolean
+              description: "Supports speaking style selection"
+            supports_sample_rate:
+              type: boolean
+              description: "Supports custom sample rate"
+            supports_ssml:
+              type: boolean
+              description: "Supports SSML input"
+            supports_speed_control:
+              type: boolean
+              description: "Supports speaking speed control"
+            supports_pitch_control:
+              type: boolean
+              description: "Supports pitch control"
+            supports_volume_control:
+              type: boolean
+              description: "Supports volume control"
+            supports_resampling:
+              type: boolean
+              description: "Supports automatic resampling"
+        parameters:
+          type: object
+          description: "Model parameters and constraints"
+          properties:
+            max_text_length:
+              type: integer
+              description: "Maximum text length"
+            supported_formats:
+              type: array
+              items:
+                type: string
+              description: "Supported output formats"
+            sample_rates:
+              type: array
+              items:
+                type: integer
+              description: "Supported sample rates in Hz"
+            speed_range:
+              type: array
+              items:
+                type: number
+              description: "Speaking speed range [min, max]"
+            pitch_range:
+              type: array
+              items:
+                type: number
+              description: "Pitch range [min, max]"
+            volume_range:
+              type: array
+              items:
+                type: number
+              description: "Volume range [min, max]"
+      required:
+        - name
+
+    TTSVoice:
+      type: object
+      description: "Text-to-speech voice information"
+      properties:
+        name:
+          type: string
+          description: "Unique voice identifier"
+          example: "default"
+        display_name:
+          type: string
+          description: "Human-readable voice name"
+          example: "Default Voice"
+        language:
+          type: string
+          description: "ISO 639-1 language code"
+          example: "en"
+        language_name:
+          type: string
+          description: "Language name"
+          example: "English"
+        gender:
+          type: string
+          description: "Voice gender"
+          enum: ["male", "female", "neutral"]
+          example: "neutral"
+        style:
+          type: string
+          description: "Speaking style"
+          example: "neutral"
+        sample_rate:
+          type: integer
+          description: "Native sample rate in Hz"
+          example: 44100
+        description:
+          type: string
+          description: "Voice description"
+          example: "Default voice for English"
+      required:
+        - name
+        - language
+
+    SynthesizeRequest:
+      type: object
+      description: "Text-to-speech synthesis request"
+      properties:
+        text:
+          type: string
+          description: "Text to synthesize into speech"
+          example: "Hello, how are you today?"
+        model:
+          type: string
+          description: "TTS model ID"
+          example: "melo-tts-en"
+        language:
+          type: string
+          description: "ISO 639-1 language code"
+          example: "en"
+        voice:
+          type: string
+          description: "Voice identifier (if model supports multiple voices)"
+          example: "default"
+        gender:
+          type: string
+          description: "Voice gender preference (if supported by model)"
+          enum: ["male", "female", "neutral"]
+          example: "neutral"
+        style:
+          type: string
+          description: "Speaking style (if supported by model)"
+          example: "neutral"
+        sample_rate:
+          type: integer
+          description: "Output sample rate in Hz (if supported by model). Audio will be resampled if different from native rate."
+          example: 44100
+        parameters:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Additional synthesis parameters (e.g., speaking_rate, pitch, gain)"
+          example:
+            speaking_rate: "1.0"
+            pitch: "1.0"
+            gain: "0.0"
+        output_speaker:
+          type: boolean
+          description: "Output audio data results to speaker"
+          example: false
+      required:
+        - text
+        - model
+
+    KeyValueParam:
+      type: object
+      description: "Key-value pair for additional parameters"
+      properties:
+        key:
+          type: string
+          description: "Parameter name"
+          example: "sampling_rate"
+        value:
+          type: string
+          description: "Parameter value"
+          example: "16000"
+      required:
+        - key
+        - value
+
+    AudioOutputDevice:
+      type: object
+      description: "Audio output (playback) device information"
+      properties:
+        index:
+          type: integer
+          description: "Device index"
+          example: 0
+        name:
+          type: string
+          description: "Device name"
+          example: "LEMANS-EVK: - (hw:0,0)"
+        default_samplerate:
+          type: number
+          description: "Default sample rate in Hz"
+          example: 48000
+        max_output_channels:
+          type: integer
+          description: "Maximum number of output channels"
+          example: 2
+      required:
+        - index
+        - name
+
+    AudioInputDevice:
+      type: object
+      description: "Audio input (recording) device information"
+      properties:
+        index:
+          type: integer
+          description: "Device index"
+          example: 0
+        name:
+          type: string
+          description: "Device name"
+          example: "LEMANS-EVK: - (hw:0,0)"
+        default_samplerate:
+          type: number
+          description: "Default sample rate in Hz"
+          example: 48000
+        max_input_channels:
+          type: integer
+          description: "Maximum number of input channels"
+          example: 2
+      required:
+        - index
+        - name
+
+    StreamAudioRequest:
+      type: object
+      description: "WebSocket message for streaming audio chunk"
+      properties:
+        message_type:
+          type: string
+          description: "Message type identifier"
+          example: "transcriptions_session_audio"
+        message_source:
+          type: string
+          description: "Message source identifier"
+          example: "audio_analytics_api"
+        session_id:
+          type: string
+          description: "Session ID for this audio stream"
+          example: "session123"
+        type:
+          type: string
+          enum: ["input_audio"]
+          description: "Audio data type"
+          example: "input_audio"
+        data:
+          type: string
+          format: byte
+          description: "Base64-encoded audio data chunk"
+          example: "<base64_audio_data>"
+      required:
+        - session_id
+        - type
+        - data

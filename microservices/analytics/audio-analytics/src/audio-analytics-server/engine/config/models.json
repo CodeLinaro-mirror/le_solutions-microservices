@@ -1,0 +1,295 @@
+{
+  "_comment": "Audio Analytics Models Configuration",
+  "_version": "1.0.0",
+  "_description": "This file defines all available models for ASR, T2T, and TTS services. This file is automatically copied to /opt/audio/models/models.json on the device by the init container.",
+  
+  "asr": {
+    "default_model": "whisper-small",
+    "models": [
+      {
+        "name": "whisper-small",
+        "display_name": "Whisper Small",
+        "version": "1.0.0",
+        "description": "OpenAI Whisper small model for general speech recognition",
+        "capabilities": {
+          "streaming": true,
+          "file_based": true,
+          "real_time": true,
+          "language_detection": true,
+          "confidence_scores": false
+        },
+        "parameters": {
+          "max_file_size_mb": 25,
+          "supported_formats": ["wav"],
+          "sample_rates": [16000]
+        },
+        "model_path": "/opt/audio/models/whisper/encoder_model_htp.bin",
+        "vocab_path": "/opt/audio/models/whisper/vocab.bin",
+        "decoder_path": "/opt/audio/models/whisper/decoder_model_htp.bin",
+        "speech_path": "/opt/audio/models/whisper/speech_float.eai",
+        "loaded": false
+      }
+    ]
+  },
+
+  "translation": {
+    "default_model": "opus-en-zh",
+    "models": [
+      {
+        "name": "opus-en-zh",
+        "display_name": "English to Chinese",
+        "version": "1.0.0",
+        "description": "Translation from English to Chinese using Opus",
+        "source_languages": [
+          { "code": "en", "name": "English" }
+        ],
+        "target_languages": [
+          { "code": "zh", "name": "Chinese" }
+        ],
+        "capabilities": { "batch_translation": true, "language_detection": false, "formality_control": false },
+        "parameters": {
+          "max_text_length": 1024,
+          "max_batch_size": 100
+        },
+        "model_path": "/opt/audio/models/translation/opus_en_to_zh.64_bit.qnn_v2.33.0.qnn",
+        "loaded": false
+      },
+      {
+        "name": "opus-zh-en",
+        "display_name": "Chinese to English",
+        "version": "1.0.0",
+        "description": "Translation from Chinese to English using Opus",
+        "source_languages": [
+          { "code": "zh", "name": "Chinese" }
+        ],
+        "target_languages": [
+          { "code": "en", "name": "English" }
+        ],
+        "capabilities": { "batch_translation": true, "language_detection": false, "formality_control": false },
+        "parameters": {
+          "max_text_length": 341,
+          "max_batch_size": 100
+        },
+        "model_path": "/opt/audio/models/translation/opus_zh_to_en.64_bit.qnn_v2.33.0.qnn",
+        "loaded": false
+      },
+      {
+        "name": "opus-es-en",
+        "display_name": "Spanish to English",
+        "version": "1.0.0",
+        "description": "Translation from Spanish to English using Opus",
+        "source_languages": [
+          { "code": "es", "name": "Spanish" }
+        ],
+        "target_languages": [
+          { "code": "en", "name": "English" }
+        ],
+        "capabilities": { "batch_translation": true, "language_detection": false, "formality_control": false },
+        "parameters": {
+          "max_text_length": 1024,
+          "max_batch_size": 100
+        },
+        "model_path": "/opt/audio/models/translation/opus_es_to_en.64_bit.qnn_v2.33.0.qnn",
+        "loaded": false
+      },
+      {
+        "name": "opus-en-es",
+        "display_name": "English to Spanish",
+        "version": "1.0.0",
+        "description": "Translation from English to Spanish using Opus",
+        "source_languages": [
+          { "code": "en", "name": "English" }
+        ],
+        "target_languages": [
+          { "code": "es", "name": "Spanish" }
+        ],
+        "capabilities": { "batch_translation": true, "language_detection": false, "formality_control": false },
+        "parameters": {
+          "max_text_length": 1024,
+          "max_batch_size": 100
+        },
+        "model_path": "/opt/audio/models/translation/opus_en_to_es.64_bit.qnn_v2.33.0.qnn",
+        "loaded": false
+      }
+    ]
+  },
+
+  "tts": {
+    "default_model": "melo-tts-en",
+    "models": [
+      {
+        "name": "melo-tts-en",
+        "display_name": "MeloTTS English",
+        "version": "1.0.0",
+        "description": "MeloTTS text-to-speech model with multiple language support",
+        "voices": [
+          {
+            "name": "default",
+            "display_name": "Default Voice",
+            "language": "en",
+            "language_name": "English",
+            "gender": "neutral",
+            "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
+            "sample_rate": 44100,
+            "language_code": 0,
+            "description": "Default voice for English",
+            "model_path": "/opt/audio/models/tts/melo_en.64_bit.qnn_v2.33.0.qnn"
+          }
+        ],
+        "capabilities": {
+          "supports_gender": false,
+          "supports_style": false,
+          "supports_sample_rate": false,
+          "supports_ssml": false,
+          "supports_speed_control": false,
+          "supports_pitch_control": false,
+          "supports_volume_control": false,
+          "supports_resampling": false
+        },
+        "parameters": {
+          "max_text_length": 1024,
+          "supported_formats": ["wav"],
+          "sample_rates": [44100],
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
+        },
+        "loaded": false
+      },
+      {
+        "name": "melo-tts-es",
+        "display_name": "MeloTTS Spanish",
+        "version": "1.0.0",
+        "description": "MeloTTS text-to-speech model with multiple language support",
+        "voices": [
+          {
+            "name": "default",
+            "display_name": "Default Voice",
+            "language": "es",
+            "language_name": "Spanish",
+            "gender": "neutral",
+            "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
+            "sample_rate": 44100,
+            "language_code": 2,
+            "description": "Default voice for Spanish",
+            "model_path": "/opt/audio/models/tts/melo_es.64_bit.qnn_v2.33.0.qnn"
+          }
+        ],
+        "capabilities": {
+          "supports_gender": false,
+          "supports_style": false,
+          "supports_sample_rate": false,
+          "supports_ssml": false,
+          "supports_speed_control": false,
+          "supports_pitch_control": false,
+          "supports_volume_control": false,
+          "supports_resampling": false
+        },
+        "parameters": {
+          "max_text_length": 1024,
+          "supported_formats": ["wav"],
+          "sample_rates": [44100],
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
+        },
+        "loaded": false,
+        "memory_usage_mb": 2048
+      },
+      {
+        "name": "melo-tts-zh",
+        "display_name": "MeloTTS Chinese",
+        "version": "1.0.0",
+        "description": "MeloTTS text-to-speech model with multiple language support",
+        "voices": [
+          {
+            "name": "default",
+            "display_name": "Default Voice",
+            "language": "zh",
+            "language_name": "Chinese",
+            "gender": "neutral",
+            "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
+            "sample_rate": 44100,
+            "language_code": 1,
+            "description": "Default voice for Chinese",
+            "model_path": "/opt/audio/models/tts/melo_zh.64_bit.qnn_v2.33.0.qnn"
+          }
+        ],
+        "capabilities": {
+          "supports_gender": false,
+          "supports_style": false,
+          "supports_sample_rate": false,
+          "supports_ssml": false,
+          "supports_speed_control": false,
+          "supports_pitch_control": false,
+          "supports_volume_control": false,
+          "supports_resampling": false
+        },
+        "parameters": {
+          "max_text_length": 1024,
+          "supported_formats": ["wav", "mp3"],
+          "sample_rates": [44100],
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
+        },
+        "loaded": false
+      },
+      {
+        "name": "piper-tts-en",
+        "display_name": "Piper TTS English",
+        "version": "1.0.0",
+        "description": "Piper text-to-speech model for English",
+        "voices": [
+          {
+            "name": "default",
+            "display_name": "Default Voice",
+            "language": "en",
+            "language_name": "English",
+            "gender": "neutral",
+            "style": "neutral",
+            "audio_encoding": 0,
+            "speaking_rate": 1.0,
+            "pitch": 0.0,
+            "volume_gain": 0.0,
+            "sample_rate": 22050,
+            "language_code": 0,
+            "description": "Default voice for English using Piper",
+            "model_path": "/opt/audio/models/tts/piper_en.64_bit.qnn_v2.33.0.qnn"
+          }
+        ],
+        "capabilities": {
+          "supports_gender": false,
+          "supports_style": false,
+          "supports_sample_rate": false,
+          "supports_ssml": false,
+          "supports_speed_control": false,
+          "supports_pitch_control": false,
+          "supports_volume_control": false,
+          "supports_resampling": false
+        },
+        "parameters": {
+          "max_text_length": 1024,
+          "supported_formats": ["wav"],
+          "sample_rates": [22050],
+          "speed_range": [0.25, 4.0],
+          "pitch_range": [-20.0, 20.0],
+          "volume_range": [-96.0, 16.0]
+        },
+        "loaded": false
+      }
+    ]
+  }
+}

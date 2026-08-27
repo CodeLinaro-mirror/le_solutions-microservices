@@ -1,0 +1,26 @@
+# Audio Analytics Server Requirements
+# Tested with Python 3.11.0rc1, Python 3.10.12
+# All packages include SHA256 hashes for security
+
+redis==5.0.8 \
+    --hash=sha256:56134ee08ea909106090934adc36f65c9bcbbaecea5b21ba704ba6fb561f8eb4 \
+    --hash=sha256:0c5b10d387568dfe0698c6fad6615750c24170e548ca2deac10c649d463e9870
+
+async-timeout==4.0.3 \
+    --hash=sha256:7405140ff1230c310e51dc27b3145b9092d659ce68ff733fb0cefe3ee42be028 \
+    --hash=sha256:4640d96be84d82d02ed59ea2b7105a0f7b33abe8703703cd0ab0bf87c427522f
+
+# Needed by audio resampler
+numpy==1.26.4 \
+    --hash=sha256:9fad7dcb1aac3c7f0584a5a8133e3a43eeb2fe127f47e3632d43d677c66c102b \
+    --hash=sha256:675d61ffbfa78604709862923189bad94014bef562cc35cf61d3a07bba02a7ed \
+    --hash=sha256:0621a7f94bca5aaaf4b7ed7222c2e2f9d4a9be26b852c5b3a8955f4e6c643520 \
+    --hash=sha256:8a326af80e86d0e9ce92bcc1e65c8ff88297de4fa14ee936cb2293d414c9ec63 \
+    --hash=sha256:8a92c5aea763d14ba9d6475803fc7904bda7decc2a0a68153f587ad82941fec1 \
+    --hash=sha256:a3bae1a2ed00e90b3ba5f7bd0a7c7999b55d609e0c54ceb2b076a25e345fa9f4 \
+    --hash=sha256:5671338034b820c8d58c81ad1dafc0ed3b2251304a39c3c82e6e766c96a25331 \
+    --hash=sha256:3b8410b1a8a2ae1b8f9a9f9b9f7d4fb7aa13cc19de29d75f37c00703baef836b \
+    --hash=sha256:d209d8969599b27ad20994c8e41936ee0964e6da07478d6c35016bc386b66ad4 \
+    --hash=sha256:2a02aba9ed12e4ac4eb3ea9421c420301a0c6460d9830d74a9df87efa4912010 # debian
+
+
