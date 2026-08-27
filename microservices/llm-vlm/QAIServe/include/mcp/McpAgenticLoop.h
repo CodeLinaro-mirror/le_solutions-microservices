@@ -128,6 +128,18 @@ private:
                            McpSseEmitter* emitter,
                            int output_index_start);
 
+    // Emit the full output-item lifecycle for the final text-only message:
+    // output_item.added, content_part.added, output_text.delta (if
+    // non-empty), output_text.done. output_index must be the item's final
+    // position in build_output_array()'s output[] (i.e. call_records.size()),
+    // since OpenAI-SDK streaming clients index their output[] snapshot by
+    // this value and require an output_item.added at that exact index
+    // before any content_part/output_text event references it.
+    void emitFinalMessageEvents(const McpSseEmitter& emitter,
+                                 const std::string& response_id,
+                                 int output_index,
+                                 const std::string& final_text);
+
     // Generate a unique call ID: "mcpcall_{counter}"
     std::string generateCallId();
 

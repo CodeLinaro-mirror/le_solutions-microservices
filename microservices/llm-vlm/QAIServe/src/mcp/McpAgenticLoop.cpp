@@ -59,6 +59,12 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
                  << call_id << " name=" << func_name
                  << " output_index=" << output_index);
 
+        auto [server_label, bare_name] = [&func_name]() {
+            auto pos = func_name.find("__");
+            if (pos == std::string::npos) return std::make_pair(std::string(""), func_name);
+            return std::make_pair(func_name.substr(0, pos), func_name.substr(pos + 2));
+        }();
+
         // Parse arguments
         json arguments;
         try {
@@ -67,24 +73,34 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
             arguments = json::object();
         }
 
-        // Emit in_progress SSE event
+        // Emit output_item.added + in_progress SSE event.
+        // output_item.added must precede any other event referencing this
+        // output_index — OpenAI-SDK streaming clients build their output[]
+        // snapshot strictly by appending on output_item.added, so every
+        // index referenced later (including this same mcp_call's completed/
+        // failed event and the final message's own output_item.added) must
+        // already have a slot reserved for it in order.
         if (emitter) {
-            auto [server_label, bare_name] = [&func_name]() {
-                auto pos = func_name.find("__");
-                if (pos == std::string::npos) return std::make_pair(std::string(""), func_name);
-                return std::make_pair(func_name.substr(0, pos), func_name.substr(pos + 2));
-            }();
+            json in_progress_item = {
+                {"type",         "mcp_call"},
+                {"id",           call_id},
+                {"server_label", server_label},
+                {"name",         bare_name},
+                {"arguments",    args_str},
+                {"output",       nullptr},
+                {"error",        nullptr}
+            };
+
+            (*emitter)("response.output_item.added", {
+                {"type",         "response.output_item.added"},
+                {"output_index", output_index},
+                {"item",         in_progress_item}
+            });
 
             (*emitter)("response.mcp_call.in_progress", {
                 {"type",         "response.mcp_call.in_progress"},
                 {"output_index", output_index},
-                {"item", {
-                    {"type",         "mcp_call"},
-                    {"id",           call_id},
-                    {"server_label", server_label},
-                    {"name",         bare_name},
-                    {"arguments",    args_str}
-                }}
+                {"item",         in_progress_item}
             });
         }
 
@@ -97,7 +113,8 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
         // Find the record we just added
         const McpCallRecord& record = records.back();
 
-        // Emit completed/failed SSE event
+        // Emit completed/failed SSE event, then output_item.done to close
+        // out this item's lifecycle before the next item's added event.
         if (emitter) {
             std::string event_type = result.is_error
                 ? "response.mcp_call.failed"
@@ -105,6 +122,12 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
 
             (*emitter)(event_type, {
                 {"type",         event_type},
+                {"output_index", output_index},
+                {"item",         record.to_output_item()}
+            });
+
+            (*emitter)("response.output_item.done", {
+                {"type",         "response.output_item.done"},
                 {"output_index", output_index},
                 {"item",         record.to_output_item()}
             });
@@ -130,6 +153,54 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
     }
 
     return tool_result_messages;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// emitFinalMessageEvents — output-item lifecycle for the final text message
+//
+// Must emit output_item.added (reserving this item's slot in the SDK
+// client's output[] snapshot, built by appending on each added event) BEFORE
+// content_part.added/output_text.delta/output_text.done, all of which index
+// into that same snapshot slot by output_index/content_index.
+// ─────────────────────────────────────────────────────────────────────────────
+void McpAgenticLoop::emitFinalMessageEvents(const McpSseEmitter& emitter,
+                                             const std::string& response_id,
+                                             int output_index,
+                                             const std::string& final_text) {
+    emitter("response.output_item.added", {
+        {"type",         "response.output_item.added"},
+        {"output_index", output_index},
+        {"item", {
+            {"type",    "message"},
+            {"id",      "msg_" + response_id},
+            {"role",    "assistant"},
+            {"content", json::array()},
+            {"status",  "in_progress"}
+        }}
+    });
+
+    emitter("response.content_part.added", {
+        {"type",          "response.content_part.added"},
+        {"output_index",  output_index},
+        {"content_index", 0},
+        {"part",          {{"type", "output_text"}, {"text", ""}}}
+    });
+
+    if (!final_text.empty()) {
+        emitter("response.output_text.delta", {
+            {"type",          "response.output_text.delta"},
+            {"output_index",  output_index},
+            {"content_index", 0},
+            {"delta",         final_text}
+        });
+    }
+
+    emitter("response.output_text.done", {
+        {"type",          "response.output_text.done"},
+        {"output_index",  output_index},
+        {"content_index", 0},
+        {"text",          final_text}
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,32 +344,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
 
             std::string final_text = response.content.value_or("");
             int output_index = static_cast<int>(loop_result.call_records.size());
-
-            // Emit content_part.added
-            emitter("response.content_part.added", {
-                {"type",          "response.content_part.added"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"part",          {{"type", "output_text"}, {"text", ""}}}
-            });
-
-            // Emit the full text as a single delta (could be chunked in future)
-            if (!final_text.empty()) {
-                emitter("response.output_text.delta", {
-                    {"type",          "response.output_text.delta"},
-                    {"output_index",  output_index},
-                    {"content_index", 0},
-                    {"delta",         final_text}
-                });
-            }
-
-            // Emit output_text.done
-            emitter("response.output_text.done", {
-                {"type",          "response.output_text.done"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"text",          final_text}
-            });
+            emitFinalMessageEvents(emitter, response_id, output_index, final_text);
 
             return loop_result;
         }
@@ -316,7 +362,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
         // Build next turn messages
         json assistant_msg = {
             {"role",       "assistant"},
-            {"content",    nullptr},
+            {"content",    ""},
             {"tool_calls", tool_calls}
         };
 
@@ -334,6 +380,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
     LOG_WARN("[McpAgenticLoop] Streaming max iterations reached: response="
              << response_id << " max_iterations=" << max_iterations_);
     current_request.tools = std::nullopt;
+    std::string final_text;
     try {
         qai_forge::GenerateOptions invoke_options;
         invoke_options.response_id = response_id;
@@ -345,27 +392,15 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
         loop_result.final_response =
             qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
-        std::string final_text = loop_result.final_response.content.value_or("");
-        int output_index = static_cast<int>(loop_result.call_records.size());
-
-        if (!final_text.empty()) {
-            emitter("response.output_text.delta", {
-                {"type",          "response.output_text.delta"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"delta",         final_text}
-            });
-        }
-        emitter("response.output_text.done", {
-            {"type",          "response.output_text.done"},
-            {"output_index",  output_index},
-            {"content_index", 0},
-            {"text",          final_text}
-        });
+        final_text = loop_result.final_response.content.value_or("");
     } catch (...) {
-        loop_result.final_response.content = "(Response truncated: maximum tool call iterations reached)";
+        final_text = "(Response truncated: maximum tool call iterations reached)";
+        loop_result.final_response.content = final_text;
         loop_result.final_response.finish_reason = "stop";
     }
+
+    int output_index = static_cast<int>(loop_result.call_records.size());
+    emitFinalMessageEvents(emitter, response_id, output_index, final_text);
 
     return loop_result;
 }
