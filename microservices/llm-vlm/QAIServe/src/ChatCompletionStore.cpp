@@ -228,18 +228,32 @@ void ChatCompletionStore::updateSession(const std::string& completion_id, const 
 
     ChatSession& session = it->second;
 
-    // Unregister old hash mappings
+    // Unregister old hash mappings (continuation/retry/tool-call/job-id)
     unregisterHashMappings(session);
 
     // Update messages
     session.messages = messages;
     session.last_accessed = std::chrono::steady_clock::now();
 
-    // Recalculate hashes
+    // Recalculate hashes.
     // continuation_hash = hash of ALL complete pairs (for next turn lookup)
     // retry_candidate_hash = hash excluding last pair (for idempotent retry lookup)
-    session.continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
-    session.retry_candidate_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
+    //
+    // A freshly computed hash can legitimately come back empty (e.g. once a
+    // conversation's only pair becomes "complete", excluding the last pair
+    // leaves nothing to hash) — that just means there's nothing new to key
+    // on, NOT that the previously-registered hash should be discarded. Keep
+    // the previous value in that case so idempotent-retry / continuation
+    // matching for this session keeps working across turns.
+    std::string new_continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
+    if (!new_continuation_hash.empty()) {
+        session.continuation_hash = new_continuation_hash;
+    }
+
+    std::string new_retry_candidate_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
+    if (!new_retry_candidate_hash.empty()) {
+        session.retry_candidate_hash = new_retry_candidate_hash;
+    }
 
     // Register new hash mappings
     registerHashMappings(session);

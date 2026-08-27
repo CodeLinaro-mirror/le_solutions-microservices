@@ -1061,7 +1061,7 @@ void ResponsesController::createResponse(
                         stream->close();
                     }
                 );
-                resp->addHeader("Content-Type", "text/event-stream");
+                resp->setContentTypeString("text/event-stream");
                 resp->addHeader("Cache-Control", "no-cache");
                 resp->addHeader("Connection", "keep-alive");
                 callback(resp);
@@ -1698,7 +1698,7 @@ void ResponsesController::createResponse(
                     }
                 }
             );
-            resp->addHeader("Content-Type", "text/event-stream");
+            resp->setContentTypeString("text/event-stream");
             resp->addHeader("Cache-Control", "no-cache");
             resp->addHeader("Connection", "keep-alive");
             callback(resp);

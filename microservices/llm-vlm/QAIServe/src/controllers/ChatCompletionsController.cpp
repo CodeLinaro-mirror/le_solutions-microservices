@@ -131,6 +131,13 @@ void ChatCompletionsController::createChatCompletion(
             session->model = model;
         }
 
+        // The client resends the full conversation on every stateless request;
+        // keep the session's stored history in sync with it before the
+        // assistant reply is appended below, otherwise the hashes computed
+        // from session->messages in updateSession() would miss this turn's
+        // user message(s) entirely.
+        session->messages = messages;
+
         LOG_INFO << "Chat completion request: session=" << session->completion_id
                  << " model=" << model << " stream=" << stream
                  << " is_new=" << is_new;
@@ -370,7 +377,7 @@ void ChatCompletionsController::handleStreamingRequest(
 
     // Set headers
     stream_resp->setStatusCode(k200OK);
-    stream_resp->addHeader("Content-Type", "text/event-stream");
+    stream_resp->setContentTypeString("text/event-stream");
     stream_resp->addHeader("Cache-Control", "no-cache");
     stream_resp->addHeader("Connection", "keep-alive");
     stream_resp->addHeader("Access-Control-Allow-Origin", "*");

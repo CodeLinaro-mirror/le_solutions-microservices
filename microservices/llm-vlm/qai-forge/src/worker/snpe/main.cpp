@@ -103,20 +103,30 @@ static void sendMsg(const json& msg) {
     write(g_sock_fd, line.c_str(), line.size());
 }
 
+// Bytes already read from g_sock_fd but not yet consumed as a full line —
+// carried across readMsg() calls so a single recv() can satisfy multiple/
+// partial lines without re-reading one byte at a time (a multi-MB base64
+// EXECUTE payload can otherwise cost millions of select()+read() pairs).
+static std::string g_read_buf;
+
 static json readMsg() {
-    std::string line;
-    char ch;
+    char chunk[65536];
     while (true) {
+        size_t newline_pos = g_read_buf.find('\n');
+        if (newline_pos != std::string::npos) {
+            std::string line = g_read_buf.substr(0, newline_pos);
+            g_read_buf.erase(0, newline_pos + 1);
+            return json::parse(line);
+        }
+
         fd_set fds; FD_ZERO(&fds); FD_SET(g_sock_fd, &fds);
         struct timeval tv{300, 0};
         int r = select(g_sock_fd + 1, &fds, nullptr, nullptr, &tv);
         if (r <= 0) { std::cerr << "[snpe-worker] read timeout/error\n"; throw WorkerExit{1}; }
-        ssize_t n = read(g_sock_fd, &ch, 1);
+        ssize_t n = read(g_sock_fd, chunk, sizeof(chunk));
         if (n <= 0) { std::cerr << "[snpe-worker] server disconnected\n"; throw WorkerExit{0}; }
-        if (ch == '\n') break;
-        line += ch;
+        g_read_buf.append(chunk, static_cast<size_t>(n));
     }
-    return json::parse(line);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
