@@ -15,7 +15,6 @@ namespace scheduler {
 enum class EvictionPolicyActionType {
     Activate,
     Drain,
-    ProtectedDrain,
     Reject,
 };
 
@@ -23,7 +22,7 @@ struct EvictionPolicyConfig {
     size_t max_active_models = 0;
     size_t max_concurrent_model_loads = 1;
     std::chrono::milliseconds idle_timeout{0};
-    std::chrono::milliseconds model_residency_ttl{0};
+    std::chrono::milliseconds blocked_admission_timeout{0};
     long memory_headroom_mb = 1024;
 };
 
@@ -69,11 +68,17 @@ private:
 
     static bool isActiveReservedState(ModelRuntimeState state);
     static bool isColdWaitingState(ModelRuntimeState state);
-    static bool isProtectedDrainReady(const ModelPoolRuntimeSnapshot& runtime);
-    static bool isIdleTtlExpired(const ModelPoolRuntimeSnapshot& runtime,
-                                 const EvictionPolicyConfig& config,
-                                 std::chrono::steady_clock::time_point now);
+    static bool isIdleTimeoutExpired(
+        const ModelPoolRuntimeSnapshot& runtime,
+        const EvictionPolicyConfig& config,
+        std::chrono::steady_clock::time_point now);
     static bool isEvictableIdleRuntime(const ModelPoolRuntimeSnapshot& runtime);
+    static bool isFairnessDrainCandidate(
+        const ModelPoolRuntimeSnapshot& runtime);
+    static bool hasWaitedPastBlockedAdmissionTimeout(
+        const WaitingCandidate& candidate,
+        std::chrono::steady_clock::time_point now,
+        std::chrono::milliseconds timeout);
     static long modelMemoryMb(const EvictionPolicyInput& input,
                               const std::string& model_id);
     static bool waitingLess(const WaitingCandidate& lhs,

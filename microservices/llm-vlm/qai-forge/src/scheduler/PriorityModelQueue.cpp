@@ -67,22 +67,6 @@ InferenceJobPtr PriorityModelQueue::pop() {
     return job;
 }
 
-InferenceJobPtr PriorityModelQueue::popProtectedDrainJob() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (auto job = popFrom(control_)) {
-        LOG_INFO("[PriorityModelQueue] Popped protected-drain job: job="
-                 << job->job_id << " priority=control");
-        return job;
-    }
-    auto job = popFrom(ready_tool_cont_);
-    if (job) {
-        LOG_INFO("[PriorityModelQueue] Popped protected-drain job: job="
-                 << job->job_id << " priority=ready_tool_cont");
-    }
-    return job;
-}
-
 InferenceJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -109,11 +93,6 @@ InferenceJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
 
 bool PriorityModelQueue::empty() const {
     return size() == 0;
-}
-
-bool PriorityModelQueue::hasProtectedDrainWork() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return hasReadyJobIn(control_) || hasReadyJobIn(ready_tool_cont_);
 }
 
 size_t PriorityModelQueue::size() const {
@@ -237,15 +216,6 @@ InferenceJobPtr PriorityModelQueue::popFrom(Lane& lane) {
     }
 
     return nullptr;
-}
-
-bool PriorityModelQueue::hasReadyJobIn(const Lane& lane) const {
-    for (const InferenceJobPtr& job : lane) {
-        if (job && !job->isCancelled()) {
-            return true;
-        }
-    }
-    return false;
 }
 
 QueueAdmissionCandidate PriorityModelQueue::peekFrom(

@@ -131,9 +131,9 @@ ModelSchedulerConfig configFromEnvironment() {
     config.pool_config.max_concurrent_model_loads =
         parseSizeEnv("MAX_CONCURRENT_MODEL_LOADS",
                      config.pool_config.max_concurrent_model_loads);
-    config.pool_config.model_residency_ttl =
-        parseSecondsEnv("MODEL_RESIDENCY_TTL_SECONDS",
-                        config.pool_config.model_residency_ttl);
+    config.pool_config.blocked_admission_timeout =
+        parseSecondsEnv("BLOCKED_ADMISSION_TIMEOUT_SECONDS",
+                        config.pool_config.blocked_admission_timeout);
 
     config.tool_response_timeout =
         parseSecondsEnv("TOOL_RESPONSE_TIMEOUT_SECONDS",

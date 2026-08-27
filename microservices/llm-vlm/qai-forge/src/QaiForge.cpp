@@ -59,7 +59,7 @@ struct QaiForge::Impl {
             /* max_active_models          = */ 3,
             /* max_concurrent_model_loads = */ 1,
             /* idle_timeout               = */ std::chrono::minutes(5),
-            /* model_residency_ttl        = */ std::chrono::seconds(60),
+            /* blocked_admission_timeout  = */ std::chrono::seconds(30),
             /* tool_response_timeout      = */ std::chrono::seconds(30),
             /* max_queue_depth_per_model  = */ 0,
             /* memory_headroom_mb         = */ 1024,

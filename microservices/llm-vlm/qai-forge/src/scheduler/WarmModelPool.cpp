@@ -68,8 +68,6 @@ const char* actionToString(int type) {
         case 1:
             return "drain";
         case 2:
-            return "protected_drain";
-        case 3:
             return "reject";
     }
     return "unknown";
@@ -89,8 +87,8 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
     if (config_.max_concurrent_model_loads == 0) {
         config_.max_concurrent_model_loads = 1;
     }
-    if (config_.model_residency_ttl.count() <= 0) {
-        config_.model_residency_ttl = std::chrono::seconds(60);
+    if (config_.blocked_admission_timeout.count() <= 0) {
+        config_.blocked_admission_timeout = std::chrono::seconds(30);
     }
     if (config_.tool_response_timeout.count() <= 0) {
         config_.tool_response_timeout = std::chrono::seconds(30);
@@ -100,7 +98,8 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
              << " max_concurrent_model_loads="
              << config_.max_concurrent_model_loads
              << " idle_timeout_ms=" << config_.idle_timeout.count()
-             << " residency_ttl_ms=" << config_.model_residency_ttl.count()
+             << " blocked_admission_timeout_ms="
+             << config_.blocked_admission_timeout.count()
              << " tool_response_timeout_ms="
              << config_.tool_response_timeout.count()
              << " memory_headroom_mb=" << config_.memory_headroom_mb);
@@ -334,12 +333,9 @@ ModelPoolSnapshot WarmModelPool::snapshotLocked() const {
             runtime_snapshot.healthy,
             record.active_reserved,
             record.eviction_requested,
-            record.expiry_pending,
             static_cast<bool>(record.tool_lease_until),
             record.tool_chain_id,
             record.tool_lease_until,
-            record.resident_since,
-            record.residency_expires_at,
             record.last_used_at,
             record.idle_since,
         });
@@ -360,15 +356,6 @@ void WarmModelPool::refreshTimedStateLocked(
             clearToolLeaseLocked(record);
         }
 
-        if (record.active_reserved &&
-            isActiveReservedState(record.state) &&
-            record.residency_expires_at &&
-            !record.expiry_pending &&
-            now >= *record.residency_expires_at) {
-            record.expiry_pending = true;
-            LOG_INFO("[WarmModelPool] Residency TTL expired: model="
-                     << entry.first << " state=" << stateToString(record.state));
-        }
     }
 }
 
@@ -413,8 +400,8 @@ void WarmModelPool::eventLoop() {
     std::unique_lock<std::mutex> lock(mutex_);
 
     while (!shutdown_requested_) {
-        std::vector<PoolAction> actions =
-            planActionsLocked(std::chrono::steady_clock::now());
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<PoolAction> actions = planActionsLocked(now);
 
         if (!actions.empty()) {
             lock.unlock();
@@ -423,7 +410,7 @@ void WarmModelPool::eventLoop() {
             continue;
         }
 
-        const auto next_deadline = nextIdleDeadlineLocked();
+        const auto next_deadline = nextPolicyDeadlineLocked(now);
         if (next_deadline == std::chrono::steady_clock::time_point::max()) {
             cv_.wait(lock, [this]() {
                 return shutdown_requested_ || event_pending_;
@@ -450,7 +437,7 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
         config_.max_active_models,
         config_.max_concurrent_model_loads,
         config_.idle_timeout,
-        config_.model_residency_ttl,
+        config_.blocked_admission_timeout,
         config_.memory_headroom_mb,
     };
     input.available_memory_mb = availableMemoryMb();
@@ -479,11 +466,6 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
             case EvictionPolicyActionType::Drain:
                 it->second.eviction_requested = true;
                 pool_type = PoolActionType::Drain;
-                break;
-            case EvictionPolicyActionType::ProtectedDrain:
-                it->second.eviction_requested = true;
-                it->second.expiry_pending = true;
-                pool_type = PoolActionType::ProtectedDrain;
                 break;
             case EvictionPolicyActionType::Reject:
                 pool_type = PoolActionType::Reject;
@@ -550,13 +532,6 @@ void WarmModelPool::applyActions(const std::vector<PoolAction>& actions) {
             continue;
         }
 
-        if (action.type == PoolActionType::ProtectedDrain) {
-            LOG_INFO("[WarmModelPool] Applying action: protected_drain model="
-                     << action.model_id);
-            action.runtime->requestProtectedDrain();
-            continue;
-        }
-
         LOG_INFO("[WarmModelPool] Applying action: drain model="
                  << action.model_id);
         action.runtime->requestDrain();
@@ -589,13 +564,11 @@ void WarmModelPool::handleRuntimeStateChanged(const std::string& model_id,
             case ModelRuntimeState::Running:
                 record.idle_since.reset();
                 record.last_used_at = now;
-                markResidentLocked(record, now);
                 break;
             case ModelRuntimeState::Idle:
                 record.idle_since = now;
                 record.last_used_at = now;
                 record.eviction_requested = false;
-                markResidentLocked(record, now);
                 break;
             case ModelRuntimeState::Draining:
             case ModelRuntimeState::Evicting:
@@ -608,9 +581,7 @@ void WarmModelPool::handleRuntimeStateChanged(const std::string& model_id,
                 record.active_reserved = false;
                 record.idle_since.reset();
                 record.eviction_requested = false;
-                record.expiry_pending = false;
                 clearToolLeaseLocked(record);
-                clearResidencyLocked(record);
                 break;
         }
 
@@ -658,7 +629,6 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
     record.state = ModelRuntimeState::NotResident;
     record.active_reserved = false;
     record.eviction_requested = false;
-    record.expiry_pending = false;
     record.last_used_at = now;
 
     auto inserted = runtimes_.emplace(model_id, std::move(record));
@@ -695,28 +665,12 @@ void WarmModelPool::clearToolLeaseLocked(RuntimeRecord& record) {
     record.tool_lease_until.reset();
 }
 
-void WarmModelPool::markResidentLocked(
-    RuntimeRecord& record,
-    std::chrono::steady_clock::time_point now) {
-    if (!record.resident_since) {
-        record.resident_since = now;
-
-        if (config_.model_residency_ttl.count() > 0) {
-            record.residency_expires_at = now + config_.model_residency_ttl;
-        } else {
-            record.residency_expires_at.reset();
-        }
-    }
-}
-
-void WarmModelPool::clearResidencyLocked(RuntimeRecord& record) {
-    record.resident_since.reset();
-    record.residency_expires_at.reset();
-}
-
 std::chrono::steady_clock::time_point
-WarmModelPool::nextIdleDeadlineLocked() const {
+WarmModelPool::nextPolicyDeadlineLocked(
+    std::chrono::steady_clock::time_point now) const {
     auto next_deadline = std::chrono::steady_clock::time_point::max();
+    const size_t active_reserved_count = activeReservedCountLocked();
+    const long available_memory_mb = availableMemoryMb();
 
     for (const auto& entry : runtimes_) {
         const RuntimeRecord& record = entry.second;
@@ -724,27 +678,47 @@ WarmModelPool::nextIdleDeadlineLocked() const {
             next_deadline = std::min(next_deadline, *record.tool_lease_until);
         }
 
-        if (record.residency_expires_at &&
-            !record.expiry_pending &&
+        if (config_.idle_timeout.count() > 0 &&
+            record.state == ModelRuntimeState::Idle &&
             record.active_reserved &&
-            isActiveReservedState(record.state)) {
+            !record.eviction_requested &&
+            !record.tool_lease_until &&
+            record.idle_since &&
+            !runtimeHasQueuedWorkLocked(record)) {
             next_deadline = std::min(
                 next_deadline,
-                *record.residency_expires_at);
+                *record.idle_since + config_.idle_timeout);
         }
 
-        if (record.state != ModelRuntimeState::Idle ||
-            !record.active_reserved ||
-            record.eviction_requested ||
-            record.tool_lease_until ||
-            !record.idle_since ||
-            runtimeHasQueuedWorkLocked(record)) {
+        const bool is_cold_waiting =
+            (record.state == ModelRuntimeState::NotResident ||
+             record.state == ModelRuntimeState::Failed) &&
+            !record.active_reserved;
+        if (!is_cold_waiting) {
             continue;
         }
 
-        next_deadline = std::min(
-            next_deadline,
-            *record.idle_since + config_.idle_timeout);
+        const ModelRuntimeAdmissionSnapshot admission =
+            record.runtime->admissionSnapshot();
+        if (!admission.candidate.has_work) {
+            continue;
+        }
+
+        const long required_memory_mb =
+            modelMemoryMb(entry.first) + config_.memory_headroom_mb;
+        const bool blocked_by_capacity =
+            active_reserved_count + 1 > config_.max_active_models;
+        const bool blocked_by_memory =
+            available_memory_mb < required_memory_mb;
+        if (!blocked_by_capacity && !blocked_by_memory) {
+            continue;
+        }
+
+        const auto blocked_deadline =
+            admission.candidate.created_at + config_.blocked_admission_timeout;
+        if (blocked_deadline > now) {
+            next_deadline = std::min(next_deadline, blocked_deadline);
+        }
     }
 
     return next_deadline;
