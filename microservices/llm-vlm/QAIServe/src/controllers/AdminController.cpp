@@ -22,6 +22,7 @@
 #include <thread>
 #include <cstdlib>
 #include <iostream>
+#include <set>
 
 namespace fs = std::filesystem;
 // Note: ModelConfigManager.h already declares `using json = nlohmann::ordered_json`
@@ -55,6 +56,63 @@ std::string modelsDir() {
 std::string tmpDownloadDir() {
     const char* env = std::getenv("QAISERVE_TMP_DIR");
     return env ? std::string(env) : "/tmp/qaiserve-downloads";
+}
+
+// AI Hub publishes assets under format-specific runtime tags rather than the
+// logical backend name — "qnn" assets are named "qnn_context_binary" and
+// "snpe" assets are named "qnn_dlc" (mirrors BackendFactory's acceptance of
+// both spellings for backend selection). Translate the logical name to the
+// asset tag before building the S3 URL / filenames; unrecognized runtimes
+// pass through unchanged.
+std::string assetRuntime(const std::string& runtime) {
+    if (runtime == "qnn")  return "qnn_context_binary";
+    if (runtime == "snpe") return "qnn_dlc";
+    return runtime;
+}
+
+// Predictive AI backends (QNN, SNPE, LiteRT) accept either the logical
+// runtime name or the AI-Hub asset tag it maps to (see assetRuntime() /
+// BackendFactory) — metadata.json downloaded from AI Hub carries the asset
+// tag (e.g. "qnn_dlc"), so both spellings must be recognized here.
+bool isPredictiveRuntime(const std::string& runtime) {
+    static const std::set<std::string> predictive_runtimes = {
+        "qnn", "qnn_context_binary",
+        "snpe", "qnn_dlc",
+        "litert", "tflite",
+    };
+    return predictive_runtimes.count(runtime) > 0;
+}
+
+// AI Hub's published metadata.json has no "model_type" field — backfill it
+// from "runtime" so ModelConfigManager (which defaults missing model_type to
+// "generative") routes predictive bundles correctly. Inserted right after
+// "model_name" to match the field ordering the rest of metadata.json uses.
+void backfillModelType(const fs::path& meta_path) {
+    json meta;
+    try {
+        std::ifstream in(meta_path);
+        meta = json::parse(in);
+    } catch (...) {
+        return;
+    }
+    if (meta.contains("model_type")) return;
+
+    std::string model_type = isPredictiveRuntime(meta.value("runtime", ""))
+                                  ? "predictive" : "generative";
+
+    json patched = json::object();
+    bool inserted = false;
+    for (auto it = meta.begin(); it != meta.end(); ++it) {
+        patched[it.key()] = it.value();
+        if (it.key() == "model_name") {
+            patched["model_type"] = model_type;
+            inserted = true;
+        }
+    }
+    if (!inserted) patched["model_type"] = model_type;
+
+    std::ofstream out(meta_path);
+    out << patched.dump(4);
 }
 
 } // namespace
@@ -137,6 +195,24 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
         }
     }
 
+    // Reject up front if the destination bundle directory already exists —
+    // extractZip() only checks this after the download completes, which
+    // wastes a full download just to fail. dest_name mirrors the naming used
+    // in the background thread below.
+    {
+        std::string asset_rt = assetRuntime(runtime);
+        std::string dest_name = model + "-" + asset_rt + "-" + precision;
+        if (!chipset.empty()) dest_name += "-" + chipset;
+        std::string dest_path = modelsDir() + "/" + dest_name;
+        if (fs::exists(dest_path)) {
+            callback(errorResp(
+                "Model already installed at " + dest_path
+                    + " — delete it first (DELETE /admin/models/{model_id}) to re-fetch.",
+                k409Conflict));
+            return;
+        }
+    }
+
     // Create job
     auto& registry = ModelFetchJobRegistry::getInstance();
     registry.pruneOldJobs();
@@ -149,6 +225,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
     std::thread([job, model, runtime, precision, version, chipset, source]() {
         const std::string models_dir = modelsDir();
         const std::string tmp_dir    = tmpDownloadDir();
+        const std::string asset_rt   = assetRuntime(runtime);
 
         try {
             if (source == "geniex") {
@@ -189,12 +266,12 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
             // ── AI-Hub path (default): direct S3 download ──────────────────
             // ── Step 1: Resolve S3 URL ─────────────────────────────────────
             std::string url = AiHubClient::resolveUrl(
-                model, runtime, precision, version, chipset);
+                model, asset_rt, precision, version, chipset);
 
             // ── Step 2: Download ZIP ───────────────────────────────────────
             job->status.store(FetchStatus::DOWNLOADING);
 
-            std::string zip_filename = model + "-" + runtime + "-" + precision;
+            std::string zip_filename = model + "-" + asset_rt + "-" + precision;
             if (!chipset.empty()) zip_filename += "-" + chipset;
             zip_filename += "-v" + version + ".zip";
 
@@ -219,7 +296,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
 
             // Destination directory name mirrors the ZIP filename without .zip
             // e.g. nomic_embed_text-qnn_dlc-float/
-            std::string dest_name = model + "-" + runtime + "-" + precision;
+            std::string dest_name = model + "-" + asset_rt + "-" + precision;
             if (!chipset.empty()) dest_name += "-" + chipset;
             std::string dest_path = models_dir + "/" + dest_name;
 
@@ -227,6 +304,15 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
 
             // Clean up ZIP
             fs::remove(zip_path);
+
+            // AI Hub's metadata.json has no "model_type" field — backfill it
+            // from "runtime" before the registry scans this bundle, so
+            // predictive bundles (qnn/snpe/litert) aren't misclassified as
+            // "generative" (ModelConfigManager's default).
+            fs::path extracted_meta = fs::path(extracted) / "metadata.json";
+            if (fs::exists(extracted_meta)) {
+                backfillModelType(extracted_meta);
+            }
 
             // ── Step 4: Hot-reload model registry ─────────────────────────
             ModelConfigManager::getInstance().scanModelBundles();

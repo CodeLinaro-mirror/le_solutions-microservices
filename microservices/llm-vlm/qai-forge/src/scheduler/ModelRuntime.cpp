@@ -90,6 +90,23 @@ bool shouldRecoverBackend(const GenAIException& error) {
     return error.http_status >= 500;
 }
 
+// After any worker subprocess teardown (load failure or eviction), the DSP
+// kernel needs time to reclaim that process's FastRPC/SMMU mappings before a
+// new worker can safely map the same memory. Without this delay, a load
+// attempted right after teardown can fail with e.g. "fastrpc memory map
+// failed" / "[LlmEngine] Failed to create dialog", since the previous
+// worker's mappings haven't been reclaimed yet.
+// Default: 2000ms. Override: MODEL_LOAD_FAILURE_DELAY_MS env var.
+void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
+    const long delay_ms = parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
+    if (delay_ms > 0 && !stop_requested) {
+        LOG_INFO("[ModelRuntime] Waiting " << delay_ms
+                 << "ms after backend teardown for DSP memory reclaim: model="
+                 << model_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    }
+}
+
 } // namespace
 
 ModelRuntime::ModelRuntime(std::string model_id,
@@ -453,21 +470,7 @@ void ModelRuntime::executorLoop() {
                 // Force-kill the worker subprocess (SIGKILL) so the kernel
                 // reclaims all its file descriptors and DSP SMMU mappings.
                 unloadBackend(/*force=*/true);
-                // Wait for the DSP kernel to reclaim leaked mappings from the
-                // failed worker before the next load attempt.  Without this
-                // delay, repeated failures exhaust DSP SMMU address space.
-                // Default: 2000ms.  Override: MODEL_LOAD_FAILURE_DELAY_MS env var.
-                {
-                    const long delay_ms =
-                        parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
-                    if (delay_ms > 0 && !stop_requested_) {
-                        LOG_INFO("[ModelRuntime] Waiting " << delay_ms
-                                 << "ms after load failure for DSP memory reclaim: model="
-                                 << model_id_);
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(delay_ms));
-                    }
-                }
+                waitForDspMemoryReclaim(model_id_, stop_requested_);
                 std::vector<ModelRuntimeState> failure_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -481,18 +484,7 @@ void ModelRuntime::executorLoop() {
                           << " message=\"" << error.what() << "\"");
                 // Force-kill the worker subprocess (SIGKILL).
                 unloadBackend(/*force=*/true);
-                // Wait for DSP memory reclaim before next retry.
-                {
-                    const long delay_ms =
-                        parseLongEnv("MODEL_LOAD_FAILURE_DELAY_MS", 2000);
-                    if (delay_ms > 0 && !stop_requested_) {
-                        LOG_INFO("[ModelRuntime] Waiting " << delay_ms
-                                 << "ms after load failure for DSP memory reclaim: model="
-                                 << model_id_);
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(delay_ms));
-                    }
-                }
+                waitForDspMemoryReclaim(model_id_, stop_requested_);
                 std::vector<ModelRuntimeState> failure_events;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -508,6 +500,7 @@ void ModelRuntime::executorLoop() {
         if (should_unload) {
             LOG_INFO("[ModelRuntime] Unloading backend: model=" << model_id_);
             unloadBackend(false);
+            waitForDspMemoryReclaim(model_id_, stop_requested_);
             std::vector<ModelRuntimeState> unload_events;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -584,6 +577,7 @@ void ModelRuntime::executorLoop() {
             LOG_WARN("[ModelRuntime] Recovering backend after execution failure: model="
                      << model_id_ << " job=" << job->job_id);
             unloadBackend(true);
+            waitForDspMemoryReclaim(model_id_, stop_requested_);
         }
 
         std::vector<ModelRuntimeState> complete_events;

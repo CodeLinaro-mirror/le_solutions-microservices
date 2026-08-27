@@ -151,7 +151,7 @@ RUN git config --global http.postBuffer 1048576000 \
 ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
 ENV QAIRT_LITERT_DIR=/tmp/qairt-litert
 RUN mkdir -p ${QAIRT_LITERT_DIR} \
-    && wget -t 3 -T 120 --no-verbose \
+    && wget -c -t 5 -T 120 --no-verbose \
         -P ${QAIRT_LITERT_DIR} \
         "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip" \
     && cd ${QAIRT_LITERT_DIR} \
@@ -458,7 +458,7 @@ ENV QAIRT_LIB_PATH=${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/lib
 RUN mkdir -p ${QAIRT_DOWNLOAD_DIR} \
              ${DEPLOY_DIR}/usr/lib/rfsa/adsp \
              ${DEPLOY_DIR}/usr/include && \
-    wget -t 2 -T 30 -P ${QAIRT_DOWNLOAD_DIR} \
+    wget -c -t 5 -T 120 -P ${QAIRT_DOWNLOAD_DIR} \
         https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip && \
     cd ${QAIRT_DOWNLOAD_DIR} && \
     unzip v${QAIRT_VERSION}.zip && \
