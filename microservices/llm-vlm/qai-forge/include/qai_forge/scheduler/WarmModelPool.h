@@ -32,7 +32,6 @@ struct WarmModelPoolConfig {
     std::chrono::milliseconds tool_response_timeout = std::chrono::seconds(30);
     size_t max_queue_depth_per_model = 0; // 0 = unlimited
     long memory_headroom_mb = 1024;
-    RunningCancelMode running_cancel_mode = RunningCancelMode::SOFT;
 };
 
 struct ModelPoolRuntimeSnapshot {

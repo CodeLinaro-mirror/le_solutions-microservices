@@ -55,16 +55,6 @@ const char* stateToString(ModelRuntimeState state) {
     return "unknown";
 }
 
-const char* runningCancelModeToString(RunningCancelMode mode) {
-    switch (mode) {
-        case RunningCancelMode::SOFT:
-            return "soft";
-        case RunningCancelMode::HARD:
-            return "hard";
-    }
-    return "soft";
-}
-
 long parseLongEnv(const char* name, long fallback) {
     const char* value = std::getenv(name);
     if (!value || value[0] == '\0') {
@@ -84,6 +74,14 @@ std::chrono::milliseconds queueAgingThresholdFromEnv() {
         return std::chrono::milliseconds(0);
     }
     return std::chrono::seconds(seconds);
+}
+
+std::chrono::milliseconds cancelGracePeriodFromEnv() {
+    const long ms = parseLongEnv("RESPONSES_CANCEL_GRACE_MS", 30000);
+    if (ms < 0) {
+        return std::chrono::milliseconds(30000);
+    }
+    return std::chrono::milliseconds(ms);
 }
 
 bool shouldRecoverBackend(const GenAIException& error) {
@@ -112,14 +110,13 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<IGenerativeBackend> backend,
                      std::unique_ptr<IOrchestrator> orchestrator,
-                     ModelRuntimeEvents events,
-                     RunningCancelMode running_cancel_mode)
+                     ModelRuntimeEvents events)
     : model_id_(std::move(model_id)),
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
       events_(std::move(events)),
       new_request_aging_threshold_(queueAgingThresholdFromEnv()),
-      running_cancel_mode_(running_cancel_mode) {
+      cancel_grace_period_(cancelGracePeriodFromEnv()) {
     if (model_id_.empty()) {
         throw std::invalid_argument("ModelRuntime requires a non-empty model id");
     }
@@ -133,6 +130,7 @@ ModelRuntime::ModelRuntime(std::string model_id,
 
 ModelRuntime::~ModelRuntime() {
     stop(false);
+    stopCancelWatchdog();
 }
 
 void ModelRuntime::start() {
@@ -143,9 +141,14 @@ void ModelRuntime::start() {
 
     stop_requested_ = false;
     force_stop_ = false;
+    {
+        std::lock_guard<std::mutex> watchdog_lock(cancel_watchdog_mutex_);
+        cancel_watchdog_shutdown_ = false;
+    }
     started_ = true;
     executor_thread_ = std::thread(&ModelRuntime::executorLoop, this);
-    LOG_INFO("[ModelRuntime] Started executor: model=" << model_id_);
+    LOG_INFO("[ModelRuntime] Started executor: model=" << model_id_
+             << " cancel_grace_ms=" << cancel_grace_period_.count());
 }
 
 void ModelRuntime::enqueue(InferenceJobPtr job) {
@@ -223,22 +226,24 @@ CancelResult ModelRuntime::cancel(const std::string& job_id) {
 
     LOG_WARN("[ModelRuntime] Cancelling running job: model=" << model_id_
              << " job=" << job_id
-             << " mode=" << runningCancelModeToString(running_cancel_mode_));
+             << " grace_ms=" << cancel_grace_period_.count());
     notifyCancelled(running);
-
-    if (running_cancel_mode_ == RunningCancelMode::HARD) {
-        try {
-            backend_->terminateWorker(/*force=*/true);
-        } catch (...) {
-        }
+    try {
+        armCancelWatchdog(job_id);
+    } catch (const std::exception& e) {
+        LOG_WARN("[ModelRuntime] Failed to arm cancel grace watchdog: model="
+                 << model_id_ << " job=" << job_id
+                 << " error=" << e.what());
+    } catch (...) {
+        LOG_WARN("[ModelRuntime] Failed to arm cancel grace watchdog: model="
+                 << model_id_ << " job=" << job_id
+                 << " error=<unknown>");
     }
 
     return CancelResult{
         CancelStatus::RUNNING_CANCELLED,
         job_id,
-        running_cancel_mode_ == RunningCancelMode::HARD
-            ? "Running scheduler job cancelled and worker abort requested"
-            : "Running scheduler job soft-cancelled"};
+        "Running scheduler job soft-cancelled and grace watchdog armed"};
 }
 
 void ModelRuntime::requestDrain() {
@@ -301,6 +306,8 @@ void ModelRuntime::failQueued(const GenAIException& error) {
 }
 
 void ModelRuntime::stop(bool force) {
+    stopCancelWatchdog();
+
     std::string running_job_id;
     bool should_join = false;
     bool was_started = false;
@@ -527,6 +534,7 @@ void ModelRuntime::executorLoop() {
                     setStateLocked(ModelRuntimeState::Idle, cancel_events);
                 }
             }
+            invalidateCancelWatchdog();
             notifyStateChanges(cancel_events);
             continue;
         }
@@ -573,18 +581,13 @@ void ModelRuntime::executorLoop() {
             }
         }
 
-        if (recover_backend) {
-            LOG_WARN("[ModelRuntime] Recovering backend after execution failure: model="
-                     << model_id_ << " job=" << job->job_id);
-            unloadBackend(true);
-            waitForDspMemoryReclaim(model_id_, stop_requested_);
-        }
-
+        bool cancel_force_killed = false;
         std::vector<ModelRuntimeState> complete_events;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            cancel_force_killed = job->isCancelled() && !backend_healthy_;
             running_job_.reset();
-            if (recover_backend) {
+            if (recover_backend || cancel_force_killed) {
                 backend_healthy_ = false;
                 if (!stop_requested_) {
                     setStateLocked(ModelRuntimeState::Failed, complete_events);
@@ -598,6 +601,18 @@ void ModelRuntime::executorLoop() {
         }
 
         notifyStateChanges(complete_events);
+        invalidateCancelWatchdog();
+
+        if (recover_backend || cancel_force_killed) {
+            LOG_WARN("[ModelRuntime] Recovering backend after "
+                     << (cancel_force_killed
+                         ? "cancel watchdog force-kill"
+                         : "execution failure")
+                     << ": model=" << model_id_ << " job=" << job->job_id);
+            unloadBackend(true);
+            waitForDspMemoryReclaim(model_id_, stop_requested_);
+        }
+
         cv_.notify_one();
     }
 
@@ -755,6 +770,117 @@ void ModelRuntime::runJob(InferenceJob& job) {
         LOG_WARN("[ModelRuntime] Execution threw: job=" << job.job_id
                  << " model=" << model_id_);
         throw;
+    }
+}
+
+void ModelRuntime::armCancelWatchdog(const std::string& job_id) {
+    std::thread previous_thread;
+    {
+        std::lock_guard<std::mutex> lock(cancel_watchdog_mutex_);
+        if (cancel_watchdog_shutdown_) {
+            LOG_WARN("[ModelRuntime] Cancel grace watchdog skipped; runtime is "
+                     "stopping: model=" << model_id_ << " job=" << job_id);
+            return;
+        }
+        ++cancel_watchdog_generation_;
+        if (cancel_watchdog_thread_.joinable()) {
+            previous_thread = std::move(cancel_watchdog_thread_);
+        }
+    }
+
+    cancel_watchdog_cv_.notify_all();
+    if (previous_thread.joinable()) {
+        previous_thread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cancel_watchdog_mutex_);
+        if (cancel_watchdog_shutdown_) {
+            LOG_WARN("[ModelRuntime] Cancel grace watchdog skipped after join; "
+                     "runtime is stopping: model=" << model_id_
+                     << " job=" << job_id);
+            return;
+        }
+        const std::uint64_t generation = ++cancel_watchdog_generation_;
+        cancel_watchdog_thread_ = std::thread(
+            &ModelRuntime::cancelWatchdogLoop, this, job_id, generation);
+    }
+
+    LOG_WARN("[ModelRuntime] Cancel grace watchdog armed: model=" << model_id_
+             << " job=" << job_id
+             << " grace_ms=" << cancel_grace_period_.count());
+}
+
+void ModelRuntime::invalidateCancelWatchdog() {
+    {
+        std::lock_guard<std::mutex> lock(cancel_watchdog_mutex_);
+        ++cancel_watchdog_generation_;
+    }
+    cancel_watchdog_cv_.notify_all();
+}
+
+void ModelRuntime::stopCancelWatchdog() {
+    std::thread thread_to_join;
+    {
+        std::lock_guard<std::mutex> lock(cancel_watchdog_mutex_);
+        cancel_watchdog_shutdown_ = true;
+        ++cancel_watchdog_generation_;
+        if (cancel_watchdog_thread_.joinable()) {
+            thread_to_join = std::move(cancel_watchdog_thread_);
+        }
+    }
+
+    cancel_watchdog_cv_.notify_all();
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
+    }
+}
+
+void ModelRuntime::cancelWatchdogLoop(std::string job_id,
+                                      std::uint64_t generation) {
+    {
+        std::unique_lock<std::mutex> lock(cancel_watchdog_mutex_);
+        const bool cancelled = cancel_watchdog_cv_.wait_for(
+            lock,
+            cancel_grace_period_,
+            [this, generation]() {
+                return cancel_watchdog_shutdown_ ||
+                       generation != cancel_watchdog_generation_;
+            });
+        if (cancelled) {
+            return;
+        }
+    }
+
+    handleCancelWatchdogTimeout(job_id);
+}
+
+void ModelRuntime::handleCancelWatchdogTimeout(const std::string& job_id) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!running_job_ ||
+        running_job_->job_id != job_id ||
+        !running_job_->isCancelled() ||
+        !backend_healthy_) {
+        return;
+    }
+
+    LOG_WARN("[ModelRuntime] Cancel grace expired; force-killing worker: model="
+             << model_id_ << " job=" << job_id
+             << " grace_ms=" << cancel_grace_period_.count());
+
+    bool killed = false;
+    try {
+        killed = backend_ && backend_->forceKillActiveWorker();
+    } catch (const std::exception& e) {
+        LOG_WARN("[ModelRuntime] Worker force-kill failed: model=" << model_id_
+                 << " job=" << job_id << " error=" << e.what());
+    } catch (...) {
+        LOG_WARN("[ModelRuntime] Worker force-kill failed: model=" << model_id_
+                 << " job=" << job_id << " error=<unknown>");
+    }
+
+    if (killed) {
+        backend_healthy_ = false;
     }
 }
 

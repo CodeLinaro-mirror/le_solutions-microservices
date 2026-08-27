@@ -157,6 +157,7 @@ public:
      *               false → graceful SHUTDOWN command
      */
     void terminateWorker(bool force = false) override;
+    bool forceKillActiveWorker() override;
 
     /**
      * Returns true if the active worker subprocess is alive.
@@ -173,7 +174,7 @@ private:
     // Track which worker is currently active.
     // Updated by ensureWorkerRunning() on each request.
     std::string current_model_id_;
-    bool        current_is_vlm_ = false;
+    std::atomic<bool> current_is_vlm_{false};
 
     std::unique_ptr<InferenceWorkerManager>    llm_worker_;
     std::unique_ptr<VlmInferenceWorkerManager> vlm_worker_;

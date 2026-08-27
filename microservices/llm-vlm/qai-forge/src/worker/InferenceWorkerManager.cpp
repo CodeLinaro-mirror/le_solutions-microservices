@@ -502,6 +502,34 @@ void InferenceWorkerManager::terminateWorker(bool force) {
     cleanupWorker(force);
 }
 
+bool InferenceWorkerManager::forceKillActiveWorker() {
+    const int target_pid =
+        watchdog_target_pid_.exchange(-1, std::memory_order_relaxed);
+    if (target_pid <= 0) {
+        LOG_WARN("[" << process_type_
+                 << "Worker] Active worker force-kill skipped; no target PID");
+        return false;
+    }
+
+    if (::kill(target_pid, 0) != 0) {
+        LOG_WARN("[" << process_type_
+                 << "Worker] Active worker force-kill skipped for PID "
+                 << target_pid << ": " << strerror(errno));
+        return false;
+    }
+
+    if (::kill(target_pid, SIGKILL) != 0) {
+        LOG_WARN("[" << process_type_
+                 << "Worker] Active worker SIGKILL failed for PID "
+                 << target_pid << ": " << strerror(errno));
+        return false;
+    }
+
+    LOG_WARN("[" << process_type_
+             << "Worker] Active worker SIGKILL sent to PID " << target_pid);
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // shutdown — Graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────

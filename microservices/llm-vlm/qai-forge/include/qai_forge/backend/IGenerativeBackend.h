@@ -204,6 +204,12 @@ public:
     virtual void terminateWorker(bool force = false) = 0;
 
     /**
+     * Force-kill the active worker subprocess without using model-specific
+     * abort APIs. Backends without a killable worker may return false.
+     */
+    virtual bool forceKillActiveWorker() { return false; }
+
+    /**
      * Returns true if the worker subprocess is alive and responsive.
      */
     virtual bool isHealthy() const = 0;

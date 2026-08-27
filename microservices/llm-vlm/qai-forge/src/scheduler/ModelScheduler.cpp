@@ -123,30 +123,6 @@ std::chrono::milliseconds parseSecondsEnv(
     return std::chrono::seconds(parsed);
 }
 
-RunningCancelMode parseRunningCancelModeEnv(RunningCancelMode fallback) {
-    const char* value = std::getenv("RESPONSES_RUNNING_CANCEL_MODE");
-    if (!value || value[0] == '\0') {
-        return fallback;
-    }
-
-    const std::string mode(value);
-    if (mode == "hard" || mode == "HARD") {
-        return RunningCancelMode::HARD;
-    }
-
-    return RunningCancelMode::SOFT;
-}
-
-const char* runningCancelModeToString(RunningCancelMode mode) {
-    switch (mode) {
-        case RunningCancelMode::SOFT:
-            return "soft";
-        case RunningCancelMode::HARD:
-            return "hard";
-    }
-    return "soft";
-}
-
 ModelSchedulerConfig configFromEnvironment() {
     ModelSchedulerConfig config;
     config.pool_config.max_active_models =
@@ -164,8 +140,6 @@ ModelSchedulerConfig configFromEnvironment() {
                         config.tool_response_timeout);
     config.pool_config.tool_response_timeout =
         config.tool_response_timeout;
-    config.pool_config.running_cancel_mode =
-        parseRunningCancelModeEnv(config.pool_config.running_cancel_mode);
 
     return config;
 }
@@ -367,10 +341,7 @@ ModelScheduler::ModelScheduler(ModelSchedulerConfig config,
              << " tool_response_timeout_ms="
              << config_.tool_response_timeout.count()
              << " checkpoint_interval_ms="
-             << config_.checkpoint_interval.count()
-             << " running_cancel_mode="
-             << runningCancelModeToString(
-                    config_.pool_config.running_cancel_mode));
+             << config_.checkpoint_interval.count());
 }
 
 ModelScheduler::~ModelScheduler() {

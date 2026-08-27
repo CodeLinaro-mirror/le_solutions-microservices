@@ -19,14 +19,52 @@
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 #include "qai_forge/utils/GgufMetadataReader.h"
 #endif
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+std::string runtimeAliasKey(std::string runtime) {
+    std::transform(runtime.begin(), runtime.end(), runtime.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    std::replace(runtime.begin(), runtime.end(), '-', '_');
+
+    const std::string geniex_prefix = "geniex_";
+    if (runtime.rfind(geniex_prefix, 0) == 0) {
+        runtime.erase(0, geniex_prefix.size());
+    }
+
+    runtime.erase(std::remove(runtime.begin(), runtime.end(), '_'),
+                  runtime.end());
+    return runtime;
+}
+
+std::string normalizeRuntime(const std::string& runtime) {
+    static const std::unordered_map<std::string, std::string> aliases = {
+        {"genie", "genie"},
+        {"qairt", "genie"},
+        {"llama", "llamacpp"},
+        {"llamacpp", "llamacpp"},
+        {"litertlm", "litert_lm"},
+    };
+
+    const std::string key = runtimeAliasKey(runtime);
+    auto it = aliases.find(key);
+    return it != aliases.end() ? it->second : runtime;
+}
+
+}  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
@@ -390,7 +428,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     // aren't misrouted to the GenerativeOrchestrator. Falls back to
     // "generative" only when runtime itself doesn't match a known predictive
     // spelling (covers "genie", "litert_lm", "onnxrt", etc).
-    config.runtime = metadata.value("runtime", "genie");
+    config.runtime = normalizeRuntime(metadata.value("runtime", "genie"));
     if (metadata.contains("model_type")) {
         config.model_type = metadata.value("model_type", "generative");
     } else {
@@ -586,7 +624,7 @@ ModelConfig ModelConfigManager::parseGenieXJson(const json& manifest,
     std::string runtime = manifest.value("PluginId",
                           manifest.value("plugin_id",
                           manifest.value("runtime", std::string("qairt"))));
-    config.runtime = runtime;
+    config.runtime = normalizeRuntime(runtime);
 
     // ── Model name / id ───────────────────────────────────────────────────────
     // Prefer ModelName (architecture id, already filesystem-friendly); fall back

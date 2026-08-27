@@ -243,6 +243,10 @@ void LiteRTLMBackend::terminateWorker(bool force) {
     current_model_id_.clear();
 }
 
+bool LiteRTLMBackend::forceKillActiveWorker() {
+    return false;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // isHealthy()
 // ─────────────────────────────────────────────────────────────────────────────

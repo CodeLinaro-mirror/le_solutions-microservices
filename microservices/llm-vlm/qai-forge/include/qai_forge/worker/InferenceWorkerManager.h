@@ -166,6 +166,12 @@ public:
     void terminateWorker(bool force = false);
 
     /**
+     * Force-kill the active worker subprocess without taking the worker I/O mutex.
+     * Returns true when SIGKILL was sent.
+     */
+    bool forceKillActiveWorker();
+
+    /**
      * Gracefully shut down the worker (sends SHUTDOWN command, then waits).
      */
     void shutdown();
