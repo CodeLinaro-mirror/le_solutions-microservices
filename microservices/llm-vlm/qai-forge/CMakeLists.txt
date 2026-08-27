@@ -287,7 +287,10 @@ if(QAI_FORGE_BUILD_LLAMACPP)
             "  Example: -DLLAMACPP_INCLUDE_PATH=/install/include")
     endif()
 
-    target_include_directories(qai_forge PRIVATE ${LLAMACPP_INCLUDE_PATH})
+    target_include_directories(qai_forge PRIVATE 
+            ${LLAMACPP_INCLUDE_PATH}
+	    ${LLAMACPP_INCLUDE_PATH}/ggml/include
+    )
     message(STATUS "[qai-forge] Added llama.cpp include path: ${LLAMACPP_INCLUDE_PATH}")
 
     # Locate libllama, libggml, and its modular dependencies (base, cpu, common)
