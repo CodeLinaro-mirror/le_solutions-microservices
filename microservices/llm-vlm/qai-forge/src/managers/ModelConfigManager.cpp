@@ -16,6 +16,9 @@
 
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+#include "qai_forge/utils/GgufMetadataReader.h"
+#endif
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
@@ -189,6 +192,73 @@ void ModelConfigManager::scanModelBundles() {
                       << file_path << ": " << e.what());
         }
     }
+
+    // ── llama.cpp: discover bare .gguf files ──────────────────────────────────
+    // .gguf files contain embedded metadata (chat template, context length) in
+    // their file header. GgufMetadataReader extracts this without loading weights.
+    //
+    // Discovery rules:
+    //   - Scans models_dir_ recursively for files with extension ".gguf"
+    //   - Model ID: "{stem}-llamacpp"  (e.g. "llama-3-8b-instruct-q4_0-llamacpp")
+    //   - Skips files whose model_id was already registered via metadata.json
+    //   - context_size and chat_template extracted from GGUF header
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+    for (const auto& entry : fs::recursive_directory_iterator(models_dir_)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".gguf") continue;
+
+        const std::string file_path = entry.path().string();
+        const std::string stem      = entry.path().stem().string();
+        const std::string model_id  = stem + "-llamacpp";
+
+        // Skip if already registered (e.g. via metadata.json in the same directory)
+        if (new_models.count(model_id)) {
+            LOG_DEBUG("[ModelConfigManager] Skipping .gguf auto-discovery for '"
+                      << model_id << "' — already registered via metadata.json");
+            continue;
+        }
+
+        try {
+            auto meta = GgufMetadataReader::readMetadata(file_path);
+
+            ModelConfig config;
+            config.id                  = model_id;
+            config.display_name        = stem;
+            config.runtime             = "llamacpp";
+            config.model_type          = "generative";
+            config.config_file         = file_path;
+            config.context_size        = meta.isValid ? meta.contextLength : 4096;
+            config.supports_streaming  = true;
+            config.supports_vision     = false;
+            config.supports_thinking   = false;
+            config.thinking_start_tag  = "<think>";
+            config.thinking_end_tag    = "</think>";
+
+            // Store Jinja template from GGUF header
+            if (meta.isValid && !meta.chatTemplate.empty()) {
+                config.chat_template["jinja_template"] = meta.chatTemplate;
+            }
+
+            // Estimate memory from file size (×1.25 for runtime overhead)
+            std::error_code ec;
+            uintmax_t file_bytes = fs::file_size(entry.path(), ec);
+            config.memory_requirement_mb = (!ec && file_bytes > 0)
+                ? static_cast<int>(static_cast<double>(file_bytes) / (1024.0 * 1024.0) * 1.25)
+                : 4096;
+
+            new_models[model_id] = std::move(config);
+            if (new_default.empty()) new_default = model_id;
+
+            LOG_INFO("[ModelConfigManager] Auto-discovered llama.cpp model: "
+                     << model_id << " -> " << file_path
+                     << " (ctx=" << config.context_size << ")");
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("[ModelConfigManager] Error auto-discovering .gguf file "
+                      << file_path << ": " << e.what());
+        }
+    }
+#endif // QAI_FORGE_BUILD_LLAMACPP
 
     std::unique_lock lock(mutex_);
     models_ = std::move(new_models);

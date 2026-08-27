@@ -599,7 +599,7 @@ std::optional<ResponseStoreJson> ResponseStore::getInputItems(
     if (it == responses_by_id_.end()) {
         return std::nullopt;
     }
-    return it->second.input_items;
+    return std::make_optional(it->second.input_items);
 }
 
 BuildCandidateResult ResponseStore::buildCandidateMessages(

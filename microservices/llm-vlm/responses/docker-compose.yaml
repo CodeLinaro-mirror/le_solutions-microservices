@@ -29,6 +29,9 @@ services:
       context: ..
       dockerfile: responses/Dockerfile
       target: responses-runtime
+      args:
+        BUILD_LITERT_LM: "true"
+        BUILD_LLAMACPP: "false"  # Set to "true" to enable llama.cpp backend
     ports:
       - "${RESPONSES_PORT:-9002}:${RESPONSES_PORT:-9002}"
 
@@ -57,7 +60,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 10G
+          memory: 12G  # Increased for llama.cpp models
         reservations:
           memory: 8G
 
@@ -72,6 +75,12 @@ services:
       - GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
       - GENAI_CONTEXT_CAPPING=${GENAI_CONTEXT_CAPPING:-1024}
       - MAX_ACTIVE_MODELS=${MAX_ACTIVE_MODELS:-3}
+
+      # llama.cpp backend configuration (when BUILD_LLAMACPP=true)
+      - LLAMACPP_SERVER_BINARY=/usr/bin/llama-server
+      - ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
+      - GGML_HEXAGON_MULTI_DEVICE=1
+      - GGML_LOG_LEVEL=${GGML_LOG_LEVEL:-1}
 
     volumes:
       # fastrpc reads the device model name from this file to select the

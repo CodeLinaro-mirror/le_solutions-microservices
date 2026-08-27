@@ -27,7 +27,7 @@ static int g_sock_fd = -1;
 
 static void send_message(const json& msg) {
     std::string line = msg.dump() + "\n";
-    ::write(g_sock_fd, line.c_str(), line.size());
+    (void)::write(g_sock_fd, line.c_str(), line.size());
 }
 
 static json read_message() {

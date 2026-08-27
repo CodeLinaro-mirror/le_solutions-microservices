@@ -9,8 +9,9 @@
 // backend instance per ModelRuntime so each resident model owns its worker.
 //
 // Current routing table:
-//   "genie"     → owned GenIEBackend / legacy GenIEBackend singleton
-//   "litert_lm" → legacy LiteRTLMBackend singleton only for now
+//   "genie"     → GenIEBackend + GenieOrchestrator (scheduler-owned)
+//   "litert_lm" → LiteRTLMBackend + LiteRTLMOrchestrator (scheduler-owned)
+//   "llamacpp"  → LlamaCppBackend + LlamaCppOrchestrator (scheduler-owned, requires BUILD_LLAMACPP=ON)
 //   "onnxrt"    → unsupported until implemented
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -25,6 +26,11 @@
 #include "qai_forge/orchestration/GenieOrchestrator.h"
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
+
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+#include "qai_forge/backend/LlamaCppBackend.h"
+#include "qai_forge/orchestration/LlamaCppOrchestrator.h"
+#endif
 // PredictiveWorkerManager must be a complete type here because
 // std::make_unique<QNNBackend/SNPEBackend/LiteRTBackend>() instantiates
 // std::default_delete<T>, which calls ~T(), which destroys the
@@ -43,6 +49,13 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
         // Phase 3: Scheduler-owned LiteRTLMBackend instance
         return std::make_unique<LiteRTLMBackend>();
     }
+
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+    if (runtime == "llamacpp") {
+        // Phase 4: Scheduler-owned LlamaCppBackend instance
+        return std::make_unique<qai_forge::LlamaCppBackend>("/usr/bin/llama-server");
+    }
+#endif
 
     throw GenAIException(
         GenAIErrorCode::INVALID_REQUEST,
@@ -89,7 +102,24 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
                      " — falling back to GenieOrchestrator");
             pair.orchestrator = std::make_unique<GenieOrchestrator>();
         }
-    } else {
+    }
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+    else if (runtime == "llamacpp") {
+        // Phase 4: LlamaCppOrchestrator
+        // Similar to LiteRTLM, do NOT call loadModel() here — ModelRuntime handles it.
+        // LlamaCppOrchestrator passes OpenAI JSON directly to llama-server without
+        // pre-rendering Jinja templates in C++.
+        auto* llamacpp_backend = dynamic_cast<qai_forge::LlamaCppBackend*>(pair.backend.get());
+        if (llamacpp_backend) {
+            pair.orchestrator = std::make_unique<qai_forge::LlamaCppOrchestrator>();
+        } else {
+            LOG_WARN("[BackendFactory] llamacpp runtime but backend is not LlamaCppBackend"
+                     " — falling back to GenieOrchestrator");
+            pair.orchestrator = std::make_unique<GenieOrchestrator>();
+        }
+    }
+#endif
+    else {
         pair.orchestrator = std::make_unique<GenieOrchestrator>();
     }
 
