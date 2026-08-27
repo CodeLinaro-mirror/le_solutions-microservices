@@ -496,8 +496,7 @@ ENV LITERT_LM_BACKEND=npu
 ENV LOG_LEVEL=ERROR
 ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
-# Watchdog timeouts — override in docker-compose.yaml as needed
-ENV GENAI_WORKER_IDLE_TIMEOUT=120
+# Active-worker silence threshold — override in docker-compose.yaml as needed
 ENV GENAI_WORKER_ACTIVE_TIMEOUT=600
 ENV QAISERVE_MAX_BODY_SIZE=16777216
 ENV GRPC_SERVER_PORT=50051

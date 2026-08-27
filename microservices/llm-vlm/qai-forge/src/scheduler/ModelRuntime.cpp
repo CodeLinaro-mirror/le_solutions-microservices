@@ -59,35 +59,6 @@ const char* stateToString(ModelRuntimeState state) {
     return "unknown";
 }
 
-long parseLongEnv(const char* name, long fallback) {
-    const char* value = std::getenv(name);
-    if (!value || value[0] == '\0') {
-        return fallback;
-    }
-
-    try {
-        return std::stol(value);
-    } catch (...) {
-        return fallback;
-    }
-}
-
-std::chrono::milliseconds queueAgingThresholdFromEnv() {
-    const long seconds = parseLongEnv("MODEL_QUEUE_AGING_SECONDS", 30);
-    if (seconds <= 0) {
-        return std::chrono::milliseconds(0);
-    }
-    return std::chrono::seconds(seconds);
-}
-
-std::chrono::milliseconds cancelGracePeriodFromEnv() {
-    const long ms = parseLongEnv("RESPONSES_CANCEL_GRACE_MS", 30000);
-    if (ms < 0) {
-        return std::chrono::milliseconds(30000);
-    }
-    return std::chrono::milliseconds(ms);
-}
-
 bool shouldRecoverBackend(const GenAIException& error) {
     return error.http_status >= 500;
 }
@@ -100,7 +71,15 @@ bool shouldRecoverBackend(const GenAIException& error) {
 // worker's mappings haven't been reclaimed yet.
 // Default: 2000ms. Override: DSP_RECLAIM_DELAY_MS env var.
 void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
-    const long delay_ms = parseLongEnv("DSP_RECLAIM_DELAY_MS", 2000);
+    const char* value = std::getenv("DSP_RECLAIM_DELAY_MS");
+    long delay_ms = 2000;
+    if (value && value[0] != '\0') {
+        try {
+            delay_ms = std::stol(value);
+        } catch (...) {
+        }
+    }
+
     if (delay_ms > 0 && !stop_requested) {
         LOG_INFO("[ModelRuntime] Waiting " << delay_ms
                  << "ms after backend teardown for DSP memory reclaim: model="
@@ -123,9 +102,7 @@ ModelRuntime::ModelRuntime(std::string model_id,
       memory_coordinator_(std::move(coordinator)),
       load_coordinator_(std::move(load_coordinator)),
       events_(std::move(events)),
-      model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 4096),
-      new_request_aging_threshold_(queueAgingThresholdFromEnv()),
-      cancel_grace_period_(cancelGracePeriodFromEnv()) {
+      model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 4096) {
     if (model_id_.empty()) {
         throw std::invalid_argument("ModelRuntime requires a non-empty model id");
     }
@@ -507,7 +484,6 @@ void ModelRuntime::executorLoop() {
                     should_reload_unhealthy = true;
                     setStateLocked(ModelRuntimeState::Evicting, state_events);
                 } else {
-                    promoteAgedJobs();
                     job = queue_.pop();
                     if (job) {
                         running_job_ = job;
@@ -837,22 +813,6 @@ void ModelRuntime::executorLoop() {
     notifyStateChanges(stopped_events);
     LOG_INFO("[ModelRuntime] Executor stopped: model=" << model_id_
              << " force_unload=" << (force_unload ? "true" : "false"));
-}
-
-size_t ModelRuntime::promoteAgedJobs() {
-    if (new_request_aging_threshold_.count() <= 0) {
-        return 0;
-    }
-
-    const size_t promoted = queue_.promoteAgedNewRequests(
-        std::chrono::steady_clock::now(),
-        new_request_aging_threshold_);
-    if (promoted > 0) {
-        LOG_INFO("[ModelRuntime] Promoted aged queued jobs: model=" << model_id_
-                 << " count=" << promoted
-                 << " threshold_ms=" << new_request_aging_threshold_.count());
-    }
-    return promoted;
 }
 
 bool ModelRuntime::runJob(GenerativeJob& job) {

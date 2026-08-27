@@ -39,16 +39,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
     : process_type_(process_type) {
-    // Read watchdog timeout configuration from environment variables.
-    // These can be tuned per deployment without recompilation.
+    // Read the active-inference silence threshold once at startup.
     auto read_env_int = [](const char* name, int default_val) -> int {
         const char* val = std::getenv(name);
         if (!val) return default_val;
         try { return std::stoi(val); } catch (...) { return default_val; }
     };
-    idle_timeout_seconds_      = read_env_int("GENAI_WORKER_IDLE_TIMEOUT",     120);
-    active_timeout_seconds_    = read_env_int("GENAI_WORKER_ACTIVE_TIMEOUT",   600);
-    watchdog_interval_seconds_ = read_env_int("GENAI_WATCHDOG_CHECK_INTERVAL", 5);
+    active_timeout_seconds_ = read_env_int("GENAI_WORKER_ACTIVE_TIMEOUT", 600);
+    if (active_timeout_seconds_ <= 0) {
+        active_timeout_seconds_ = 600;
+    }
 }
 
 InferenceWorkerManager::~InferenceWorkerManager() {
@@ -317,6 +317,24 @@ void InferenceWorkerManager::sendExecuteAndStream(const json& execute_cmd,
                                                    TokenCallback on_token,
                                                    DoneCallback on_done,
                                                    ErrorCallback on_error) {
+    struct ActiveStateGuard {
+        explicit ActiveStateGuard(std::atomic<bool>& active)
+            : active_(active) {
+        }
+
+        ~ActiveStateGuard() {
+            active_.store(false, std::memory_order_release);
+        }
+
+        std::atomic<bool>& active_;
+    };
+
+    last_activity_time_.store(
+        std::chrono::steady_clock::now(),
+        std::memory_order_relaxed);
+    is_active_.store(true, std::memory_order_release);
+    const ActiveStateGuard active_state_guard(is_active_);
+
     sendMessage(execute_cmd);
 
     bool pending_error = false;
@@ -325,7 +343,9 @@ void InferenceWorkerManager::sendExecuteAndStream(const json& execute_cmd,
     while (true) {
         json response;
         try {
-            response = readMessage(300); // 5 min timeout for long inference
+            const int socket_fallback_seconds =
+                active_timeout_seconds_ + (2 * watchdog_interval_seconds_);
+            response = readMessage(socket_fallback_seconds);
         } catch (const std::exception& e) {
             on_error({event_id, "", std::string("Socket error: ") + e.what()});
             return;
@@ -379,7 +399,6 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
     waitForPendingReset();
 
     std::lock_guard<std::mutex> lock(mutex_);
-    is_active_ = true;
 
     LOG_DEBUG("[" << process_type_ << "Worker] executeRequest event_id=" << event_id
               << " model=" << current_model_id_ << " streaming=" << streaming
@@ -390,8 +409,6 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
         top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter
     );
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
-
-    is_active_ = false;
 }
 
 void InferenceWorkerManager::executeStructuredRequest(
@@ -411,7 +428,6 @@ void InferenceWorkerManager::executeStructuredRequest(
     waitForPendingReset();
 
     std::lock_guard<std::mutex> lock(mutex_);
-    is_active_ = true;
 
     json execute_cmd = InferenceProtocol::createStructuredExecuteCommand(
         event_id,
@@ -425,8 +441,6 @@ void InferenceWorkerManager::executeStructuredRequest(
         presence_penalty,
         frequency_penalty);
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
-
-    is_active_ = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -627,7 +641,6 @@ std::chrono::steady_clock::time_point InferenceWorkerManager::lastActivityTime()
 //     second kill if cleanupWorker() races with the watchdog.
 void InferenceWorkerManager::watchdogThreadFunc() {
     LOG_INFO("[" << process_type_ << "Watchdog] Started"
-             << " idle_timeout=" << idle_timeout_seconds_ << "s"
              << " active_timeout=" << active_timeout_seconds_ << "s"
              << " check_interval=" << watchdog_interval_seconds_ << "s");
 
@@ -652,6 +665,9 @@ void InferenceWorkerManager::watchdogThreadFunc() {
             continue;
         }
 
+        const bool active = is_active_.load(std::memory_order_acquire);
+        if (!active) continue;
+
         // Check whether the last IPC activity is within the allowed window.
         auto last = last_activity_time_.load(std::memory_order_relaxed);
         if (last == std::chrono::steady_clock::time_point{}) {
@@ -662,17 +678,12 @@ void InferenceWorkerManager::watchdogThreadFunc() {
         auto now     = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last).count();
 
-        // Use a longer threshold while an EXECUTE is in flight (long inference).
-        bool active   = is_active_.load(std::memory_order_relaxed);
-        int threshold = active ? active_timeout_seconds_ : idle_timeout_seconds_;
-
-        if (elapsed < threshold) continue;
+        if (elapsed < active_timeout_seconds_) continue;
 
         // ── Timeout detected ──────────────────────────────────────────────
         LOG_WARN("[" << process_type_ << "Watchdog] Worker PID " << target_pid
                  << " unresponsive for " << elapsed << "s"
-                 << " (threshold=" << threshold << "s"
-                 << ", active=" << (active ? "true" : "false") << ")."
+                 << " (threshold=" << active_timeout_seconds_ << "s)."
                  << " Sending SIGKILL.");
 
         // Clear the target PID *before* sending SIGKILL to prevent a

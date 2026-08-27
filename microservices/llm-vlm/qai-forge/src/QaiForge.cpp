@@ -103,12 +103,10 @@ const char* priorityToString(scheduler::JobPriority priority) {
     switch (priority) {
         case scheduler::JobPriority::CONTROL:
             return "control";
-        case scheduler::JobPriority::READY_TOOL_CONT:
-            return "ready_tool_cont";
-        case scheduler::JobPriority::SESSION_CONT:
-            return "session_cont";
-        case scheduler::JobPriority::NEW_REQUEST:
-            return "new_request";
+        case scheduler::JobPriority::TOOL_CONTINUATION:
+            return "tool_continuation";
+        case scheduler::JobPriority::ANY_REQUEST:
+            return "any_request";
     }
     return "unknown";
 }
@@ -481,7 +479,7 @@ private:
         context.request = request;
         context.caller = options;
         context.kind = kind;
-        context.priority = scheduler::JobPriority::NEW_REQUEST;
+        context.priority = scheduler::JobPriority::ANY_REQUEST;
         context.skip_post_turn_summarization = false;
 
         const std::string response_id = options.response_id.empty()
@@ -534,7 +532,7 @@ private:
                 context.model_id = chain.model_id;
                 context.request.model = chain.model_id;
                 context.request.user = chain.session_id;
-                context.priority = scheduler::JobPriority::READY_TOOL_CONT;
+                context.priority = scheduler::JobPriority::TOOL_CONTINUATION;
                 context.tool_continuation = true;
                 if (!tool_chains_.markContinuationQueued(
                         chain.chain_id,
@@ -552,7 +550,7 @@ private:
                     context.model_id = request.model;
                     context.request.model = request.model;
                     context.request.user = session_id;
-                    context.priority = scheduler::JobPriority::SESSION_CONT;
+                    context.priority = scheduler::JobPriority::ANY_REQUEST;
                     context.tool_continuation = false;
                 } else {
                     scheduler_.renewToolLease(
@@ -565,7 +563,7 @@ private:
 
         if (!context.tool_continuation &&
             !options.previous_response_id.empty()) {
-            context.priority = scheduler::JobPriority::SESSION_CONT;
+            context.priority = scheduler::JobPriority::ANY_REQUEST;
         }
 
         const std::string final_session_id =

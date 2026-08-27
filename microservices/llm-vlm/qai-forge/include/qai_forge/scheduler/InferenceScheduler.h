@@ -24,7 +24,7 @@ namespace scheduler {
 struct GenerativeScheduleMetadata {
     std::string job_id;
     std::string model_id;
-    JobPriority priority = JobPriority::NEW_REQUEST;
+    JobPriority priority = JobPriority::ANY_REQUEST;
 };
 
 struct PredictiveScheduleMetadata {

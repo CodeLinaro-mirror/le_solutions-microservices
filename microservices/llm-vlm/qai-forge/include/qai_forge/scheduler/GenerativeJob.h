@@ -41,7 +41,7 @@ struct GenerativeJob {
     std::string conversation_memory_key;
 
     JobKind kind = JobKind::HTTP_NON_STREAMING;
-    JobPriority priority = JobPriority::NEW_REQUEST;
+    JobPriority priority = JobPriority::ANY_REQUEST;
     PreparedGenerativeRequest prepared;
     bool skip_post_turn_summarization = false;
 

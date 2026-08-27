@@ -104,8 +104,8 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
             std::make_shared<ModelLoadCoordinator>(config_.memory_headroom_mb);
         load_coordinator_->start();
     }
-    if (config_.blocked_admission_timeout.count() <= 0) {
-        config_.blocked_admission_timeout = std::chrono::seconds(30);
+    if (config_.cold_model_fairness_wait.count() <= 0) {
+        config_.cold_model_fairness_wait = std::chrono::seconds(120);
     }
     if (config_.tool_response_timeout.count() <= 0) {
         config_.tool_response_timeout = std::chrono::seconds(30);
@@ -113,8 +113,8 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
     LOG_INFO("[WarmModelPool] Configured: max_active_models="
              << config_.max_active_models
              << " idle_timeout_ms=" << config_.idle_timeout.count()
-             << " blocked_admission_timeout_ms="
-             << config_.blocked_admission_timeout.count()
+             << " cold_model_fairness_wait_ms="
+             << config_.cold_model_fairness_wait.count()
              << " tool_response_timeout_ms="
              << config_.tool_response_timeout.count()
              << " memory_headroom_mb=" << config_.memory_headroom_mb);
@@ -517,7 +517,7 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
     input.config = EvictionPolicyConfig{
         config_.max_active_models,
         config_.idle_timeout,
-        config_.blocked_admission_timeout,
+        config_.cold_model_fairness_wait,
         config_.memory_headroom_mb,
     };
     input.available_memory_mb = availableMemoryMb();
@@ -814,10 +814,10 @@ WarmModelPool::nextPolicyDeadlineLocked(
             continue;
         }
 
-        const auto blocked_deadline =
-            admission.candidate.created_at + config_.blocked_admission_timeout;
-        if (blocked_deadline > now) {
-            next_deadline = std::min(next_deadline, blocked_deadline);
+        const auto fairness_deadline =
+            admission.candidate.created_at + config_.cold_model_fairness_wait;
+        if (fairness_deadline > now) {
+            next_deadline = std::min(next_deadline, fairness_deadline);
         }
     }
 

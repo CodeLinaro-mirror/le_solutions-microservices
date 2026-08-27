@@ -175,7 +175,7 @@ ModelRuntimeSnapshot PredictiveModelRuntime::snapshot() const {
     ModelRuntimeSnapshot snapshot;
     snapshot.model_id = model_id_;
     snapshot.state = state_;
-    snapshot.queue.new_request = queue_.size();
+    snapshot.queue.any_request = queue_.size();
     snapshot.has_running_job = static_cast<bool>(running_job_);
     snapshot.running_job_id = running_job_ ? running_job_->job_id : std::string{};
     snapshot.healthy = backend_healthy_;

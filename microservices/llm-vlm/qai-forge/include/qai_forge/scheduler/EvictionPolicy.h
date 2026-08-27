@@ -21,7 +21,7 @@ enum class EvictionPolicyActionType {
 struct EvictionPolicyConfig {
     size_t max_active_models = 0;
     std::chrono::milliseconds idle_timeout{0};
-    std::chrono::milliseconds blocked_admission_timeout{0};
+    std::chrono::milliseconds cold_model_fairness_wait{0};
     long memory_headroom_mb = 1024;
 };
 
@@ -74,10 +74,10 @@ private:
     static bool isEvictableIdleRuntime(const ModelPoolRuntimeSnapshot& runtime);
     static bool isFairnessDrainCandidate(
         const ModelPoolRuntimeSnapshot& runtime);
-    static bool hasWaitedPastBlockedAdmissionTimeout(
+    static bool hasWaitedPastColdModelFairnessWait(
         const WaitingCandidate& candidate,
         std::chrono::steady_clock::time_point now,
-        std::chrono::milliseconds timeout);
+        std::chrono::milliseconds fairness_wait);
     static long modelMemoryMb(const EvictionPolicyInput& input,
                               const std::string& model_id);
     static bool waitingLess(const WaitingCandidate& lhs,

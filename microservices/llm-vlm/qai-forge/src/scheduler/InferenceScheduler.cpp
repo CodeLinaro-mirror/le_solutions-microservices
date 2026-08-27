@@ -61,11 +61,19 @@ InferenceSchedulerConfig configFromEnvironment() {
     config.generative_pool_config.max_active_models = max_active_models;
     config.predictive_pool_config.max_active_models = max_active_models;
 
-    const auto blocked_timeout = parseSecondsEnv(
-        "BLOCKED_ADMISSION_TIMEOUT_SECONDS",
-        config.generative_pool_config.blocked_admission_timeout);
-    config.generative_pool_config.blocked_admission_timeout = blocked_timeout;
-    config.predictive_pool_config.blocked_admission_timeout = blocked_timeout;
+    const auto idle_timeout = parseSecondsEnv(
+        "MODEL_IDLE_TIMEOUT_SECONDS",
+        config.generative_pool_config.idle_timeout);
+    config.generative_pool_config.idle_timeout = idle_timeout;
+    config.predictive_pool_config.idle_timeout = idle_timeout;
+
+    const auto cold_model_fairness_wait = parseSecondsEnv(
+        "COLD_MODEL_FAIRNESS_WAIT_SECONDS",
+        config.generative_pool_config.cold_model_fairness_wait);
+    config.generative_pool_config.cold_model_fairness_wait =
+        cold_model_fairness_wait;
+    config.predictive_pool_config.cold_model_fairness_wait =
+        cold_model_fairness_wait;
 
     const auto tool_timeout = parseSecondsEnv(
         "TOOL_RESPONSE_TIMEOUT_SECONDS",
@@ -74,6 +82,7 @@ InferenceSchedulerConfig configFromEnvironment() {
     config.predictive_pool_config.max_queue_depth_per_model = parseSizeEnv(
         "MAX_QUEUE_DEPTH_PER_MODEL",
         config.predictive_pool_config.max_queue_depth_per_model);
+
     return config;
 }
 

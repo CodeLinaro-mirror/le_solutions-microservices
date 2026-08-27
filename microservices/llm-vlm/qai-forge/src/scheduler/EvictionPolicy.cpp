@@ -84,6 +84,9 @@ EvictionPolicyPlan EvictionPolicy::plan(
 
     long remaining_available_mb = input.available_memory_mb;
     size_t active_reserved_count = input.snapshot.active_reserved_models;
+    std::vector<WaitingCandidate> blocked_candidates;
+    bool activated_candidate = false;
+
     for (const WaitingCandidate& candidate : waiting) {
         if (!candidate.runtime) {
             continue;
@@ -102,23 +105,61 @@ EvictionPolicyPlan EvictionPolicy::plan(
                        candidate.runtime->model_id);
             remaining_available_mb -= candidate.required_memory_mb;
             ++active_reserved_count;
+            activated_candidate = true;
             continue;
         }
 
-        const size_t count_evictions_needed =
-            active_reserved_count + 1 > input.config.max_active_models
-                ? active_reserved_count + 1 - input.config.max_active_models
-                : 0;
-        const long memory_needed_mb =
-            remaining_available_mb < candidate.required_memory_mb
-                ? candidate.required_memory_mb - remaining_available_mb
-                : 0;
+        blocked_candidates.push_back(candidate);
+    }
 
-        size_t planned_eviction_count = 0;
-        long planned_freed_mb = 0;
-        std::vector<std::string> victims_for_candidate;
+    // Activating a runtime publishes a new state and wakes the pool. Replan
+    // eviction from that fresh snapshot instead of mixing load and reclaim
+    // decisions based on stale capacity.
+    if (activated_candidate || blocked_candidates.empty()) {
+        return plan;
+    }
 
-        for (const EvictionCandidate& victim : evictable) {
+    // No cold model currently fits. Plan eviction only for the highest-priority
+    // blocked candidate; once reclaim completes, every waiting model is checked
+    // again for immediate admission before another eviction is requested.
+    const WaitingCandidate& candidate = blocked_candidates.front();
+
+    const size_t count_evictions_needed =
+        active_reserved_count + 1 > input.config.max_active_models
+            ? active_reserved_count + 1 - input.config.max_active_models
+            : 0;
+    const long memory_needed_mb =
+        remaining_available_mb < candidate.required_memory_mb
+            ? candidate.required_memory_mb - remaining_available_mb
+            : 0;
+
+    size_t planned_eviction_count = 0;
+    long planned_freed_mb = 0;
+    std::vector<std::string> victims_for_candidate;
+
+    for (const EvictionCandidate& victim : evictable) {
+        if (!victim.runtime ||
+            planned_model_ids.count(victim.runtime->model_id) > 0) {
+            continue;
+        }
+
+        victims_for_candidate.push_back(victim.runtime->model_id);
+        planned_freed_mb += victim.model_memory_mb;
+        ++planned_eviction_count;
+
+        if (planned_eviction_count >= count_evictions_needed &&
+            planned_freed_mb >= memory_needed_mb) {
+            break;
+        }
+    }
+
+    if ((planned_eviction_count < count_evictions_needed ||
+         planned_freed_mb < memory_needed_mb) &&
+        hasWaitedPastColdModelFairnessWait(
+            candidate,
+            input.now,
+            input.config.cold_model_fairness_wait)) {
+        for (const EvictionCandidate& victim : fairness_evictable) {
             if (!victim.runtime ||
                 planned_model_ids.count(victim.runtime->model_id) > 0) {
                 continue;
@@ -133,41 +174,13 @@ EvictionPolicyPlan EvictionPolicy::plan(
                 break;
             }
         }
+    }
 
-        if ((planned_eviction_count < count_evictions_needed ||
-             planned_freed_mb < memory_needed_mb) &&
-            hasWaitedPastBlockedAdmissionTimeout(
-                candidate,
-                input.now,
-                input.config.blocked_admission_timeout)) {
-            for (const EvictionCandidate& victim : fairness_evictable) {
-                if (!victim.runtime ||
-                    planned_model_ids.count(victim.runtime->model_id) > 0) {
-                    continue;
-                }
-
-                victims_for_candidate.push_back(victim.runtime->model_id);
-                planned_freed_mb += victim.model_memory_mb;
-                ++planned_eviction_count;
-
-                if (planned_eviction_count >= count_evictions_needed &&
-                    planned_freed_mb >= memory_needed_mb) {
-                    break;
-                }
-            }
+    if (planned_eviction_count >= count_evictions_needed &&
+        planned_freed_mb >= memory_needed_mb) {
+        for (const std::string& victim_model_id : victims_for_candidate) {
+            add_action(EvictionPolicyActionType::Drain, victim_model_id);
         }
-
-        if (planned_eviction_count >= count_evictions_needed &&
-            planned_freed_mb >= memory_needed_mb) {
-            for (const std::string& victim_model_id : victims_for_candidate) {
-                add_action(EvictionPolicyActionType::Drain, victim_model_id);
-            }
-        }
-
-        // Eviction is asynchronous. Once victims report NotResident, the pool
-        // wakes and re-runs this policy over every waiting runtime in priority
-        // order. Do not let lower-priority cold models bypass this candidate.
-        break;
     }
 
     return plan;
@@ -222,14 +235,14 @@ bool EvictionPolicy::isFairnessDrainCandidate(
             runtime.state == ModelRuntimeState::Running);
 }
 
-bool EvictionPolicy::hasWaitedPastBlockedAdmissionTimeout(
+bool EvictionPolicy::hasWaitedPastColdModelFairnessWait(
     const WaitingCandidate& candidate,
     std::chrono::steady_clock::time_point now,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds fairness_wait) {
     return candidate.runtime &&
            candidate.runtime->candidate.has_work &&
-           timeout.count() > 0 &&
-           now - candidate.runtime->candidate.created_at >= timeout;
+           fairness_wait.count() > 0 &&
+           now - candidate.runtime->candidate.created_at >= fairness_wait;
 }
 
 long EvictionPolicy::modelMemoryMb(
