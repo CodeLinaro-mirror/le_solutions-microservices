@@ -144,6 +144,14 @@ private:
                                   const std::string& processed_config_dir);
 
     /**
+     * Parse a geniex.json manifest (written by the GenieX SDK) into a ModelConfig.
+     * GenieX bundles use the "qairt" runtime and resolve entry files directly
+     * within the bundle directory (no /tmp/configs processing needed).
+     * The config id follows the same "{model_id}-{runtime}" convention.
+     */
+    ModelConfig parseGenieXJson(const json& manifest, const std::string& bundle_path);
+
+    /**
      * Generate a synthetic genie_config.json for VLM models.
      * Matches the structure expected by vlm-service.cpp.
      * Returns the path to the generated file.

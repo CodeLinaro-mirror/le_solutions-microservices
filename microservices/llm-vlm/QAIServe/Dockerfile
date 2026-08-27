@@ -347,7 +347,7 @@ RUN mkdir -p "${LITERT_LM_DEPLOY_DIR}/lib" \
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: Builder
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:bookworm-slim AS builder
+FROM --platform=linux/arm64 debian:trixie-slim AS builder
 
 # Install build dependencies:
 #   - Drogon hard deps (no DB client libs)
@@ -455,6 +455,30 @@ RUN mkdir -p ${QAIRT_DOWNLOAD_DIR} \
     cp ${QAIRT_LIB_PATH}/aarch64-oe-linux-gcc11.2/* ${DEPLOY_DIR}/usr/lib/ && \
     rm -rf ${QAIRT_DOWNLOAD_DIR}/qairt
 
+# ── Stage the GenieX SDK (libgeniex.so + headers) ────────────────────────────
+# GenieX model-manager C ABI, used by QAIServe's GenieXClient for multi-hub
+# model downloads (HuggingFace / AI Hub / …). The SDK zip lives on the SAME
+# Qualcomm public S3 mirror as QAIRT.
+#   - Headers (geniex.h, geniex_model.h) → /usr/include/  (for build)
+#   - libgeniex.so + libgeniex_* backends → /usr/lib/ (build) + ${DEPLOY_DIR}
+# We intentionally do NOT copy the SDK's bundled lib/qairt/htp-files/* (libQnn*,
+# libQnnSystem, …) — those overlap the QAIRT libs already staged above; reusing
+# a single QAIRT copy avoids duplicate/mismatched QNN runtimes.
+ENV GENIEX_SDK_VERSION=v0.3.14
+ENV GENIEX_DOWNLOAD_DIR=/tmp/geniex-download
+
+RUN mkdir -p ${GENIEX_DOWNLOAD_DIR} && \
+    wget -t 2 -T 60 -P ${GENIEX_DOWNLOAD_DIR} \
+        https://github.com/qualcomm/GenieX/releases/download/${GENIEX_SDK_VERSION}/geniex-sdk-linux-arm64-${GENIEX_SDK_VERSION}.zip  && \
+    cd ${GENIEX_DOWNLOAD_DIR} && \
+    unzip geniex-sdk-linux-arm64-${GENIEX_SDK_VERSION}.zip && \
+    cp sdk-linux-arm64/include/*.h /usr/include/ && \
+    cp sdk-linux-arm64/lib/libgeniex.so /usr/lib/ && \
+    cp sdk-linux-arm64/lib/libgeniex.so ${DEPLOY_DIR}/usr/lib/ && \
+    cp sdk-linux-arm64/lib/qairt/libgeniex*.so ${DEPLOY_DIR}/usr/lib/ && \
+    cp sdk-linux-arm64/lib/qairt/libgeniex-proc*.so ${DEPLOY_DIR}/usr/lib/ 2>/dev/null || true && \
+    rm -rf ${GENIEX_DOWNLOAD_DIR}/sdk-linux-arm64 ${GENIEX_DOWNLOAD_DIR}/*.zip
+
 # Copy fastrpc runtime libraries into deploy staging
 RUN cp /usr/lib/libcdsprpc.so* ${DEPLOY_DIR}/usr/lib/ && \
     cp /usr/lib/libadsprpc.so* ${DEPLOY_DIR}/usr/lib/
@@ -540,54 +564,67 @@ RUN find ${DEPLOY_DIR}/usr/bin -type f \
 # cherry-picks only the required libraries into /export. Nothing else from
 # this stage's OS lands in the final image.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:bookworm-slim AS stager
+FROM --platform=linux/arm64 debian:trixie-slim AS stager
 
 # Install runtime deps to make their .so files available for cherry-picking.
 # libgrpc++1.51/libgrpc29/libprotobuf32 pull in abseil + re2 + c-ares
 # transitively — apt resolves the exact versioned packages; we only
 # cherry-pick the .so files below, not the packages themselves.
 #
-# NOTE: bookworm's runtime gRPC C++ package is named libgrpc++1.51 (SONAME-
-# versioned), not "libgrpc++1" — that plain name doesn't exist on bookworm
-# and silently resolves to nothing being installed, which is what caused
-# qaiserve to fail at startup with "libgrpc++.so.1.51: cannot open shared
-# object file". Likewise there is no separate "libgpr" package on this gRPC
-# version; the gpr symbols live inside libgrpc29.
+# NOTE: on trixie the runtime gRPC/protobuf packages carry the 64-bit time_t
+# suffix — libgrpc++1.51t64 / libgrpc29t64 / libprotobuf32t64 (the plain
+# bookworm names libgrpc++1.51 / libgrpc29 / libprotobuf32 do not exist on
+# trixie and silently resolve to nothing, causing qaiserve to fail at startup
+# with "libgrpc++.so.1.51: cannot open shared object file"). There is no
+# separate "libgpr" package; the gpr symbols live inside libgrpc29t64. abseil /
+# re2 / c-ares / upb are pulled in transitively by these packages and
+# cherry-picked below by SONAME, so they are not listed explicitly here.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        ca-certificates \
         libyaml-0-2 \
         libbsd0 \
         libmd0 \
-        libjsoncpp25 \
+        libjsoncpp26 \
         libssl3 \
         zlib1g \
         libuuid1 \
         libatomic1 \
         libcurl4 \
-        libzip4 \
+        libzip5 \
         libnghttp2-14 \
+        libnghttp3-9 \
         librtmp1 \
         libidn2-0 \
         libssh2-1 \
         libpsl5 \
         libgssapi-krb5-2 \
-        libldap-2.5-0 \
+        libldap2 \
         libbrotli1 \
         libzstd1 \
+        liblzma5 \
         libbz2-1.0 \
         libsasl2-2 \
-        libunistring2 \
+        libunistring5 \
         libgnutls30 \
-        libgrpc++1.51 \
-        libgrpc29 \
-        libprotobuf32 \
+        libgrpc++1.51t64 \
+        libgrpc29t64 \
+        libprotobuf32t64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Assemble the /export tree that will be COPY'd into the distroless runtime.
 RUN mkdir -p /export/usr/bin \
              /export/usr/lib/rfsa/adsp \
-             /export/etc/fastrpc
+             /export/etc/fastrpc \
+             /export/etc/ssl/certs
+
+# Stage CA certificates so in-container HTTPS works (AiHubClient libcurl +
+# libgeniex both do TLS to S3/HuggingFace). trixie-slim does not ship certs by
+# default; without this, all HTTPS fails with "SSL CA cert (path? access rights?)".
+RUN cp -a /etc/ssl/certs/. /export/etc/ssl/certs/ && \
+    mkdir -p /export/usr/share/ca-certificates && \
+    cp -a /usr/share/ca-certificates/. /export/usr/share/ca-certificates/ 2>/dev/null || true
 
 # Copy stripped binaries from the builder deploy tree.
 # Deliberately excludes qai-forge-daemon — the HTTP server spawns workers directly.
@@ -613,7 +650,7 @@ COPY --from=builder /build/deploy/usr/lib /export/usr/lib
 #
 # Uses find to locate .so files regardless of whether Debian placed them under
 # /usr/lib/aarch64-linux-gnu/, /usr/lib/, or /lib/ — all three are searched.
-RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap-2.5" "liblber-2.5" libbrotlidec libbrotlicommon libzstd libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb; do \
+RUN for lib in libyaml-0 libbsd libmd libjsoncpp libssl libcrypto libz libuuid libatomic libcurl libzip libnghttp2 libnghttp3 librtmp libidn2 libssh2 libpsl libgssapi_krb5 libkrb5 libk5crypto libcom_err libkrb5support libkeyutils "libldap*" "liblber*" libbrotlidec libbrotlicommon libzstd liblzma libbz2 libsasl2 libunistring libgnutls libhogweed libnettle libgmp libp11-kit libffi libtasn1 libgrpc++ libgrpc libgpr libaddress_sorting libprotobuf libre2 libcares libupb; do \
       find /usr/lib /lib -name "${lib}.so*" -exec cp -dp {} /export/usr/lib/ \; ; \
     done && \
     find /usr/lib /lib -name "libabsl_*.so*" -exec cp -dp {} /export/usr/lib/ \;
@@ -636,14 +673,15 @@ RUN { \
     } > /export/etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3: Runtime (distroless)
+# Stage 3: Runtime (debian:trixie-slim)
 #
-# gcr.io/distroless/cc-debian12 provides only:
-#   libc6, libstdc++6, libgcc-s1, libm6 — nothing else.
-# No shell, no package manager, no apt cache, no /usr/share docs.
-# All additional .so files were cherry-picked into /export by the stager.
+# Uses debian:trixie-slim (glibc 2.41, GCC 14 libstdc++) rather than
+# distroless/cc-debian12, because the prebuilt GenieX SDK (libgeniex.so)
+# requires GLIBC_2.39 + GLIBCXX_3.4.32 — newer than bookworm/distroless-12
+# (glibc 2.36) can provide. trixie-slim already ships libc6/libstdc++6/libgcc-s1
+# at the required versions; the stager's cherry-picked .so files overlay on top.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12 AS qaiserve-runtime
+FROM --platform=linux/arm64 debian:trixie-slim AS qaiserve-runtime
 
 # Single COPY brings in:
 #   /usr/bin/   - qaiserve, genai-inference-worker, genai-vlm-inference-worker,

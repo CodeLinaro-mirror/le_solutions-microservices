@@ -41,7 +41,8 @@ std::shared_ptr<ModelFetchJob> ModelFetchJobRegistry::create(
     const std::string& runtime,
     const std::string& precision,
     const std::string& version,
-    const std::string& chipset)
+    const std::string& chipset,
+    const std::string& source)
 {
     auto job = std::make_shared<ModelFetchJob>();
     job->job_id    = generateJobId();
@@ -50,6 +51,7 @@ std::shared_ptr<ModelFetchJob> ModelFetchJobRegistry::create(
     job->precision = precision;
     job->version   = version;
     job->chipset   = chipset;
+    job->source    = source;
 
     std::unique_lock lock(mutex_);
     jobs_[job->job_id] = job;

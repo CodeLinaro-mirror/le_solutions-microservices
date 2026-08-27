@@ -60,19 +60,25 @@ public:
      * Body (JSON):
      *   {
      *     "model":     "nomic_embed_text",   // required
-     *     "runtime":   "qnn_dlc",            // required
+     *     "runtime":   "qnn_dlc",            // required for source=aihub
      *     "precision": "float",              // optional, default "float"
-     *     "version":   "0.45.0",             // optional, default latest
-     *     "chipset":   "qcs8550"             // optional
+     *     "version":   "0.45.0",             // optional (aihub), default latest
+     *     "chipset":   "qcs8550",            // optional
+     *     "source":    "aihub"               // optional: "aihub" (default) | "geniex"
      *   }
+     *
+     * source=aihub: direct S3 download of a qai-hub-models asset (AiHubClient).
+     * source=geniex: delegate to the GenieX SDK, which resolves the hub
+     *   (HuggingFace / AI Hub / …) from the model name; "runtime"/"version"
+     *   are ignored. Example model: "ai-hub-models/Qwen3-4B-Instruct-2507".
      *
      * Returns 202 Accepted:
      *   { "job_id": "...", "status": "pending" }
      *
      * Starts a background thread that:
-     *   1. Resolves the S3 URL (HEAD check)
-     *   2. Downloads the ZIP with progress tracking
-     *   3. Extracts to the models directory
+     *   1. Resolves the S3 URL (HEAD check) — aihub; or calls geniex_model_pull
+     *   2. Downloads the ZIP with progress tracking (aihub)
+     *   3. Extracts to the models directory (aihub)
      *   4. Calls ModelConfigManager::scanModelBundles() to hot-reload
      */
     void fetchModel(const HttpRequestPtr& req,

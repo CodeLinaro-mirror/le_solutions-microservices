@@ -22,6 +22,7 @@
 #include <vector>
 #include <functional>
 #include <stdexcept>
+#include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Exceptions

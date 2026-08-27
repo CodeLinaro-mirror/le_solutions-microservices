@@ -29,6 +29,7 @@
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
+#include <cstdint>
 
 struct MultipartParseError : std::runtime_error {
     using std::runtime_error::runtime_error;

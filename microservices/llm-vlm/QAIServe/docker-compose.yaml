@@ -73,6 +73,13 @@ services:
       - CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
       - QAISERVE_MAX_BODY_SIZE=${QAISERVE_MAX_BODY_SIZE:-16777216}
 
+      # Admin model management — set QAISERVE_ADMIN_TOKEN to enable /admin/models/*
+      # (unset ⇒ all admin endpoints return 403). GENIEX_DATADIR points the
+      # GenieX SDK cache at the scanned models dir so `source:geniex` pulls are
+      # hot-reloaded into the model list.
+      - QAISERVE_ADMIN_TOKEN=${QAISERVE_ADMIN_TOKEN:-}
+      - GENIEX_DATADIR=${GENIEX_DATADIR:-/mnt/work/models}
+
       # Generative AI workers (GenIE — LLM + VLM)
       - GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
       - GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker

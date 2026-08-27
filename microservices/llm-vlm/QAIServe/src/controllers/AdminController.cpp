@@ -10,6 +10,7 @@
 
 #include "controllers/AdminController.h"
 #include "admin/AiHubClient.h"
+#include "admin/GenieXClient.h"
 #include "admin/ModelFetchJob.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 
@@ -101,18 +102,26 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
     std::string precision = body.value("precision", "float");
     std::string version   = body.value("version", "");
     std::string chipset   = body.value("chipset", "");
+    std::string source    = body.value("source", "aihub");
 
     if (model.empty()) {
         callback(errorResp("'model' is required.", k400BadRequest));
         return;
     }
-    if (runtime.empty()) {
+    if (source != "aihub" && source != "geniex") {
+        callback(errorResp("'source' must be 'aihub' or 'geniex'.", k400BadRequest));
+        return;
+    }
+    // 'runtime' is required only for the aihub S3 path (it is part of the asset
+    // URL). GenieX resolves the runtime itself from the model repo.
+    if (source == "aihub" && runtime.empty()) {
         callback(errorResp("'runtime' is required.", k400BadRequest));
         return;
     }
 
-    // If version not specified, fetch latest from PyPI
-    if (version.empty()) {
+    // If version not specified, fetch latest from PyPI (aihub path only —
+    // GenieX does not use qai-hub-models package versions).
+    if (source == "aihub" && version.empty()) {
         try {
             auto versions = AiHubClient::fetchVersions();
             if (versions.empty()) {
@@ -131,17 +140,53 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
     // Create job
     auto& registry = ModelFetchJobRegistry::getInstance();
     registry.pruneOldJobs();
-    auto job = registry.create(model, runtime, precision, version, chipset);
+    auto job = registry.create(model, runtime, precision, version, chipset, source);
 
     // Capture job_id for the response (job ptr is moved into the thread)
     std::string job_id = job->job_id;
 
     // Launch background download thread
-    std::thread([job, model, runtime, precision, version, chipset]() {
+    std::thread([job, model, runtime, precision, version, chipset, source]() {
         const std::string models_dir = modelsDir();
         const std::string tmp_dir    = tmpDownloadDir();
 
         try {
+            if (source == "geniex") {
+                // ── GenieX path: delegate to the native SDK ────────────────
+                // The SDK resolves the hub (HuggingFace / AI Hub / …), downloads
+                // (with resume), and writes the bundle + geniex.json manifest
+                // under its data dir. We point that data dir at the scanned
+                // models directory so the hot-reload picks it up.
+                job->status.store(FetchStatus::DOWNLOADING);
+
+                GenieXClient::pull(
+                    model, precision,
+                    GenieXClient::Hub::Auto,   // auto-select hub from repo name
+                    chipset, models_dir,
+                    [&job](int64_t done, int64_t total) {
+                        job->bytes_downloaded.store(done);
+                        job->total_bytes.store(total);
+                    });
+
+                // ── Hot-reload model registry ──────────────────────────────
+                job->status.store(FetchStatus::EXTRACTING);
+                ModelConfigManager::getInstance().scanModelBundles();
+
+                // Resolve the installed paths from the SDK.
+                GenieXClient::ModelPaths paths = GenieXClient::getPaths(model);
+                std::string rt = paths.plugin_id.empty() ? "qairt" : paths.plugin_id;
+                std::string mname = paths.model_name.empty() ? model : paths.model_name;
+
+                job->installed_id   = mname + "-" + rt;
+                job->installed_path = paths.model_dir;
+                job->status.store(FetchStatus::DONE);
+
+                std::cout << "[AdminController] GenieX model installed: "
+                          << job->installed_id << " at " << paths.model_dir << "\n";
+                return;
+            }
+
+            // ── AI-Hub path (default): direct S3 download ──────────────────
             // ── Step 1: Resolve S3 URL ─────────────────────────────────────
             std::string url = AiHubClient::resolveUrl(
                 model, runtime, precision, version, chipset);
@@ -210,7 +255,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
             job->error = e.what();
             job->status.store(FetchStatus::FAILED);
             std::cerr << "[AdminController] Fetch failed for "
-                      << model << "-" << runtime << ": " << e.what() << "\n";
+                      << model << " (" << source << "): " << e.what() << "\n";
         }
     }).detach();
 
@@ -221,7 +266,8 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
         {"model",  model},
         {"runtime", runtime},
         {"precision", precision},
-        {"version", version}
+        {"version", version},
+        {"source", source}
     }, k202Accepted));
 }
 

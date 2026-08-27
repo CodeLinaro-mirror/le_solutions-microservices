@@ -59,6 +59,20 @@ add_custom_command(
 add_custom_target(qai_forge_proto_gen DEPENDS ${PROTO_GEN_SRC} ${GRPC_GEN_SRC})
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GenieX SDK — native model-manager library (libgeniex.so)
+# Headers (geniex.h, geniex_model.h) and the .so are staged into
+# /usr/include and /usr/lib by the Dockerfile builder stage. GENIEX_LIB_PATH
+# may be set to override the search location for local builds.
+# ─────────────────────────────────────────────────────────────────────────────
+find_library(GENIEX_LIB
+    NAMES geniex libgeniex
+    PATHS ${GENIEX_LIB_PATH} /usr/lib
+)
+if(NOT GENIEX_LIB)
+    message(FATAL_ERROR "libgeniex.so not found (set GENIEX_LIB_PATH or stage it into /usr/lib)")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Source files
 # ─────────────────────────────────────────────────────────────────────────────
 set(SERVER_SOURCES
@@ -70,6 +84,7 @@ set(SERVER_SOURCES
     # Admin model management (admin-only, requires X-Admin-Token)
     src/controllers/AdminController.cpp
     src/admin/AiHubClient.cpp
+    src/admin/GenieXClient.cpp
     src/admin/ModelFetchJob.cpp
 
     # OIP v2 — model discovery (GET /v1/models, GET /v2/models, GET /v2/models/{model})
@@ -142,6 +157,7 @@ target_link_libraries(qaiserve PRIVATE
     libzip::zip
     gRPC::grpc++
     protobuf::libprotobuf
+    ${GENIEX_LIB}
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
