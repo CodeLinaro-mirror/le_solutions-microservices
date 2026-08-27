@@ -15,7 +15,7 @@
 //
 // All policy constants are application-level (not in metadata.json):
 //   MIN_ANSWER_RESERVE    = 256   tokens always reserved for the answer
-//   MAX_THINKING_FRACTION = 0.60  thinking never > 60% of available output
+//   MAX_THINKING_FRACTION = 0.70  thinking never > 70% of available output
 //   MIN_THINKING_TOKENS   = 64    minimum useful thinking budget
 //
 // Effort → fraction of available output tokens:
@@ -24,7 +24,8 @@
 //   low     = 0.20
 //   medium  = 0.35  (default when no reasoning.effort specified)
 //   high    = 0.50
-//   xhigh   = 0.60  (equals MAX_THINKING_FRACTION)
+//   xhigh   = 0.60
+//   max     = 0.70  (equals MAX_THINKING_FRACTION)
 //
 // Token estimation uses a character-based heuristic (3.5 chars/token + 50
 // safety margin). This is fast, requires no tokenizer, and errs on the side
@@ -41,7 +42,7 @@
 //   if (budget.context_too_small) throw ...;
 //   if (budget.suppress_thinking) bypass_think_filter = false;
 //   // Use budget.thinking_budget for ReasoningRouter
-//   // Use budget.answer_budget for max_completion_tokens in executeRequest()
+//   // Use thinking_budget + answer_budget as the runtime output cap
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <string>
@@ -70,7 +71,7 @@ public:
     static constexpr int   MIN_ANSWER_RESERVE    = 256;
 
     /// Thinking tokens never exceed this fraction of available output tokens.
-    static constexpr float MAX_THINKING_FRACTION = 0.60f;
+    static constexpr float MAX_THINKING_FRACTION = 0.70f;
 
     /// Minimum useful thinking budget. If the computed budget is below this
     /// and effort != none, thinking is suppressed (not worth the overhead).
@@ -86,27 +87,25 @@ public:
      * @param context_size        Model's context window size in tokens
      *                            (from ModelConfigManager::getContextSize())
      * @param effort              Reasoning effort level: "none"/"minimal"/"low"/
-     *                            "medium"/"high"/"xhigh"
-     *                            Unknown values are treated as "medium".
+     *                            "medium"/"high"/"xhigh"/"max"
+     *                            Public callers must validate values before
+     *                            invoking this calculator.
      * @param max_output_tokens   Optional client-requested output token cap.
      *                            Covers both thinking + answer tokens combined.
-     * @param max_reasoning_tokens Optional explicit cap on thinking tokens only.
-     *                            Takes precedence over effort-based calculation.
      * @return                    ReasoningBudgetResult with all computed values
      */
     static ReasoningBudgetResult compute(
         const std::string&   assembled_prompt,
         int                  context_size,
         const std::string&   effort,
-        std::optional<int>   max_output_tokens = std::nullopt,
-        std::optional<int>   max_reasoning_tokens = std::nullopt
+        std::optional<int>   max_output_tokens = std::nullopt
     );
 
     // ── Helpers (exposed for testing) ─────────────────────────────────────────
 
     /**
      * Map an effort string to a fraction of available output tokens.
-     * Returns 0.0 for "none", 0.35 for unknown values (medium default).
+     * Returns 0.0 for "none", 0.35 for unknown values as a defensive fallback.
      */
     static float effortToFraction(const std::string& effort);
 

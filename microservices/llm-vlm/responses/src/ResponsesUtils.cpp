@@ -11,7 +11,6 @@
 #include "ResponsesUtils.h"
 #include <algorithm>
 #include <chrono>
-#include <cctype>
 #include <sstream>
 #include <iomanip>
 #include <random>
@@ -298,6 +297,7 @@ json build_text_runtime_messages(const json& messages) {
         }
 
         json runtime_message = message;
+        runtime_message.erase("_thinking_content");
         bool has_tool_calls =
             runtime_message.contains("tool_calls")
             && runtime_message["tool_calls"].is_array()
@@ -416,15 +416,8 @@ std::string strip_tool_call_protocol_text(const std::string& text) {
 // ─────────────────────────────────────────────────────────────────────────────
 // build_output_array
 //
-// Per the OpenAI Responses API spec, the reasoning output item is a SEPARATE
-// top-level item in output[], not nested inside message.content[].
-//
-// Correct structure:
-//   output[0] = {"type":"reasoning", "id":"rs_...", "summary":[...]}  ← separate
-//   output[1] = {"type":"message", "content":[{"type":"output_text"}]} ← answer only
-//
-// The reasoning item always appears when reasoning_content is non-empty,
-// regardless of whether reasoning.summary was requested in the API call.
+// Reasoning summaries are not exposed in output[]; reasoning effort only
+// affects model-side thinking budget and usage accounting.
 // ─────────────────────────────────────────────────────────────────────────────
 json build_output_array(const StandardResponse& result,
                          const std::vector<McpCallRecord>& mcp_records) {
@@ -433,20 +426,6 @@ json build_output_array(const StandardResponse& result,
     // MCP call records come first (they happened before the final answer)
     for (const auto& record : mcp_records) {
         output.push_back(record.to_output_item());
-    }
-
-    // ── Reasoning output item (separate top-level item, NOT inside message) ──
-    // Emitted whenever the model produced thinking tokens, regardless of whether
-    // the client requested a summary. The full thinking text is in summary[].
-    if (result.reasoning_content.has_value() && !result.reasoning_content.value().empty()) {
-        output.push_back({
-            {"type", "reasoning"},
-            {"id",   "rs_" + result.id},
-            {"summary", json::array({{
-                {"type", "summary_text"},
-                {"text", result.reasoning_content.value()}
-            }})}
-        });
     }
 
     // ── Message output item (answer text only — no reasoning here) ────────────

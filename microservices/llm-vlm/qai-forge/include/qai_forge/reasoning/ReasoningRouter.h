@@ -25,14 +25,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum class ChannelState {
-    OUTSIDE,  // Currently in the answer channel
-    INSIDE    // Currently inside a <think>...</think> block
+    OUTSIDE,    // Currently in the answer channel
+    INSIDE,     // Currently inside a <think>...</think> block
+    DISCARDING  // Discarding over-budget thinking until the end tag
 };
 
 enum class BudgetState {
     IDLE,      // Not yet activated
     COUNTING,  // Counting thinking tokens
-    FORCING,   // Budget exhausted — force exit from thinking
+    FORCING,   // Budget exhausted; discard thinking until end tag
     DONE       // Natural end of thinking block
 };
 
@@ -42,7 +43,8 @@ enum class BudgetState {
 class ReasoningBudgetTracker {
 public:
     /**
-     * @param budget_tokens  Max thinking tokens. -1 = unlimited, 0 = suppress immediately.
+     * @param budget_tokens  Max thinking tokens. -1 = unlimited,
+     *                       0 = suppress immediately.
      */
     explicit ReasoningBudgetTracker(int budget_tokens);
 
@@ -50,11 +52,20 @@ public:
     void deactivate();
     BudgetState accept(const std::string& text_fragment);
 
+    /**
+     * Accepts only the prefix that fits the remaining budget.
+     *
+     * @return Number of bytes from text_fragment that may be emitted.
+     */
+    int acceptWithinBudget(const std::string& text_fragment);
+
     bool isExhausted() const { return state_ == BudgetState::FORCING; }
     int tokensCounted() const { return counted_; }
     BudgetState state() const { return state_; }
 
 private:
+    static int estimateTokens(const std::string& text_fragment);
+
     int budget_;
     int remaining_;
     int counted_ = 0;
@@ -91,10 +102,13 @@ public:
     /**
      * Returns true if the router is currently inside a thinking block.
      */
-    bool isInsideThinking() const { return state_ == ChannelState::INSIDE; }
+    bool isInsideThinking() const {
+        return state_ == ChannelState::INSIDE ||
+               state_ == ChannelState::DISCARDING;
+    }
 
     /**
-     * Force the router out of the thinking channel (used when budget is exhausted).
+     * Force the router out of the thinking channel.
      */
     void forceOutside() { state_ = ChannelState::OUTSIDE; }
 
@@ -135,4 +149,7 @@ private:
     // Emit a thinking-channel chunk, enforcing the budget tracker.
     // Appends zero or more StreamChunks to `results`.
     void emitThinkingChunk(const std::string& text, std::vector<StreamChunk>& results);
+
+    // Discard over-budget thinking content until the matching end tag is seen.
+    void discardThinkingUntilEndTag();
 };
