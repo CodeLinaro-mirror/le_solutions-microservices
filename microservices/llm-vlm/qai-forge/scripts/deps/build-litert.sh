@@ -5,10 +5,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # build-litert.sh
 #
-# Builds LiteRT v2.1.5 with QNN dispatch and compiler plugin for QAIServe.
+# Builds LiteRT with QNN dispatch and compiler plugin for QAIServe.
 # This matches the exact build logic from QAIServe/Dockerfile litert_builder stage.
 #
 # Environment Variables (must be set to overwrite default values):
+#   LITERT_VERSION=2.1.5
 #   LITERT_SRC_DIR=/mnt/work/src/litert
 #   LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
 #   QAIRT_LITERT_VERSION=2.45.40.260406
@@ -25,6 +26,7 @@ set -eu
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults — used only when a variable isn't already set in the environment
 # ─────────────────────────────────────────────────────────────────────────────
+LITERT_VERSION="${LITERT_VERSION:-2.1.5}"
 LITERT_SRC_DIR="${LITERT_SRC_DIR:-/mnt/work/src/litert}"
 LITERT_DEPLOY_DIR="${LITERT_DEPLOY_DIR:-/mnt/work/deploy/usr}"
 QAIRT_LITERT_VERSION="${QAIRT_LITERT_VERSION:-2.45.40.260406}"
@@ -49,7 +51,7 @@ export PYTHON_BIN_PATH PYTHON_LIB_PATH \
     TF_NEED_MPI TF_NEED_COMPUTECPP TF_NEED_CLANG CLANG_COMPILER_PATH \
     TF_SET_ANDROID_WORKSPACE TF_DOWNLOAD_CLANG TF_ENABLE_XLA
 
-echo "=== Building LiteRT v2.1.5 with QNN dispatch and compiler plugin ==="
+echo "=== Building LiteRT v${LITERT_VERSION} with QNN dispatch and compiler plugin ==="
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Install Bazelisk
@@ -62,9 +64,9 @@ wget -t 3 -T 120 --no-verbose \
 chmod +x /usr/local/bin/bazel
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Clone LiteRT v2.1.5 with retry logic (POSIX-compatible)
+# Clone LiteRT v${LITERT_VERSION} with retry logic (POSIX-compatible)
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Cloning LiteRT v2.1.5..."
+echo "Cloning LiteRT v${LITERT_VERSION}..."
 git config --global http.postBuffer 1048576000
 git config --global http.lowSpeedLimit 0
 git config --global http.lowSpeedTime 999999
@@ -72,7 +74,7 @@ git config --global core.compression 0
 
 i=1
 while [ "$i" -le 5 ]; do
-    if git clone --branch v2.1.5 --depth 1 https://github.com/google-ai-edge/LiteRT.git "${LITERT_SRC_DIR}"; then
+    if git clone --branch "v${LITERT_VERSION}" --depth 1 https://github.com/google-ai-edge/LiteRT.git "${LITERT_SRC_DIR}"; then
         break
     else
         echo "Clone failed, retrying in 15 seconds..."
@@ -104,6 +106,19 @@ elif [ -f configure.py ]; then
 else
     echo "No configure script found; using env-based configuration"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch @stblib references
+#
+# LiteRT-LM's own WORKSPACE fetches LiteRT as an http_archive and applies a
+# patch_cmd (sed 's|"@stblib"|"@stb//:stblib"|g') to rewrite bare "@stblib"
+# labels to the "@stb" repo it defines. We build LiteRT-LM against this
+# locally-cloned LiteRT via --override_repository instead, which bypasses
+# that http_archive/patch_cmds machinery, leaving "@stblib" dangling with no
+# repo defined. Apply the same rewrite here so it's a no-op on LiteRT
+# versions without the reference and a fix on versions that have it.
+# ─────────────────────────────────────────────────────────────────────────────
+find support -mindepth 2 -maxdepth 2 -name BUILD -exec sed -i -e 's|"@stblib"|"@stb//:stblib"|g' {} +
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download QAIRT SDK
@@ -212,7 +227,7 @@ test -f "${LITERT_DEPLOY_DIR}/bin/run_model"
 test -f "${LITERT_DEPLOY_DIR}/bin/run_model_simple"
 test -f "${LITERT_DEPLOY_DIR}/bin/benchmark_model"
 
-echo "✓ LiteRT v2.1.5 build complete"
+echo "✓ LiteRT v${LITERT_VERSION} build complete"
 echo "  Libraries: ${LITERT_DEPLOY_DIR}/lib"
 echo "  Binaries: ${LITERT_DEPLOY_DIR}/bin"
 echo "  Headers: ${LITERT_DEPLOY_DIR}/include"

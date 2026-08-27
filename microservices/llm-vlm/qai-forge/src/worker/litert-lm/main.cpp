@@ -338,13 +338,15 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     }
 
     sess.session_config = litert_lm_session_config_create();
-    LiteRtLmSamplerParams sampler_params;
-    sampler_params.type        = kLiteRtLmSamplerTypeTopP;
-    sampler_params.top_k       = top_k > 0 ? top_k : 40;
-    sampler_params.top_p       = top_p > 0.0f ? top_p : 0.9f;
-    sampler_params.temperature = temperature > 0.0f ? temperature : 0.7f;
-    sampler_params.seed        = 0;
-    litert_lm_session_config_set_sampler_params(sess.session_config, &sampler_params);
+    LiteRtLmSamplerParams* sampler_params =
+        litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
+    litert_lm_sampler_params_set_top_k(sampler_params, top_k > 0 ? top_k : 40);
+    litert_lm_sampler_params_set_top_p(sampler_params, top_p > 0.0f ? top_p : 0.9f);
+    litert_lm_sampler_params_set_temperature(
+        sampler_params, temperature > 0.0f ? temperature : 0.7f);
+    litert_lm_sampler_params_set_seed(sampler_params, 0);
+    litert_lm_session_config_set_sampler_params(sess.session_config, sampler_params);
+    litert_lm_sampler_params_delete(sampler_params);
     litert_lm_session_config_set_max_output_tokens(
         sess.session_config, max_tokens > 0 ? max_tokens : 512);
     litert_lm_session_config_set_apply_prompt_template(sess.session_config, true);

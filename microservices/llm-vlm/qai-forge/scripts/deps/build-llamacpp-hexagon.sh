@@ -91,10 +91,23 @@ sed -i 's/string(FIND \${PREBUILT_LIB_DIR} /string(FIND "${PREBUILT_LIB_DIR}" /g
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Setting up multi-arch support for x86_64..."
 dpkg --add-architecture amd64
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
-sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
+# Read the codename off this host instead of hardcoding one.
+UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
+echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+
+# Restrict the native repo to arm64 only, so `apt-get update` doesn't also
+# try to fetch amd64 indices from it (ports.ubuntu.com never hosts amd64).
+# Ubuntu 24.04+ ("noble") ships its default sources in the new DEB822 format
+# at /etc/apt/sources.list.d/ubuntu.sources instead of the classic one-line
+# /etc/apt/sources.list, so patch whichever file is actually populated.
+if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then
+    sed -i '/^Types:/i Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
+fi
+if [ -s /etc/apt/sources.list ]; then
+    sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
+fi
 
 apt-get update
 apt-get install -y --no-install-recommends \

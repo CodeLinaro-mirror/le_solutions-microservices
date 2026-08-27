@@ -6,7 +6,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 ARG BUILD_LITERT_LM=true
 ARG BUILD_LLAMACPP=false
-ARG QAIRT_SDK_VERSION=2.45.40.260406
+ARG QAIRT_SDK_VERSION=2.48.0.260626
 # ─────────────────────────────────────────────────────────────────────────────
 # responses/Dockerfile
 #

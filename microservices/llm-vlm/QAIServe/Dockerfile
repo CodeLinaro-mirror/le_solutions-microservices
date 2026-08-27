@@ -46,6 +46,13 @@
 #                       (Stage 1). Defaults to the version validated for
 #                       this Dockerfile.
 #
+#   LITERT_VERSION      LiteRT release tag to build in Stage 0 (litert_builder).
+#                       Defaults to the version validated for this Dockerfile.
+#
+#   LITERT_LM_VERSION   LiteRT-LM release tag to build in Stage 0b
+#                       (litert_lm_builder). Defaults to the version validated
+#                       for this Dockerfile.
+#
 #   BUILD_LITERT_LM_CLI_TOOLS  Build the litert-lm / litert-lm-advanced
 #                       on-device debugging/benchmarking CLI binaries
 #                       (Stage 0b). QAIServe never calls these at runtime —
@@ -56,24 +63,29 @@
 #                       and ship them again.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-ARG QAIRT_SDK_VERSION=2.45.40.260406
+ARG QAIRT_SDK_VERSION=2.48.0.260626
+ARG LITERT_VERSION=2.1.6
+ARG LITERT_LM_VERSION=0.14.0
 ARG BUILD_LITERT_LM_CLI_TOOLS=false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: litert_builder
 #
-# Builds LiteRT v2.1.5 natively on AArch64 using Bazelisk.
+# Builds LiteRT natively on AArch64 using Bazelisk.
 # Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
 
-# Re-declare to bring the global ARG into this stage's scope.
+# Re-declare to bring the global ARGs into this stage's scope.
 ARG QAIRT_SDK_VERSION
+ARG LITERT_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         clang \
+        clang-15 \
         lld \
+        lld-15 \
         llvm \
         g++ \
         wget \
@@ -102,6 +114,7 @@ RUN wget -t 3 -T 120 --no-verbose \
     && chmod +x /usr/local/bin/bazel
 
 # Build LiteRT using modular script
+ENV LITERT_VERSION=${LITERT_VERSION}
 ENV QAIRT_LITERT_VERSION=${QAIRT_SDK_VERSION}
 ENV LITERT_SRC_DIR=/mnt/work/src/litert
 ENV LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
@@ -133,11 +146,13 @@ RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-liter
 # ─────────────────────────────────────────────────────────────────────────────
 FROM litert_builder AS litert_lm_builder
 
-# Re-declare to bring the global ARG into this stage's scope, then export as
+# Re-declare to bring the global ARGs into this stage's scope, then export as
 # ENV so build-litert-lm-incremental.sh (a plain RUN, not a build-arg-aware
-# step) can read it.
+# step) can read them.
 ARG BUILD_LITERT_LM_CLI_TOOLS
+ARG LITERT_LM_VERSION
 ENV BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS}
+ENV LITERT_LM_VERSION=${LITERT_LM_VERSION}
 
 # Build LiteRT-LM using modular script
 # LITERT_SRC_DIR is already inherited from litert_builder (this stage is

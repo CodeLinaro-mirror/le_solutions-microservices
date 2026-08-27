@@ -5,10 +5,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # build-litert-lm-incremental.sh
 #
-# Builds LiteRT-LM v0.13.0 incrementally on top of already-built LiteRT.
+# Builds LiteRT-LM incrementally on top of already-built LiteRT.
 # This matches the exact build logic from QAIServe/Dockerfile litert_lm_builder stage.
 #
 # Environment Variables (must be set to overwrite default values):
+#   LITERT_LM_VERSION=0.13.0
 #   LITERT_SRC_DIR=/mnt/work/src/litert (from litert_builder stage)
 #   LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 #   LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
@@ -22,22 +23,23 @@ set -eu
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults — used only when a variable isn't already set in the environment
 # ─────────────────────────────────────────────────────────────────────────────
+LITERT_LM_VERSION="${LITERT_LM_VERSION:-0.13.0}"
 LITERT_SRC_DIR="${LITERT_SRC_DIR:-/mnt/work/src/litert}"
 LITERT_LM_SRC_DIR="${LITERT_LM_SRC_DIR:-/mnt/work/src/litert-lm}"
 LITERT_LM_DEPLOY_DIR="${LITERT_LM_DEPLOY_DIR:-/mnt/work/deploy/usr}"
 BUILD_LITERT_LM_CLI_TOOLS="${BUILD_LITERT_LM_CLI_TOOLS:-true}"
 
-echo "=== Building LiteRT-LM v0.13.0 (incremental on top of LiteRT) ==="
+echo "=== Building LiteRT-LM v${LITERT_LM_VERSION} (incremental on top of LiteRT) ==="
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Clone LiteRT-LM v0.13.0 with retry logic (POSIX-compatible)
+# Clone LiteRT-LM v${LITERT_LM_VERSION} with retry logic (POSIX-compatible)
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Cloning LiteRT-LM v0.13.0..."
+echo "Cloning LiteRT-LM v${LITERT_LM_VERSION}..."
 git lfs install
 
 i=1
 while [ "$i" -le 5 ]; do
-    if git clone --branch v0.13.0 --depth 1 \
+    if git clone --branch "v${LITERT_LM_VERSION}" --depth 1 \
         https://github.com/google-ai-edge/LiteRT-LM.git "${LITERT_LM_SRC_DIR}"; then
         break
     else
@@ -73,6 +75,8 @@ bazel build \
     --config=linux \
     --config=linux_arm64 \
     --compilation_mode=opt \
+    --action_env=CC=clang-15 \
+    --action_env=CXX=clang++-15 \
     --override_repository=litert="${LITERT_SRC_DIR}" \
     --define=litert_enable_qnn=true \
     --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
@@ -92,6 +96,8 @@ if [ "$BUILD_LITERT_LM_CLI_TOOLS" = "true" ]; then
         --config=linux \
         --config=linux_arm64 \
         --compilation_mode=opt \
+        --action_env=CC=clang-15 \
+        --action_env=CXX=clang++-15 \
         --override_repository=litert="${LITERT_SRC_DIR}" \
         --define=litert_enable_qnn=true \
         --define=litert_link_capi_so=true \
@@ -174,7 +180,7 @@ test -f "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm"
 test -f "${LITERT_LM_DEPLOY_DIR}/bin/litert-lm-advanced"
 echo "✓ litert-lm CLI tools staged successfully"
 
-echo "✓ LiteRT-LM v0.13.0 build complete (incremental)"
+echo "✓ LiteRT-LM v${LITERT_LM_VERSION} build complete (incremental)"
 echo "  Libraries: ${LITERT_LM_DEPLOY_DIR}/lib"
 echo "  Binaries: ${LITERT_LM_DEPLOY_DIR}/bin"
 echo "  Headers: ${LITERT_LM_DEPLOY_DIR}/include"
