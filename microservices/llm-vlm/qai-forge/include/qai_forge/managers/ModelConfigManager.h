@@ -39,7 +39,7 @@ struct ModelConfig {
     std::string thinking_start_tag = "<think>";
     std::string thinking_end_tag = "</think>";
     int default_thinking_budget = 8192;
-    json chat_template;                     // Chat template config from metadata.json
+    json chat_template = json::object();    // Chat template config from metadata.json
     std::optional<json> vision_preprocessing; // VLM-specific preprocessing params
 
     // Runtime identifier from metadata.json "runtime" field.
@@ -112,6 +112,13 @@ public:
     // Returns "generative" if the model is not found (safe default).
     // Used by InferenceRouter to select the correct orchestrator.
     std::string getModelType(const std::string& model_id) const;
+
+    // Dynamic metadata update — called by LiteRTLMWorkerManager after the worker
+    // sends the METADATA IPC message. Updates context_size and jinja_template
+    // for the given model_id under a write lock.
+    void updateLiteRTLMMetadata(const std::string& model_id,
+                                 int max_context_length,
+                                 const std::string& jinja_template);
 
 private:
     ModelConfigManager() = default;

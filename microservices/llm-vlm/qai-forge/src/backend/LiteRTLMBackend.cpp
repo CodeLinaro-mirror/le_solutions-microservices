@@ -2,11 +2,18 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMBackend — IGenerativeBackend implementation for LiteRT-LM
+// LiteRTLMBackend — Phase 3: IGenerativeBackend implementation for LiteRT-LM
 //
-// Delegates to InferenceWorkerManager with process_type "litert-lm".
-// The worker binary (litert-lm-inference-worker) uses LiteRT-LM's
-// LlmInference C++ API to run LLM inference on the Qualcomm NPU.
+// Wraps LiteRTLMWorkerManager (which extends InferenceWorkerManager) to manage
+// the litert-lm-inference-worker subprocess. The worker uses the LiteRT-LM
+// Session API for raw inference; all chat intelligence lives in
+// LiteRTLMOrchestrator (Phase 4).
+//
+// Key differences from the old singleton-based implementation:
+//   - Uses LiteRTLMWorkerManager instead of plain InferenceWorkerManager
+//   - Exposes getMetadata() for LiteRTLMOrchestrator initialization
+//   - unloadModel() always uses SIGKILL for clean DSP resource reclamation
+//   - Supports scheduler-owned instances (one per ModelRuntime)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/LiteRTLMBackend.h"
@@ -14,23 +21,29 @@
 #include "qai_forge/utils/Logger.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker singleton
-// ─────────────────────────────────────────────────────────────────────────────
-
-static InferenceWorkerManager& getLiteRTLMWorker() {
-    static InferenceWorkerManager worker("litert-lm");
-    return worker;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Singleton
+// Construction
 // ─────────────────────────────────────────────────────────────────────────────
 
 LiteRTLMBackend::LiteRTLMBackend() = default;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Singleton (legacy path — kept for BackendFactory::getGenerativeBackend)
+// ─────────────────────────────────────────────────────────────────────────────
+
 LiteRTLMBackend& LiteRTLMBackend::getInstance() {
     static LiteRTLMBackend instance;
     return instance;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// worker() — lazy-initialize the LiteRTLMWorkerManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+LiteRTLMWorkerManager& LiteRTLMBackend::worker() {
+    if (!worker_) {
+        worker_ = std::make_unique<LiteRTLMWorkerManager>();
+    }
+    return *worker_;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,14 +59,53 @@ BackendCapabilities LiteRTLMBackend::capabilities() const {
                                             ? 4096
                                             : cfg.getContextSize(current_model_id_),
         .compaction_threshold         = 0.70f,
-        // Qualcomm NPU: only one inference at a time
+        // Qualcomm NPU: only one inference at a time per backend instance
         .concurrency_model            = ConcurrencyModel::EXCLUSIVE,
         .max_concurrent               = 1,
         // LiteRT-LM does not filter <think> tokens internally
         .backend_filters_think_tokens = false,
-        // KV save/restore support depends on LiteRT-LM version
+        // KV save/restore not yet supported for LiteRT-LM
         .supports_kv_save_restore     = false,
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// loadModel()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void LiteRTLMBackend::loadModel(const std::string& model_id) {
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id + "' not found. Check /v1/models for available models.",
+            404);
+    }
+
+    LOG_INFO("[LiteRTLMBackend] loadModel: model=" << model_id
+             << " config=" << model_config->config_file);
+
+    ensureWorkerRunning(model_id, model_config->config_file, "");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// unloadModel()
+//
+// Always uses SIGKILL (force=true) to ensure the kernel's QNN driver exit
+// handler reclaims all DSP contexts cleanly. Same rationale as GenIEBackend.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void LiteRTLMBackend::unloadModel(bool /*force*/) {
+    LOG_INFO("[LiteRTLMBackend] unloadModel: model=" << current_model_id_
+             << " (always SIGKILL for clean DSP reclamation)");
+
+    if (worker_) {
+        worker_->terminateWorker(true); // Always SIGKILL
+        worker_.reset();
+    }
+
+    current_model_id_.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,8 +116,9 @@ void LiteRTLMBackend::ensureWorkerRunning(const std::string& model_id,
                                            const std::string& config_file,
                                            const std::string& sampler_config) {
     current_model_id_ = model_id;
-    LOG_DEBUG("[LiteRTLMBackend] ensureWorkerRunning: model=" << model_id);
-    getLiteRTLMWorker().ensureWorkerRunning(model_id, config_file, sampler_config);
+    LOG_DEBUG("[LiteRTLMBackend] ensureWorkerRunning: model=" << model_id
+              << " config=" << config_file);
+    worker().ensureWorkerRunning(model_id, config_file, sampler_config);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +140,7 @@ void LiteRTLMBackend::generate(
     std::function<void(const IPCDoneEvent&)>   on_done,
     std::function<void(const IPCErrorEvent&)>  on_error)
 {
-    getLiteRTLMWorker().executeRequest(
+    worker().executeRequest(
         event_id,
         prompt,
         streaming,
@@ -133,10 +186,27 @@ void LiteRTLMBackend::onContextCompacted() {
     LOG_INFO("[LiteRTLMBackend] Context compacted — resetting KV cache for model: "
              << current_model_id_);
     try {
-        getLiteRTLMWorker().sendReset();
+        worker().sendReset();
     } catch (const std::exception& e) {
         LOG_WARN("[LiteRTLMBackend] KV cache reset failed: " << e.what()
                  << " (non-fatal — continuing with summary)");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resetKvAsync() — Eager background KV cache reset
+// ─────────────────────────────────────────────────────────────────────────────
+
+void LiteRTLMBackend::resetKvAsync() {
+    LOG_INFO("[LiteRTLMBackend] Initiating background KV reset for model: "
+             << current_model_id_);
+    try {
+        if (worker_) {
+            worker_->initiateBackgroundReset();
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("[LiteRTLMBackend] Failed to initiate background KV reset: " << e.what()
+                 << " (non-fatal)");
     }
 }
 
@@ -145,25 +215,48 @@ void LiteRTLMBackend::onContextCompacted() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void LiteRTLMBackend::saveKv(const std::string& name) {
-    getLiteRTLMWorker().saveKvCache(name);
+    // LiteRT-LM KV save not yet supported — log and continue
+    LOG_WARN("[LiteRTLMBackend] saveKv('" << name << "') not supported for LiteRT-LM");
 }
 
 void LiteRTLMBackend::restoreKv(const std::string& name) {
-    getLiteRTLMWorker().restoreKvCache(name);
+    // LiteRT-LM KV restore not yet supported — log and continue
+    LOG_WARN("[LiteRTLMBackend] restoreKv('" << name << "') not supported for LiteRT-LM");
 }
 
 void LiteRTLMBackend::resetKv() {
-    getLiteRTLMWorker().sendReset();
+    try {
+        worker().sendReset();
+    } catch (const std::exception& e) {
+        LOG_WARN("[LiteRTLMBackend] resetKv failed: " << e.what());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// terminateWorker() / isHealthy()
+// terminateWorker()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void LiteRTLMBackend::terminateWorker(bool force) {
-    getLiteRTLMWorker().terminateWorker(force);
+    if (worker_) {
+        worker_->terminateWorker(force);
+    }
+    current_model_id_.clear();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// isHealthy()
+// ─────────────────────────────────────────────────────────────────────────────
+
 bool LiteRTLMBackend::isHealthy() const {
-    return getLiteRTLMWorker().isWorkerRunning();
+    return worker_ && worker_->isWorkerRunning();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getMetadata() — Return metadata received from worker after model load
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LiteRTLMMetadata& LiteRTLMBackend::getMetadata() const {
+    static const LiteRTLMMetadata empty_metadata;
+    if (!worker_) return empty_metadata;
+    return worker_->getMetadata();
 }

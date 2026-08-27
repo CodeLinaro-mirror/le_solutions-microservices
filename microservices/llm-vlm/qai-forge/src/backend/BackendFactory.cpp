@@ -23,6 +23,7 @@
 #include "qai_forge/backend/SNPEBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/GenieOrchestrator.h"
+#include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
 // PredictiveWorkerManager must be a complete type here because
 // std::make_unique<QNNBackend/SNPEBackend/LiteRTBackend>() instantiates
@@ -39,10 +40,8 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
     }
 
     if (runtime == "litert_lm") {
-        throw GenAIException(
-            GenAIErrorCode::INVALID_REQUEST,
-            "Scheduler-owned LiteRT-LM backend is not implemented yet.",
-            400);
+        // Phase 3: Scheduler-owned LiteRTLMBackend instance
+        return std::make_unique<LiteRTLMBackend>();
     }
 
     throw GenAIException(
@@ -68,7 +67,32 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
 RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
     RuntimePair pair;
     pair.backend = createGenerativeBackendForModel(model_id);
-    pair.orchestrator = std::make_unique<GenieOrchestrator>();
+
+    // Select the correct orchestrator based on the backend runtime
+    const auto* model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    std::string runtime = model_config ? model_config->runtime : "genie";
+
+    if (runtime == "litert_lm") {
+        // Phase 4: LiteRTLMOrchestrator
+        // Do NOT call loadModel() here — ModelRuntime::executorLoop() is responsible
+        // for calling backend_->loadModel() when it transitions to the Loading state.
+        // Calling it here would cause a double-load (worker started twice).
+        // LiteRTLMOrchestrator initializes its metadata lazily on the first execute()
+        // call, after ModelRuntime has already loaded the model and the worker has
+        // sent the METADATA IPC event.
+        auto* litert_backend = dynamic_cast<LiteRTLMBackend*>(pair.backend.get());
+        if (litert_backend) {
+            pair.orchestrator = std::make_unique<LiteRTLMOrchestrator>();
+        } else {
+            LOG_WARN("[BackendFactory] litert_lm runtime but backend is not LiteRTLMBackend"
+                     " — falling back to GenieOrchestrator");
+            pair.orchestrator = std::make_unique<GenieOrchestrator>();
+        }
+    } else {
+        pair.orchestrator = std::make_unique<GenieOrchestrator>();
+    }
+
     return pair;
 }
 

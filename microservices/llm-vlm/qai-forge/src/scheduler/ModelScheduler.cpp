@@ -242,7 +242,7 @@ void validateSchedulableOrThrow(const CreateChatCompletionRequest& request,
     }
 
     const std::string runtime = config_mgr.getRuntime(request.model);
-    if (runtime != "genie") {
+    if (runtime != "genie" && runtime != "litert_lm") {
         const std::string reason =
             "runtime '" + runtime + "' is not supported by the scheduler";
         LOG_WARN("[ModelScheduler] " << request_kind

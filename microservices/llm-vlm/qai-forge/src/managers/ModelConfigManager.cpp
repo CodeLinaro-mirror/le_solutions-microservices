@@ -130,6 +130,66 @@ void ModelConfigManager::scanModelBundles() {
         }
     }
 
+    // ── LiteRT-LM: discover bare .litertlm files ──────────────────────────────
+    // .litertlm bundles don't ship with metadata.json — the model metadata
+    // (Jinja template, context length, tool call delimiters) is embedded inside
+    // the binary and extracted by the worker at load time via the METADATA IPC
+    // event. We auto-generate a ModelConfig for each .litertlm file found.
+    //
+    // Discovery rules:
+    //   - Scans models_dir_ recursively for files with extension ".litertlm"
+    //   - Model ID: "{stem}-litert_lm"  (e.g. "gemma3-4b-it-litert_lm")
+    //   - Skips files whose model_id was already registered via metadata.json
+    //   - context_size defaults to 4096; actual value comes from the METADATA
+    //     IPC event sent by the worker after loading the model file
+    for (const auto& entry : fs::recursive_directory_iterator(models_dir_)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".litertlm") continue;
+
+        const std::string file_path = entry.path().string();
+        const std::string stem      = entry.path().stem().string();
+        const std::string model_id  = stem + "-litert_lm";
+
+        // Skip if already registered (e.g. via metadata.json in the same directory)
+        if (new_models.count(model_id)) {
+            LOG_DEBUG("[ModelConfigManager] Skipping .litertlm auto-discovery for '"
+                      << model_id << "' — already registered via metadata.json");
+            continue;
+        }
+
+        try {
+            ModelConfig config;
+            config.id                  = model_id;
+            config.display_name        = stem;
+            config.runtime             = "litert_lm";
+            config.model_type          = "generative";
+            config.config_file         = file_path;
+            config.context_size        = 4096;  // actual value from METADATA IPC event
+            config.supports_streaming  = true;
+            config.supports_vision     = false;
+            config.supports_thinking   = false;
+            config.thinking_start_tag  = "<think>";
+            config.thinking_end_tag    = "</think>";
+
+            // Estimate memory from file size (×1.25 for runtime overhead)
+            std::error_code ec;
+            uintmax_t file_bytes = fs::file_size(entry.path(), ec);
+            config.memory_requirement_mb = (!ec && file_bytes > 0)
+                ? static_cast<int>(static_cast<double>(file_bytes) / (1024.0 * 1024.0) * 1.25)
+                : 4096;
+
+            new_models[model_id] = std::move(config);
+            if (new_default.empty()) new_default = model_id;
+
+            LOG_INFO("[ModelConfigManager] Auto-discovered LiteRT-LM model: "
+                     << model_id << " -> " << file_path);
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("[ModelConfigManager] Error auto-discovering .litertlm file "
+                      << file_path << ": " << e.what());
+        }
+    }
+
     std::unique_lock lock(mutex_);
     models_ = std::move(new_models);
     default_model_id_ = new_default;
@@ -232,6 +292,11 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     // "predictive" is used for classification/detection/segmentation models.
     config.model_type = metadata.value("model_type", "generative");
 
+    // ── Runtime identifier ────────────────────────────────────────────────────
+    // Read runtime FIRST so it can be used in the config_file resolution below.
+    // Defaults to "genie" for backward compatibility.
+    config.runtime = metadata.value("runtime", "genie");
+
     auto pipeline_nodes = genie.value("pipeline", json::object()).value("nodes", json::object());
 
     if (config.model_type == "predictive") {
@@ -239,8 +304,28 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         std::string model_file;
         if (!model_files.empty()) {
             model_file = model_files.begin().key();
-			config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
+            config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
         }
+    }
+    else if (config.runtime == "litert_lm") {
+        // Phase 5: LiteRT-LM model discovery
+        // The config_file points to the .litertlm model bundle file.
+        // Look for a .litertlm file in the bundle directory.
+        auto model_files = metadata.value("model_files", json::object());
+        if (!model_files.empty()) {
+            // Use the first model file listed in metadata.json
+            std::string model_file = model_files.begin().key();
+            config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
+        } else {
+            // Scan the bundle directory for a .litertlm file
+            for (const auto& entry : fs::directory_iterator(bundle_path)) {
+                if (entry.path().extension() == ".litertlm") {
+                    config.config_file = entry.path().string();
+                    break;
+                }
+            }
+        }
+        LOG_DEBUG("[ModelConfigManager] LiteRT-LM model: " << config.config_file);
     }
     else if (config.supports_vision) {
         config.config_file = generateVlmGenieConfig(metadata, genie, pipeline_nodes, processed_config_dir);
@@ -257,13 +342,6 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     if (genie.contains("vision_preprocessing") && !genie["vision_preprocessing"].is_null()) {
         config.vision_preprocessing = genie["vision_preprocessing"];
     }
-
-    // ── Runtime identifier ────────────────────────────────────────────────────
-    // Read from metadata.json "runtime" field. Defaults to "genie" for backward
-    // compatibility — all existing bundles already have "runtime": "genie".
-    // Future values: "litert_lm", "onnxrt"
-    // Used by BackendFactory to select the correct IGenerativeBackend.
-    config.runtime = metadata.value("runtime", "genie");
 
     // ── Tensor Specs (for Predictive AI) ────────────────────────────────────
     // Primary source: input_specs / output_specs (flat array format).
@@ -662,4 +740,22 @@ std::string ModelConfigManager::getModelType(const std::string& model_id) const 
     auto it = models_.find(model_id);
     // Default to "generative" — safe for all existing bundles
     return (it != models_.end()) ? it->second.model_type : "generative";
+}
+
+void ModelConfigManager::updateLiteRTLMMetadata(const std::string& model_id,
+                                                 int max_context_length,
+                                                 const std::string& jinja_template) {
+    std::unique_lock lock(mutex_);
+    auto it = models_.find(model_id);
+    if (it == models_.end()) {
+        LOG_WARN("[ModelConfigManager] updateLiteRTLMMetadata: model not found: " << model_id);
+        return;
+    }
+    it->second.context_size = max_context_length;
+    if (!jinja_template.empty()) {
+        it->second.chat_template["jinja_template"] = jinja_template;
+    }
+    LOG_INFO("[ModelConfigManager] Updated LiteRT-LM metadata for " << model_id
+             << ": ctx=" << max_context_length
+             << " jinja=" << (jinja_template.empty() ? "(none)" : "(set)"));
 }
