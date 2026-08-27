@@ -76,16 +76,15 @@ const char* actionToString(int type) {
 } // namespace
 
 WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
-                             ModelRuntimePairFactory runtime_factory)
+                             ModelRuntimePairFactory runtime_factory,
+                             ModelRuntimeEvents runtime_events)
     : config_(config),
       runtime_factory_(runtime_factory ? std::move(runtime_factory)
                                        : defaultRuntimeFactory()),
+      runtime_events_(std::move(runtime_events)),
       eviction_policy_(std::make_unique<EvictionPolicy>()) {
     if (!runtime_factory_) {
         throw std::invalid_argument("WarmModelPool requires a runtime factory");
-    }
-    if (config_.max_concurrent_model_loads == 0) {
-        config_.max_concurrent_model_loads = 1;
     }
     if (config_.blocked_admission_timeout.count() <= 0) {
         config_.blocked_admission_timeout = std::chrono::seconds(30);
@@ -95,8 +94,6 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
     }
     LOG_INFO("[WarmModelPool] Configured: max_active_models="
              << config_.max_active_models
-             << " max_concurrent_model_loads="
-             << config_.max_concurrent_model_loads
              << " idle_timeout_ms=" << config_.idle_timeout.count()
              << " blocked_admission_timeout_ms="
              << config_.blocked_admission_timeout.count()
@@ -123,19 +120,47 @@ void WarmModelPool::start() {
     LOG_INFO("[WarmModelPool] Started event loop");
 }
 
-SubmitResult WarmModelPool::submit(InferenceJobPtr job) {
+ModelRuntime* WarmModelPool::reserve(const std::string& model_id) {
+    if (model_id.empty()) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Cannot reserve a generative runtime without model_id",
+            400);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_requested_) {
+        throw GenAIException(
+            GenAIErrorCode::HARDWARE_UNAVAILABLE,
+            "WarmModelPool is shutting down",
+            503);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    RuntimeRecord& record = getOrCreateRuntimeLocked(model_id, now);
+    ++record.reservation_count;
+    record.last_used_at = now;
+    event_pending_ = true;
+    cv_.notify_one();
+    LOG_DEBUG("[WarmModelPool] Reserved runtime: model=" << model_id
+              << " pending_reservations=" << record.reservation_count);
+    return record.runtime.get();
+}
+
+SubmitResult WarmModelPool::submit(ModelRuntime* runtime,
+                                   GenerativeJobPtr job) {
     if (!job) {
         return rejected(
             SubmitStatus::REJECTED_MODEL_NOT_FOUND,
             {},
-            "WarmModelPool received null inference job");
+            "WarmModelPool received null generative job");
     }
 
-    if (job->model_id.empty()) {
+    if (!runtime || job->model_id.empty()) {
         return rejected(
             SubmitStatus::REJECTED_MODEL_NOT_FOUND,
             job->job_id,
-            "Inference job is missing model_id");
+            "Generative job is missing its reserved runtime or model_id");
     }
 
     {
@@ -147,8 +172,16 @@ SubmitResult WarmModelPool::submit(InferenceJobPtr job) {
                 "WarmModelPool is shutting down");
         }
 
+        auto it = runtimes_.find(job->model_id);
+        if (it == runtimes_.end() || it->second.runtime.get() != runtime) {
+            return rejected(
+                SubmitStatus::REJECTED_MODEL_NOT_FOUND,
+                job->job_id,
+                "Reserved runtime does not match model '" + job->model_id + "'");
+        }
+
         const auto now = std::chrono::steady_clock::now();
-        RuntimeRecord& record = getOrCreateRuntimeLocked(job->model_id, now);
+        RuntimeRecord& record = it->second;
 
         if (config_.max_queue_depth_per_model > 0) {
             const ModelRuntimeSnapshot runtime_snapshot = record.runtime->snapshot();
@@ -177,6 +210,33 @@ SubmitResult WarmModelPool::submit(InferenceJobPtr job) {
         job->job_id,
         "queued",
     };
+}
+
+void WarmModelPool::releaseReservation(ModelRuntime* runtime) noexcept {
+    if (!runtime) {
+        return;
+    }
+
+    bool released = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : runtimes_) {
+            RuntimeRecord& record = entry.second;
+            if (record.runtime.get() != runtime || record.reservation_count == 0) {
+                continue;
+            }
+            --record.reservation_count;
+            event_pending_ = true;
+            released = true;
+            LOG_DEBUG("[WarmModelPool] Released runtime reservation: model="
+                      << entry.first << " pending_reservations="
+                      << record.reservation_count);
+            break;
+        }
+    }
+    if (released) {
+        cv_.notify_one();
+    }
 }
 
 CancelResult WarmModelPool::cancel(const std::string& job_id) {
@@ -332,6 +392,7 @@ ModelPoolSnapshot WarmModelPool::snapshotLocked() const {
             runtime_snapshot.running_job_id,
             runtime_snapshot.healthy,
             record.active_reserved,
+            record.reservation_count,
             record.eviction_requested,
             static_cast<bool>(record.tool_lease_until),
             record.tool_chain_id,
@@ -435,7 +496,6 @@ std::vector<WarmModelPool::PoolAction> WarmModelPool::planActionsLocked(
     input.snapshot = snapshotLocked();
     input.config = EvictionPolicyConfig{
         config_.max_active_models,
-        config_.max_concurrent_model_loads,
         config_.idle_timeout,
         config_.blocked_admission_timeout,
         config_.memory_headroom_mb,
@@ -608,7 +668,7 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
         return existing->second;
     }
 
-    ModelRuntimeEvents events;
+    ModelRuntimeEvents events = runtime_events_;
     events.on_state_changed =
         [this](const std::string& changed_model_id, ModelRuntimeState state) {
             handleRuntimeStateChanged(changed_model_id, state);
@@ -628,6 +688,7 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
     record.runtime = std::move(runtime);
     record.state = ModelRuntimeState::NotResident;
     record.active_reserved = false;
+    record.reservation_count = 0;
     record.eviction_requested = false;
     record.last_used_at = now;
 
@@ -681,6 +742,7 @@ WarmModelPool::nextPolicyDeadlineLocked(
         if (config_.idle_timeout.count() > 0 &&
             record.state == ModelRuntimeState::Idle &&
             record.active_reserved &&
+            record.reservation_count == 0 &&
             !record.eviction_requested &&
             !record.tool_lease_until &&
             record.idle_since &&

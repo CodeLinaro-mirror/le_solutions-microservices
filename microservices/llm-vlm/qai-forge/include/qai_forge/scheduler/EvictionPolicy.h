@@ -20,7 +20,6 @@ enum class EvictionPolicyActionType {
 
 struct EvictionPolicyConfig {
     size_t max_active_models = 0;
-    size_t max_concurrent_model_loads = 1;
     std::chrono::milliseconds idle_timeout{0};
     std::chrono::milliseconds blocked_admission_timeout{0};
     long memory_headroom_mb = 1024;

@@ -11,6 +11,45 @@
 
 namespace scheduler {
 
+namespace {
+
+class ScopedLoadPermit {
+public:
+    explicit ScopedLoadPermit(const ModelRuntimeEvents& events)
+        : release_(events.release_load_permit) {
+        if (events.acquire_load_permit) {
+            events.acquire_load_permit();
+            acquired_ = true;
+        }
+    }
+
+    ~ScopedLoadPermit() {
+        release();
+    }
+
+    ScopedLoadPermit(const ScopedLoadPermit&) = delete;
+    ScopedLoadPermit& operator=(const ScopedLoadPermit&) = delete;
+
+    void release() noexcept {
+        if (!acquired_) {
+            return;
+        }
+        acquired_ = false;
+        if (release_) {
+            try {
+                release_();
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    std::function<void()> release_;
+    bool acquired_ = false;
+};
+
+} // namespace
+
 PredictiveModelRuntime::PredictiveModelRuntime(
     std::string model_id,
     std::unique_ptr<IInferenceBackend> backend,
@@ -170,7 +209,9 @@ void PredictiveModelRuntime::loadModelLocked() {
         LOG_DEBUG("[PredictiveModelRuntime] Initializing backend for model '"
                   << model_id_ << "' (file: " << model_file << ")");
 
+        ScopedLoadPermit load_permit(events_);
         backend_->initialize(model_id_, model_file);
+        load_permit.release();
         backend_healthy_ = backend_->isHealthy();
 
         if (!backend_healthy_) {

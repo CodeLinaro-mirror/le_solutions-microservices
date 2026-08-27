@@ -40,18 +40,12 @@ EvictionPolicyPlan EvictionPolicy::plan(
     std::vector<EvictionCandidate> evictable;
     std::vector<EvictionCandidate> fairness_evictable;
     long eventual_reclaimable_mb = 0;
-    size_t loading_count = 0;
 
     for (const auto& runtime : input.snapshot.runtimes) {
         const long model_memory_mb = modelMemoryMb(input, runtime.model_id);
 
         if (runtime.active_reserved && isActiveReservedState(runtime.state)) {
             eventual_reclaimable_mb += model_memory_mb;
-        }
-
-        if (runtime.active_reserved &&
-            runtime.state == ModelRuntimeState::Loading) {
-            ++loading_count;
         }
 
         if (isColdWaitingState(runtime.state) &&
@@ -90,15 +84,6 @@ EvictionPolicyPlan EvictionPolicy::plan(
 
     long remaining_available_mb = input.available_memory_mb;
     size_t active_reserved_count = input.snapshot.active_reserved_models;
-    const size_t max_concurrent_model_loads =
-        input.config.max_concurrent_model_loads > 0
-            ? input.config.max_concurrent_model_loads
-            : 1;
-    size_t available_load_permits =
-        loading_count < max_concurrent_model_loads
-            ? max_concurrent_model_loads - loading_count
-            : 0;
-
     for (const WaitingCandidate& candidate : waiting) {
         if (!candidate.runtime) {
             continue;
@@ -111,14 +96,12 @@ EvictionPolicyPlan EvictionPolicy::plan(
             continue;
         }
 
-        if (available_load_permits > 0 &&
-            active_reserved_count + 1 <= input.config.max_active_models &&
+        if (active_reserved_count + 1 <= input.config.max_active_models &&
             remaining_available_mb >= candidate.required_memory_mb) {
             add_action(EvictionPolicyActionType::Activate,
                        candidate.runtime->model_id);
             remaining_available_mb -= candidate.required_memory_mb;
             ++active_reserved_count;
-            --available_load_permits;
             continue;
         }
 
@@ -210,6 +193,7 @@ bool EvictionPolicy::isIdleTimeoutExpired(
     return config.idle_timeout.count() > 0 &&
            runtime.state == ModelRuntimeState::Idle &&
            runtime.active_reserved &&
+           runtime.reservation_count == 0 &&
            !runtime.eviction_requested &&
            !runtime.tool_lease_active &&
            runtime.queue.total() == 0 &&
@@ -221,6 +205,7 @@ bool EvictionPolicy::isEvictableIdleRuntime(
     const ModelPoolRuntimeSnapshot& runtime) {
     return runtime.state == ModelRuntimeState::Idle &&
            runtime.active_reserved &&
+           runtime.reservation_count == 0 &&
            !runtime.eviction_requested &&
            !runtime.tool_lease_active &&
            runtime.queue.total() == 0;
@@ -229,6 +214,7 @@ bool EvictionPolicy::isEvictableIdleRuntime(
 bool EvictionPolicy::isFairnessDrainCandidate(
     const ModelPoolRuntimeSnapshot& runtime) {
     return runtime.active_reserved &&
+           runtime.reservation_count == 0 &&
            !runtime.eviction_requested &&
            !runtime.tool_lease_active &&
            (runtime.state == ModelRuntimeState::Idle ||

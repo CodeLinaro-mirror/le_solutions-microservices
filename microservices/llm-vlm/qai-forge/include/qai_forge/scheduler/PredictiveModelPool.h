@@ -54,7 +54,8 @@ public:
      *                 If not provided, uses BackendFactory::createPredictiveBackendForModel.
      */
     explicit PredictiveModelPool(WarmModelPoolConfig config,
-                                 PredictiveBackendFactory factory = {});
+                                 PredictiveBackendFactory factory = {},
+                                 ModelRuntimeEvents runtime_events = {});
 
     ~PredictiveModelPool();
 
@@ -63,27 +64,15 @@ public:
     PredictiveModelPool(PredictiveModelPool&&) = delete;
     PredictiveModelPool& operator=(PredictiveModelPool&&) = delete;
 
-    /**
-     * Run synchronous tensor inference.
-     *
-     * If the model is not yet loaded, this will:
-     *   1. Evict idle models if needed to make room
-     *   2. Create a new PredictiveModelRuntime
-     *   3. Load the model (backend.initialize)
-     *   4. Run inference
-     *
-     * If the model is already loaded, this will:
-     *   1. Route to the existing PredictiveModelRuntime
-     *   2. Run inference (serialized with other requests for the same model)
-     *
-     * Thread safety: Multiple concurrent calls are safe. Different models
-     * run concurrently; same model requests are serialized.
-     *
-     * @param request  Input tensors + model ID + output names
-     * @return         Output tensors + inference stats
-     * @throws GenAIException on model-not-found, eviction failure, or inference error
-     */
-    TensorInferenceResponse infer(const TensorInferenceRequest& request);
+    /** @brief Reserve a predictive runtime without passing request payload. */
+    PredictiveModelRuntime* reserve(const std::string& model_id);
+
+    /** @brief Run synchronous inference on the reserved runtime. */
+    TensorInferenceResponse submit(PredictiveModelRuntime* runtime,
+                                   const TensorInferenceRequest& request);
+
+    /** @brief Release one pending runtime reservation. */
+    void releaseReservation(PredictiveModelRuntime* runtime) noexcept;
 
     /**
      * Get a snapshot of the pool state (for monitoring/debugging).
@@ -101,12 +90,12 @@ public:
 private:
     struct RuntimeRecord {
         std::unique_ptr<PredictiveModelRuntime> runtime;
+        size_t reservation_count = 0;
         std::chrono::steady_clock::time_point last_used_at =
             std::chrono::steady_clock::now();
         std::optional<std::chrono::steady_clock::time_point> idle_since;
     };
 
-    PredictiveModelRuntime& getOrLoadModel(const std::string& model_id);
     void evictIfNeeded(const std::string& model_id_to_load);
     void evictIdleModels();
     RuntimeRecord& createRuntimeLocked(const std::string& model_id);
@@ -116,6 +105,7 @@ private:
 
     WarmModelPoolConfig config_;
     PredictiveBackendFactory factory_;
+    ModelRuntimeEvents runtime_events_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

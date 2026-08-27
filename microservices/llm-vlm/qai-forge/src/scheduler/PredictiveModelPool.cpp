@@ -16,9 +16,11 @@ namespace scheduler {
 
 PredictiveModelPool::PredictiveModelPool(
     WarmModelPoolConfig config,
-    PredictiveBackendFactory factory)
+    PredictiveBackendFactory factory,
+    ModelRuntimeEvents runtime_events)
     : config_(std::move(config))
     , factory_(std::move(factory))
+    , runtime_events_(std::move(runtime_events))
     , eviction_policy_(std::make_unique<EvictionPolicy>())
 {
     // Use default factory if none provided
@@ -42,44 +44,60 @@ PredictiveModelPool::~PredictiveModelPool() {
     }
 }
 
-TensorInferenceResponse PredictiveModelPool::infer(
-    const TensorInferenceRequest& request) {
+PredictiveModelRuntime* PredictiveModelPool::reserve(
+    const std::string& model_id) {
+    if (model_id.empty()) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Cannot reserve a predictive runtime without model_id",
+            400);
+    }
 
-    // Get or load the model (outside the critical section for inference)
-    PredictiveModelRuntime* runtime = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_requested_) {
+        throw GenAIException(
+            GenAIErrorCode::HARDWARE_UNAVAILABLE,
+            "PredictiveModelPool is shutting down",
+            503);
+    }
 
-        if (shutdown_requested_) {
-            throw GenAIException(
-                GenAIErrorCode::INTERNAL_ERROR,
-                "PredictiveModelPool is shutting down",
-                503);
-        }
+    evictIdleModels();
 
-        // Evict idle models first (proactive cleanup)
-        evictIdleModels();
-
-        // Get or create runtime for this model
-        auto it = runtimes_.find(request.model);
+    auto it = runtimes_.find(model_id);
+    if (it == runtimes_.end()) {
+        evictIfNeeded(model_id);
+        it = runtimes_.find(model_id);
         if (it == runtimes_.end()) {
-            // Model not loaded — check if we need to evict
-            evictIfNeeded(request.model);
-
-            // Create new runtime
-            auto& record = createRuntimeLocked(request.model);
-            runtime = record.runtime.get();
-        } else {
-            runtime = it->second.runtime.get();
+            RuntimeRecord& record = createRuntimeLocked(model_id);
+            ++record.reservation_count;
+            return record.runtime.get();
         }
     }
 
-    // Run inference (outside the pool mutex — runtime has its own mutex)
+    ++it->second.reservation_count;
+    return it->second.runtime.get();
+}
+
+TensorInferenceResponse PredictiveModelPool::submit(
+    PredictiveModelRuntime* runtime,
+    const TensorInferenceRequest& request) {
     if (!runtime) {
         throw GenAIException(
             GenAIErrorCode::INTERNAL_ERROR,
-            "Failed to get runtime for model '" + request.model + "'",
+            "Predictive submit is missing its reserved runtime",
             500);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = runtimes_.find(request.model);
+        if (it == runtimes_.end() || it->second.runtime.get() != runtime) {
+            throw GenAIException(
+                GenAIErrorCode::INVALID_REQUEST,
+                "Reserved predictive runtime does not match model '" +
+                    request.model + "'",
+                400);
+        }
     }
 
     TensorInferenceResponse response = runtime->infer(request);
@@ -97,6 +115,23 @@ TensorInferenceResponse PredictiveModelPool::infer(
     return response;
 }
 
+void PredictiveModelPool::releaseReservation(
+    PredictiveModelRuntime* runtime) noexcept {
+    if (!runtime) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& entry : runtimes_) {
+        RuntimeRecord& record = entry.second;
+        if (record.runtime.get() != runtime || record.reservation_count == 0) {
+            continue;
+        }
+        --record.reservation_count;
+        break;
+    }
+}
+
 ModelPoolSnapshot PredictiveModelPool::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -109,6 +144,12 @@ ModelPoolSnapshot PredictiveModelPool::snapshot() const {
         ModelPoolRuntimeSnapshot runtime_snap;
         runtime_snap.model_id = model_id;
         runtime_snap.state = record.runtime->state();
+        runtime_snap.active_reserved =
+            record.reservation_count > 0 ||
+            (runtime_snap.state != ModelRuntimeState::NotResident &&
+             runtime_snap.state != ModelRuntimeState::Stopped &&
+             runtime_snap.state != ModelRuntimeState::Failed);
+        runtime_snap.reservation_count = record.reservation_count;
         runtime_snap.last_used_at = record.last_used_at;
         runtime_snap.idle_since = record.idle_since;
         runtime_snap.healthy = (runtime_snap.state == ModelRuntimeState::Idle ||
@@ -158,19 +199,6 @@ void PredictiveModelPool::stop(bool force) {
 // Private methods
 // ─────────────────────────────────────────────────────────────────────────────
 
-PredictiveModelRuntime& PredictiveModelPool::getOrLoadModel(
-    const std::string& model_id) {
-
-    auto it = runtimes_.find(model_id);
-    if (it != runtimes_.end()) {
-        return *it->second.runtime;
-    }
-
-    // Model not loaded — create new runtime
-    auto& record = createRuntimeLocked(model_id);
-    return *record.runtime;
-}
-
 void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
     const size_t active_count = activeModelCount();
 
@@ -198,7 +226,8 @@ void PredictiveModelPool::evictIfNeeded(const std::string& model_id_to_load) {
     std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> candidates;
     for (const auto& [model_id, record] : runtimes_) {
         // Only evict idle models
-        if (record.runtime->state() == ModelRuntimeState::Idle) {
+        if (record.runtime->state() == ModelRuntimeState::Idle &&
+            record.reservation_count == 0) {
             candidates.emplace_back(model_id, record.last_used_at);
         }
     }
@@ -242,6 +271,11 @@ void PredictiveModelPool::evictIdleModels() {
         if (record.runtime->state() != ModelRuntimeState::Idle) {
             // Not idle right now (e.g. Running/Loading) — any previously
             // recorded idle_since is stale.
+            record.idle_since.reset();
+            continue;
+        }
+
+        if (record.reservation_count > 0) {
             record.idle_since.reset();
             continue;
         }
@@ -301,7 +335,7 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
     // a call the pool itself made. The pool queries live state via
     // record.runtime->state() instead of caching a mirrored copy.
     auto runtime = std::make_unique<PredictiveModelRuntime>(
-        model_id, std::move(backend), ModelRuntimeEvents{});
+        model_id, std::move(backend), runtime_events_);
 
     runtime->start();
 
@@ -326,9 +360,10 @@ size_t PredictiveModelPool::activeModelCount() const {
     size_t count = 0;
     for (const auto& [model_id, record] : runtimes_) {
         const ModelRuntimeState state = record.runtime->state();
-        if (state != ModelRuntimeState::NotResident &&
-            state != ModelRuntimeState::Stopped &&
-            state != ModelRuntimeState::Failed) {
+        if (record.reservation_count > 0 ||
+            (state != ModelRuntimeState::NotResident &&
+             state != ModelRuntimeState::Stopped &&
+             state != ModelRuntimeState::Failed)) {
             ++count;
         }
     }
