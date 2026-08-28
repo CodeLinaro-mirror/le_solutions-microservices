@@ -18,7 +18,7 @@ if [ "${SKIP_QAIRT:-false}" = "true" ]; then
 fi
 
 # Configuration
-QAIRT_VERSION="${QAIRT_VERSION:-2.45.40.260406}"
+QAIRT_VERSION="${QAIRT_VERSION:-2.48.0.260626}"
 QAIRT_DOWNLOAD_DIR="${QAIRT_DOWNLOAD_DIR:-/tmp/qairt-download}"
 DEPLOY_DIR="${DEPLOY_DIR:-/build/deploy}"
 
@@ -30,14 +30,22 @@ mkdir -p "${QAIRT_DOWNLOAD_DIR}" \
          "${DEPLOY_DIR}/usr/include"
 
 # Download QAIRT SDK (resume on drop; retry with backoff instead of
-# restarting the multi-hundred-MB transfer from scratch each time)
-wget -c -t 5 -T 30 --waitretry=10 -P "${QAIRT_DOWNLOAD_DIR}" \
-    "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
+# restarting the multi-hundred-MB transfer from scratch each time).
+# Skipped when ${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION} already exists —
+# the Dockerfile's qairt_fetcher stage downloads/extracts the SDK once and
+# COPY --from='s it into this path before this script runs, so this and
+# build-litert.sh don't each fetch their own copy of the same
+# multi-hundred-MB zip.
+if [ -d "${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}" ]; then
+    echo "QAIRT SDK v${QAIRT_VERSION} already present at ${QAIRT_DOWNLOAD_DIR} (pre-fetched); skipping download."
+else
+    wget -c -t 5 -T 30 --waitretry=10 -P "${QAIRT_DOWNLOAD_DIR}" \
+        "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
 
-# Extract
-cd "${QAIRT_DOWNLOAD_DIR}"
-unzip "v${QAIRT_VERSION}.zip"
-rm -f "v${QAIRT_VERSION}.zip"
+    cd "${QAIRT_DOWNLOAD_DIR}"
+    unzip "v${QAIRT_VERSION}.zip"
+    rm -f "v${QAIRT_VERSION}.zip"
+fi
 
 # Set paths
 QAIRT_LIB_PATH="${QAIRT_DOWNLOAD_DIR}/qairt/${QAIRT_VERSION}/lib"

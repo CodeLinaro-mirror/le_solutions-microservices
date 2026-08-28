@@ -9,11 +9,12 @@
 # This matches the exact build logic from QAIServe/Dockerfile litert_builder stage.
 #
 # Environment Variables (must be set to overwrite default values):
-#   LITERT_VERSION=2.1.5
+#   LITERT_VERSION=2.1.6
 #   LITERT_SRC_DIR=/mnt/work/src/litert
 #   LITERT_DEPLOY_DIR=/mnt/work/deploy/usr
-#   QAIRT_LITERT_VERSION=2.45.40.260406
+#   QAIRT_LITERT_VERSION=2.48.0.260626
 #   QAIRT_LITERT_DIR=/tmp/qairt-litert
+#   LITERT_QAIRT_PIN_VERSION=2.47.0.260601
 #   HERMETIC_PYTHON_VERSION=3.10
 #   BAZELISK_VERSION=v1.28.1
 #   PYTHON_BIN_PATH=/usr/bin/python3
@@ -26,11 +27,17 @@ set -eu
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults — used only when a variable isn't already set in the environment
 # ─────────────────────────────────────────────────────────────────────────────
-LITERT_VERSION="${LITERT_VERSION:-2.1.5}"
+LITERT_VERSION="${LITERT_VERSION:-2.1.6}"
 LITERT_SRC_DIR="${LITERT_SRC_DIR:-/mnt/work/src/litert}"
 LITERT_DEPLOY_DIR="${LITERT_DEPLOY_DIR:-/mnt/work/deploy/usr}"
-QAIRT_LITERT_VERSION="${QAIRT_LITERT_VERSION:-2.45.40.260406}"
+QAIRT_LITERT_VERSION="${QAIRT_LITERT_VERSION:-2.48.0.260626}"
 QAIRT_LITERT_DIR="${QAIRT_LITERT_DIR:-/tmp/qairt-litert}"
+# The qairt strip_prefix/URL version LiteRT's third_party/qairt/workspace.bzl
+# hardcodes for LITERT_VERSION=2.1.6 (bazel would otherwise auto-download this
+# exact version itself). Must be updated whenever LITERT_VERSION changes to
+# a tag that pins a different qairt version, or bazel's local_path_env lookup
+# below (which reads a directory literally named this) won't find anything.
+LITERT_QAIRT_PIN_VERSION="${LITERT_QAIRT_PIN_VERSION:-2.47.0.260601}"
 HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.10}"
 PYTHON_BIN_PATH="${PYTHON_BIN_PATH:-/usr/bin/python3}"
 PYTHON_LIB_PATH="${PYTHON_LIB_PATH:-/usr/lib/python3/dist-packages}"
@@ -122,29 +129,47 @@ find support -mindepth 2 -maxdepth 2 -name BUILD -exec sed -i -e 's|"@stblib"|"@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download QAIRT SDK
+#
+# Skipped when ${QAIRT_LITERT_DIR}/qairt/${QAIRT_LITERT_VERSION} already
+# exists — the Dockerfile's qairt_fetcher stage downloads/extracts the SDK
+# once and COPY --from='s it into this path before build-litert.sh runs, so
+# this and fetch-qairt-sdk.sh don't each fetch their own copy of the same
+# multi-hundred-MB zip.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Downloading QAIRT SDK ${QAIRT_LITERT_VERSION}..."
-mkdir -p "${QAIRT_LITERT_DIR}"
-QAIRT_ZIP="${QAIRT_LITERT_DIR}/v${QAIRT_LITERT_VERSION}.zip"
-QAIRT_URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip"
-i=1
-while [ "$i" -le 10 ]; do
-    wget -c -t 1 -T 120 --no-verbose -O "${QAIRT_ZIP}" "${QAIRT_URL}" && break
-    echo "Download attempt $i failed, retrying in 15 seconds..."
-    sleep 15
-    i=$((i + 1))
-done
-[ -f "${QAIRT_ZIP}" ] || { echo "ERROR: QAIRT SDK download failed after 10 attempts"; exit 1; }
+if [ -d "${QAIRT_LITERT_DIR}/qairt/${QAIRT_LITERT_VERSION}" ]; then
+    echo "QAIRT SDK ${QAIRT_LITERT_VERSION} already present at ${QAIRT_LITERT_DIR} (pre-fetched); skipping download."
+else
+    echo "Downloading QAIRT SDK ${QAIRT_LITERT_VERSION}..."
+    mkdir -p "${QAIRT_LITERT_DIR}"
+    QAIRT_ZIP="${QAIRT_LITERT_DIR}/v${QAIRT_LITERT_VERSION}.zip"
+    QAIRT_URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_LITERT_VERSION}/v${QAIRT_LITERT_VERSION}.zip"
+    i=1
+    while [ "$i" -le 10 ]; do
+        wget -c -t 1 -T 120 --no-verbose -O "${QAIRT_ZIP}" "${QAIRT_URL}" && break
+        echo "Download attempt $i failed, retrying in 15 seconds..."
+        sleep 15
+        i=$((i + 1))
+    done
+    [ -f "${QAIRT_ZIP}" ] || { echo "ERROR: QAIRT SDK download failed after 10 attempts"; exit 1; }
 
-cd "${QAIRT_LITERT_DIR}"
-unzip "${QAIRT_ZIP}"
-rm -f "${QAIRT_ZIP}"
+    cd "${QAIRT_LITERT_DIR}"
+    unzip "${QAIRT_ZIP}"
+    rm -f "${QAIRT_ZIP}"
+fi
 
-# Create compatibility symlink
+# Create compatibility symlink so LiteRT's local_path_env lookup (which reads
+# "${LITERT_QAIRT_SDK}qairt/${LITERT_QAIRT_PIN_VERSION}" literally) finds our
+# downloaded QAIRT_LITERT_VERSION SDK under the path name LiteRT expects.
 ln -sf "${QAIRT_LITERT_DIR}/qairt/${QAIRT_LITERT_VERSION}" \
-       "${QAIRT_LITERT_DIR}/qairt/2.44.0.260225"
+       "${QAIRT_LITERT_DIR}/qairt/${LITERT_QAIRT_PIN_VERSION}"
 
-echo "QAIRT ${QAIRT_LITERT_VERSION} ready; symlink 2.44.0.260225 → ${QAIRT_LITERT_VERSION}"
+echo "QAIRT ${QAIRT_LITERT_VERSION} ready; symlink ${LITERT_QAIRT_PIN_VERSION} → ${QAIRT_LITERT_VERSION}"
+
+# Point LiteRT's qairt() workspace rule at our local download instead of
+# letting bazel auto-fetch its own hardcoded LITERT_QAIRT_PIN_VERSION — keeps
+# the QNN dispatch/compiler plugin built against the same QAIRT SDK version
+# that fetch-qairt-sdk.sh deploys as the runtime .so libs.
+export LITERT_QAIRT_SDK="${QAIRT_LITERT_DIR}/"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build LiteRT with Bazel
