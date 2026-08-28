@@ -9,6 +9,7 @@
 #include <vector>
 #include <functional>
 #include <stdexcept>
+#include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IGenerativeBackend — Layer 3 interface for generative AI inference
@@ -128,16 +129,16 @@ public:
      * Default implementation is a no-op — only backends that support VLM
      * override this (currently GenIEBackend).
      *
-     * @param image_paths  Preprocessed image file paths written by the
-     *                     orchestrator's preprocessImagesToTempFiles().
-     *                     The backend loads these files and passes them to
-     *                     the VLM pipeline. The orchestrator owns the temp
-     *                     files and deletes them via TempFileGuard.
+     * @param images  Preprocessed image tensors (already encoded by the
+     *                orchestrator's preprocessVision() adapter). The backend
+     *                copies these into IPC shared memory and passes them to
+     *                the VLM pipeline — no temp files, no filesystem lifetime
+     *                to manage.
      */
     virtual void generateVlm(
         const std::string&              event_id,
         const std::string&              prompt,
-        const std::vector<std::string>& image_paths,
+        const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
         int                             max_tokens,
         float                           temperature,
@@ -149,7 +150,7 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) {
         // Default: no-op. Backends without VLM support do not override this.
-        (void)event_id; (void)prompt; (void)image_paths; (void)streaming;
+        (void)event_id; (void)prompt; (void)images; (void)streaming;
         (void)max_tokens; (void)temperature; (void)top_p; (void)top_k;
         (void)presence_penalty; (void)frequency_penalty;
         (void)on_token; (void)on_done; (void)on_error;

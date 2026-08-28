@@ -5,8 +5,8 @@
 // VlmInferenceWorkerManager — Layer 3 VLM Subprocess Manager
 //
 // Extends InferenceWorkerManager for VLM inference. The key addition is
-// executeVlmRequest() which appends image_urls to the EXECUTE command before
-// sending it to the VLM worker subprocess.
+// executeVlmRequest() which appends image_refs (shared-memory offsets) to
+// the EXECUTE command before sending it to the VLM worker subprocess.
 //
 // The VLM worker subprocess (genai-vlm-inference-worker) links against
 // libvlmengine.so (VlmEngine) and handles the image encoding pipeline
@@ -27,7 +27,7 @@ VlmInferenceWorkerManager& VlmInferenceWorkerManager::getInstance() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// executeVlmRequest — builds augmented EXECUTE command with image_urls and
+// executeVlmRequest — builds augmented EXECUTE command with image_refs and
 //                     delegates to the protected sendExecuteAndStream helper.
 //
 // The base class executeRequest() builds its own command internally, so we
@@ -37,7 +37,7 @@ VlmInferenceWorkerManager& VlmInferenceWorkerManager::getInstance() {
 void VlmInferenceWorkerManager::executeVlmRequest(
     const std::string& event_id,
     const std::string& prompt,
-    const std::vector<std::string>& image_urls,
+    const std::vector<std::vector<uint8_t>>& images,
     bool streaming,
     int max_tokens,
     float temperature,
@@ -51,24 +51,39 @@ void VlmInferenceWorkerManager::executeVlmRequest(
 
     std::lock_guard<std::mutex> lock(mutex_);
 
+    json prompt_ref;
+    try {
+        prompt_ref = writePromptToShm(prompt);
+    } catch (const std::exception& e) {
+        is_active_ = false;
+        on_error({event_id, "", e.what()});
+        return;
+    }
+
+    json image_refs;
+    try {
+        image_refs = writeImagesToShm(images);
+    } catch (const std::exception& e) {
+        is_active_ = false;
+        on_error({event_id, "", e.what()});
+        return;
+    }
+
     // Build the EXECUTE command using the standard factory method
     json execute_cmd = InferenceProtocol::createExecuteCommand(
-        event_id, prompt, streaming, max_tokens, temperature,
+        event_id, prompt_ref, streaming, max_tokens, temperature,
         top_p, top_k, presence_penalty, frequency_penalty,
         false  // bypass_think_filter — VLM models don't use thinking
     );
 
-    // Append image URLs so the VLM worker can load and encode them
-    if (!image_urls.empty()) {
-        json urls_array = json::array();
-        for (const auto& url : image_urls) {
-            urls_array.push_back(url);
-        }
-        execute_cmd["image_urls"] = urls_array;
+    // Attach the image shared-memory references so the VLM worker can
+    // resolve them directly from the region it inherited at fork() time.
+    if (!images.empty()) {
+        execute_cmd["image_refs"] = image_refs;
     }
 
     LOG_INFO("[VlmInferenceWorkerManager] Executing VLM request "
-             << event_id << " with " << image_urls.size() << " image(s)");
+             << event_id << " with " << images.size() << " image(s)");
 
     // Delegate to the protected helper — mutex_ is already held above
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);

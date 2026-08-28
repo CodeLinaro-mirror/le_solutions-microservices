@@ -27,7 +27,7 @@
 //   2. Base64: "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ..."}
 //              → Extracts the raw base64 payload directly.
 //
-// VLM Preprocessing (preprocessImage / preprocessImagesToTempFiles):
+// VLM Preprocessing (preprocessImage / preprocessImageToBuffer):
 //   Implements the full Qwen2.5-VL preprocessing pipeline in C++, matching
 //   the Python image_preprocessor.py exactly:
 //     1. Decode JPEG/PNG/WEBP/BMP/GIF via stb_image
@@ -38,11 +38,11 @@
 //     6. Transpose to CHW format
 //     7. Duplicate to temporal_patch_size frames
 //     8. Reshape + transpose to (L, D) patch tensor
-//     9. Write float32 little-endian binary to temp file
+//     9. Return as float32 little-endian bytes
 //
-//   The preprocessed float32 data is written to a temp file and the path is
-//   passed to the VLM worker subprocess, which loads it and passes it directly
-//   to GenieNode_setData(GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT, ...).
+//   The preprocessed float32 bytes are copied into the VLM worker's IPC
+//   shared-memory region by InferenceWorkerManager::writeImagesToShm() and
+//   the worker resolves them directly from the mapped region — no temp file.
 //
 // Session storage optimization:
 //   Full base64 image data is stored only for the LATEST image; older images
@@ -196,7 +196,7 @@ public:
      * containing the raw (compressed) image bytes.
      *
      * This is used for simple file-path passing; for VLM inference use
-     * preprocessImageToTempFile() instead.
+     * preprocessImageToBuffer() instead.
      */
     static std::string resolveToTempFile(const std::string& url);
 
@@ -228,15 +228,15 @@ public:
         const std::string& model_id = "");
 
     /**
-     * Download/decode an image URL and preprocess it, writing the resulting
-     * float32 pixel data to a temporary file.
+     * Download/decode an image URL and preprocess it, returning the
+     * resulting float32 pixel data as an owned byte buffer.
      *
      * This is the primary entry point for the VLM pipeline:
-     *   URL/base64 → download/decode → preprocess → write .raw temp file
+     *   URL/base64 → download/decode → preprocess → raw float32 bytes
      *
-     * The temp file contains the raw float32 bytes of the (L, D) tensor.
-     * The VLM worker loads this file and passes the bytes directly to
-     * GenieNode_setData(GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT, ...).
+     * The caller copies the returned bytes into the VLM worker's IPC shared-
+     * memory region (see InferenceWorkerManager::writeImagesToShm()) — no
+     * temp file is created.
      *
      * The patch ordering algorithm is selected automatically from model_id:
      *   - Qwen models: block-major ordering (Qwen2-VL / Qwen2.5-VL / Qwen3-VL)
@@ -245,38 +245,11 @@ public:
      * @param url      Image URL, data URI, or raw base64 string.
      * @param config   Model-specific preprocessing parameters.
      * @param model_id Model identifier used to select the preprocessing adapter.
-     * @return         Absolute path to a temp file containing float32 pixel data.
-     *                 The caller must delete this file after use.
+     * @return         Raw float32 pixel bytes of the (L, D) tensor.
      * @throws GenAIException(INVALID_REQUEST, ..., 400) on failure.
      */
-    static std::string preprocessImageToTempFile(
+    static std::vector<uint8_t> preprocessImageToBuffer(
         const std::string& url,
         const VisionPreprocessConfig& config,
         const std::string& model_id = "");
-
-    // ── RAII temp file guard ──────────────────────────────────────────────────
-
-    /**
-     * RAII helper: holds a list of temp file paths and deletes them on destruction.
-     *
-     * Example:
-     *   ImageUtils::TempFileGuard guard;
-     *   for (auto& url : image_urls) {
-     *       guard.paths.push_back(
-     *           ImageUtils::preprocessImageToTempFile(url, config));
-     *   }
-     *   // ... pass guard.paths to VLM worker ...
-     *   // Files are deleted when guard goes out of scope.
-     */
-    struct TempFileGuard {
-        std::vector<std::string> paths;
-
-        TempFileGuard() = default;
-        TempFileGuard(const TempFileGuard&) = delete;
-        TempFileGuard& operator=(const TempFileGuard&) = delete;
-        TempFileGuard(TempFileGuard&& other) noexcept
-            : paths(std::move(other.paths)) {}
-        TempFileGuard& operator=(TempFileGuard&&) = delete;
-        ~TempFileGuard();
-    };
 };

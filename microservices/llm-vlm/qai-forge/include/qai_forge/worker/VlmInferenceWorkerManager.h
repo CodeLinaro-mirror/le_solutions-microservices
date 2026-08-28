@@ -6,6 +6,7 @@
 #include "qai_forge/worker/InferenceWorkerManager.h"
 #include <string>
 #include <vector>
+#include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VlmInferenceWorkerManager — Layer 3 VLM Subprocess Manager (P5)
@@ -14,9 +15,10 @@
 // The key difference from the LLM manager is that VLM requests may include
 // image data that must be passed to the worker subprocess.
 //
-// Image data is passed via the EXECUTE command's JSON payload as a base64-
-// encoded string or as a file path (depending on the model adapter's
-// preprocessVision() output).
+// Preprocessed image tensors are copied into the base class's image
+// shared-memory region (see InferenceWorkerManager header Section H) and
+// referenced in the EXECUTE command as an "image_refs" array of
+// {"offset","len"} pairs — no file paths or inline base64 are sent over IPC.
 //
 // The VLM worker subprocess links against libvlmservice.so (vlm-interface.h)
 // instead of libllmservice.so (llm-interface.h).
@@ -34,8 +36,9 @@ public:
      *
      * @param event_id          Unique ID for this inference event
      * @param prompt            The compacted context prompt (text portion)
-     * @param image_urls        List of image URLs or base64 data from the request
-     *                          (extracted by the model adapter's preprocessVision())
+     * @param images             Preprocessed image tensors (already encoded
+     *                          by the model adapter's preprocessVision()),
+     *                          one entry per image in request order
      * @param streaming         Whether to stream tokens
      * @param max_tokens        Max completion tokens
      * @param temperature       Sampling temperature
@@ -49,7 +52,7 @@ public:
      */
     void executeVlmRequest(const std::string& event_id,
                            const std::string& prompt,
-                           const std::vector<std::string>& image_urls,
+                           const std::vector<std::vector<uint8_t>>& images,
                            bool streaming,
                            int max_tokens,
                            float temperature,

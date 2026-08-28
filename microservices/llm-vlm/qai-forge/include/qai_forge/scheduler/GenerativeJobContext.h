@@ -4,8 +4,8 @@
 #pragma once
 
 #include "qai_forge/QaiForge.h"
-#include "qai_forge/utils/ImageUtils.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <variant>
@@ -42,8 +42,7 @@ struct GenerationConfig {
 };
 
 struct PreparedVisionInputs {
-    std::vector<std::string> paths;
-    std::shared_ptr<ImageUtils::TempFileGuard> lifetime;
+    std::vector<std::vector<uint8_t>> buffers;
 };
 
 struct GeniePreparedRequest {

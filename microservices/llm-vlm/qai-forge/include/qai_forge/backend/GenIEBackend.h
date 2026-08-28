@@ -105,13 +105,14 @@ public:
     /**
      * Vision-language VLM inference.
      * Delegates to VlmInferenceWorkerManager::executeVlmRequest().
-     * image_paths are preprocessed .raw files written by the orchestrator's
-     * preprocessImagesToTempFiles() — the VLM worker loads them directly.
+     * images are preprocessed tensors from the orchestrator's
+     * preprocessVision() adapter — copied into IPC shared memory and
+     * referenced by the VLM worker, no temp files involved.
      */
     void generateVlm(
         const std::string&              event_id,
         const std::string&              prompt,
-        const std::vector<std::string>& image_paths,
+        const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
         int                             max_tokens,
         float                           temperature,

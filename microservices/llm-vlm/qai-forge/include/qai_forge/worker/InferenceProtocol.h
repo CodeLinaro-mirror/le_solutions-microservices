@@ -23,6 +23,15 @@ using json = nlohmann::ordered_json;
 // Command flow:
 //   Server → Worker: INIT, EXECUTE, RESET, SAVE_KV, RESTORE_KV, SHUTDOWN
 //   Worker → Server: READY, TOKEN, DONE, ERROR
+//
+// EXECUTE's prompt text does not travel inline in this JSON. The server
+// memcpy's it into a memfd-backed shared-memory region (inherited by the
+// worker across fork()/exec() via the PROMPT_SHM_FD/PROMPT_SHM_BYTES env
+// vars — see InferenceWorkerManager::startWorker()) and EXECUTE carries only
+// a "prompt_ref": {"offset":..,"len":..} pointing into it. This avoids the
+// JSON-escape/unescape scan a large inline prompt string would otherwise
+// cost on every request. Streamed TOKEN output is unaffected — token chunks
+// are small and stay inline.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Command types (Server → Worker) ──────────────────────────────────────────
@@ -101,8 +110,11 @@ public:
         };
     }
 
+    // prompt_ref: {"offset":.., "len":..} into the prompt shared-memory
+    // region (see InferenceWorkerManager::writePromptToShm) — the prompt
+    // text itself never travels inline in this JSON message.
     static json createExecuteCommand(const std::string& event_id,
-                                      const std::string& prompt,
+                                      const json& prompt_ref,
                                       bool streaming,
                                       int max_tokens = 1024,
                                       float temperature = 1.0f,
@@ -114,7 +126,7 @@ public:
         return {
             {"type", CommandType::EXECUTE},
             {"event_id", event_id},
-            {"prompt", prompt},
+            {"prompt_ref", prompt_ref},
             {"streaming", streaming},
             {"max_tokens", max_tokens},
             {"temperature", temperature},

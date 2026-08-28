@@ -33,6 +33,12 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <sys/mman.h>
+
+namespace {
+constexpr size_t kDefaultPromptShmBytes = 4u * 1024 * 1024;   // 4MB
+constexpr size_t kDefaultImageShmBytes  = 32u * 1024 * 1024;  // 32MB
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor / Destructor
@@ -49,6 +55,19 @@ InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
     if (active_timeout_seconds_ <= 0) {
         active_timeout_seconds_ = 600;
     }
+
+    prompt_shm_bytes_ = kDefaultPromptShmBytes;
+    if (const char* env = std::getenv("GENAI_PROMPT_SHM_BYTES")) {
+        size_t bytes = std::strtoull(env, nullptr, 10);
+        if (bytes > 0) prompt_shm_bytes_ = bytes;
+    }
+
+    image_shm_bytes_ = kDefaultImageShmBytes;
+    if (const char* env = std::getenv("GENAI_IMAGE_SHM_BYTES")) {
+        size_t bytes = std::strtoull(env, nullptr, 10);
+        if (bytes > 0) image_shm_bytes_ = bytes;
+    }
+
 }
 
 InferenceWorkerManager::~InferenceWorkerManager() {
@@ -103,6 +122,53 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     int parent_fd = sv[0];
     int child_fd  = sv[1];
 
+    // Create the prompt shared-memory region before fork() so both sides
+    // inherit the same fd number across fork/exec (mirrors sv[] above).
+    // No MFD_CLOEXEC — the fd must survive execl() in the child.
+    int prompt_shm_fd = memfd_create("qai-forge-prompt-shm", 0);
+    if (prompt_shm_fd < 0) {
+        ::close(sv[0]); ::close(sv[1]);
+        throw std::runtime_error(std::string("memfd_create failed: ") + strerror(errno));
+    }
+    if (ftruncate(prompt_shm_fd, static_cast<off_t>(prompt_shm_bytes_)) < 0) {
+        ::close(prompt_shm_fd); ::close(sv[0]); ::close(sv[1]);
+        throw std::runtime_error(std::string("ftruncate failed: ") + strerror(errno));
+    }
+    void* prompt_shm_ptr = mmap(nullptr, prompt_shm_bytes_, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, prompt_shm_fd, 0);
+    if (prompt_shm_ptr == MAP_FAILED) {
+        ::close(prompt_shm_fd); ::close(sv[0]); ::close(sv[1]);
+        throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
+    }
+
+    // Create the image shared-memory region (VLM only) — mirrors the prompt
+    // region above. LLM/litert-lm workers never see this fd/env var.
+    int   image_shm_fd  = -1;
+    void* image_shm_ptr = nullptr;
+    const bool is_vlm_worker = (process_type_ == "vlm");
+    if (is_vlm_worker) {
+        image_shm_fd = memfd_create("qai-forge-image-shm", 0);
+        if (image_shm_fd < 0) {
+            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            ::close(sv[0]); ::close(sv[1]);
+            throw std::runtime_error(std::string("memfd_create (image) failed: ") + strerror(errno));
+        }
+        if (ftruncate(image_shm_fd, static_cast<off_t>(image_shm_bytes_)) < 0) {
+            ::close(image_shm_fd);
+            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            ::close(sv[0]); ::close(sv[1]);
+            throw std::runtime_error(std::string("ftruncate (image) failed: ") + strerror(errno));
+        }
+        image_shm_ptr = mmap(nullptr, image_shm_bytes_, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, image_shm_fd, 0);
+        if (image_shm_ptr == MAP_FAILED) {
+            ::close(image_shm_fd);
+            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            ::close(sv[0]); ::close(sv[1]);
+            throw std::runtime_error(std::string("mmap (image) failed: ") + strerror(errno));
+        }
+    }
+
     // Determine worker binary path from environment.
     // Each process type has its own binary and socket FD env var.
     const char* worker_bin_env = nullptr;
@@ -128,9 +194,15 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     // Set the child socket FD in the environment for the worker
     std::string child_fd_str = std::to_string(child_fd);
     std::string env_var = socket_fd_var;
+    std::string prompt_shm_fd_var    = "PROMPT_SHM_FD=" + std::to_string(prompt_shm_fd);
+    std::string prompt_shm_bytes_var = "PROMPT_SHM_BYTES=" + std::to_string(prompt_shm_bytes_);
+    std::string image_shm_fd_var     = "IMAGE_SHM_FD=" + std::to_string(image_shm_fd);
+    std::string image_shm_bytes_var  = "IMAGE_SHM_BYTES=" + std::to_string(image_shm_bytes_);
 
     pid_t pid = ::fork();
     if (pid < 0) {
+        if (is_vlm_worker) { munmap(image_shm_ptr, image_shm_bytes_); ::close(image_shm_fd); }
+        munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
         ::close(sv[0]);
         ::close(sv[1]);
         throw std::runtime_error(std::string("fork() failed: ") + strerror(errno));
@@ -140,8 +212,14 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
         // ── Child process ──────────────────────────────────────────────────
         ::close(parent_fd);
 
-        // Set socket FD environment variable
+        // Set socket FD and prompt shm FD/size environment variables
         ::putenv(const_cast<char*>(env_var.c_str()));
+        ::putenv(const_cast<char*>(prompt_shm_fd_var.c_str()));
+        ::putenv(const_cast<char*>(prompt_shm_bytes_var.c_str()));
+        if (is_vlm_worker) {
+            ::putenv(const_cast<char*>(image_shm_fd_var.c_str()));
+            ::putenv(const_cast<char*>(image_shm_bytes_var.c_str()));
+        }
 
         // Exec the worker binary
         ::execl(worker_bin, worker_bin, nullptr);
@@ -156,6 +234,12 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     ::close(child_fd);
     worker_pid_ = pid;
     sock_fd_ = parent_fd;
+    prompt_shm_ptr_ = prompt_shm_ptr;
+    prompt_shm_fd_  = prompt_shm_fd;
+    if (is_vlm_worker) {
+        image_shm_ptr_ = image_shm_ptr;
+        image_shm_fd_  = image_shm_fd;
+    }
     socket_path_ = generateSocketPath(model_id);
 
     LOG_INFO("[" << process_type_ << "Worker] Started PID " << worker_pid_
@@ -226,6 +310,25 @@ void InferenceWorkerManager::cleanupWorker(bool force) {
         worker_pid_ = -1;
     }
 
+    if (prompt_shm_ptr_ != nullptr) {
+        munmap(prompt_shm_ptr_, prompt_shm_bytes_);
+        prompt_shm_ptr_ = nullptr;
+    }
+    if (prompt_shm_fd_ >= 0) {
+        ::close(prompt_shm_fd_);
+        prompt_shm_fd_ = -1;
+    }
+
+    if (image_shm_ptr_ != nullptr) {
+        munmap(image_shm_ptr_, image_shm_bytes_);
+        image_shm_ptr_ = nullptr;
+    }
+    if (image_shm_fd_ >= 0) {
+        ::close(image_shm_fd_);
+        image_shm_fd_ = -1;
+    }
+
+    read_buf_.clear();
     current_model_id_.clear();
     is_active_ = false;
 }
@@ -250,28 +353,81 @@ void InferenceWorkerManager::sendMessage(const json& msg) {
 json InferenceWorkerManager::readMessage(int timeout_seconds) {
     if (sock_fd_ < 0) throw std::runtime_error("Worker socket not connected");
 
-    // Use select() for timeout
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(sock_fd_, &read_fds);
-    struct timeval tv{timeout_seconds, 0};
+    // Drain a large chunk per recv() instead of one byte per syscall — a
+    // long prompt/response line can otherwise cost many select()+read()
+    // pairs and dominate the request's wall-clock time.
+    char chunk[65536];
 
-    int ready = ::select(sock_fd_ + 1, &read_fds, nullptr, nullptr, &tv);
-    if (ready == 0) throw std::runtime_error("Timeout waiting for worker response");
-    if (ready < 0) throw std::runtime_error(std::string("select() failed: ") + strerror(errno));
+    while (true) {
+        size_t newline_pos = read_buf_.find('\n');
+        if (newline_pos != std::string::npos) {
+            std::string line = read_buf_.substr(0, newline_pos);
+            read_buf_.erase(0, newline_pos + 1);
+            // Any inbound IPC traffic counts as activity — reset the watchdog timer.
+            last_activity_time_.store(std::chrono::steady_clock::now());
+            return InferenceProtocol::deserialize(line);
+        }
 
-    // Read until newline
-    std::string line;
-    char c;
-    while (::read(sock_fd_, &c, 1) == 1) {
-        if (c == '\n') break;
-        line += c;
+        // Use select() for timeout
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sock_fd_, &read_fds);
+        struct timeval tv{timeout_seconds, 0};
+
+        int ready = ::select(sock_fd_ + 1, &read_fds, nullptr, nullptr, &tv);
+        if (ready == 0) throw std::runtime_error("Timeout waiting for worker response");
+        if (ready < 0) throw std::runtime_error(std::string("select() failed: ") + strerror(errno));
+
+        ssize_t n = ::read(sock_fd_, chunk, sizeof(chunk));
+        if (n <= 0) throw std::runtime_error("Worker socket closed (EOF)");
+
+        read_buf_.append(chunk, static_cast<size_t>(n));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// writePromptToShm — copy a prompt into the shared-memory region, return a
+// {"offset","len"} reference for EXECUTE's "prompt_ref" field. Caller must
+// hold mutex_. See header Section G for the region's lifecycle.
+// ─────────────────────────────────────────────────────────────────────────────
+json InferenceWorkerManager::writePromptToShm(const std::string& prompt) {
+    if (prompt.size() > prompt_shm_bytes_) {
+        throw std::runtime_error(
+            "Prompt exceeds shared-memory capacity (" +
+            std::to_string(prompt_shm_bytes_) + " bytes)");
+    }
+    if (!prompt.empty()) {
+        std::memcpy(prompt_shm_ptr_, prompt.data(), prompt.size());
+    }
+    return {{"offset", 0}, {"len", prompt.size()}};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// writeImagesToShm — copy each image's bytes sequentially into the image
+// shared-memory region, return a JSON array of {"offset","len"} references
+// for EXECUTE's "image_refs" field. Caller must hold mutex_. See header
+// Section H for the region's lifecycle.
+// ─────────────────────────────────────────────────────────────────────────────
+json InferenceWorkerManager::writeImagesToShm(const std::vector<std::vector<uint8_t>>& images) {
+    size_t total = 0;
+    for (const auto& img : images) total += img.size();
+    if (total > image_shm_bytes_) {
+        throw std::runtime_error(
+            "Images exceed shared-memory capacity (" +
+            std::to_string(image_shm_bytes_) + " bytes)");
     }
 
-    if (line.empty()) throw std::runtime_error("Worker socket closed (EOF)");
-    // Any inbound IPC traffic counts as activity — reset the watchdog timer.
-    last_activity_time_.store(std::chrono::steady_clock::now());
-    return InferenceProtocol::deserialize(line);
+    json refs = json::array();
+    size_t offset = 0;
+    auto* base = static_cast<uint8_t*>(image_shm_ptr_);
+    for (const auto& img : images) {
+        if (!img.empty()) {
+            std::memcpy(base + offset, img.data(), img.size());
+        }
+        refs.push_back({{"offset", offset}, {"len", img.size()}});
+        offset += img.size();
+    }
+    return refs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -309,7 +465,7 @@ bool InferenceWorkerManager::sendCommandAndWaitReady(const json& cmd, int timeou
 // until the final READY arrives. Caller MUST hold mutex_.
 //
 // Extracted from executeRequest() so that VlmInferenceWorkerManager can build
-// an augmented command (with image_urls) and call this method directly,
+// an augmented command (with image_refs) and call this method directly,
 // without duplicating the streaming loop.
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::sendExecuteAndStream(const json& execute_cmd,
@@ -404,8 +560,17 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
               << " model=" << current_model_id_ << " streaming=" << streaming
               << " max_tokens=" << max_tokens);
 
+    json prompt_ref;
+    try {
+        prompt_ref = writePromptToShm(prompt);
+    } catch (const std::exception& e) {
+        is_active_ = false;
+        on_error({event_id, "", e.what()});
+        return;
+    }
+
     json execute_cmd = InferenceProtocol::createExecuteCommand(
-        event_id, prompt, streaming, max_tokens, temperature,
+        event_id, prompt_ref, streaming, max_tokens, temperature,
         top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter
     );
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
