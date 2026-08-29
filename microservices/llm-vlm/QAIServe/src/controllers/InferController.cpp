@@ -29,9 +29,10 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <iomanip>
+#include <mutex>
 #include <random>
 #include <sstream>
-#include <iomanip>
 #include <iostream>
 #include <thread>
 #include <future>
@@ -63,9 +64,32 @@ HttpResponsePtr makeJson(const json& body, HttpStatusCode code = k200OK) {
 
 std::string generateRequestId() {
     static std::mt19937_64 rng(std::random_device{}());
+    static std::mutex rng_mutex;
+    std::lock_guard<std::mutex> lock(rng_mutex);
     std::ostringstream oss;
     oss << "infer-" << std::hex << std::setw(16) << std::setfill('0') << rng();
     return oss.str();
+}
+
+qai_forge::GenerateOptions makeOipGenerateOptions(
+    const OipGenerateRequest& oip_request,
+    const CreateChatCompletionRequest& request) {
+    qai_forge::GenerateOptions options;
+    const std::string turn_id = generateRequestId();
+    options.response_id = turn_id;
+    options.session_id = request.user.value_or(turn_id);
+
+    if (oip_request.messages.has_value() && request.user.has_value() &&
+        !request.user->empty()) {
+        qai_forge::ConversationReference reference;
+        reference.namespace_id = "qaiserve.oip.generate";
+        reference.conversation_id = request.user.value();
+        reference.turn_id = turn_id;
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Latest;
+        options.conversation = std::move(reference);
+    }
+    return options;
 }
 
 // ── KFServing v2 data encoding/decoding ──────────────────────────────────────
@@ -155,12 +179,9 @@ CreateChatCompletionRequest buildChatRequest(
     req.top_p                 = p.top_p;
     req.top_k                 = p.top_k;
 
-    // OIP stateless mode: use a unique ephemeral session ID
-    // (empty user = stateless; non-empty = multi-turn via /v1/responses)
     if (!p.user.empty()) {
         req.user = p.user;
     }
-    // else: no user field → ChatOrchestrator creates a fresh session
 
     if (oip_req.messages.has_value()) {
         // Server applies chat template
@@ -503,7 +524,7 @@ void InferController::inferPostprocess(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /v2/models/{model}/generate — Generative AI blocking (OIP stateless)
+// POST /v2/models/{model}/generate — Generative AI blocking
 // ─────────────────────────────────────────────────────────────────────────────
 void InferController::generate(
     const HttpRequestPtr& req,
@@ -563,8 +584,8 @@ void InferController::generate(
     CreateChatCompletionRequest chat_req = buildChatRequest(oip_req, model_name);
 
     try {
-        qai_forge::GenerateOptions opts;
-        opts.session_id = chat_req.user.value_or(generateRequestId());
+        qai_forge::GenerateOptions opts =
+            makeOipGenerateOptions(oip_req, chat_req);
 
         StandardResponse resp =
             qai_forge::QaiForge::getInstance().generate(chat_req, opts);
@@ -656,9 +677,8 @@ void InferController::generateStream(
             auto done_future  = done_promise->get_future();
 
             try {
-                qai_forge::GenerateOptions opts;
-                opts.session_id = chat_req.user.value_or(
-                    "oip_stream_" + model_name);
+                qai_forge::GenerateOptions opts =
+                    makeOipGenerateOptions(oip_req, chat_req);
 
                 qai_forge::StreamCallbacks callbacks;
                 callbacks.onToken = [shared_stream, model_name, &completion_tokens]

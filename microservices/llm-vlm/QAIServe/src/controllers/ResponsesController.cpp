@@ -15,7 +15,7 @@
 //
 // Input conversion:
 //   Responses API `input` (string or array) → ChatCompletionRequest `messages[]`
-//   `previous_response_id` → session lookup via SessionManager
+//   `previous_response_id` → response lineage lookup via ResponseStore
 //
 // Output conversion:
 //   StandardResponse / StreamChunk → Responses API `output[]` array

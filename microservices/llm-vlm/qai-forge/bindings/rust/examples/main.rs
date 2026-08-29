@@ -9,7 +9,7 @@
 //! QAI_FORGE_LIB_DIR=/path/to/lib cargo run --example chat
 //! ```
 
-use qai_forge::{chat, chat_stream, ChatMessage, ChatRequest};
+use qai_forge::{chat, chat_stream, release_conversation, ChatMessage, ChatRequest};
 
 const MODEL: &str = "Qwen3-1.7B";
 
@@ -92,35 +92,44 @@ fn main() {
     println!("\n=== Multi-turn conversation ===");
     let session = "rust-example-session-001".to_string();
 
+    let first_message = ChatMessage {
+        role: "user".to_string(),
+        content: "My name is Carol and I love Rust.".to_string(),
+    };
     let req1 = ChatRequest {
         model: MODEL.to_string(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: "My name is Carol and I love Rust.".to_string(),
-        }],
+        messages: vec![first_message.clone()],
         user: Some(session.clone()),
         ..Default::default()
     };
 
     match chat(&req1) {
-        Ok(r) => println!("Turn 1: {}", r.content),
+        Ok(r1) => {
+            println!("Turn 1: {}", r1.content);
+            let req2 = ChatRequest {
+                model: MODEL.to_string(),
+                messages: vec![
+                    first_message,
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: r1.content,
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "What is my name and what do I love?".to_string(),
+                    },
+                ],
+                user: Some(session.clone()),
+                ..Default::default()
+            };
+            match chat(&req2) {
+                Ok(r2) => println!("Turn 2: {}", r2.content),
+                Err(e) => eprintln!("Turn 2 error: {}", e),
+            }
+        }
         Err(e) => eprintln!("Turn 1 error: {}", e),
     }
-
-    let req2 = ChatRequest {
-        model: MODEL.to_string(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: "What is my name and what do I love?".to_string(),
-        }],
-        user: Some(session),
-        ..Default::default()
-    };
-
-    match chat(&req2) {
-        Ok(r) => println!("Turn 2: {}", r.content),
-        Err(e) => eprintln!("Turn 2 error: {}", e),
-    }
+    let _ = release_conversation(&session);
 
     // ── Example 5: Custom sampling parameters ─────────────────────────────────
     println!("\n=== Custom sampling parameters ===");

@@ -3,7 +3,7 @@
 
 //! # qai-forge — Rust bindings for qai-forge Layer 2
 //!
-//! Calls `ChatOrchestrator` directly in-process via the C FFI —
+//! Calls `QaiForge` directly in-process via the C FFI —
 //! no HTTP/gRPC/D-Bus server needed.
 //!
 //! ## Build
@@ -38,19 +38,20 @@ use serde::{Deserialize, Serialize};
 
 // ── Raw FFI declarations ───────────────────────────────────────────────────────
 extern "C" {
-    fn qai_forge_chat_blocking(
+    fn qai_forge_generate(
         request_json: *const c_char,
         response_json_out: *mut *mut c_char,
         error_out: *mut *mut c_char,
     ) -> c_int;
 
-    fn qai_forge_chat_streaming(
+    fn qai_forge_generate_stream(
         request_json: *const c_char,
         callback: unsafe extern "C" fn(*const c_char, *mut c_void),
         user_data: *mut c_void,
         error_out: *mut *mut c_char,
     ) -> c_int;
 
+    fn qai_forge_release_conversation(user: *const c_char) -> c_int;
     fn qai_forge_free_string(s: *mut c_char);
     fn qai_forge_version() -> *const c_char;
 }
@@ -79,7 +80,8 @@ pub struct ChatRequest {
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
-    /// Optional session ID for multi-turn conversations.
+    /// Optional private Genie memory scope. Supply the complete transcript on
+    /// every request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
@@ -152,6 +154,12 @@ pub fn version() -> &'static str {
         .unwrap_or("unknown")
 }
 
+/// Releases private runtime memory associated with `user`.
+pub fn release_conversation(user: &str) -> Result<bool, QaiForgeError> {
+    let user = CString::new(user)?;
+    Ok(unsafe { qai_forge_release_conversation(user.as_ptr()) } != 0)
+}
+
 /// Blocking chat completion.
 ///
 /// Blocks until generation is complete and returns the full response.
@@ -167,7 +175,7 @@ pub fn chat(req: &ChatRequest) -> Result<ChatResponse, QaiForgeError> {
     let mut err_ptr: *mut c_char = std::ptr::null_mut();
 
     let rc = unsafe {
-        qai_forge_chat_blocking(req_json.as_ptr(), &mut resp_ptr, &mut err_ptr)
+        qai_forge_generate(req_json.as_ptr(), &mut resp_ptr, &mut err_ptr)
     };
 
     if rc != 0 {
@@ -231,7 +239,7 @@ pub fn chat_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError>
     let mut err_ptr: *mut c_char = std::ptr::null_mut();
 
     let rc = unsafe {
-        qai_forge_chat_streaming(req_json.as_ptr(), on_chunk, chunks_ptr, &mut err_ptr)
+        qai_forge_generate_stream(req_json.as_ptr(), on_chunk, chunks_ptr, &mut err_ptr)
     };
 
     if rc != 0 {
@@ -247,7 +255,7 @@ pub fn chat_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError>
         return Err(QaiForgeError::CApi { code: rc, message });
     }
 
-    // qai_forge_chat_streaming blocks until all callbacks are done
+    // qai_forge_generate_stream blocks until all callbacks are done
     let result = Arc::try_unwrap(chunks)
         .map_err(|_| QaiForgeError::CApi {
             code: -1,

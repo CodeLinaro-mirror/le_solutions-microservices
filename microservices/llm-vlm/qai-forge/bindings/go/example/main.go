@@ -73,10 +73,14 @@ func main() {
 	// ── Example 4: Multi-turn conversation ────────────────────────────────────
 	fmt.Println("\n=== Multi-turn conversation ===")
 	const session = "go-example-session-001"
+	defer qaiforge.ReleaseConversation(session)
+	messages := []qaiforge.ChatMessage{
+		{Role: "user", Content: "My name is Bob and I love Go."},
+	}
 
 	r1, err := qaiforge.Chat(qaiforge.ChatRequest{
 		Model:    model,
-		Messages: []qaiforge.ChatMessage{{Role: "user", Content: "My name is Bob and I love Go."}},
+		Messages: messages,
 		User:     session,
 	})
 	if err != nil {
@@ -84,9 +88,13 @@ func main() {
 	}
 	fmt.Printf("Turn 1: %s\n", r1.Content)
 
+	messages = append(messages,
+		qaiforge.ChatMessage{Role: "assistant", Content: r1.Content},
+		qaiforge.ChatMessage{Role: "user", Content: "What is my name and what do I love?"},
+	)
 	r2, err := qaiforge.Chat(qaiforge.ChatRequest{
 		Model:    model,
-		Messages: []qaiforge.ChatMessage{{Role: "user", Content: "What is my name and what do I love?"}},
+		Messages: messages,
 		User:     session,
 	})
 	if err != nil {

@@ -56,21 +56,30 @@ except QaiForgeError as e:
 print("\n=== Multi-turn conversation ===")
 SESSION = "example-session-001"
 try:
+    messages = [
+        {"role": "user", "content": "My name is Alice and I love Python."}
+    ]
     r1 = llm.chat(
         MODEL,
-        [{"role": "user", "content": "My name is Alice and I love Python."}],
+        messages,
         user=SESSION,
     )
     print(f"Turn 1: {r1['content']}")
 
+    messages.extend([
+        {"role": "assistant", "content": r1["content"]},
+        {"role": "user", "content": "What is my name and what do I love?"},
+    ])
     r2 = llm.chat(
         MODEL,
-        [{"role": "user", "content": "What is my name and what do I love?"}],
+        messages,
         user=SESSION,
     )
     print(f"Turn 2: {r2['content']}")
 except QaiForgeError as e:
     print(f"Error: {e}")
+finally:
+    llm.release_conversation(SESSION)
 
 # ── Example 5: Sampling parameters ────────────────────────────────────────────
 print("\n=== Custom sampling parameters ===")

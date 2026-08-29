@@ -23,11 +23,9 @@ struct GenerativeCallbacks {
 
 struct PostTurnInput {
     std::string session_id;
-    std::string conversation_memory_key;
     json request_messages = json::array();
     GenieMemoryState input_memory;
-    std::optional<MemoryTurnCommitToken> memory_turn;
-    bool uses_private_memory = false;
+    MemoryTurnCommitToken memory_turn;
 };
 
 struct PostTurnTask {
@@ -41,7 +39,6 @@ struct GenerativeJob {
     std::string response_id;
     std::string session_id;
     std::string tool_chain_id;
-    std::string conversation_memory_key;
     std::optional<MemoryTurnCommitToken> memory_turn;
 
     JobKind kind = JobKind::HTTP_NON_STREAMING;

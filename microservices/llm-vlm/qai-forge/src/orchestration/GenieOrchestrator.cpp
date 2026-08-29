@@ -85,26 +85,6 @@ std::string generateEventId() {
     return oss.str();
 }
 
-ConversationMemoryUpdate makeConversationMemoryUpdate(
-    const scheduler::GenieMemoryState& memory) {
-    ConversationMemoryUpdate update;
-    update.summary_content = memory.summary_content;
-    update.summary_token_count = memory.summary_token_count;
-    update.facts = memory.facts;
-    update.evicted_message_count = memory.canonical_boundary;
-    return update;
-}
-
-scheduler::GenieMemoryState makeGenieMemoryState(
-    const ConversationMemoryUpdate& memory) {
-    scheduler::GenieMemoryState state;
-    state.summary_content = memory.summary_content;
-    state.summary_token_count = memory.summary_token_count;
-    state.facts = memory.facts;
-    state.canonical_boundary = memory.evicted_message_count;
-    return state;
-}
-
 json canonicalConversationMessages(const json& messages) {
     json canonical = json::array();
     if (!messages.is_array()) {
@@ -465,14 +445,6 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     const bool uses_private_memory = context.memory_turn.has_value();
 
     json complete_messages = json::array();
-    if (context.caller.use_response_history &&
-        context.caller.response_history.is_array()) {
-        for (const auto& message : context.caller.response_history) {
-            if (message.is_object()) {
-                complete_messages.push_back(message);
-            }
-        }
-    }
     if (request.messages.is_array()) {
         for (const auto& message : request.messages) {
             if (message.is_object()) {
@@ -481,19 +453,9 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
         }
     }
 
-    scheduler::GenieMemoryState input_memory;
-    if (uses_private_memory) {
-        input_memory = std::move(context.memory_state).value_or(
+    scheduler::GenieMemoryState input_memory =
+        std::move(context.memory_state).value_or(
             scheduler::GenieMemoryState{});
-    } else {
-        ConversationMemoryUpdate legacy_memory;
-        legacy_memory.summary_content = context.caller.summary_content;
-        legacy_memory.summary_token_count = context.caller.summary_token_count;
-        legacy_memory.facts = context.caller.facts;
-        legacy_memory.evicted_message_count =
-            context.caller.evicted_message_count;
-        input_memory = makeGenieMemoryState(legacy_memory);
-    }
 
     json post_turn_messages = complete_messages;
     CreateChatCompletionRequest prompt_request = request;
@@ -516,21 +478,6 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
         for (const auto& message : complete_messages) {
             if (message.value("role", "") == "system") {
                 prompt_request.messages.push_back(message);
-            }
-        }
-    } else {
-        if (!is_vlm) {
-            session.summary_content = input_memory.summary_content;
-            session.summary_token_count = input_memory.summary_token_count;
-            session.facts = input_memory.facts;
-            session.evicted_message_count = input_memory.canonical_boundary;
-        }
-        if (context.caller.use_response_history &&
-            context.caller.response_history.is_array()) {
-            for (const auto& message : context.caller.response_history) {
-                if (message.is_object()) {
-                    session.addMessage(message);
-                }
             }
         }
     }
@@ -771,10 +718,6 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    if (!prepared.uses_private_memory && !is_vlm && tool_calls.empty()) {
-        response.updated_conversation_memory =
-            makeConversationMemoryUpdate(prepared.input_memory);
-    }
     LOG_INFO("[GenieOrchestrator] Blocking inference completed: model="
              << job.model_id << " session=" << job.session_id
              << " finish_reason=" << response.finish_reason
@@ -955,10 +898,6 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    if (!prepared.uses_private_memory && !is_vlm && tool_calls.empty()) {
-        response.updated_conversation_memory =
-            makeConversationMemoryUpdate(prepared.input_memory);
-    }
     LOG_INFO("[GenieOrchestrator] Streaming inference completed: model="
              << job.model_id << " session=" << job.session_id
              << " finish_reason=" << response.finish_reason
@@ -972,7 +911,8 @@ GenieOrchestrator::createPostTurnTask(
     const StandardResponse& response) const {
     auto* prepared =
         std::get_if<scheduler::GeniePreparedRequest>(&job.prepared);
-    if (!prepared || job.skip_post_turn_summarization ||
+    if (!prepared || !job.memory_turn.has_value() ||
+        job.skip_post_turn_summarization ||
         !prepared->vision.buffers.empty() ||
         (response.tool_calls.has_value() &&
          !response.tool_calls.value().empty())) {
@@ -981,13 +921,8 @@ GenieOrchestrator::createPostTurnTask(
 
     scheduler::PostTurnTask task;
     task.input.session_id = job.session_id;
-    task.input.conversation_memory_key =
-        job.conversation_memory_key.empty()
-            ? job.session_id
-            : job.conversation_memory_key;
     task.input.input_memory = std::move(prepared->input_memory);
-    task.input.memory_turn = job.memory_turn;
-    task.input.uses_private_memory = prepared->uses_private_memory;
+    task.input.memory_turn = job.memory_turn.value();
     task.input.request_messages =
         std::move(prepared->conversation_messages);
     task.response = response;
@@ -1029,7 +964,7 @@ scheduler::GenieMemoryState GenieOrchestrator::executePostTurn(
     updated.summary_token_count = session.summary_token_count;
     updated.facts = session.facts;
     updated.canonical_boundary = session.evicted_message_count;
-    if (task.input.uses_private_memory && updated.canonical_boundary != 0) {
+    if (updated.canonical_boundary != 0) {
         json canonical = json::array();
         for (const auto& message : session.messages) {
             canonical.push_back(message);

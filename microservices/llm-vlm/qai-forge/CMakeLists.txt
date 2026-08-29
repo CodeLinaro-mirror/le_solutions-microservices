@@ -235,7 +235,6 @@ set(QAI_FORGE_SOURCES
     src/scheduler/EvictionPolicy.cpp
     src/scheduler/ModelRuntime.cpp
     src/scheduler/PostTurnWorker.cpp
-    src/scheduler/StoreWorker.cpp
     src/scheduler/WarmModelPool.cpp
     src/scheduler/InferenceScheduler.cpp
 
@@ -250,9 +249,6 @@ set(QAI_FORGE_SOURCES
     # Reasoning (Layer 2)
     src/reasoning/ReasoningRouter.cpp
     src/reasoning/ReasoningBudgetCalculator.cpp
-
-    # Session (Layer 2)
-    src/session/SessionManager.cpp
 
     # Utils (Layer 2)
     src/utils/ImageUtils.cpp

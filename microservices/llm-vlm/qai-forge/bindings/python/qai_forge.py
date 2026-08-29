@@ -34,23 +34,26 @@ except OSError as e:
     ) from e
 
 # ── C function signatures ──────────────────────────────────────────────────────
-_lib.qai_forge_chat_blocking.argtypes = [
+_lib.qai_forge_generate.argtypes = [
     ctypes.c_char_p,                    # request_json
     ctypes.POINTER(ctypes.c_char_p),    # response_json_out
     ctypes.POINTER(ctypes.c_char_p),    # error_out
 ]
-_lib.qai_forge_chat_blocking.restype = ctypes.c_int
+_lib.qai_forge_generate.restype = ctypes.c_int
 
 # Streaming callback: void (*)(const char* chunk_json, void* user_data)
 _STREAM_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
-_lib.qai_forge_chat_streaming.argtypes = [
+_lib.qai_forge_generate_stream.argtypes = [
     ctypes.c_char_p,                    # request_json
     _STREAM_CB_TYPE,                    # callback
     ctypes.c_void_p,                    # user_data
     ctypes.POINTER(ctypes.c_char_p),    # error_out
 ]
-_lib.qai_forge_chat_streaming.restype = ctypes.c_int
+_lib.qai_forge_generate_stream.restype = ctypes.c_int
+
+_lib.qai_forge_release_conversation.argtypes = [ctypes.c_char_p]
+_lib.qai_forge_release_conversation.restype = ctypes.c_int
 
 _lib.qai_forge_free_string.argtypes = [ctypes.c_char_p]
 _lib.qai_forge_free_string.restype = None
@@ -70,7 +73,7 @@ class QaiForge:
     """
     Pythonic wrapper around the qai-forge Layer 2 C API.
 
-    Calls ChatOrchestrator directly in-process — no HTTP/gRPC/D-Bus server needed.
+    Calls QaiForge directly in-process — no HTTP/gRPC/D-Bus server needed.
 
     Examples
     --------
@@ -85,15 +88,18 @@ class QaiForge:
         for chunk in llm.chat_stream("Qwen3-1.7B", [{"role": "user", "content": "Hello"}]):
             print(chunk.get("content_delta", ""), end="", flush=True)
 
-    Multi-turn session (pass the same ``user`` value across turns)::
+    Multi-turn session (send the complete transcript on every turn)::
 
         resp1 = llm.chat("Qwen3-1.7B",
                           [{"role": "user", "content": "My name is Alice"}],
                           user="session-alice")
         resp2 = llm.chat("Qwen3-1.7B",
-                          [{"role": "user", "content": "What is my name?"}],
+                          [{"role": "user", "content": "My name is Alice"},
+                           {"role": "assistant", "content": resp1["content"]},
+                           {"role": "user", "content": "What is my name?"}],
                           user="session-alice")
-        print(resp2["content"])  # → "Your name is Alice."
+        print(resp2["content"])
+        llm.release_conversation("session-alice")
     """
 
     @staticmethod
@@ -130,7 +136,8 @@ class QaiForge:
         top_k : int
             Top-k sampling.
         user : str, optional
-            Session ID for multi-turn conversations.
+            Scope for private Genie runtime memory. The complete message
+            history must still be supplied on every request.
 
         Returns
         -------
@@ -150,7 +157,7 @@ class QaiForge:
         resp_ptr = ctypes.c_char_p(None)
         err_ptr  = ctypes.c_char_p(None)
 
-        rc = _lib.qai_forge_chat_blocking(
+        rc = _lib.qai_forge_generate(
             req_bytes,
             ctypes.byref(resp_ptr),
             ctypes.byref(err_ptr),
@@ -218,7 +225,7 @@ class QaiForge:
             err_ptr = ctypes.c_char_p(None)
             # Keep a reference to the callback so it isn't GC'd during the call
             cb = _STREAM_CB_TYPE(_on_chunk)
-            rc = _lib.qai_forge_chat_streaming(
+            rc = _lib.qai_forge_generate_stream(
                 req_bytes, cb, None, ctypes.byref(err_ptr)
             )
             if rc != 0:
@@ -241,6 +248,15 @@ class QaiForge:
             yield item
 
         t.join()
+
+    @staticmethod
+    def release_conversation(user: str) -> bool:
+        """Release private runtime memory associated with ``user``."""
+        if not user:
+            return False
+        return bool(
+            _lib.qai_forge_release_conversation(user.encode("utf-8"))
+        )
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 

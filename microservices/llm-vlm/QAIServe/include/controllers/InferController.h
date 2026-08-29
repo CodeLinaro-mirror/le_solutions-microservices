@@ -22,10 +22,10 @@
 // Model discovery (GET /v2/models, GET /v2/models/{model}) is handled by
 // ModelsController to keep routing concerns separate.
 //
-// Statelessness for generative models:
-//   /generate and /generate_stream call ChatOrchestrator::resetKvCache()
-//   before and after each inference to ensure clean Genie KV cache state.
-//   This is the OIP stateless contract — each request is independent.
+// Conversation behavior for generative models:
+//   Clients always send the complete message history. Structured-message
+//   requests with a non-empty parameters.user may reuse private Genie runtime
+//   memory for that history. Raw prompts and anonymous requests are stateless.
 //
 // Binary extension for /infer:
 //   Content-Type: application/octet-stream
@@ -109,13 +109,14 @@ public:
     /**
      * POST /v2/models/{model}/generate
      *
-     * Runs Generative AI inference (blocking) via ChatOrchestrator.
+     * Runs Generative AI inference (blocking) via QaiForge.
      * Accepts:
      *   - JSON: { "text_input": "...", "parameters": {...} }
      *   - JSON: { "messages": [...], "parameters": {...} }  (server applies template)
      *   - Multipart: "request" part (JSON) + "image_N" parts (raw bytes, VLM only)
      *
-     * Stateless: resets Genie KV cache before and after inference.
+     * Complete messages remain authoritative when parameters.user scopes
+     * optional Genie runtime memory.
      */
     void generate(const HttpRequestPtr& req,
                   std::function<void(const HttpResponsePtr&)>&& callback,
@@ -124,11 +125,12 @@ public:
     /**
      * POST /v2/models/{model}/generate_stream
      *
-     * Runs Generative AI inference with SSE streaming via ChatOrchestrator.
+     * Runs Generative AI inference with SSE streaming via QaiForge.
      * Same request format as /generate.
      * Response: text/event-stream with OipStreamChunk JSON per token.
      *
-     * Stateless: resets Genie KV cache before and after inference.
+     * Complete messages remain authoritative when parameters.user scopes
+     * optional Genie runtime memory.
      */
     void generateStream(const HttpRequestPtr& req,
                         std::function<void(const HttpResponsePtr&)>&& callback,

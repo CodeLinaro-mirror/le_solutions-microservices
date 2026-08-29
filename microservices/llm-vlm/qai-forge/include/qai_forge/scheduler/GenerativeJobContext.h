@@ -93,7 +93,6 @@ struct GenerativeJobContext {
     std::string execution_session_id;
 
     std::string tool_chain_id;
-    std::string conversation_memory_write_key;
     std::optional<MemoryTurnCommitToken> memory_turn;
     std::optional<GenieMemoryState> memory_state;
     JobKind kind = JobKind::HTTP_NON_STREAMING;

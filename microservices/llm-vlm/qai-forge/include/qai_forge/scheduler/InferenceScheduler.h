@@ -8,7 +8,6 @@
 #include "qai_forge/scheduler/GenerativeJob.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/PredictiveModelPool.h"
-#include "qai_forge/scheduler/StoreWorker.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
 
 #include <chrono>
@@ -120,10 +119,6 @@ public:
     PredictiveRuntimeHandle reserve(
         const PredictiveScheduleMetadata& metadata);
     std::shared_ptr<ConversationMemoryCoordinator> memoryCoordinator() const;
-    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
-        const std::string& memory_key);
-    bool enqueueStoreTask(std::string idempotency_key,
-                          std::function<void()> task);
     CancelResult cancel(const std::string& job_id);
 
     // Scoped to model_id — see QaiForge::clearSession() for rationale.
@@ -150,7 +145,6 @@ private:
 
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> model_load_coordinator_;
-    StoreWorker store_worker_;
     WarmModelPool generative_pool_;
     PredictiveModelPool predictive_pool_;
 };

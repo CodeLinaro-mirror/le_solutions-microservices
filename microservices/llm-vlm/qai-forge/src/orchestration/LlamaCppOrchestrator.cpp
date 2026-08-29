@@ -13,17 +13,9 @@ namespace qai_forge {
 scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
     scheduler::GenerativeJobContext context,
     scheduler::GenerativeCallbacks callbacks) const {
-    json merged_messages = json::array();
-    if (context.caller.use_response_history &&
-        context.caller.response_history.is_array()) {
-        for (auto& message : context.caller.response_history) {
-            merged_messages.push_back(std::move(message));
-        }
-    }
-    if (context.request.messages.is_array()) {
-        for (auto& message : context.request.messages) {
-            merged_messages.push_back(std::move(message));
-        }
+    json merged_messages = std::move(context.request.messages);
+    if (!merged_messages.is_array()) {
+        merged_messages = json::array();
     }
 
     scheduler::LlamaCppPreparedRequest prepared;

@@ -18,9 +18,13 @@
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
 #include <nlohmann/json.hpp>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+#include <mutex>
 
 using json = nlohmann::ordered_json;
 
@@ -34,6 +38,38 @@ static char* alloc_str(const std::string& s) {
     if (p) memcpy(p, s.c_str(), s.size() + 1);
     return p;
 }
+
+static std::string generate_turn_id() {
+    static std::atomic<uint64_t> next_id{1};
+    return "c_api_turn_" + std::to_string(next_id.fetch_add(1));
+}
+
+static qai_forge::GenerateOptions make_generate_options(
+    const CreateChatCompletionRequest& request) {
+    qai_forge::GenerateOptions options;
+    const std::string turn_id = generate_turn_id();
+    options.response_id = turn_id;
+    options.session_id = request.user.value_or(turn_id);
+    if (request.user.has_value() && !request.user->empty() &&
+        request.messages.is_array() && !request.messages.empty()) {
+        qai_forge::ConversationReference reference;
+        reference.namespace_id = "qai_forge.c_api";
+        reference.conversation_id = request.user.value();
+        reference.turn_id = turn_id;
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Latest;
+        options.conversation = std::move(reference);
+    }
+    return options;
+}
+
+struct StreamCompletion {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    int status = 0;
+    std::string error;
+};
 
 // Serialize a StandardResponse to a JSON string.
 static std::string serialize_response(const StandardResponse& resp) {
@@ -113,8 +149,7 @@ int qai_forge_generate(const char*  request_json,
         json j = json::parse(request_json);
         auto req = CreateChatCompletionRequest::from_json(j);
 
-        qai_forge::GenerateOptions opts;
-        opts.session_id = req.user.value_or("");
+        qai_forge::GenerateOptions opts = make_generate_options(req);
 
         StandardResponse resp =
             qai_forge::QaiForge::getInstance().generate(req, opts);
@@ -154,8 +189,8 @@ int qai_forge_generate_stream(const char*           request_json,
         json j = json::parse(request_json);
         auto req = CreateChatCompletionRequest::from_json(j);
 
-        qai_forge::GenerateOptions opts;
-        opts.session_id = req.user.value_or("");
+        qai_forge::GenerateOptions opts = make_generate_options(req);
+        auto completion = std::make_shared<StreamCompletion>();
 
         // Use new async API with callbacks
         qai_forge::StreamCallbacks callbacks;
@@ -166,17 +201,39 @@ int qai_forge_generate_stream(const char*           request_json,
             callback(s.c_str(), user_data);
         };
 
-        // For C API, we don't need onComplete, onError, onCancelled
-        // since this is a fire-and-forget interface
-        callbacks.onComplete = [](const StandardResponse&) {};
-        callbacks.onError = [](const GenAIException&) {};
-        callbacks.onCancelled = []() {};
+        callbacks.onComplete = [completion](const StandardResponse&) {
+            std::lock_guard<std::mutex> lock(completion->mutex);
+            completion->done = true;
+            completion->cv.notify_one();
+        };
+        callbacks.onError = [completion](const GenAIException& error) {
+            std::lock_guard<std::mutex> lock(completion->mutex);
+            completion->status = error.http_status;
+            completion->error = error.message;
+            completion->done = true;
+            completion->cv.notify_one();
+        };
+        callbacks.onCancelled = [completion]() {
+            std::lock_guard<std::mutex> lock(completion->mutex);
+            completion->status = -1;
+            completion->error = "Request cancelled";
+            completion->done = true;
+            completion->cv.notify_one();
+        };
 
         qai_forge::QaiForge::getInstance().generateStream(
             req,
             std::move(callbacks),
             opts);
 
+        std::unique_lock<std::mutex> lock(completion->mutex);
+        completion->cv.wait(lock, [completion]() { return completion->done; });
+        if (completion->status != 0) {
+            if (error_out) {
+                *error_out = alloc_str(completion->error);
+            }
+            return completion->status;
+        }
         return 0;
 
     } catch (const GenAIException& e) {
@@ -263,6 +320,14 @@ void qai_forge_shutdown(int force) {
 int qai_forge_cancel(const char* response_id) {
     if (!response_id) return 0;
     return qai_forge::QaiForge::getInstance().cancel(response_id) ? 1 : 0;
+}
+
+int qai_forge_release_conversation(const char* user) {
+    if (!user || user[0] == '\0') {
+        return 0;
+    }
+    return qai_forge::QaiForge::getInstance().releaseConversation(
+        "qai_forge.c_api", user) ? 1 : 0;
 }
 
 // ── Memory management ─────────────────────────────────────────────────────────

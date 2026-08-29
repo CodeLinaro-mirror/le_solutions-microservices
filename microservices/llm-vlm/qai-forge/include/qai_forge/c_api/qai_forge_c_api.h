@@ -45,8 +45,11 @@ typedef void (*qai_forge_stream_cb_t)(const char* chunk_json, void* user_data);
 //                         "temperature":           1.0,    // optional
 //                         "top_p":                 1.0,    // optional
 //                         "top_k":                 40,     // optional
-//                         "user":                  "sid"   // optional (multi-turn)
+//                         "user":                  "sid"   // optional memory scope
 //                       }
+//                       Callers provide the complete messages array on every
+//                       request. user scopes optional Genie runtime memory; it
+//                       does not provide or replace conversation history.
 //   response_json_out — On success: heap-allocated JSON string. Caller MUST free
 //                       with qai_forge_free_string(). NULL on error.
 //                       {
@@ -133,6 +136,10 @@ void qai_forge_shutdown(int force);
 // Cancel an in-flight generative request by response_id.
 // Returns 1 if cancelled, 0 if not found.
 int qai_forge_cancel(const char* response_id);
+
+// Release QaiForge-owned runtime memory for a non-empty C API user value.
+// Returns 1 if the conversation existed, 0 otherwise.
+int qai_forge_release_conversation(const char* user);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Memory management

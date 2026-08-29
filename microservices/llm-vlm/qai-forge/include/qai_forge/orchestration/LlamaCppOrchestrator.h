@@ -24,7 +24,7 @@ namespace qai_forge {
  * Design:
  * - Stateless: No member variables for backend, session, or state
  * - Backend Injection: Backend passed to execute(), not stored
- * - Response History Merging: Merges options response_history into request.messages
+ * - Complete transcript forwarding through request.messages
  * - Direct Message Passing: Passes messages to llama-server (no Jinja in C++)
  * - SSE Parsing: Parses Server-Sent Events from llama-server
  * - Callback Invocation: Calls OrchestratorStreamCallback with StreamChunk
@@ -63,7 +63,7 @@ private:
     /**
      * @brief Build OpenAI chat completions JSON request
      * @param request Original request
-     * @param merged_messages Messages with response_history merged in
+     * @param merged_messages Complete messages supplied by the caller
      * @return JSON request body for /v1/chat/completions
      */
     json buildChatCompletionsRequest(

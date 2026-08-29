@@ -40,8 +40,11 @@
                    "messages": [{"role": "user", "content": "Hello"}],
                    "max_completion_tokens": 1024,
                    "temperature": 1.0,
-                   "user": "session-id-optional"
+                   "user": "memory-scope-optional"
                  }
+
+         The caller supplies the complete messages array on every request.
+         user only scopes optional private Genie runtime memory.
 
          Output: response_json (s) — JSON string with the full response
                  {

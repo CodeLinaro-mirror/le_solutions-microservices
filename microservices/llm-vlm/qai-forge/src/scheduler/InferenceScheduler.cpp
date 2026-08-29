@@ -301,7 +301,6 @@ void InferenceScheduler::start() {
         generative_pool_.checkpoint();
     });
     model_load_coordinator_->start();
-    store_worker_.start();
     generative_pool_.start();
     started_ = true;
     LOG_INFO("[InferenceScheduler] Started");
@@ -332,20 +331,6 @@ PredictiveRuntimeHandle InferenceScheduler::reserve(
 std::shared_ptr<ConversationMemoryCoordinator>
 InferenceScheduler::memoryCoordinator() const {
     return memory_coordinator_;
-}
-
-std::optional<ConversationMemoryUpdate>
-InferenceScheduler::awaitConversationMemory(const std::string& memory_key) {
-    memory_coordinator_->awaitReady(memory_key);
-    return memory_coordinator_->committedSnapshot(memory_key);
-}
-
-bool InferenceScheduler::enqueueStoreTask(
-    std::string idempotency_key,
-    std::function<void()> task) {
-    return store_worker_.enqueue(
-        std::move(idempotency_key),
-        std::move(task));
 }
 
 CancelResult InferenceScheduler::cancel(const std::string& job_id) {
@@ -387,7 +372,6 @@ void InferenceScheduler::shutdown(bool force) {
     predictive_pool_.stop(force);
     model_load_coordinator_->setCapacityChangedCallback({});
     memory_coordinator_->cancelPending();
-    store_worker_.stop(force);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

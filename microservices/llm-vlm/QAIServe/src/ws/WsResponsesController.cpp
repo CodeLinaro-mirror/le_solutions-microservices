@@ -21,7 +21,8 @@
 #include "ws/WsResponsesController.h"
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/session/SessionManager.h"
+#include <algorithm>
+#include <future>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -38,6 +39,64 @@ static std::string generate_connection_id() {
     std::ostringstream oss;
     oss << "wsconn_" << std::hex << std::setw(16) << std::setfill('0') << rng();
     return oss.str();
+}
+
+static json append_messages(const json& prefix, const json& suffix) {
+    json messages = json::array();
+    for (const auto& message : prefix) {
+        messages.push_back(message);
+    }
+    for (const auto& message : suffix) {
+        messages.push_back(message);
+    }
+    return messages;
+}
+
+static json make_assistant_message(const StandardResponse& response) {
+    json message = {
+        {"role", "assistant"},
+        {"content", response.content.value_or("")},
+    };
+    if (response.reasoning_content.has_value() &&
+        !response.reasoning_content->empty()) {
+        message["_thinking_content"] = response.reasoning_content.value();
+    }
+    if (response.tool_calls.has_value() && !response.tool_calls->empty()) {
+        message["tool_calls"] = response.tool_calls.value();
+    }
+    return message;
+}
+
+static qai_forge::GenerateOptions make_generate_options(
+    const WsConnectionState& state,
+    const std::string& response_id,
+    const std::string& memory_parent_turn_id,
+    const std::string& tool_chain_response_id,
+    bool tool_output_submission) {
+    qai_forge::GenerateOptions options;
+    options.response_id = response_id;
+    options.session_id = state.connection_id;
+
+    qai_forge::ConversationReference reference;
+    reference.namespace_id = "responses.websocket";
+    reference.conversation_id = state.connection_id;
+    reference.turn_id = response_id;
+    if (memory_parent_turn_id.empty()) {
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Root;
+    } else {
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Explicit;
+        reference.parent_turn_id = memory_parent_turn_id;
+    }
+    options.conversation = std::move(reference);
+
+    if (tool_output_submission && !tool_chain_response_id.empty()) {
+        options.previous_response_id = tool_chain_response_id;
+        options.tool_output_submission = true;
+        options.allow_tool_chain_fallback = true;
+    }
+    return options;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,9 +133,9 @@ void WsResponsesController::handleNewConnection(
     std::string conn_id = generate_connection_id();
     conn->setContext(std::make_shared<std::string>(conn_id));
 
-    WsConnectionState state;
-    state.connection_id = conn_id;
-    state.connected_at  = std::chrono::steady_clock::now();
+    auto state = std::make_shared<WsConnectionState>();
+    state->connection_id = conn_id;
+    state->connected_at  = std::chrono::steady_clock::now();
 
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -110,7 +169,7 @@ void WsResponsesController::handleNewMessage(
         std::shared_lock<std::shared_mutex> lock(mutex_);
         auto it = states_.find(conn_id);
         if (it == states_.end()) return;
-        if (it->second.isExpired()) {
+        if (it->second->isExpired()) {
             lock.unlock();
             int timeout_min = WsProtocol::connection_timeout_minutes();
             sendEvent(conn, WsProtocol::make_error(400,
@@ -152,7 +211,7 @@ void WsResponsesController::handleNewMessage(
         std::unique_lock<std::shared_mutex> wlock(mutex_);
         auto it = states_.find(conn_id);
         if (it == states_.end()) return;
-        WsConnectionState& state = it->second;
+        std::shared_ptr<WsConnectionState> state = it->second;
         wlock.unlock();
 
         onResponseCreate(conn, state, event);
@@ -173,16 +232,28 @@ void WsResponsesController::handleConnectionClosed(
     std::string conn_id = getConnectionId(conn);
     if (conn_id.empty()) return;
 
+    std::shared_ptr<WsConnectionState> state;
+    std::string active_response_id;
     std::string last_session_id;
     std::string last_model;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = states_.find(conn_id);
-        if (it != states_.end()) {
-            last_session_id = it->second.last_session_id;
-            last_model = it->second.last_model;
+        auto found = states_.find(conn_id);
+        if (found != states_.end()) {
+            state = found->second;
+            active_response_id = state->active_response_id;
+            last_session_id = state->last_session_id;
+            last_model = state->last_model;
+            states_.erase(found);
         }
-        states_.erase(conn_id);
+    }
+    if (state) {
+        if (!active_response_id.empty()) {
+            qai_forge::QaiForge::getInstance().cancel(
+                active_response_id);
+        }
+        qai_forge::QaiForge::getInstance().releaseConversation(
+            "responses.websocket", state->connection_id);
     }
 
     // Best-effort cleanup of any per-session backend state (e.g. LiteRT-LM
@@ -202,11 +273,9 @@ void WsResponsesController::handleConnectionClosed(
 // ─────────────────────────────────────────────────────────────────────────────
 void WsResponsesController::onResponseCreate(
     const drogon::WebSocketConnectionPtr& conn,
-    WsConnectionState& state,
+    const std::shared_ptr<WsConnectionState>& state,
     const json& event) {
-
-    // ── Sequential enforcement ────────────────────────────────────────────────
-    if (state.response_in_flight.exchange(true)) {
+    if (state->response_in_flight.exchange(true)) {
         sendEvent(conn, WsProtocol::make_error(400,
             WsProtocol::ERR_RESPONSE_IN_PROGRESS,
             "A response is already in progress on this connection. "
@@ -214,64 +283,65 @@ void WsResponsesController::onResponseCreate(
         return;
     }
 
-    // ── Parse required fields ─────────────────────────────────────────────────
     if (!event.contains("model") || !event.contains("input")) {
-        state.response_in_flight.store(false);
+        state->response_in_flight.store(false);
         sendEvent(conn, WsProtocol::make_error(400,
             WsProtocol::ERR_INVALID_REQUEST,
             "Missing required fields: 'model' and 'input'"));
         return;
     }
 
-    std::string model              = event.value("model", "");
-    std::string system_prompt      = event.value("instructions", "");
-    std::string previous_response_id = event.value("previous_response_id", "");
-    bool        store_flag         = event.value("store", true);
-    bool        generate           = event.value("generate", true);
+    const std::string model = event.value("model", "");
+    const std::string system_prompt = event.value("instructions", "");
+    const std::string previous_response_id =
+        event.value("previous_response_id", "");
+    const bool generate = event.value("generate", true);
 
-    // Update store flag on the connection state
-    state.store = store_flag;
-
-    // ── Validate model ────────────────────────────────────────────────────────
     if (!ModelConfigManager::getInstance().validateModel(model)) {
-        state.response_in_flight.store(false);
+        state->response_in_flight.store(false);
         sendEvent(conn, WsProtocol::make_error(404,
             WsProtocol::ERR_MODEL_NOT_FOUND,
             "Model '" + model + "' not found. Check /v1/models for available models."));
         return;
     }
 
-    // ── Resolve session from previous_response_id ─────────────────────────────
-    std::string resolved_session_id;
+    json ancestor_messages = json::array();
+    std::string memory_parent_turn_id;
+    std::string tool_chain_response_id;
+    bool retained_tool_output = false;
     if (!previous_response_id.empty()) {
-        resolved_session_id = state.resolveSession(previous_response_id);
-        if (resolved_session_id.empty()) {
-            state.response_in_flight.store(false);
+        std::optional<WsStoredResponse> parent;
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            parent = state->findResponse(previous_response_id);
+        }
+        if (!parent.has_value()) {
+            state->response_in_flight.store(false);
             sendEvent(conn, WsProtocol::make_error(400,
                 WsProtocol::ERR_PREVIOUS_RESPONSE_NOT_FOUND,
                 "Previous response with id '" + previous_response_id + "' not found.",
                 "previous_response_id"));
             return;
         }
+        ancestor_messages = std::move(parent->messages);
+        memory_parent_turn_id = std::move(parent->memory_turn_id);
+        tool_chain_response_id = std::move(parent->tool_chain_response_id);
+        retained_tool_output = parent->tool_output_pending;
     }
 
-    // ── Parse tools ───────────────────────────────────────────────────────────
-    bool has_mcp_tools      = false;
-    bool has_function_tools = false;
-    json function_tools     = json::array();
+    bool has_mcp_tools = false;
+    json function_tools = json::array();
     std::vector<McpToolRequest> mcp_requests;
-
     if (event.contains("tools") && event["tools"].is_array()) {
         for (const auto& tool : event["tools"]) {
-            std::string tool_type = tool.value("type", "");
+            const std::string tool_type = tool.value("type", "");
             if (tool_type == "mcp") {
                 has_mcp_tools = true;
             } else if (tool_type == "function") {
-                has_function_tools = true;
                 function_tools.push_back(tool);
-            } else if (tool_type == "web_search" || tool_type == "file_search"
-                       || tool_type == "code_interpreter") {
-                state.response_in_flight.store(false);
+            } else if (tool_type == "web_search" || tool_type == "file_search" ||
+                       tool_type == "code_interpreter") {
+                state->response_in_flight.store(false);
                 sendEvent(conn, WsProtocol::make_error(400,
                     WsProtocol::ERR_INVALID_REQUEST,
                     "Built-in tool '" + tool_type + "' is not available on-device. "
@@ -280,110 +350,146 @@ void WsResponsesController::onResponseCreate(
             }
         }
         if (has_mcp_tools) {
-            mcp_requests = ResponsesUtils::extract_mcp_tool_requests(event["tools"]);
+            mcp_requests =
+                ResponsesUtils::extract_mcp_tool_requests(event["tools"]);
         }
     }
 
-    // ── Validate MCP servers ──────────────────────────────────────────────────
     if (has_mcp_tools) {
         auto& registry = McpClientRegistry::getInstance();
-        for (const auto& mcp_req : mcp_requests) {
-            if (!mcp_req.server_label.empty() && !registry.hasServer(mcp_req.server_label)) {
-                state.response_in_flight.store(false);
+        for (const auto& mcp_request : mcp_requests) {
+            if (!mcp_request.server_label.empty() &&
+                !registry.hasServer(mcp_request.server_label)) {
+                state->response_in_flight.store(false);
                 sendEvent(conn, WsProtocol::make_error(400,
                     WsProtocol::ERR_MCP_SERVER_NOT_FOUND,
-                    "MCP server '" + mcp_req.server_label + "' is not registered. "
-                    "Check mcp_servers.json configuration."));
+                    "MCP server '" + mcp_request.server_label +
+                        "' is not registered. Check mcp_servers.json configuration."));
                 return;
             }
         }
     }
 
-    // ── Convert input to messages ─────────────────────────────────────────────
-    json messages = ResponsesUtils::input_to_messages(event["input"], system_prompt);
-    if (messages.empty()) {
-        state.response_in_flight.store(false);
+    json current_messages =
+        ResponsesUtils::input_to_messages(event["input"], system_prompt);
+    if (current_messages.empty()) {
+        state->response_in_flight.store(false);
         sendEvent(conn, WsProtocol::make_error(400,
             WsProtocol::ERR_INVALID_REQUEST,
             "Input produced no messages"));
         return;
     }
+    const bool current_has_tool_output = std::any_of(
+        current_messages.begin(),
+        current_messages.end(),
+        [](const json& message) {
+            return message.is_object() && message.value("role", "") == "tool";
+        });
+    const bool tool_output_submission =
+        retained_tool_output || current_has_tool_output;
+    if (current_has_tool_output && tool_chain_response_id.empty()) {
+        tool_chain_response_id = previous_response_id;
+    }
+    json messages = append_messages(ancestor_messages, current_messages);
+    const std::string response_id = ResponsesUtils::generate_response_id();
 
-    // ── Build SDK request ─────────────────────────────────────────────────────
     CreateChatCompletionRequest sdk_request;
     try {
         json sdk_body = {
-            {"model",    model},
+            {"model", model},
             {"messages", messages},
-            {"stream",   false}
+            {"stream", false},
+            {"user", state->connection_id},
         };
-        if (event.contains("max_output_tokens") && !event["max_output_tokens"].is_null())
+        if (event.contains("max_output_tokens") &&
+            !event["max_output_tokens"].is_null()) {
             sdk_body["max_completion_tokens"] = event["max_output_tokens"];
-        if (event.contains("temperature") && !event["temperature"].is_null())
+        }
+        if (event.contains("temperature") && !event["temperature"].is_null()) {
             sdk_body["temperature"] = event["temperature"];
-        if (event.contains("top_p") && !event["top_p"].is_null())
+        }
+        if (event.contains("top_p") && !event["top_p"].is_null()) {
             sdk_body["top_p"] = event["top_p"];
-
-        // Use resolved session ID (or response_id as session key for new sessions)
-        std::string session_key = resolved_session_id.empty()
-            ? ResponsesUtils::generate_response_id()
-            : resolved_session_id;
-        sdk_body["user"] = session_key;
-
+        }
         sdk_request = CreateChatCompletionRequest::from_json(sdk_body);
-    } catch (const std::exception& e) {
-        state.response_in_flight.store(false);
+    } catch (const std::exception& error) {
+        state->response_in_flight.store(false);
         sendEvent(conn, WsProtocol::make_error(400,
             WsProtocol::ERR_INVALID_REQUEST,
-            std::string("Request parsing error: ") + e.what()));
+            std::string("Request parsing error: ") + error.what()));
         return;
     }
 
-    // ── Aggregate MCP tools ───────────────────────────────────────────────────
     json mcp_function_tools = json::array();
     if (has_mcp_tools) {
         auto& registry = McpClientRegistry::getInstance();
-        for (const auto& mcp_req : mcp_requests) {
-            json server_tools = registry.getAllTools(mcp_req.server_label,
-                                                      mcp_req.allowed_tools);
-            for (const auto& t : server_tools) mcp_function_tools.push_back(t);
+        for (const auto& mcp_request : mcp_requests) {
+            const json server_tools = registry.getAllTools(
+                mcp_request.server_label, mcp_request.allowed_tools);
+            for (const auto& tool : server_tools) {
+                mcp_function_tools.push_back(tool);
+            }
         }
     }
-    for (const auto& ft : function_tools) mcp_function_tools.push_back(ft);
+    for (const auto& tool : function_tools) {
+        mcp_function_tools.push_back(tool);
+    }
+    if (!mcp_function_tools.empty()) {
+        sdk_request.tools = mcp_function_tools;
+    }
 
-    std::string response_id    = ResponsesUtils::generate_response_id();
-    std::string new_session_id = sdk_request.user.value_or(response_id);
-
-    // ── generate=false warmup path ────────────────────────────────────────────
     if (!generate) {
-        runWarmup(conn, state, sdk_request, response_id, model, new_session_id);
+        runWarmup(
+            conn,
+            state,
+            std::move(messages),
+            response_id,
+            model,
+            std::move(memory_parent_turn_id),
+            std::move(tool_chain_response_id),
+            tool_output_submission);
         return;
     }
 
-    // ── Spawn inference thread ────────────────────────────────────────────────
-    // Capture by value — conn is a shared_ptr, everything else is copied.
-    std::thread([this, conn, conn_id = state.connection_id,
-                 sdk_request, mcp_function_tools,
-                 has_mcp_tools, response_id, model, new_session_id]() mutable {
-        runResponse(conn, conn_id, sdk_request, mcp_function_tools,
-                    has_mcp_tools, response_id, model, new_session_id);
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        auto found = states_.find(state->connection_id);
+        if (found == states_.end() || found->second != state) {
+            state->response_in_flight.store(false);
+            return;
+        }
+        state->active_response_id = response_id;
+    }
+
+    std::thread([this, conn, state, sdk_request, mcp_function_tools,
+                 has_mcp_tools, response_id, model, memory_parent_turn_id,
+                 tool_chain_response_id, tool_output_submission]() mutable {
+        runResponse(
+            conn,
+            state,
+            std::move(sdk_request),
+            std::move(mcp_function_tools),
+            has_mcp_tools,
+            std::move(response_id),
+            std::move(model),
+            std::move(memory_parent_turn_id),
+            std::move(tool_chain_response_id),
+            tool_output_submission);
     }).detach();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// runWarmup — generate=false: pre-load session without inference
+// runWarmup — generate=false: retain input without inference
 // ─────────────────────────────────────────────────────────────────────────────
 void WsResponsesController::runWarmup(
     const drogon::WebSocketConnectionPtr& conn,
-    WsConnectionState& state,
-    const CreateChatCompletionRequest& sdk_request,
+    const std::shared_ptr<WsConnectionState>& state,
+    json messages,
     const std::string& response_id,
     const std::string& model,
-    const std::string& new_session_id) {
-
-    // Pre-warm the session in SessionManager
-    auto& session_mgr = SessionManager::getInstance();
-    session_mgr.findOrCreate(new_session_id, "ws_warmup");
+    std::string memory_parent_turn_id,
+    std::string tool_chain_response_id,
+    bool tool_output_pending) {
 
     int created_time = ResponsesUtils::current_unix_time();
 
@@ -408,18 +514,21 @@ void WsResponsesController::runWarmup(
             created_time, json(nullptr), json(nullptr), "", json::object())}
     });
 
-    // Update connection-local cache
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = states_.find(state.connection_id);
-        if (it != states_.end()) {
-            it->second.last_response_id = response_id;
-            it->second.last_session_id  = new_session_id;
-            it->second.last_model       = model;
+         auto it = states_.find(state->connection_id);
+         if (it != states_.end() && it->second == state) {
+             state->last_session_id = state->connection_id;
+             state->last_model = model;
+             state->recordResponse(
+                 response_id,
+                std::move(messages),
+                std::move(memory_parent_turn_id),
+                 std::move(tool_chain_response_id),
+                 tool_output_pending);
         }
     }
-
-    state.response_in_flight.store(false);
+    state->response_in_flight.store(false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -427,13 +536,15 @@ void WsResponsesController::runWarmup(
 // ─────────────────────────────────────────────────────────────────────────────
 void WsResponsesController::runResponse(
     drogon::WebSocketConnectionPtr conn,
-    std::string connection_id,
+    std::shared_ptr<WsConnectionState> state,
     CreateChatCompletionRequest sdk_request,
     json mcp_function_tools,
     bool has_mcp_tools,
     std::string response_id,
     std::string model,
-    std::string new_session_id) {
+    std::string memory_parent_turn_id,
+    std::string tool_chain_response_id,
+    bool tool_output_submission) {
 
     int created_time = ResponsesUtils::current_unix_time();
 
@@ -468,6 +579,12 @@ void WsResponsesController::runResponse(
     std::string error_msg;
     std::vector<McpCallRecord> mcp_records;
     StandardResponse final_response;
+    qai_forge::GenerateOptions options = make_generate_options(
+        *state,
+        response_id,
+        memory_parent_turn_id,
+        tool_chain_response_id,
+        tool_output_submission);
 
     if (has_mcp_tools && !mcp_function_tools.empty()) {
         // ── MCP path: McpAgenticLoop::runStreaming() ──────────────────────────
@@ -485,10 +602,17 @@ void WsResponsesController::runResponse(
             };
 
             McpLoopResult loop_result = loop.runStreaming(
-                sdk_request, mcp_function_tools, ws_emitter, response_id);
+                sdk_request,
+                mcp_function_tools,
+                ws_emitter,
+                response_id,
+                options);
 
             final_response = loop_result.final_response;
             mcp_records    = loop_result.call_records;
+            for (const auto& message : loop_result.generated_messages) {
+                sdk_request.messages.push_back(message);
+            }
 
         } catch (const GenAIException& e) {
             had_error = true;
@@ -512,8 +636,9 @@ void WsResponsesController::runResponse(
         sdk_request.stream = true;
 
         try {
-            qai_forge::GenerateOptions opts;
-            opts.session_id = sdk_request.user.value_or(new_session_id);
+            auto done_promise = std::make_shared<std::promise<void>>();
+            auto done_future = done_promise->get_future();
+            auto terminal = std::make_shared<std::atomic<bool>>(false);
 
             // Use new async API with StreamCallbacks
             qai_forge::StreamCallbacks callbacks;
@@ -539,26 +664,47 @@ void WsResponsesController::runResponse(
                 }
             };
 
-            callbacks.onComplete = [&final_response, &new_session_id, &model](const StandardResponse& response) {
+            callbacks.onComplete = [
+                &final_response,
+                &model,
+                done_promise,
+                terminal](const StandardResponse& response) {
                 final_response = response;
-                final_response.id = new_session_id;
                 final_response.model = model;
+                if (!terminal->exchange(true)) {
+                    done_promise->set_value();
+                }
             };
 
-            callbacks.onError = [&had_error, &error_msg](const GenAIException& error) {
+            callbacks.onError = [
+                &had_error,
+                &error_msg,
+                done_promise,
+                terminal](const GenAIException& error) {
                 had_error = true;
                 error_msg = error.message;
+                if (!terminal->exchange(true)) {
+                    done_promise->set_value();
+                }
             };
 
-            callbacks.onCancelled = [&had_error, &error_msg]() {
+            callbacks.onCancelled = [
+                &had_error,
+                &error_msg,
+                done_promise,
+                terminal]() {
                 had_error = true;
                 error_msg = "Request was cancelled";
+                if (!terminal->exchange(true)) {
+                    done_promise->set_value();
+                }
             };
 
             qai_forge::QaiForge::getInstance().generateStream(
                 sdk_request,
                 std::move(callbacks),
-                opts);
+                options);
+            done_future.wait();
 
         } catch (const GenAIException& e) {
             had_error = true;
@@ -569,6 +715,8 @@ void WsResponsesController::runResponse(
         }
 
         if (!had_error) {
+            sdk_request.messages.push_back(
+                make_assistant_message(final_response));
             // response.output_text.done
             sendEvent(conn, {
                 {"type",          WsProtocol::SERVER_OUTPUT_TEXT_DONE},
@@ -581,14 +729,16 @@ void WsResponsesController::runResponse(
 
     // ── Step 4: Error or completion ───────────────────────────────────────────
     if (had_error) {
+        qai_forge::QaiForge::getInstance().cancel(response_id);
         sendEvent(conn, WsProtocol::make_error(500,
             WsProtocol::ERR_INFERENCE_FAILED, error_msg));
 
         // Release in-flight flag even on error
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = states_.find(connection_id);
-        if (it != states_.end()) {
-            it->second.response_in_flight.store(false);
+        auto it = states_.find(state->connection_id);
+        if (it != states_.end() && it->second == state) {
+            state->active_response_id.clear();
+            state->response_in_flight.store(false);
         }
         return;
     }
@@ -620,15 +770,23 @@ void WsResponsesController::runResponse(
             created_time, json(nullptr), json(nullptr), "", json::object())}
     });
 
-    // ── Step 5: Update connection-local cache ─────────────────────────────────
+    // ── Step 5: Update connection-owned transcript and lineage ────────────────
+    const bool opens_tool_chain = final_response.tool_calls.has_value() &&
+        !final_response.tool_calls->empty();
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = states_.find(connection_id);
-        if (it != states_.end()) {
-            it->second.last_response_id = response_id;
-            it->second.last_session_id  = new_session_id;
-            it->second.last_model       = model;
-            it->second.response_in_flight.store(false);
+         auto it = states_.find(state->connection_id);
+         if (it != states_.end() && it->second == state) {
+             state->last_session_id = state->connection_id;
+             state->last_model = model;
+             state->recordResponse(
+                response_id,
+                std::move(sdk_request.messages),
+                response_id,
+                opens_tool_chain ? response_id : std::string(),
+                false);
+             state->active_response_id.clear();
+             state->response_in_flight.store(false);
         }
     }
 }

@@ -24,7 +24,7 @@
 //
 // Output format (to stderr)
 // ─────────────────────────
-//   [2026-05-21 23:51:14.123] [INFO ] [SessionManager.cpp:87] message text
+//   [2026-05-21 23:51:14.123] [INFO ] [QaiForge.cpp:87] message text
 //
 // Thread safety
 // ─────────────

@@ -18,17 +18,6 @@
 
 namespace scheduler {
 
-struct MemoryReadyResult {
-    enum class Status {
-        Success,
-        Failed,
-        Cancelled,
-    };
-
-    Status status = Status::Success;
-    std::uint64_t snapshot_version = 0;
-};
-
 enum class MemoryTurnState {
     InProgress,
     AwaitingTool,
@@ -108,18 +97,6 @@ public:
     std::size_t expireIdle(std::chrono::milliseconds ttl);
     void clear();
 
-    // Temporary flat-memory compatibility for callers migrated in later
-    // commits. These methods are removed with the legacy public DTOs.
-    void seedIfAbsent(const std::string& memory_key,
-                      const ConversationMemoryUpdate& snapshot);
-    MemoryReadyResult awaitReady(const std::string& memory_key);
-    std::optional<ConversationMemoryUpdate> committedSnapshot(
-        const std::string& memory_key) const;
-    bool beginPostTurn(const std::string& memory_key);
-    MemoryReadyResult publish(
-        const std::string& memory_key,
-        MemoryReadyResult::Status status,
-        std::optional<ConversationMemoryUpdate> snapshot = std::nullopt);
     void cancelPending();
 
 private:
@@ -142,13 +119,6 @@ private:
             std::chrono::steady_clock::now();
     };
 
-    struct LegacyEntry {
-        ConversationMemoryUpdate snapshot;
-        bool has_snapshot = false;
-        bool pending = false;
-        MemoryReadyResult result;
-    };
-
     static std::string conversationKey(const std::string& namespace_id,
                                        const std::string& conversation_id);
     static bool isBlocking(MemoryTurnState state);
@@ -163,7 +133,6 @@ private:
     std::condition_variable cv_;
     std::unordered_map<std::string, Conversation> conversations_;
     std::unordered_map<std::uint64_t, Node> nodes_;
-    std::unordered_map<std::string, LegacyEntry> legacy_entries_;
     std::uint64_t next_node_id_ = 1;
     std::uint64_t next_epoch_ = 1;
 };

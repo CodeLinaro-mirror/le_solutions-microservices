@@ -327,101 +327,11 @@ void ConversationMemoryCoordinator::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     conversations_.clear();
     nodes_.clear();
-    legacy_entries_.clear();
     cv_.notify_all();
-}
-
-void ConversationMemoryCoordinator::seedIfAbsent(
-    const std::string& memory_key,
-    const ConversationMemoryUpdate& snapshot) {
-    if (memory_key.empty()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    LegacyEntry& entry = legacy_entries_[memory_key];
-    if (!entry.has_snapshot) {
-        entry.snapshot = snapshot;
-        entry.has_snapshot = true;
-    }
-}
-
-MemoryReadyResult ConversationMemoryCoordinator::awaitReady(
-    const std::string& memory_key) {
-    if (memory_key.empty()) {
-        return {};
-    }
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (legacy_entries_.find(memory_key) == legacy_entries_.end()) {
-        return {};
-    }
-    cv_.wait(lock, [this, &memory_key]() {
-        auto found = legacy_entries_.find(memory_key);
-        return found == legacy_entries_.end() || !found->second.pending;
-    });
-    auto found = legacy_entries_.find(memory_key);
-    return found == legacy_entries_.end() ? MemoryReadyResult{}
-                                          : found->second.result;
-}
-
-std::optional<ConversationMemoryUpdate>
-ConversationMemoryCoordinator::committedSnapshot(
-    const std::string& memory_key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto found = legacy_entries_.find(memory_key);
-    if (found == legacy_entries_.end() || !found->second.has_snapshot) {
-        return std::nullopt;
-    }
-    return found->second.snapshot;
-}
-
-bool ConversationMemoryCoordinator::beginPostTurn(
-    const std::string& memory_key) {
-    if (memory_key.empty()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    LegacyEntry& entry = legacy_entries_[memory_key];
-    if (entry.pending) {
-        return false;
-    }
-    entry.pending = true;
-    return true;
-}
-
-MemoryReadyResult ConversationMemoryCoordinator::publish(
-    const std::string& memory_key,
-    MemoryReadyResult::Status status,
-    std::optional<ConversationMemoryUpdate> snapshot) {
-    if (memory_key.empty()) {
-        return {};
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    LegacyEntry& entry = legacy_entries_[memory_key];
-    if (!entry.pending) {
-        return entry.result;
-    }
-    if (status == MemoryReadyResult::Status::Success && snapshot.has_value()) {
-        entry.snapshot = std::move(snapshot.value());
-        entry.has_snapshot = true;
-    }
-    entry.pending = false;
-    entry.result.status = status;
-    ++entry.result.snapshot_version;
-    const MemoryReadyResult result = entry.result;
-    cv_.notify_all();
-    return result;
 }
 
 void ConversationMemoryCoordinator::cancelPending() {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& item : legacy_entries_) {
-        LegacyEntry& entry = item.second;
-        if (entry.pending) {
-            entry.pending = false;
-            entry.result.status = MemoryReadyResult::Status::Cancelled;
-            ++entry.result.snapshot_version;
-        }
-    }
     for (auto& item : nodes_) {
         Node& node = item.second;
         if (node.state == MemoryTurnState::InProgress ||

@@ -2,7 +2,7 @@
 name = "qai-forge"
 version = "1.0.0"
 edition = "2021"
-description = "Rust bindings for qai-forge Layer 2 (ChatOrchestrator)"
+description = "Rust bindings for the qai-forge inference facade"
 license = "BSD-3-Clause-Clear"
 
 [dependencies]

@@ -3,7 +3,7 @@
 
 // Package qaiforge provides Go bindings for the qai-forge Layer 2 C API.
 //
-// Calls ChatOrchestrator directly in-process via cgo — no HTTP/gRPC/D-Bus
+// Calls QaiForge directly in-process via cgo — no HTTP/gRPC/D-Bus
 // server needed.
 //
 // Build requirements:
@@ -59,7 +59,8 @@ type ChatRequest struct {
 	Temperature float32 `json:"temperature,omitempty"`
 	TopP        float32 `json:"top_p,omitempty"`
 	TopK        int     `json:"top_k,omitempty"`
-	// User is an optional session ID for multi-turn conversations.
+	// User scopes private Genie runtime memory. Messages must contain the
+	// complete conversation history on every request.
 	User string `json:"user,omitempty"`
 }
 
@@ -92,6 +93,16 @@ func Version() string {
 	return C.GoString(C.qai_forge_version())
 }
 
+// ReleaseConversation releases private runtime memory associated with user.
+func ReleaseConversation(user string) bool {
+	if user == "" {
+		return false
+	}
+	cUser := C.CString(user)
+	defer C.free(unsafe.Pointer(cUser))
+	return C.qai_forge_release_conversation(cUser) != 0
+}
+
 // Chat runs a blocking chat completion.
 // It blocks until generation is complete and returns the full response.
 func Chat(req ChatRequest) (*ChatResponse, error) {
@@ -106,7 +117,7 @@ func Chat(req ChatRequest) (*ChatResponse, error) {
 	var cResp *C.char
 	var cErr *C.char
 
-	rc := C.qai_forge_chat_blocking(cReq, &cResp, &cErr)
+	rc := C.qai_forge_generate(cReq, &cResp, &cErr)
 	if rc != 0 {
 		errMsg := "unknown error"
 		if cErr != nil {
@@ -165,7 +176,7 @@ func ChatStream(req ChatRequest) (<-chan StreamChunk, <-chan error) {
 		defer handle.Delete()
 
 		var cErr *C.char
-		rc := C.qai_forge_chat_streaming(
+		rc := C.qai_forge_generate_stream(
 			cReq,
 			C.qai_forge_stream_cb_t(C.streamCallbackBridge),
 			unsafe.Pointer(&handle),

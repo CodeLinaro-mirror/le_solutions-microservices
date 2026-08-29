@@ -968,41 +968,26 @@ bool ModelRuntime::beginPostTurn(
         }
         return false;
     }
-    if (task->input.conversation_memory_key.empty()) {
-        task->input.conversation_memory_key = task->input.session_id;
-    }
-    const std::string conversation_memory_key =
-        task->input.conversation_memory_key;
-    const bool uses_private_memory = task->input.uses_private_memory &&
-        task->input.memory_turn.has_value();
-    const bool began_post_turn = uses_private_memory
-        ? memory_coordinator_->beginPostTurn(task->input.memory_turn.value())
-        : memory_coordinator_->beginPostTurn(conversation_memory_key);
+    const bool began_post_turn =
+        memory_coordinator_->beginPostTurn(task->input.memory_turn);
     if (!began_post_turn) {
         LOG_WARN("[ModelRuntime] Post-turn state transition rejected: model="
                  << model_id_ << " session=" << task->input.session_id);
-        if (uses_private_memory) {
-            memory_coordinator_->abortTurn(
-                task->input.memory_turn.value(),
-                MemoryTurnState::GenerationFailed);
-        }
+        memory_coordinator_->abortTurn(
+            task->input.memory_turn,
+            MemoryTurnState::GenerationFailed);
         return false;
     }
     const std::string session_id = task->input.session_id;
+    const MemoryTurnCommitToken memory_turn = task->input.memory_turn;
 
     std::vector<ModelRuntimeState> state_events;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_requested_) {
-            if (uses_private_memory) {
-                memory_coordinator_->abortTurn(
-                    task->input.memory_turn.value(),
-                    MemoryTurnState::Cancelled);
-            } else {
-                memory_coordinator_->publish(
-                    conversation_memory_key,
-                    MemoryReadyResult::Status::Cancelled);
-            }
+            memory_coordinator_->abortTurn(
+                task->input.memory_turn,
+                MemoryTurnState::Cancelled);
             return false;
         }
         running_job_.reset();
@@ -1024,14 +1009,8 @@ bool ModelRuntime::beginPostTurn(
                  << " message=<unknown>");
     }
 
-    if (uses_private_memory) {
-        memory_coordinator_->publish(
-            task->input.memory_turn.value(), MemoryOutcome::Failed);
-    } else {
-        memory_coordinator_->publish(
-            conversation_memory_key,
-            MemoryReadyResult::Status::Failed);
-    }
+    memory_coordinator_->publish(
+        memory_turn, MemoryOutcome::Failed);
     finishPostTurn();
     return false;
 }

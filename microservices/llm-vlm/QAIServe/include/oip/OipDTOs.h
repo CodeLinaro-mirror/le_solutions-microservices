@@ -99,7 +99,8 @@ struct OipGenerateParameters {
     float top_p          = 1.0f;
     int   top_k          = 40;
     bool  stream         = false;
-    std::string user;   // session ID for multi-turn (empty = stateless OIP mode)
+    // Optional Genie memory scope for structured-message requests.
+    std::string user;
 
     static OipGenerateParameters fromJson(const nlohmann::json& j);
 };

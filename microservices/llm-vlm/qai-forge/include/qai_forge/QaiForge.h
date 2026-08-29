@@ -5,12 +5,10 @@
 
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/dto/TensorDTOs.h"
-#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QaiForge — Unified inference facade
@@ -84,29 +82,13 @@ struct GenerateOptions {
     bool allow_tool_chain_fallback = false;
 
     // Explicit QaiForge-owned conversation lineage. An omitted reference keeps
-    // the request stateless unless a temporary legacy memory key is supplied.
+    // the request stateless.
     std::optional<ConversationReference> conversation;
 
     // Internal MCP rounds reuse one logical conversation turn while each call
     // receives an independent scheduler job identity.
     bool internal_mcp_round = false;
 
-    // Response history (Responses API — ancestor messages from ResponseStore)
-    bool use_response_history = false;
-    bool response_history_is_pruned = false;
-    json response_history = json::array();
-
-    // Conversation memory identity. Responses uses response-lineage keys so
-    // sibling response branches never share post-turn memory. When both are
-    // omitted, QaiForge uses session_id for both keys.
-    std::string conversation_memory_read_key;
-    std::string conversation_memory_write_key;
-
-    // Generic conversation memory used to seed orchestrator prompt slots.
-    std::string summary_content;
-    int summary_token_count = 0;
-    std::unordered_map<std::string, std::string> facts;
-    std::size_t evicted_message_count = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,14 +207,6 @@ public:
     /** @brief Release all private runtime memory for a scoped conversation. */
     bool releaseConversation(const std::string& namespace_id,
                              const std::string& conversation_id);
-
-    /** @brief Await and read the latest committed conversation memory snapshot. */
-    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
-        const std::string& memory_key);
-
-    /** @brief Queue idempotent consumer-owned persistence after delivery. */
-    bool enqueueStoreTask(std::string idempotency_key,
-                          std::function<void()> task);
 
     /**
      * Release per-session Conversation API state for one model's backend

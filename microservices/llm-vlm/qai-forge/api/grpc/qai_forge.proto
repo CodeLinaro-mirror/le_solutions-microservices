@@ -55,9 +55,9 @@ message ChatCompletionRequest {
     float               temperature = 5;
     float               top_p       = 6;
     int32               top_k       = 7;
-    // Session ID — maps to CreateChatCompletionRequest.user in Layer 2.
-    // Clients should pass the same user value across turns to maintain
-    // conversation history.
+    // Optional memory scope. Clients still send the complete message history
+    // on every request; a repeated value lets Genie reuse private runtime
+    // summary/fact state for that history.
     string              user        = 8;
 }
 

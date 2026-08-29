@@ -525,18 +525,6 @@ struct QaiForge::Impl {
             namespace_id, conversation_id);
     }
 
-    std::optional<ConversationMemoryUpdate> awaitConversationMemory(
-        const std::string& memory_key) {
-        return scheduler_.awaitConversationMemory(memory_key);
-    }
-
-    bool enqueueStoreTask(std::string idempotency_key,
-                          std::function<void()> task) {
-        return scheduler_.enqueueStoreTask(
-            std::move(idempotency_key),
-            std::move(task));
-    }
-
 private:
     struct ActiveOperation {
         std::string job_id;
@@ -561,7 +549,8 @@ private:
         context.caller = options;
         context.kind = kind;
         context.priority = scheduler::JobPriority::ANY_REQUEST;
-        context.skip_post_turn_summarization = false;
+        context.skip_post_turn_summarization =
+            !options.conversation.has_value();
 
         const std::string response_id = options.response_id.empty()
             ? context.job_id
@@ -659,7 +648,6 @@ private:
             context.priority = scheduler::JobPriority::ANY_REQUEST;
         }
 
-        const std::string final_session_id = context.execution_session_id;
         if (context.caller.conversation.has_value()) {
             scheduler::MemoryTurnStartResult memory_turn =
                 memory_coordinator_->beginTurn(
@@ -674,45 +662,6 @@ private:
             }
             context.memory_turn = memory_turn.token;
             context.memory_state = std::move(memory_turn.memory);
-            return context;
-        }
-
-        const bool has_explicit_memory_keys =
-            !context.caller.conversation_memory_read_key.empty() ||
-            !context.caller.conversation_memory_write_key.empty();
-        const std::string conversation_memory_read_key =
-            has_explicit_memory_keys
-                ? context.caller.conversation_memory_read_key
-                : final_session_id;
-        context.conversation_memory_write_key =
-            !context.caller.conversation_memory_write_key.empty()
-                ? context.caller.conversation_memory_write_key
-                : final_session_id;
-        ConversationMemoryUpdate input_memory;
-        input_memory.summary_content = context.caller.summary_content;
-        input_memory.summary_token_count = context.caller.summary_token_count;
-        input_memory.facts = context.caller.facts;
-        input_memory.evicted_message_count =
-            context.caller.evicted_message_count;
-        if (!conversation_memory_read_key.empty()) {
-            memory_coordinator_->seedIfAbsent(
-                conversation_memory_read_key,
-                input_memory);
-            memory_coordinator_->awaitReady(conversation_memory_read_key);
-            const std::optional<ConversationMemoryUpdate> committed_memory =
-                memory_coordinator_->committedSnapshot(
-                    conversation_memory_read_key);
-            if (committed_memory.has_value()) {
-                context.caller.summary_content =
-                    committed_memory->summary_content;
-                context.caller.summary_token_count =
-                    committed_memory->summary_token_count;
-                context.caller.facts = committed_memory->facts;
-                if (!context.caller.response_history_is_pruned) {
-                    context.caller.evicted_message_count =
-                        committed_memory->evicted_message_count;
-                }
-            }
         }
         return context;
     }
@@ -722,8 +671,6 @@ private:
         scheduler::GenerativeCallbacks callbacks) {
         const std::string model_id = context.model_id;
         const std::string tool_chain_id = context.tool_chain_id;
-        const std::string conversation_memory_key =
-            context.conversation_memory_write_key;
         const std::optional<scheduler::MemoryTurnCommitToken> memory_turn =
             context.memory_turn;
         try {
@@ -732,7 +679,6 @@ private:
                     model_id)
                     ->createJob(
                         std::move(context), std::move(callbacks));
-            job->conversation_memory_key = conversation_memory_key;
             wrapCallbacks(*job);
             return job;
         } catch (...) {
@@ -1110,18 +1056,6 @@ bool QaiForge::releaseConversationSubtree(
 bool QaiForge::releaseConversation(const std::string& namespace_id,
                                    const std::string& conversation_id) {
     return impl_->releaseConversation(namespace_id, conversation_id);
-}
-
-std::optional<ConversationMemoryUpdate> QaiForge::awaitConversationMemory(
-    const std::string& memory_key) {
-    return impl_->awaitConversationMemory(memory_key);
-}
-
-bool QaiForge::enqueueStoreTask(std::string idempotency_key,
-                               std::function<void()> task) {
-    return impl_->enqueueStoreTask(
-        std::move(idempotency_key),
-        std::move(task));
 }
 
 void QaiForge::clearSession(const std::string& model_id,

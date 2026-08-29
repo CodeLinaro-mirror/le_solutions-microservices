@@ -36,15 +36,13 @@ inline std::string sessionGetStringOrDefault(const json& obj,
 // ─────────────────────────────────────────────────────────────────────────────
 // ConversationSession — Pure Data Record (Section 3.A of architecture design)
 //
-// This is a plain data object. It holds the shared message history and
-// metadata for a single conversation session. It does NOT execute inference,
-// manage handles, or contain business logic.
+// This is a transient data object used while preparing a Genie request and
+// running post-turn processing. Persistent runtime memory lives in the private
+// ConversationMemoryCoordinator tree.
 //
 // Key design decisions:
-//   - session_id is the stable chat completion ID returned to the client.
-//   - messages is the shared OpenAI-format message history.
-//   - DraftTurn pattern (Section 3.C): new messages are staged in a DraftTurn
-//     before being committed to this session's history.
+//   - session_id identifies the active backend execution.
+//   - messages contains the complete caller-supplied transcript for this turn.
 //   - Thinking content is stored with a private "_thinking_content" key and
 //     stripped before being sent to the model (Section 3.F).
 //   - Post-turn memory management (Phase 5):
@@ -80,7 +78,7 @@ struct ConversationSession {
     // Updated by GenieOrchestrator::postTurnProcessing() after each eviction.
     std::unordered_map<std::string, std::string> facts;
 
-    // ── Legacy fields (kept for compatibility) ────────────────────────────────
+    // ── Prompt accounting ─────────────────────────────────────────────────────
     int system_prompt_tokens = 0;
     std::string system_prompt_content;
     int total_cumulative_tokens = 0;

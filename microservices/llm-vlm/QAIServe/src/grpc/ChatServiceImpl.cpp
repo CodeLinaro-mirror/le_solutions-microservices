@@ -5,8 +5,11 @@
 #include "grpc/GrpcErrorMapping.h"
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
 
@@ -42,6 +45,29 @@ CreateChatCompletionRequest BuildRequest(
     return dto;
 }
 
+std::string GenerateTurnId() {
+    static std::atomic<uint64_t> next_id{1};
+    return "grpc_chat_turn_" + std::to_string(next_id.fetch_add(1));
+}
+
+qai_forge::GenerateOptions BuildOptions(
+    const qai::forge::v1::ChatCompletionRequest* request) {
+    qai_forge::GenerateOptions options;
+    const std::string turn_id = GenerateTurnId();
+    options.response_id = turn_id;
+    options.session_id = request->user().empty() ? turn_id : request->user();
+    if (!request->user().empty() && request->messages_size() > 0) {
+        qai_forge::ConversationReference reference;
+        reference.namespace_id = "qaiserve.grpc.chat";
+        reference.conversation_id = request->user();
+        reference.turn_id = turn_id;
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Latest;
+        options.conversation = std::move(reference);
+    }
+    return options;
+}
+
 } // namespace
 
 // Note on session lifecycle: gRPC calls in this service are stateless
@@ -52,13 +78,30 @@ CreateChatCompletionRequest BuildRequest(
 // ResponseStore::deleteCascade() (see those files) does not apply to this
 // transport for that reason — not an oversight.
 grpc::Status ChatServiceImpl::CreateChatCompletion(
-    grpc::ServerContext* /*context*/,
+    grpc::ServerContext* context,
     const qai::forge::v1::ChatCompletionRequest* request,
     qai::forge::v1::ChatCompletionResponse* response) {
     CreateChatCompletionRequest dto = BuildRequest(request);
+    qai_forge::GenerateOptions options = BuildOptions(request);
 
     try {
-        StandardResponse resp = qai_forge::QaiForge::getInstance().generate(dto);
+        auto pending = std::async(
+            std::launch::async,
+            [&dto, &options]() {
+                return qai_forge::QaiForge::getInstance().generate(dto, options);
+            });
+        bool cancellation_requested = false;
+        while (pending.wait_for(std::chrono::milliseconds(25)) !=
+               std::future_status::ready) {
+            if (context->IsCancelled() && !cancellation_requested) {
+                qai_forge::QaiForge::getInstance().cancel(options.response_id);
+                cancellation_requested = true;
+            }
+        }
+        StandardResponse resp = pending.get();
+        if (context->IsCancelled()) {
+            return grpc::Status::CANCELLED;
+        }
         response->set_id(resp.id);
         response->set_model(!resp.model.empty() ? resp.model : dto.model);
         response->set_content(resp.content.value_or(""));
@@ -78,6 +121,7 @@ grpc::Status ChatServiceImpl::CreateChatCompletionStream(
     grpc::ServerWriter<qai::forge::v1::ChatCompletionChunk>* writer) {
     CreateChatCompletionRequest dto = BuildRequest(request);
     dto.stream = true;
+    qai_forge::GenerateOptions options = BuildOptions(request);
 
     // Bridges QaiForge::generateStream()'s background-thread callbacks to
     // this handler thread, which owns `writer` and must call Write() itself
@@ -117,12 +161,14 @@ grpc::Status ChatServiceImpl::CreateChatCompletionStream(
     };
     callbacks.onCancelled = [=]() {
         std::lock_guard<std::mutex> lock(*mtx);
+        *final_status = grpc::Status::CANCELLED;
         *done = true;
         cv->notify_one();
     };
 
     try {
-        qai_forge::QaiForge::getInstance().generateStream(dto, std::move(callbacks));
+        qai_forge::QaiForge::getInstance().generateStream(
+            dto, std::move(callbacks), options);
     } catch (const GenAIException& e) {
         return grpc::Status(grpc_util::MapErrorCode(e.code), e.message);
     }
@@ -130,12 +176,20 @@ grpc::Status ChatServiceImpl::CreateChatCompletionStream(
     // Drain the queue on THIS (handler) thread — Write() must be called here.
     while (true) {
         std::unique_lock<std::mutex> lock(*mtx);
-        cv->wait(lock, [&] { return !queue->empty() || *done; });
+        cv->wait_for(lock, std::chrono::milliseconds(25), [&] {
+            return !queue->empty() || *done;
+        });
+        if (context->IsCancelled()) {
+            lock.unlock();
+            qai_forge::QaiForge::getInstance().cancel(options.response_id);
+            return grpc::Status::CANCELLED;
+        }
         while (!queue->empty()) {
             auto chunk = std::move(queue->front());
             queue->pop_front();
             lock.unlock();
-            if (!writer->Write(chunk) || context->IsCancelled()) {
+            if (context->IsCancelled() || !writer->Write(chunk)) {
+                qai_forge::QaiForge::getInstance().cancel(options.response_id);
                 return grpc::Status::CANCELLED;
             }
             lock.lock();

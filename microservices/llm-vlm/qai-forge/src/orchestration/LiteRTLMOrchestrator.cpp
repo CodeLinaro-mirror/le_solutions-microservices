@@ -188,17 +188,9 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
 scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
     scheduler::GenerativeJobContext context,
     scheduler::GenerativeCallbacks callbacks) const {
-    json messages = json::array();
-    if (context.caller.use_response_history &&
-        context.caller.response_history.is_array()) {
-        for (auto& message : context.caller.response_history) {
-            messages.push_back(std::move(message));
-        }
-    }
-    if (context.request.messages.is_array()) {
-        for (auto& message : context.request.messages) {
-            messages.push_back(std::move(message));
-        }
+    json messages = std::move(context.request.messages);
+    if (!messages.is_array()) {
+        messages = json::array();
     }
 
     json tools = std::move(context.request.tools).value_or(json::array());

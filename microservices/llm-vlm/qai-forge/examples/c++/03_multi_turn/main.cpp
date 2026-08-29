@@ -4,21 +4,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Example 03: Multi-Turn Conversation
 //
-// Demonstrates persistent session management across multiple turns.
-// The SDK maintains conversation history automatically — each subsequent
-// request includes the full history via the session's message store.
+// Demonstrates caller-owned history with QaiForge-owned runtime memory.
 //
 // Key concepts:
-//   - Using the `user` field to pin a stable session ID
-//   - Session persistence: history is maintained between calls
-//   - DraftTurn: new messages are staged and committed atomically
-//   - Context compaction: SummarizationMiddleware triggers automatically
-//     when the context window fills up
+//   - Sending the complete transcript on every request
+//   - Passing explicit conversation and turn identifiers
+//   - Releasing private runtime memory when the conversation ends
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/session/SessionManager.h"
 #include "qai_forge/InternalDTOs.h"
 #include <iostream>
 #include <string>
@@ -26,7 +21,9 @@
 
 // Helper: send one turn and print the response
 static std::string send_turn(const std::string& model_id,
-                              const std::string& session_id,
+                              const std::string& conversation_id,
+                              const std::string& turn_id,
+                              const std::string& parent_turn_id,
                               const std::vector<json>& messages) {
     CreateChatCompletionRequest request;
     request.model = model_id;
@@ -34,11 +31,25 @@ static std::string send_turn(const std::string& model_id,
     request.messages = json(messages);
     request.max_completion_tokens = 256;
     request.temperature = 0.7f;
-    // Pin the session ID via the `user` field.
-    // The orchestrator uses this as the stable session key.
-    request.user = session_id;
+    request.user = conversation_id;
 
-    StandardResponse response = ChatOrchestrator::getInstance().handleBlocking(request);
+    qai_forge::GenerateOptions options;
+    options.response_id = turn_id;
+    options.session_id = conversation_id;
+    qai_forge::ConversationReference reference;
+    reference.namespace_id = "qai_forge.example.multi_turn";
+    reference.conversation_id = conversation_id;
+    reference.turn_id = turn_id;
+    if (parent_turn_id.empty()) {
+        reference.parent_policy = qai_forge::ConversationParentPolicy::Root;
+    } else {
+        reference.parent_policy = qai_forge::ConversationParentPolicy::Explicit;
+        reference.parent_turn_id = parent_turn_id;
+    }
+    options.conversation = std::move(reference);
+
+    StandardResponse response =
+        qai_forge::QaiForge::getInstance().generate(request, options);
     return response.content.value_or("");
 }
 
@@ -55,11 +66,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ── Assign a stable session ID ─────────────────────────────────────────────
-    // Using a fixed session ID means all turns in this program share the same
-    // ConversationSession. The session persists in memory for the lifetime of
-    // the process (or until deleteSession() is called).
-    const std::string session_id = "example-03-session";
+    const std::string conversation_id = "example-03-session";
+    qai_forge::QaiForge::getInstance().start();
 
     // ── Turn 1: Introduce a topic ──────────────────────────────────────────────
     std::cout << "Turn 1\n";
@@ -71,13 +79,12 @@ int main(int argc, char* argv[]) {
     };
 
     try {
-        std::string reply_1 = send_turn(model_id, session_id, messages_1);
+        std::string reply_1 = send_turn(
+            model_id, conversation_id, "turn-1", "", messages_1);
         std::cout << "Assistant: " << reply_1 << "\n\n";
 
         // ── Turn 2: Follow-up question ─────────────────────────────────────────
-        // The SDK automatically includes the previous turn in the context.
-        // We only need to send the new user message — the session history
-        // is managed internally by ConversationSession.
+        // The caller remains authoritative for the complete transcript.
         std::cout << "Turn 2\n";
         std::cout << "User: What is backpropagation?\n";
 
@@ -88,7 +95,8 @@ int main(int argc, char* argv[]) {
             {{"role", "user"},   {"content", "What is backpropagation?"}}
         };
 
-        std::string reply_2 = send_turn(model_id, session_id, messages_2);
+        std::string reply_2 = send_turn(
+            model_id, conversation_id, "turn-2", "turn-1", messages_2);
         std::cout << "Assistant: " << reply_2 << "\n\n";
 
         // ── Turn 3: Test memory ────────────────────────────────────────────────
@@ -104,26 +112,13 @@ int main(int argc, char* argv[]) {
             {{"role", "user"},   {"content", "Do you remember my name?"}}
         };
 
-        std::string reply_3 = send_turn(model_id, session_id, messages_3);
+        std::string reply_3 = send_turn(
+            model_id, conversation_id, "turn-3", "turn-2", messages_3);
         std::cout << "Assistant: " << reply_3 << "\n\n";
 
-        // ── Session info ───────────────────────────────────────────────────────
-        auto session = SessionManager::getInstance().getSession(session_id);
-        if (session) {
-            std::cout << "─── Session Info ───────────────────────────────────────\n";
-            std::cout << "Session ID:    " << session->session_id << "\n";
-            std::cout << "Messages:      " << session->messages.size() << "\n";
-            std::cout << "Model:         " << session->current_model_id << "\n";
-            if (!session->summary_content.empty()) {
-                std::cout << "Summary:       " << session->summary_content.substr(0, 80) << "...\n";
-            }
-        }
-
-        // ── Clean up ───────────────────────────────────────────────────────────
-        // Delete the session to free memory. In a server context, sessions
-        // persist until explicitly deleted or the server restarts.
-        SessionManager::getInstance().deleteSession(session_id);
-        std::cout << "\nSession deleted.\n";
+        qai_forge::QaiForge::getInstance().releaseConversation(
+            "qai_forge.example.multi_turn", conversation_id);
+        std::cout << "Runtime memory released.\n";
 
     } catch (const GenAIException& e) {
         std::cerr << "GenAI error (HTTP " << e.http_status << "): " << e.message << "\n";
@@ -133,5 +128,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    qai_forge::QaiForge::getInstance().shutdown();
     return 0;
 }
