@@ -12,6 +12,28 @@
 
 namespace scheduler {
 
+namespace {
+
+bool memoryChanged(const GenieMemoryState& before,
+                   const GenieMemoryState& after) {
+    return before.summary_content != after.summary_content ||
+           before.summary_token_count != after.summary_token_count ||
+           before.facts != after.facts ||
+           before.canonical_boundary != after.canonical_boundary ||
+           before.transcript_digest != after.transcript_digest;
+}
+
+ConversationMemoryUpdate legacyMemoryUpdate(const GenieMemoryState& memory) {
+    ConversationMemoryUpdate update;
+    update.summary_content = memory.summary_content;
+    update.summary_token_count = memory.summary_token_count;
+    update.facts = memory.facts;
+    update.evicted_message_count = memory.canonical_boundary;
+    return update;
+}
+
+} // namespace
+
 PostTurnWorker::PostTurnWorker(
     std::string model_id,
     IGenerativeBackend& backend,
@@ -101,39 +123,79 @@ void PostTurnWorker::workerLoop() {
         try {
             const std::string& conversation_memory_key =
                 task.input.conversation_memory_key;
-            const ConversationMemoryUpdate committed =
-                task.response.updated_conversation_memory.value_or(
-                    coordinator_->committedSnapshot(conversation_memory_key)
-                        .value_or(ConversationMemoryUpdate{}));
-            ConversationMemoryUpdate updated = orchestrator_->executePostTurn(
-                task, committed, backend_);
+            const GenieMemoryState& before = task.input.input_memory;
+            GenieMemoryState updated = orchestrator_->executePostTurn(
+                task, backend_);
             if (forceRequested()) {
+                if (task.input.uses_private_memory &&
+                    task.input.memory_turn.has_value()) {
+                    coordinator_->abortTurn(
+                        task.input.memory_turn.value(),
+                        MemoryTurnState::Cancelled);
+                } else {
+                    coordinator_->publish(
+                        conversation_memory_key,
+                        MemoryReadyResult::Status::Cancelled);
+                }
+            } else if (task.input.uses_private_memory &&
+                       task.input.memory_turn.has_value()) {
+                const MemoryOutcome outcome = memoryChanged(before, updated)
+                    ? MemoryOutcome::Updated
+                    : MemoryOutcome::Unchanged;
                 coordinator_->publish(
-                    conversation_memory_key,
-                    MemoryReadyResult::Status::Cancelled);
+                    task.input.memory_turn.value(),
+                    outcome,
+                    outcome == MemoryOutcome::Updated
+                        ? std::optional<GenieMemoryState>(std::move(updated))
+                        : std::nullopt);
             } else {
-                task.response.updated_conversation_memory = updated;
+                ConversationMemoryUpdate legacy = legacyMemoryUpdate(updated);
+                task.response.updated_conversation_memory = legacy;
                 coordinator_->publish(
                     conversation_memory_key,
                     MemoryReadyResult::Status::Success,
-                    std::move(updated));
+                    std::move(legacy));
             }
         } catch (const std::exception& error) {
             LOG_WARN("[PostTurnWorker] Post-turn failed: model=" << model_id_
                      << " session=" << task.input.session_id
                      << " message=\"" << error.what() << "\"");
-            coordinator_->publish(
-                task.input.conversation_memory_key,
-                forceRequested() ? MemoryReadyResult::Status::Cancelled
-                                 : MemoryReadyResult::Status::Failed);
+            if (task.input.uses_private_memory &&
+                task.input.memory_turn.has_value()) {
+                if (forceRequested()) {
+                    coordinator_->abortTurn(
+                        task.input.memory_turn.value(),
+                        MemoryTurnState::Cancelled);
+                } else {
+                    coordinator_->publish(
+                        task.input.memory_turn.value(), MemoryOutcome::Failed);
+                }
+            } else {
+                coordinator_->publish(
+                    task.input.conversation_memory_key,
+                    forceRequested() ? MemoryReadyResult::Status::Cancelled
+                                     : MemoryReadyResult::Status::Failed);
+            }
         } catch (...) {
             LOG_WARN("[PostTurnWorker] Post-turn failed: model=" << model_id_
                      << " session=" << task.input.session_id
                      << " message=<unknown>");
-            coordinator_->publish(
-                task.input.conversation_memory_key,
-                forceRequested() ? MemoryReadyResult::Status::Cancelled
-                                 : MemoryReadyResult::Status::Failed);
+            if (task.input.uses_private_memory &&
+                task.input.memory_turn.has_value()) {
+                if (forceRequested()) {
+                    coordinator_->abortTurn(
+                        task.input.memory_turn.value(),
+                        MemoryTurnState::Cancelled);
+                } else {
+                    coordinator_->publish(
+                        task.input.memory_turn.value(), MemoryOutcome::Failed);
+                }
+            } else {
+                coordinator_->publish(
+                    task.input.conversation_memory_key,
+                    forceRequested() ? MemoryReadyResult::Status::Cancelled
+                                     : MemoryReadyResult::Status::Failed);
+            }
         }
 
         if (finish_post_turn_) {
@@ -143,9 +205,15 @@ void PostTurnWorker::workerLoop() {
 }
 
 void PostTurnWorker::cancelTask(PostTurnTask& task) {
-    coordinator_->publish(
-        task.input.conversation_memory_key,
-        MemoryReadyResult::Status::Cancelled);
+    if (task.input.uses_private_memory &&
+        task.input.memory_turn.has_value()) {
+        coordinator_->abortTurn(
+            task.input.memory_turn.value(), MemoryTurnState::Cancelled);
+    } else {
+        coordinator_->publish(
+            task.input.conversation_memory_key,
+            MemoryReadyResult::Status::Cancelled);
+    }
     if (finish_post_turn_) {
         finish_post_turn_();
     }

@@ -6,21 +6,9 @@
 #include "qai_forge/orchestration/LlamaCppOrchestrator.h"
 #include "qai_forge/backend/LlamaCppBackend.h"
 #include "qai_forge/utils/Logger.h"
-#include <sstream>
 #include <stdexcept>
-#include <random>
 
 namespace qai_forge {
-
-namespace {
-// Generate a unique event ID for tracking requests
-std::string generateEventId() {
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << "evt-" << std::hex << rng();
-    return oss.str();
-}
-} // anonymous namespace
 
 scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
     scheduler::GenerativeJobContext context,
@@ -52,10 +40,12 @@ scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
     auto job = std::make_shared<scheduler::GenerativeJob>();
     job->response_id = context.caller.response_id.empty()
         ? context.job_id : std::move(context.caller.response_id);
-    job->session_id = context.request.user.value_or(context.job_id);
+    job->session_id = context.execution_session_id.empty()
+        ? context.job_id : std::move(context.execution_session_id);
     job->job_id = std::move(context.job_id);
     job->model_id = std::move(context.model_id);
     job->tool_chain_id = std::move(context.tool_chain_id);
+    job->memory_turn = context.memory_turn;
     job->kind = context.kind;
     job->priority = context.priority;
     job->prepared = std::move(prepared);
@@ -84,9 +74,6 @@ StandardResponse LlamaCppOrchestrator::execute(
     const json& chat_request = prepared->chat_completions_body;
     const bool streaming = static_cast<bool>(job.callbacks.on_token);
 
-    // Generate event ID for this request
-    std::string event_id = generateEventId();
-
     // Accumulation variables for streaming
     std::string accumulated_content;
     json accumulated_tool_calls = json::array();
@@ -105,7 +92,7 @@ StandardResponse LlamaCppOrchestrator::execute(
 
                 try {
                     // Parse SSE chunk and invoke callback
-                    handleSseChunk(sse_chunk, job.callbacks.on_token, event_id,
+                    handleSseChunk(sse_chunk, job.callbacks.on_token, job.response_id,
                                  job.model_id,
                                  accumulated_content, accumulated_tool_calls,
                                  finish_reason, prompt_tokens, completion_tokens);
@@ -152,7 +139,7 @@ StandardResponse LlamaCppOrchestrator::execute(
     }
 
     // Build and return StandardResponse
-    return buildStandardResponse(event_id, job.model_id,
+    return buildStandardResponse(job.response_id, job.model_id,
                                 accumulated_content, accumulated_tool_calls,
                                 finish_reason, prompt_tokens, completion_tokens);
 }

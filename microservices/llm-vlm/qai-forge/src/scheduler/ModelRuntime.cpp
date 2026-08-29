@@ -851,7 +851,7 @@ bool ModelRuntime::runJob(GenerativeJob& job) {
         return false;
     }
     std::string finish_reason = "stop";
-    std::string response_id = job.session_id;
+    std::string response_id = job.response_id;
     const auto original_on_token = job.callbacks.on_token;
     const bool streaming = static_cast<bool>(original_on_token);
     if (streaming) {
@@ -938,14 +938,34 @@ bool ModelRuntime::beginPostTurn(
         LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
                  << model_id_ << " session=" << job.session_id
                  << " message=\"" << error.what() << "\"");
+        if (job.memory_turn.has_value()) {
+            memory_coordinator_->publish(
+                job.memory_turn.value(), MemoryOutcome::Failed);
+        }
         return false;
     } catch (...) {
         LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
                  << model_id_ << " session=" << job.session_id
                  << " message=<unknown>");
+        if (job.memory_turn.has_value()) {
+            memory_coordinator_->publish(
+                job.memory_turn.value(), MemoryOutcome::Failed);
+        }
         return false;
     }
     if (!task.has_value()) {
+        if (job.memory_turn.has_value()) {
+            const bool has_tool_calls = response.finish_reason == "tool_calls" &&
+                response.tool_calls.has_value() &&
+                !response.tool_calls.value().empty();
+            if (has_tool_calls && job.kind == JobKind::MCP_ROUND) {
+                memory_coordinator_->markAwaitingTool(
+                    job.memory_turn.value());
+            } else {
+                memory_coordinator_->completeStructural(
+                    job.memory_turn.value());
+            }
+        }
         return false;
     }
     if (task->input.conversation_memory_key.empty()) {
@@ -953,9 +973,19 @@ bool ModelRuntime::beginPostTurn(
     }
     const std::string conversation_memory_key =
         task->input.conversation_memory_key;
-    if (!memory_coordinator_->beginPostTurn(conversation_memory_key)) {
-        LOG_WARN("[ModelRuntime] Post-turn already pending; using committed memory: model="
+    const bool uses_private_memory = task->input.uses_private_memory &&
+        task->input.memory_turn.has_value();
+    const bool began_post_turn = uses_private_memory
+        ? memory_coordinator_->beginPostTurn(task->input.memory_turn.value())
+        : memory_coordinator_->beginPostTurn(conversation_memory_key);
+    if (!began_post_turn) {
+        LOG_WARN("[ModelRuntime] Post-turn state transition rejected: model="
                  << model_id_ << " session=" << task->input.session_id);
+        if (uses_private_memory) {
+            memory_coordinator_->abortTurn(
+                task->input.memory_turn.value(),
+                MemoryTurnState::GenerationFailed);
+        }
         return false;
     }
     const std::string session_id = task->input.session_id;
@@ -964,9 +994,15 @@ bool ModelRuntime::beginPostTurn(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_requested_) {
-            memory_coordinator_->publish(
-                conversation_memory_key,
-                MemoryReadyResult::Status::Cancelled);
+            if (uses_private_memory) {
+                memory_coordinator_->abortTurn(
+                    task->input.memory_turn.value(),
+                    MemoryTurnState::Cancelled);
+            } else {
+                memory_coordinator_->publish(
+                    conversation_memory_key,
+                    MemoryReadyResult::Status::Cancelled);
+            }
             return false;
         }
         running_job_.reset();
@@ -988,9 +1024,14 @@ bool ModelRuntime::beginPostTurn(
                  << " message=<unknown>");
     }
 
-    memory_coordinator_->publish(
-        conversation_memory_key,
-        MemoryReadyResult::Status::Failed);
+    if (uses_private_memory) {
+        memory_coordinator_->publish(
+            task->input.memory_turn.value(), MemoryOutcome::Failed);
+    } else {
+        memory_coordinator_->publish(
+            conversation_memory_key,
+            MemoryReadyResult::Status::Failed);
+    }
     finishPostTurn();
     return false;
 }

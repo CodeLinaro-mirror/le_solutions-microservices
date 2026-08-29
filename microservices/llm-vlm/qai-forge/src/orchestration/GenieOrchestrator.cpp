@@ -29,6 +29,7 @@
 #include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <regex>
 #include <sstream>
@@ -36,6 +37,7 @@
 #include <iomanip>
 #include <random>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -84,13 +86,97 @@ std::string generateEventId() {
 }
 
 ConversationMemoryUpdate makeConversationMemoryUpdate(
-    const ConversationSession& session) {
+    const scheduler::GenieMemoryState& memory) {
     ConversationMemoryUpdate update;
-    update.summary_content = session.summary_content;
-    update.summary_token_count = session.summary_token_count;
-    update.facts = session.facts;
-    update.evicted_message_count = session.evicted_message_count;
+    update.summary_content = memory.summary_content;
+    update.summary_token_count = memory.summary_token_count;
+    update.facts = memory.facts;
+    update.evicted_message_count = memory.canonical_boundary;
     return update;
+}
+
+scheduler::GenieMemoryState makeGenieMemoryState(
+    const ConversationMemoryUpdate& memory) {
+    scheduler::GenieMemoryState state;
+    state.summary_content = memory.summary_content;
+    state.summary_token_count = memory.summary_token_count;
+    state.facts = memory.facts;
+    state.canonical_boundary = memory.evicted_message_count;
+    return state;
+}
+
+json canonicalConversationMessages(const json& messages) {
+    json canonical = json::array();
+    if (!messages.is_array()) {
+        return canonical;
+    }
+    for (const auto& message : messages) {
+        if (!message.is_object() || message.value("role", "") == "system") {
+            continue;
+        }
+        json clean = json::object();
+        for (const auto& item : message.items()) {
+            if (item.key().empty() || item.key().front() != '_') {
+                clean[item.key()] = item.value();
+            }
+        }
+        canonical.push_back(std::move(clean));
+    }
+    return canonical;
+}
+
+std::string canonicalPrefixDigest(const json& messages, std::size_t boundary) {
+    if (!messages.is_array() || boundary > messages.size()) {
+        return {};
+    }
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (std::size_t index = 0; index < boundary; ++index) {
+        const std::string serialized = messages[index].dump();
+        for (const unsigned char value : serialized) {
+            hash ^= value;
+            hash *= 1099511628211ULL;
+        }
+        hash ^= static_cast<unsigned char>('\n');
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream stream;
+    stream << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return stream.str();
+}
+
+bool memoryMatchesTranscript(const scheduler::GenieMemoryState& memory,
+                             const json& messages) {
+    if (memory.canonical_boundary == 0) {
+        return true;
+    }
+    return memory.canonical_boundary <= messages.size() &&
+           !memory.transcript_digest.empty() &&
+           memory.transcript_digest == canonicalPrefixDigest(
+               messages, memory.canonical_boundary);
+}
+
+std::string messageText(const json& message) {
+    auto content = message.find("content");
+    if (content == message.end() || content->is_null()) {
+        return {};
+    }
+    if (content->is_string()) {
+        return content->get<std::string>();
+    }
+    if (!content->is_array()) {
+        return content->dump();
+    }
+
+    std::ostringstream text;
+    for (const auto& part : *content) {
+        if (part.is_string()) {
+            text << part.get<std::string>();
+        } else if (part.is_object() && part.contains("text") &&
+                   part["text"].is_string()) {
+            text << part["text"].get<std::string>();
+        }
+    }
+    return text.str();
 }
 
 std::string renderToolCallsForPrompt(const json& tool_calls) {
@@ -273,7 +359,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     std::string user_system;
     for (const auto& msg : request.messages) {
         if (getStringOrDefault(msg, "role", "") == "system") {
-            user_system = getStringOrDefault(msg, "content", "");
+            user_system = messageText(msg);
             break;
         }
     }
@@ -328,7 +414,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     auto clean_messages = session.getHistoryMessages();
     for (const auto& msg : clean_messages) {
         std::string role = getStringOrDefault(msg, "role", "");
-        std::string content = getStringOrDefault(msg, "content", "");
+        std::string content = messageText(msg);
         if (role == "user") {
             prompt << user_prefix << content << user_suffix;
         } else if (role == "assistant") {
@@ -344,7 +430,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     json processed_messages = adapter.preprocessVision(request.messages, chat_template);
     for (const auto& msg : processed_messages) {
         std::string role = getStringOrDefault(msg, "role", "");
-        std::string content = getStringOrDefault(msg, "content", "");
+        std::string content = messageText(msg);
         if (role == "user") {
             prompt << user_prefix << content << user_suffix;
         } else if (role == "tool") {
@@ -371,23 +457,84 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     request.model = context.model_id;
     validateRequest(request);
 
-    const std::string session_id = request.user.value_or(context.job_id);
+    const std::string session_id = context.execution_session_id.empty()
+        ? context.job_id : context.execution_session_id;
     ConversationSession session(session_id);
-    session.summary_content = context.caller.summary_content;
-    session.summary_token_count = context.caller.summary_token_count;
-    session.facts = context.caller.facts;
-    session.evicted_message_count = context.caller.evicted_message_count;
+    auto& config_manager = ModelConfigManager::getInstance();
+    const bool is_vlm = config_manager.supportsVision(context.model_id);
+    const bool uses_private_memory = context.memory_turn.has_value();
+
+    json complete_messages = json::array();
     if (context.caller.use_response_history &&
         context.caller.response_history.is_array()) {
-        for (auto& message : context.caller.response_history) {
+        for (const auto& message : context.caller.response_history) {
             if (message.is_object()) {
-                session.addMessage(std::move(message));
+                complete_messages.push_back(message);
+            }
+        }
+    }
+    if (request.messages.is_array()) {
+        for (const auto& message : request.messages) {
+            if (message.is_object()) {
+                complete_messages.push_back(message);
             }
         }
     }
 
-    auto& config_manager = ModelConfigManager::getInstance();
-    const bool is_vlm = config_manager.supportsVision(context.model_id);
+    scheduler::GenieMemoryState input_memory;
+    if (uses_private_memory) {
+        input_memory = std::move(context.memory_state).value_or(
+            scheduler::GenieMemoryState{});
+    } else {
+        ConversationMemoryUpdate legacy_memory;
+        legacy_memory.summary_content = context.caller.summary_content;
+        legacy_memory.summary_token_count = context.caller.summary_token_count;
+        legacy_memory.facts = context.caller.facts;
+        legacy_memory.evicted_message_count =
+            context.caller.evicted_message_count;
+        input_memory = makeGenieMemoryState(legacy_memory);
+    }
+
+    json post_turn_messages = complete_messages;
+    CreateChatCompletionRequest prompt_request = request;
+    if (uses_private_memory && !is_vlm) {
+        post_turn_messages = canonicalConversationMessages(complete_messages);
+        if (!memoryMatchesTranscript(input_memory, post_turn_messages)) {
+            LOG_WARN("[GenieOrchestrator] Ignoring incompatible conversation memory: model="
+                     << context.model_id << " turn="
+                     << context.caller.conversation->turn_id);
+            input_memory = scheduler::GenieMemoryState{};
+        }
+        session.summary_content = input_memory.summary_content;
+        session.summary_token_count = input_memory.summary_token_count;
+        session.facts = input_memory.facts;
+        session.evicted_message_count = input_memory.canonical_boundary;
+        for (const auto& message : post_turn_messages) {
+            session.addMessage(message);
+        }
+        prompt_request.messages = json::array();
+        for (const auto& message : complete_messages) {
+            if (message.value("role", "") == "system") {
+                prompt_request.messages.push_back(message);
+            }
+        }
+    } else {
+        if (!is_vlm) {
+            session.summary_content = input_memory.summary_content;
+            session.summary_token_count = input_memory.summary_token_count;
+            session.facts = input_memory.facts;
+            session.evicted_message_count = input_memory.canonical_boundary;
+        }
+        if (context.caller.use_response_history &&
+            context.caller.response_history.is_array()) {
+            for (const auto& message : context.caller.response_history) {
+                if (message.is_object()) {
+                    session.addMessage(message);
+                }
+            }
+        }
+    }
+
     const int context_size = config_manager.getContextSize(context.model_id);
     bool use_reasoning =
         !is_vlm && config_manager.supportsThinking(context.model_id);
@@ -398,7 +545,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
 
     if (use_reasoning) {
         const std::string preliminary_prompt =
-            buildContextPrompt(session, request);
+            buildContextPrompt(session, prompt_request);
         const std::string effort =
             request.reasoning_effort.value_or("medium");
         const ReasoningBudgetResult budget =
@@ -425,7 +572,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
 
     scheduler::GeniePreparedRequest prepared;
     prepared.final_prompt = buildContextPrompt(
-        session, request, thinking_budget, answer_budget);
+        session, prompt_request, thinking_budget, answer_budget);
     prepared.generation.max_tokens = max_tokens;
     prepared.generation.temperature = request.temperature.value_or(1.0f);
     prepared.generation.top_p = request.top_p.value_or(1.0f);
@@ -446,24 +593,13 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
             model_config->thinking_end_tag;
     }
     prepared.tools = std::move(request.tools).value_or(json::array());
-    prepared.input_memory = makeConversationMemoryUpdate(session);
+    prepared.input_memory = std::move(input_memory);
+    prepared.uses_private_memory = uses_private_memory;
     if (is_vlm) {
         prepared.vision.buffers =
             preprocessImagesToBuffers(request.messages, context.model_id);
     }
-    prepared.conversation_messages = json::array();
-    auto& conversation_messages =
-        prepared.conversation_messages.get_ref<json::array_t&>();
-    conversation_messages.reserve(
-        session.messages.size() + request.messages.size());
-    for (auto& message : session.messages) {
-        conversation_messages.push_back(std::move(message));
-    }
-    for (auto& message : request.messages) {
-        if (message.is_object()) {
-            conversation_messages.push_back(std::move(message));
-        }
-    }
+    prepared.conversation_messages = std::move(post_turn_messages);
 
     auto job = std::make_shared<scheduler::GenerativeJob>();
     job->response_id = context.caller.response_id.empty()
@@ -472,6 +608,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     job->job_id = std::move(context.job_id);
     job->model_id = std::move(context.model_id);
     job->tool_chain_id = std::move(context.tool_chain_id);
+    job->memory_turn = context.memory_turn;
     job->kind = context.kind;
     job->priority = context.priority;
     job->prepared = std::move(prepared);
@@ -605,7 +742,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     }
 
     StandardResponse response;
-    response.id = job.session_id;
+    response.id = job.response_id;
     response.model = job.model_id;
     response.role = "assistant";
     // Only populate response.content with the raw answer text when no tool
@@ -634,8 +771,9 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    if (!is_vlm && tool_calls.empty()) {
-        response.updated_conversation_memory = prepared.input_memory;
+    if (!prepared.uses_private_memory && !is_vlm && tool_calls.empty()) {
+        response.updated_conversation_memory =
+            makeConversationMemoryUpdate(prepared.input_memory);
     }
     LOG_INFO("[GenieOrchestrator] Blocking inference completed: model="
              << job.model_id << " session=" << job.session_id
@@ -656,7 +794,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     auto& callback = job.callbacks.on_token;
 
     StreamChunk role_chunk;
-    role_chunk.id = job.session_id;
+    role_chunk.id = job.response_id;
     role_chunk.model = job.model_id;
     role_chunk.role = "assistant";
     callback(role_chunk);
@@ -693,7 +831,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             [&job, &callback, &full_response]
             (const IPCTokenEvent& token) {
                 StreamChunk chunk;
-                chunk.id = job.session_id;
+                chunk.id = job.response_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
                 full_response += token.content;
@@ -723,7 +861,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
                 if (generation.use_reasoning) {
                     auto chunks = router.route(token.content);
                     for (auto& chunk : chunks) {
-                        chunk.id = job.session_id;
+                        chunk.id = job.response_id;
                         chunk.model = job.model_id;
                         callback(chunk);
                         if (chunk.content_delta.has_value()) {
@@ -734,7 +872,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
                 }
 
                 StreamChunk chunk;
-                chunk.id = job.session_id;
+                chunk.id = job.response_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
                 full_response += token.content;
@@ -782,13 +920,13 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     }
 
     StreamChunk finish_chunk;
-    finish_chunk.id = job.session_id;
+    finish_chunk.id = job.response_id;
     finish_chunk.model = job.model_id;
     finish_chunk.finish_reason = tool_calls.empty() ? finish_reason : "tool_calls";
     callback(finish_chunk);
 
     StandardResponse response;
-    response.id = job.session_id;
+    response.id = job.response_id;
     response.model = job.model_id;
     response.role = "assistant";
     // Only populate response.content with the raw answer text when no tool
@@ -817,8 +955,9 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     response.reasoning_tokens = reasoning_token_count;
     // total_tokens = input + output (output already includes reasoning)
     response.total_tokens = response.prompt_tokens + response.completion_tokens;
-    if (!is_vlm && tool_calls.empty()) {
-        response.updated_conversation_memory = prepared.input_memory;
+    if (!prepared.uses_private_memory && !is_vlm && tool_calls.empty()) {
+        response.updated_conversation_memory =
+            makeConversationMemoryUpdate(prepared.input_memory);
     }
     LOG_INFO("[GenieOrchestrator] Streaming inference completed: model="
              << job.model_id << " session=" << job.session_id
@@ -846,21 +985,24 @@ GenieOrchestrator::createPostTurnTask(
         job.conversation_memory_key.empty()
             ? job.session_id
             : job.conversation_memory_key;
+    task.input.input_memory = std::move(prepared->input_memory);
+    task.input.memory_turn = job.memory_turn;
+    task.input.uses_private_memory = prepared->uses_private_memory;
     task.input.request_messages =
         std::move(prepared->conversation_messages);
     task.response = response;
     return task;
 }
 
-ConversationMemoryUpdate GenieOrchestrator::executePostTurn(
+scheduler::GenieMemoryState GenieOrchestrator::executePostTurn(
     scheduler::PostTurnTask& task,
-    const ConversationMemoryUpdate& committed_memory,
     IGenerativeBackend& backend) const {
     ConversationSession session(task.input.session_id);
-    session.summary_content = committed_memory.summary_content;
-    session.summary_token_count = committed_memory.summary_token_count;
-    session.facts = committed_memory.facts;
-    session.evicted_message_count = committed_memory.evicted_message_count;
+    session.summary_content = task.input.input_memory.summary_content;
+    session.summary_token_count = task.input.input_memory.summary_token_count;
+    session.facts = task.input.input_memory.facts;
+    session.evicted_message_count =
+        task.input.input_memory.canonical_boundary;
 
     if (task.input.request_messages.is_array()) {
         for (auto& message : task.input.request_messages) {
@@ -882,7 +1024,20 @@ ConversationMemoryUpdate GenieOrchestrator::executePostTurn(
     session.addMessage(assistant_message);
 
     postTurnProcessing(session, task.response.model, backend);
-    return makeConversationMemoryUpdate(session);
+    scheduler::GenieMemoryState updated;
+    updated.summary_content = session.summary_content;
+    updated.summary_token_count = session.summary_token_count;
+    updated.facts = session.facts;
+    updated.canonical_boundary = session.evicted_message_count;
+    if (task.input.uses_private_memory && updated.canonical_boundary != 0) {
+        json canonical = json::array();
+        for (const auto& message : session.messages) {
+            canonical.push_back(message);
+        }
+        updated.transcript_digest = canonicalPrefixDigest(
+            canonical, updated.canonical_boundary);
+    }
+    return updated;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -950,7 +1105,7 @@ GenieOrchestrator::generateSummary(
         std::string role = getStringOrDefault(msg, "role", "");
         if (role == "tool" || role == "system") continue;
 
-        std::string content = getStringOrDefault(msg, "content", "");
+        std::string content = messageText(msg);
         if (content.empty()) continue;
 
         int msg_tokens = estimateTokens(content);
@@ -1033,7 +1188,7 @@ void GenieOrchestrator::extractFacts(
     for (const auto& msg : messages_to_extract) {
         std::string role = getStringOrDefault(msg, "role", "");
         if (role != "user" && role != "assistant") continue;
-        std::string content = getStringOrDefault(msg, "content", "");
+        std::string content = messageText(msg);
         if (content.empty()) continue;
         std::string label = (role == "user") ? "User" : "Assistant";
         conv << label << ": " << content << "\n";
@@ -1158,7 +1313,20 @@ void GenieOrchestrator::postTurnProcessing(
     max_summary_tok     = std::min(max_summary_tok, 400);
 
     // Estimate current history tokens (messages after evicted_message_count).
-    int current_tokens = session.estimateHistoryTokens();
+    int current_tokens = 0;
+    for (size_t message_index = session.evicted_message_count;
+         message_index < session.messages.size();
+         ++message_index) {
+        const auto& message = session.messages[message_index];
+        if (message.value("role", "") == "system") {
+            continue;
+        }
+        current_tokens += static_cast<int>(messageText(message).size() / 4) + 4;
+        if (message.contains("tool_calls")) {
+            current_tokens += static_cast<int>(
+                message["tool_calls"].dump().size() / 4);
+        }
+    }
 
     if (current_tokens <= eviction_thresh) {
         LOG_DEBUG("[GenieOrchestrator] postTurnProcessing: no eviction needed ("
@@ -1171,19 +1339,39 @@ void GenieOrchestrator::postTurnProcessing(
     size_t evict_count = 0;
     int remaining_tokens = current_tokens;
 
-    for (size_t i = session.evicted_message_count; i < session.messages.size(); ++i) {
-        if (remaining_tokens <= eviction_target) break;
+    size_t index = session.evicted_message_count;
+    while (index < session.messages.size() &&
+           remaining_tokens > eviction_target) {
+        size_t group_end = index + 1;
+        const auto& first = session.messages[index];
+        const bool opens_tool_group =
+            first.value("role", "") == "assistant" &&
+            first.contains("tool_calls") && first["tool_calls"].is_array() &&
+            !first["tool_calls"].empty();
+        if (opens_tool_group) {
+            while (group_end < session.messages.size() &&
+                   session.messages[group_end].value("role", "") == "tool") {
+                ++group_end;
+            }
+        }
 
-        const auto& msg = session.messages[i];
-        std::string role = getStringOrDefault(msg, "role", "");
-        if (role == "system") continue;
-
-        std::string content = getStringOrDefault(msg, "content", "");
-        int msg_tokens = static_cast<int>(content.size() / 4) + 4;
-
-        eviction_batch.push_back(msg);
-        evict_count++;
-        remaining_tokens -= msg_tokens;
+        for (size_t message_index = index;
+             message_index < group_end;
+             ++message_index) {
+            const auto& message = session.messages[message_index];
+            ++evict_count;
+            if (message.value("role", "") == "system") {
+                continue;
+            }
+            eviction_batch.push_back(message);
+            const std::string content = messageText(message);
+            remaining_tokens -= static_cast<int>(content.size() / 4) + 4;
+            if (message.contains("tool_calls")) {
+                remaining_tokens -= static_cast<int>(
+                    message["tool_calls"].dump().size() / 4);
+            }
+        }
+        index = group_end;
     }
 
     if (eviction_batch.empty()) return;
@@ -1200,15 +1388,19 @@ void GenieOrchestrator::postTurnProcessing(
     try {
         auto [summary_text, summary_tokens] = generateSummary(
             session, eviction_batch, model_id, max_summary_tok, backend);
-        if (!summary_text.empty()) {
-            session.summary_content    = summary_text;
-            session.summary_token_count = summary_tokens;
-            LOG_INFO("[GenieOrchestrator] postTurnProcessing: summary updated ("
-                     << summary_tokens << " tokens)");
+        if (summary_text.empty()) {
+            throw std::runtime_error(
+                "Post-turn summarization produced an empty result");
         }
+        session.summary_content = summary_text;
+        session.summary_token_count = summary_tokens;
+        LOG_INFO("[GenieOrchestrator] postTurnProcessing: summary updated ("
+                 << summary_tokens << " tokens)");
     } catch (const std::exception& e) {
         LOG_WARN("[GenieOrchestrator] postTurnProcessing: summarization failed: "
-                 << e.what() << " — continuing without summary update");
+                 << e.what());
+        backend.resetKvAsync();
+        throw;
     }
 
     // Reset KV cache after summarization inference.
@@ -1221,7 +1413,9 @@ void GenieOrchestrator::postTurnProcessing(
         extractFacts(session, eviction_batch, model_id, backend);
     } catch (const std::exception& e) {
         LOG_WARN("[GenieOrchestrator] postTurnProcessing: fact extraction failed: "
-                 << e.what() << " — continuing without facts update");
+                 << e.what());
+        backend.resetKvAsync();
+        throw;
     }
 
     // Reset KV cache after fact extraction inference.

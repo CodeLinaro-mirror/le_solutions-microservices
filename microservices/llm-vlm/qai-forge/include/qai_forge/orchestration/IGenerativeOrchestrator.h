@@ -26,10 +26,9 @@ public:
         return std::nullopt;
     }
 
-    virtual ConversationMemoryUpdate executePostTurn(
+    virtual scheduler::GenieMemoryState executePostTurn(
         scheduler::PostTurnTask&,
-        const ConversationMemoryUpdate& committed_memory,
         IGenerativeBackend&) const {
-        return committed_memory;
+        return {};
     }
 };

@@ -244,10 +244,12 @@ scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
     auto job = std::make_shared<scheduler::GenerativeJob>();
     job->response_id = context.caller.response_id.empty()
         ? context.job_id : std::move(context.caller.response_id);
-    job->session_id = context.request.user.value_or(context.job_id);
+    job->session_id = context.execution_session_id.empty()
+        ? context.job_id : std::move(context.execution_session_id);
     job->job_id = std::move(context.job_id);
     job->model_id = std::move(context.model_id);
     job->tool_chain_id = std::move(context.tool_chain_id);
+    job->memory_turn = context.memory_turn;
     job->kind = context.kind;
     job->priority = context.priority;
     job->prepared = std::move(prepared);
@@ -302,7 +304,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     const bool has_thinking = !think_start_.empty() && !think_end_.empty();
     std::optional<ReasoningRouter> router;
     if (has_thinking) {
-        router.emplace(job.session_id, job.model_id, think_start_, think_end_, -1);
+        router.emplace(job.response_id, job.model_id, think_start_, think_end_, -1);
     }
     // Tracks whether the first non-empty answer-channel chunk has been
     // emitted yet, so we can strip the leading "\n\r" that typically follows
@@ -320,7 +322,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     bool saw_reasoning = false;
 
     StreamChunk stream_chunk;
-    stream_chunk.id    = job.session_id;
+    stream_chunk.id    = job.response_id;
     stream_chunk.model = job.model_id;
 
     if (streaming && job.callbacks.on_token) {
@@ -385,7 +387,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
                         if (delta.empty()) continue;  // still trimming
                         answer_started = true;
                     }
-                    chunk.id = job.session_id;
+                    chunk.id = job.response_id;
                     chunk.model = job.model_id;
                     job.callbacks.on_token(chunk);
                 }
@@ -427,7 +429,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     }
 
     StandardResponse response;
-    response.id    = job.session_id;
+    response.id = job.response_id;
     response.model = job.model_id;
     response.role  = "assistant";
     response.finish_reason = finish_reason;

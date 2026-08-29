@@ -37,6 +37,32 @@
 
 namespace qai_forge {
 
+enum class ConversationTurnOperation {
+    Begin,
+    Resume,
+};
+
+enum class ConversationParentPolicy {
+    Latest,
+    Explicit,
+};
+
+/**
+ * @brief Identifies one turn in an adapter-scoped conversation lineage.
+ *
+ * Callers must explicitly provide this reference to opt into QaiForge-owned
+ * runtime memory. The namespace prevents identifiers from different protocol
+ * adapters from sharing a lineage.
+ */
+struct ConversationReference {
+    std::string namespace_id;
+    std::string conversation_id;
+    std::string turn_id;
+    std::string parent_turn_id;
+    ConversationTurnOperation operation = ConversationTurnOperation::Begin;
+    ConversationParentPolicy parent_policy = ConversationParentPolicy::Latest;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GenerateOptions — Options for generative AI inference
 //
@@ -55,6 +81,14 @@ struct GenerateOptions {
     // Tool-call continuation flags (Responses API only)
     bool tool_output_submission = false;
     bool allow_tool_chain_fallback = false;
+
+    // Explicit QaiForge-owned conversation lineage. An omitted reference keeps
+    // the request stateless unless a temporary legacy memory key is supplied.
+    std::optional<ConversationReference> conversation;
+
+    // Internal MCP rounds reuse one logical conversation turn while each call
+    // receives an independent scheduler job identity.
+    bool internal_mcp_round = false;
 
     // Response history (Responses API — ancestor messages from ResponseStore)
     bool use_response_history = false;
@@ -183,6 +217,13 @@ public:
      * @return true if the request was found and cancelled.
      */
     bool cancel(const std::string& response_id);
+
+    /** @brief Release one turn and all of its descendants. */
+    bool releaseConversationSubtree(const ConversationReference& reference);
+
+    /** @brief Release all private runtime memory for a scoped conversation. */
+    bool releaseConversation(const std::string& namespace_id,
+                             const std::string& conversation_id);
 
     /** @brief Await and read the latest committed conversation memory snapshot. */
     std::optional<ConversationMemoryUpdate> awaitConversationMemory(

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/QaiForge.h"
+#include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 
 #include <cstdint>
 #include <memory>
@@ -52,7 +53,8 @@ struct GeniePreparedRequest {
     PreparedVisionInputs vision;
     json tools = json::array();
     json conversation_messages = json::array();
-    ConversationMemoryUpdate input_memory;
+    GenieMemoryState input_memory;
+    bool uses_private_memory = false;
 };
 
 struct LlamaCppPreparedRequest {
@@ -88,9 +90,12 @@ struct GenerativeJobContext {
     std::string model_id;
     CreateChatCompletionRequest request;
     qai_forge::GenerateOptions caller;
+    std::string execution_session_id;
 
     std::string tool_chain_id;
     std::string conversation_memory_write_key;
+    std::optional<MemoryTurnCommitToken> memory_turn;
+    std::optional<GenieMemoryState> memory_state;
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::ANY_REQUEST;
     bool tool_continuation = false;

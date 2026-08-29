@@ -59,9 +59,8 @@ public:
         scheduler::GenerativeJob& job,
         const StandardResponse& response) const override;
 
-    ConversationMemoryUpdate executePostTurn(
+    scheduler::GenieMemoryState executePostTurn(
         scheduler::PostTurnTask& task,
-        const ConversationMemoryUpdate& committed_memory,
         IGenerativeBackend& backend) const override;
 
 private:

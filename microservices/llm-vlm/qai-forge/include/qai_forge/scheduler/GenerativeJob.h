@@ -25,6 +25,9 @@ struct PostTurnInput {
     std::string session_id;
     std::string conversation_memory_key;
     json request_messages = json::array();
+    GenieMemoryState input_memory;
+    std::optional<MemoryTurnCommitToken> memory_turn;
+    bool uses_private_memory = false;
 };
 
 struct PostTurnTask {
@@ -39,6 +42,7 @@ struct GenerativeJob {
     std::string session_id;
     std::string tool_chain_id;
     std::string conversation_memory_key;
+    std::optional<MemoryTurnCommitToken> memory_turn;
 
     JobKind kind = JobKind::HTTP_NON_STREAMING;
     JobPriority priority = JobPriority::ANY_REQUEST;
