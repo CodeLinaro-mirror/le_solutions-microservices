@@ -13,7 +13,7 @@ using json = nlohmann::ordered_json;
 
 // Forward declarations
 class ChatCompletionStore;
-struct ChatSession;
+struct BeginChatTurnResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ChatCompletionsController — OpenAI Chat Completions API
@@ -103,12 +103,12 @@ private:
      * Sets up Drogon AsyncStreamResponse with qai-forge StreamCallbacks.
      * Formats output as Server-Sent Events (SSE).
      *
-     * @param session Session pointer
+     * @param turn Reserved Chat turn value
      * @param request qai-forge request
      * @param callback Response callback
      */
     void handleStreamingRequest(
-        struct ChatSession* session,
+        const struct BeginChatTurnResult& turn,
         const struct CreateChatCompletionRequest& request,
         const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);
@@ -118,12 +118,12 @@ private:
      *
      * Calls qai-forge synchronously and returns complete response.
      *
-     * @param session Session pointer
+     * @param turn Reserved Chat turn value
      * @param request qai-forge request
      * @param callback Response callback
      */
     void handleNonStreamingRequest(
-        struct ChatSession* session,
+        const struct BeginChatTurnResult& turn,
         const struct CreateChatCompletionRequest& request,
         const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);

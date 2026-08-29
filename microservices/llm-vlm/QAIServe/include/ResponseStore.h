@@ -26,21 +26,6 @@ enum class StoredResponseStatus {
 };
 
 /**
- * @brief Reserved summary metadata for future branch-aware compaction.
- */
-struct CompactionSummary {
-    std::string compaction_id;
-    std::string summarized_until_response_id;
-    std::string branch_head_response_id;
-    std::string summary_text;
-    int summary_tokens = 0;
-    int input_tokens_before = 0;
-    int input_tokens_after = 0;
-    std::string model;
-    int created_at = 0;
-};
-
-/**
  * @brief One stored Responses API turn.
  * @details The tree edge is previous_response_id. Context is derived by walking
  * completed ancestors, not from a session-level transcript.
@@ -74,7 +59,7 @@ struct StoredResponse {
 
 /**
  * @brief Grouping container for a response tree.
- * @details The session tracks membership and future compaction records only.
+ * @details The session tracks response-tree membership only.
  */
 struct StoredSession {
     std::string session_id;
@@ -82,7 +67,6 @@ struct StoredSession {
     std::unordered_set<std::string> response_ids;
     int created_at = 0;
     int last_activity_at = 0;
-    std::vector<CompactionSummary> compactions;
 };
 
 /**
@@ -95,9 +79,6 @@ struct BuildCandidateResult {
     std::string session_id;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
-    std::string applied_compaction_id;
-    std::string applied_summary;
-    int summary_tokens = 0;
 };
 
 /**
@@ -151,17 +132,6 @@ struct DeleteCascadeResult {
     bool ok = false;
     int http_status = 200;
     std::string error_message;
-};
-
-/**
- * @brief Result of storing a branch compaction summary.
- */
-struct ApplyCompactionResult {
-    bool ok = false;
-    bool applied = false;
-    int http_status = 200;
-    std::string error_message;
-    std::string compaction_id;
 };
 
 class ResponseStoreTestAccess;
@@ -220,13 +190,6 @@ public:
      * @brief Expire stale InProgress responses and return job ids to cancel.
      */
     std::vector<ExpiredResponse> expireStaleInProgress(int now_unix);
-
-    /**
-     * @brief Store or replace a fork-safe branch compaction summary.
-     */
-    ApplyCompactionResult applyCompaction(
-        const std::string& session_id,
-        const CompactionSummary& summary);
 
     /**
      * @brief Return a copy of a stored response, or nullopt if missing.

@@ -12,10 +12,6 @@ constexpr int IMAGE_TOKEN_COST = 765;
 constexpr int MESSAGE_OVERHEAD_TOKENS = 4;
 constexpr int MAX_COMPLETION_SAFETY_MARGIN = 64;
 constexpr int MIN_USEFUL_COMPLETION_TOKENS = 64;
-constexpr double SUMMARIZATION_CONTEXT_THRESHOLD = 0.9;
-constexpr double SUMMARIZATION_SUMMARY_SIZE_RATIO = 0.2;
-constexpr double SUMMARIZATION_SYSTEM_PROMPT_OVERHEAD = 1.3;
-constexpr double SUMMARIZATION_MAX_COMPLETION_MULTIPLIER = 0.5;
 
 constexpr const char* ERROR_CODE_CONTEXT_LENGTH_EXCEEDED =
     "context_length_exceeded";

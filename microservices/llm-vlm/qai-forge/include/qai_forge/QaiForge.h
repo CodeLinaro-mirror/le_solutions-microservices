@@ -45,6 +45,7 @@ enum class ConversationTurnOperation {
 enum class ConversationParentPolicy {
     Latest,
     Explicit,
+    Root,
 };
 
 /**

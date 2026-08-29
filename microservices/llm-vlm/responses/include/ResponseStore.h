@@ -26,16 +26,6 @@ enum class StoredResponseStatus {
 };
 
 /**
- * @brief Branch-local conversation memory captured after a completed turn.
- */
-struct StoredConversationMemory {
-    std::string summary_content;
-    int summary_token_count = 0;
-    std::unordered_map<std::string, std::string> facts;
-    std::string summarized_until_response_id;
-};
-
-/**
  * @brief One stored Responses API turn.
  * @details The tree edge is previous_response_id. Context is derived by walking
  * completed ancestors, not from a session-level transcript.
@@ -59,7 +49,6 @@ struct StoredResponse {
     ResponseStoreJson incomplete_details = nullptr;
     ResponseStoreJson metadata = ResponseStoreJson::object();
 
-    std::optional<StoredConversationMemory> conversation_memory;
     std::string active_job_id;
 
     int created_at = 0;
@@ -90,9 +79,7 @@ struct BuildCandidateResult {
     std::string error_message;
     std::string session_id;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
-    std::vector<std::string> ancestor_message_response_ids;
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
-    std::optional<StoredConversationMemory> conversation_memory;
 };
 
 /**
@@ -106,9 +93,7 @@ struct BeginResponseResult {
     std::string session_id;
     int created_at = 0;
     ResponseStoreJson ancestor_messages = ResponseStoreJson::array();
-    std::vector<std::string> ancestor_message_response_ids;
     ResponseStoreJson current_request_messages = ResponseStoreJson::array();
-    std::optional<StoredConversationMemory> conversation_memory;
 };
 
 /**
@@ -198,14 +183,7 @@ public:
         const ResponseStoreJson& assistant_messages,
         const ResponseStoreJson& output_items,
         const ResponseStoreJson& response_object,
-        const ResponseStoreJson& usage,
-        const std::optional<StoredConversationMemory>& memory_update =
-            std::nullopt);
-
-    /** @brief Idempotently attach asynchronously prepared conversation memory. */
-    bool updateConversationMemory(
-        const std::string& response_id,
-        const StoredConversationMemory& memory_update);
+        const ResponseStoreJson& usage);
 
     /**
      * @brief Mark an InProgress response as Failed.
@@ -268,11 +246,8 @@ private:
 
     static int currentUnixTime();
 
-    static void appendMessagesWithSource(
-        ResponseStoreJson& destination,
-        std::vector<std::string>& destination_response_ids,
-        const ResponseStoreJson& messages,
-        const std::string& response_id);
+    static void appendMessages(ResponseStoreJson& destination,
+                               const ResponseStoreJson& messages);
 
     static ResponseStoreJson makeResponseObject(
         const StoredResponse& response,

@@ -23,6 +23,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace qai_forge {
 
@@ -87,6 +88,10 @@ std::string generatedJobId() {
 std::string generatedPredictiveJobId() {
     static std::atomic<uint64_t> next_id{1};
     return "predict_job_" + std::to_string(next_id.fetch_add(1));
+}
+
+std::string internalMcpLeaseId(const std::string& response_id) {
+    return "internal_mcp_" + response_id;
 }
 
 bool requestContainsToolOutput(const CreateChatCompletionRequest& request) {
@@ -477,6 +482,8 @@ struct QaiForge::Impl {
             return false;
         }
         std::string job_id = response_id;
+        std::string lease_model_id;
+        std::string lease_id;
         std::optional<scheduler::MemoryTurnCommitToken> memory_turn;
         bool found_operation = false;
         {
@@ -488,9 +495,12 @@ struct QaiForge::Impl {
                 found->second.last_activity =
                     std::chrono::steady_clock::now();
                 job_id = found->second.job_id;
+                lease_model_id = found->second.lease_model_id;
+                lease_id = found->second.lease_id;
                 memory_turn = found->second.memory_turn;
             }
         }
+        closeChainIfPresent(lease_model_id, lease_id);
         if (memory_turn.has_value()) {
             memory_coordinator_->abortTurn(
                 memory_turn.value(), scheduler::MemoryTurnState::Cancelled);
@@ -530,6 +540,8 @@ struct QaiForge::Impl {
 private:
     struct ActiveOperation {
         std::string job_id;
+        std::string lease_model_id;
+        std::string lease_id;
         std::optional<scheduler::MemoryTurnCommitToken> memory_turn;
         bool cancelled = false;
         std::chrono::steady_clock::time_point last_activity =
@@ -566,8 +578,20 @@ private:
         }
         context.execution_session_id = session_id;
 
-        bool tool_output = !options.internal_mcp_round &&
-            (options.tool_output_submission || requestContainsToolOutput(request));
+        if (options.internal_mcp_round &&
+            !options.tool_output_submission &&
+            !options.previous_response_id.empty()) {
+            context.tool_chain_id = internalMcpLeaseId(response_id);
+            context.priority = scheduler::JobPriority::TOOL_CONTINUATION;
+            context.tool_continuation = true;
+            scheduler_.renewToolLease(
+                context.model_id,
+                context.tool_chain_id,
+                config_.tool_response_timeout);
+        }
+
+        bool tool_output = options.tool_output_submission ||
+            (!options.internal_mcp_round && requestContainsToolOutput(request));
         if (tool_output && !options.previous_response_id.empty()) {
             const scheduler::ToolChainResolveResult resolved =
                 tool_chains_.resolveByPreviousResponseId(
@@ -766,8 +790,12 @@ private:
         const std::string model_id = job.model_id;
         const std::string session_id = job.session_id;
         const std::string previous_chain_id = job.tool_chain_id;
-        const std::string job_id = job.job_id;
         const scheduler::JobKind kind = job.kind;
+        const std::string internal_mcp_lease_id =
+            kind == scheduler::JobKind::MCP_ROUND
+                ? internalMcpLeaseId(response_id)
+                : std::string();
+        const std::string job_id = job.job_id;
         const std::optional<scheduler::MemoryTurnCommitToken> memory_turn =
             job.memory_turn;
 
@@ -779,9 +807,30 @@ private:
              model_id,
              session_id,
              previous_chain_id,
+             internal_mcp_lease_id,
              job_id,
              kind](const StandardResponse& response) {
-                if (kind != scheduler::JobKind::MCP_ROUND) {
+                const bool awaiting_internal_tool =
+                    kind == scheduler::JobKind::MCP_ROUND &&
+                    responseHasToolCalls(response);
+                if (kind == scheduler::JobKind::MCP_ROUND) {
+                    if (awaiting_internal_tool) {
+                        scheduler_.openToolLease(
+                            model_id,
+                            internal_mcp_lease_id,
+                            config_.tool_response_timeout);
+                        if (previous_chain_id != internal_mcp_lease_id) {
+                            closeChainIfPresent(
+                                model_id, previous_chain_id);
+                        }
+                    } else {
+                        closeChainIfPresent(model_id, previous_chain_id);
+                        if (previous_chain_id != internal_mcp_lease_id) {
+                            closeChainIfPresent(
+                                model_id, internal_mcp_lease_id);
+                        }
+                    }
+                } else {
                     handleCompletion(
                         response_id,
                         model_id,
@@ -789,11 +838,14 @@ private:
                         previous_chain_id,
                         response);
                 }
-                finishActiveOperation(
+                const bool kept_for_resume = finishActiveOperation(
                     response_id,
                     job_id,
-                    kind == scheduler::JobKind::MCP_ROUND &&
-                        responseHasToolCalls(response));
+                    awaiting_internal_tool);
+                if (awaiting_internal_tool && !kept_for_resume) {
+                    closeChainIfPresent(
+                        model_id, internal_mcp_lease_id);
+                }
                 if (original_callbacks->on_complete) {
                     original_callbacks->on_complete(response);
                 }
@@ -861,29 +913,38 @@ private:
         }
         ActiveOperation& operation = active_operations_[job.response_id];
         operation.job_id = job.job_id;
+        operation.lease_model_id =
+            job.kind == scheduler::JobKind::MCP_ROUND
+                ? job.model_id
+                : std::string();
+        operation.lease_id =
+            job.kind == scheduler::JobKind::MCP_ROUND
+                ? internalMcpLeaseId(job.response_id)
+                : std::string();
         operation.memory_turn = job.memory_turn;
         operation.cancelled = false;
         operation.last_activity = std::chrono::steady_clock::now();
     }
 
-    void finishActiveOperation(const std::string& response_id,
+    bool finishActiveOperation(const std::string& response_id,
                                const std::string& job_id,
                                bool keep_for_resume) {
         if (response_id.empty()) {
-            return;
+            return false;
         }
         std::lock_guard<std::mutex> lock(active_operations_mutex_);
         auto found = active_operations_.find(response_id);
         if (found == active_operations_.end() ||
             found->second.job_id != job_id) {
-            return;
+            return false;
         }
         if (keep_for_resume && !found->second.cancelled) {
             found->second.job_id.clear();
             found->second.last_activity = std::chrono::steady_clock::now();
-            return;
+            return true;
         }
         active_operations_.erase(found);
+        return false;
     }
 
     void handleCompletion(const std::string& response_id,
@@ -926,15 +987,24 @@ private:
     void expireIdleActiveOperations() {
         const auto cutoff = std::chrono::steady_clock::now() -
             config_.conversation_memory_ttl;
-        std::lock_guard<std::mutex> lock(active_operations_mutex_);
-        for (auto it = active_operations_.begin();
-             it != active_operations_.end();) {
-            if (it->second.job_id.empty() &&
-                it->second.last_activity <= cutoff) {
-                it = active_operations_.erase(it);
-            } else {
-                ++it;
+        std::vector<std::pair<std::string, std::string>> expired_leases;
+        {
+            std::lock_guard<std::mutex> lock(active_operations_mutex_);
+            for (auto it = active_operations_.begin();
+                 it != active_operations_.end();) {
+                if (it->second.job_id.empty() &&
+                    it->second.last_activity <= cutoff) {
+                    expired_leases.emplace_back(
+                        it->second.lease_model_id,
+                        it->second.lease_id);
+                    it = active_operations_.erase(it);
+                } else {
+                    ++it;
+                }
             }
+        }
+        for (const auto& lease : expired_leases) {
+            closeChainIfPresent(lease.first, lease.second);
         }
     }
 

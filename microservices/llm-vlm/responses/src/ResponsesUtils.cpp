@@ -312,35 +312,6 @@ json build_text_runtime_messages(const json& messages) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_text_runtime_messages_with_sources
-// ─────────────────────────────────────────────────────────────────────────────
-json build_text_runtime_messages_with_sources(
-    const json& messages,
-    const std::vector<std::string>& message_source_ids,
-    std::vector<std::string>& runtime_message_source_ids) {
-    json runtime_messages = json::array();
-    runtime_message_source_ids.clear();
-    if (!messages.is_array()) {
-        return runtime_messages;
-    }
-
-    std::size_t index = 0;
-    for (const auto& message : messages) {
-        json runtime_message;
-        if (build_text_runtime_message(message, runtime_message)) {
-            runtime_messages.push_back(std::move(runtime_message));
-            runtime_message_source_ids.push_back(
-                index < message_source_ids.size()
-                    ? message_source_ids[index]
-                    : std::string());
-        }
-        ++index;
-    }
-
-    return runtime_messages;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // build_vlm_runtime_messages
 // ─────────────────────────────────────────────────────────────────────────────
 json build_vlm_runtime_messages(const json& current_messages,

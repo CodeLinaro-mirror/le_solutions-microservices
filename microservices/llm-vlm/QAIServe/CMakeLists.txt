@@ -119,7 +119,6 @@ set(SERVER_SOURCES
     # Shared utilities (used by HTTP + WebSocket controllers)
     src/ResponsesUtils.cpp
     src/ResponseStore.cpp
-    src/ResponsesCompactionService.cpp
     src/TokenBudgetUtils.cpp
 
     # MCP Layer 1.5 — client infrastructure

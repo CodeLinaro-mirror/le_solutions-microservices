@@ -91,7 +91,8 @@ MemoryTurnStartResult ConversationMemoryCoordinator::beginTurn(
                     "Explicit parent turn was not found");
             }
             parent_id = parent_it->second;
-        } else {
+        } else if (reference.parent_policy ==
+                   qai_forge::ConversationParentPolicy::Latest) {
             parent_id = conversation.latest_node_id;
         }
 

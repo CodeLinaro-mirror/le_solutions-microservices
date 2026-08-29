@@ -25,7 +25,6 @@
 #include "controllers/ResponsesController.h"
 #include "ResponseStore.h"
 #include "ResponsesConstants.h"
-#include "ResponsesCompactionService.h"
 #include "ResponsesUtils.h"
 #include "TokenBudgetUtils.h"
 #include "mcp/McpAgenticLoop.h"
@@ -619,33 +618,34 @@ static CreateChatCompletionRequest make_standard_sdk_request(
     return CreateChatCompletionRequest::from_json(sdk_body);
 }
 
-static std::string generate_summary_with_scheduler(
-    const std::string& model,
-    const std::string& prompt,
-    int max_output_tokens) {
-    json sdk_body = {
-        {"model", model},
-        {"messages", json::array({{
-            {"role", "user"},
-            {"content", prompt}
-        }})},
-        {"stream", false},
-        {"max_completion_tokens", max_output_tokens},
-        {"temperature", 0.3f},
-        {"reasoning_effort", "none"}
-    };
-    CreateChatCompletionRequest request =
-        CreateChatCompletionRequest::from_json(sdk_body);
+static json combine_runtime_messages(const json& ancestor_messages,
+                                     const json& current_messages) {
+    json messages = json::array();
+    for (const auto& message : ancestor_messages) {
+        messages.push_back(message);
+    }
+    for (const auto& message : current_messages) {
+        messages.push_back(message);
+    }
+    return messages;
+}
 
-    qai_forge::GenerateOptions options;
-    options.response_id = ResponsesUtils::generate_compaction_id();
-    options.session_id = options.response_id;
-    options.use_response_history = true;
-    options.response_history = json::array();
-
-    StandardResponse result =
-        qai_forge::QaiForge::getInstance().generate(request, options);
-    return result.content.value_or("");
+static qai_forge::ConversationReference make_response_conversation_reference(
+    const BeginResponseResult& begin,
+    const std::string& previous_response_id) {
+    qai_forge::ConversationReference reference;
+    reference.namespace_id = "qaiserve.responses.http";
+    reference.conversation_id = begin.session_id;
+    reference.turn_id = begin.response_id;
+    if (!previous_response_id.empty()) {
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Explicit;
+        reference.parent_turn_id = previous_response_id;
+    } else {
+        reference.parent_policy =
+            qai_forge::ConversationParentPolicy::Root;
+    }
+    return reference;
 }
 
 static HttpResponsePtr make_json_response(const json& body,
@@ -922,6 +922,16 @@ void ResponsesController::createResponse(
              << " has_mcp=" << (has_mcp_tools ? "true" : "false")
              << " has_function_tools=" << (has_function_tools ? "true" : "false"));
 
+    auto& config_mgr = ModelConfigManager::getInstance();
+    if (model.empty() || !config_mgr.validateModel(model)) {
+        callback(make_error_response(
+            404,
+            "Model '" + model + "' not found. Check /v1/models for available models.",
+            "invalid_request_error",
+            "model"));
+        return;
+    }
+
     // ── MCP path ──────────────────────────────────────────────────────────────
     if (has_mcp_tools) {
         LOG_INFO("[ResponsesController] Routing through MCP loop: response="
@@ -960,13 +970,66 @@ void ResponsesController::createResponse(
         const char* max_iter_env = std::getenv("RESPONSES_MCP_MAX_ITERATIONS");
         int max_iterations = max_iter_env ? std::stoi(max_iter_env) : 10;
 
+        ResponseStore& store = ResponseStore::getInstance();
+        BuildCandidateResult walk =
+            store.buildCandidateMessages(previous_response_id, request_messages);
+        if (!walk.ok) {
+            callback(make_error_response(
+                walk.http_status,
+                walk.error_message,
+                "invalid_request_error",
+                "previous_response_id"));
+            return;
+        }
+        BeginResponseResult begin = store.beginResponse(
+            response_id,
+            model,
+            previous_response_id,
+            ResponsesUtils::normalize_input_items(response_id, body["input"]),
+            walk.current_request_messages,
+            metadata);
+        if (!begin.ok) {
+            callback(make_error_response(
+                begin.http_status,
+                begin.error_message,
+                "invalid_request_error",
+                "previous_response_id"));
+            return;
+        }
+
+        if (config_mgr.supportsVision(model)) {
+            sdk_request.messages = ResponsesUtils::build_vlm_runtime_messages(
+                begin.current_request_messages,
+                begin.ancestor_messages);
+        } else {
+            sdk_request.messages = combine_runtime_messages(
+                ResponsesUtils::build_text_runtime_messages(
+                    begin.ancestor_messages),
+                ResponsesUtils::build_text_runtime_messages(
+                    begin.current_request_messages));
+        }
+        prepend_system_message(sdk_request.messages, system_prompt);
+
+        qai_forge::GenerateOptions mcp_options;
+        mcp_options.response_id = response_id;
+        mcp_options.session_id = begin.session_id;
+        mcp_options.conversation = make_response_conversation_reference(
+            begin, previous_response_id);
+        if (current_turn_has_tool_response(begin.current_request_messages)
+            && !previous_response_id.empty()) {
+            mcp_options.previous_response_id = previous_response_id;
+            mcp_options.tool_output_submission = true;
+            mcp_options.allow_tool_chain_fallback = true;
+        }
+
         try {
             if (streaming) {
                 // ── MCP Streaming ─────────────────────────────────────────────
                 auto resp = HttpResponse::newAsyncStreamResponse(
-                    [sdk_request, mcp_function_tools, response_id, model,
+                    [sdk_request, mcp_function_tools, mcp_options, response_id, model,
                      max_iterations, previous_response_id,
-                     metadata](ResponseStreamPtr stream) {
+                     metadata, begin_created_at = begin.created_at](
+                         ResponseStreamPtr stream) {
 
                         auto emit_event = [&stream](const std::string& event_type,
                                                      const json& data) {
@@ -976,15 +1039,13 @@ void ResponsesController::createResponse(
                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         };
 
-                        int created_time = ResponsesUtils::current_unix_time();
-
                         // response.created
                         emit_event("response.created", {
                             {"type", "response.created"},
                             {"response", {
                                 {"id",         response_id},
                                 {"object",     "response"},
-                                {"created_at", created_time},
+                                {"created_at", begin_created_at},
                                 {"model",      model},
                                 {"status",     "in_progress"},
                                 {"output",     json::array()}
@@ -1011,7 +1072,11 @@ void ResponsesController::createResponse(
                             };
 
                             loop_result = loop.runStreaming(
-                                sdk_request, mcp_function_tools, emitter, response_id);
+                                sdk_request,
+                                mcp_function_tools,
+                                emitter,
+                                response_id,
+                                mcp_options);
 
                         } catch (const GenAIException& e) {
                             had_error = true;
@@ -1045,22 +1110,58 @@ void ResponsesController::createResponse(
                             json output = ResponsesUtils::build_output_array(
                                 loop_result.final_response, loop_result.call_records);
 
-                            // response.completed
-                            emit_event("response.completed", {
-                                {"type", "response.completed"},
-                                {"response", ResponsesUtils::build_response_object(
-                                    response_id, model, output, "completed",
-                                    loop_result.final_response.prompt_tokens,
-                                    loop_result.final_response.completion_tokens,
-                                    created_time,
-                                    json(nullptr),
-                                    loop_result.truncated
-                                        ? json({{"reason", "max_tool_calls"}})
-                                        : json(nullptr),
-                                    previous_response_id,
-                                    metadata)}
-                            });
+                            json response_obj = ResponsesUtils::build_response_object(
+                                response_id,
+                                model,
+                                output,
+                                loop_result.truncated
+                                    ? "incomplete"
+                                    : "completed",
+                                loop_result.final_response.prompt_tokens,
+                                loop_result.final_response.completion_tokens,
+                                begin_created_at,
+                                json(nullptr),
+                                loop_result.truncated
+                                    ? json({{"reason", "max_tool_calls"}})
+                                    : json(nullptr),
+                                previous_response_id,
+                                metadata);
+                            bool completed =
+                                ResponseStore::getInstance().completeResponse(
+                                    response_id,
+                                    loop_result.generated_messages,
+                                    output,
+                                    response_obj,
+                                    response_obj["usage"]);
+                            if (completed) {
+                                emit_event("response.completed", {
+                                    {"type", "response.completed"},
+                                    {"response", response_obj}
+                                });
+                            } else {
+                                std::optional<json> cancelled_response =
+                                    get_stored_cancelled_response_object(
+                                        response_id);
+                                if (cancelled_response.has_value()) {
+                                    emit_event("response.cancelled", {
+                                        {"type", "response.cancelled"},
+                                        {"response", cancelled_response.value()}
+                                    });
+                                } else {
+                                    emit_event("error", {
+                                        {"type", "error"},
+                                        {"code", "server_error"},
+                                        {"message",
+                                         "Response completion could not be stored"}
+                                    });
+                                }
+                            }
                         } else {
+                            qai_forge::QaiForge::getInstance().cancel(response_id);
+                            ResponseStore::getInstance().failResponse(
+                                response_id,
+                                make_store_error_object(
+                                    "server_error", error_msg));
                             emit_event("error", {
                                 {"type",    "error"},
                                 {"code",    "server_error"},
@@ -1081,33 +1182,68 @@ void ResponsesController::createResponse(
                 // ── MCP Non-streaming ─────────────────────────────────────────
                 McpAgenticLoop loop(registry, max_iterations);
                 McpLoopResult loop_result =
-                    loop.run(sdk_request, mcp_function_tools, response_id);
+                    loop.run(
+                        sdk_request,
+                        mcp_function_tools,
+                        response_id,
+                        mcp_options);
 
                 json output = ResponsesUtils::build_output_array(
                     loop_result.final_response, loop_result.call_records);
-                int created_time = ResponsesUtils::current_unix_time();
                 json response_obj = ResponsesUtils::build_response_object(
                     response_id, model, output,
                     loop_result.truncated ? "incomplete" : "completed",
                     loop_result.final_response.prompt_tokens,
                     loop_result.final_response.completion_tokens,
-                    created_time,
+                    begin.created_at,
                     json(nullptr),
                     loop_result.truncated
                         ? json({{"reason", "max_tool_calls"}})
                         : json(nullptr),
                     previous_response_id,
                     metadata);
+                bool completed = store.completeResponse(
+                    response_id,
+                    loop_result.generated_messages,
+                    output,
+                    response_obj,
+                    response_obj["usage"]);
+                if (!completed) {
+                    std::optional<json> cancelled_response =
+                        get_stored_cancelled_response_object(response_id);
+                    if (cancelled_response.has_value()) {
+                        callback(make_json_response(
+                            cancelled_response.value(), k200OK));
+                    } else {
+                        callback(make_error_response(
+                            409,
+                            "Response completion could not be stored",
+                            "invalid_request_error"));
+                    }
+                    return;
+                }
 
                 auto resp = make_json_response(response_obj, k200OK);
                 callback(resp);
             }
 
         } catch (const GenAIException& e) {
+            qai_forge::QaiForge::getInstance().cancel(response_id);
+            store.failResponse(
+                response_id,
+                make_store_error_object(
+                    e.http_status >= 500
+                        ? "server_error"
+                        : "invalid_request_error",
+                    e.message));
             std::string error_type = (e.http_status >= 500) ? "server_error"
                                                              : "invalid_request_error";
             callback(make_error_response(e.http_status, e.message, error_type));
         } catch (const std::exception& e) {
+            qai_forge::QaiForge::getInstance().cancel(response_id);
+            store.failResponse(
+                response_id,
+                make_store_error_object("server_error", e.what()));
             callback(make_error_response(500,
                 std::string("Internal server error: ") + e.what()));
         }
@@ -1115,16 +1251,6 @@ void ResponsesController::createResponse(
     }
 
     // ── Standard (non-MCP) path ───────────────────────────────────────────────
-    auto& config_mgr = ModelConfigManager::getInstance();
-    if (model.empty() || !config_mgr.validateModel(model)) {
-        callback(make_error_response(
-            404,
-            "Model '" + model + "' not found. Check /v1/models for available models.",
-            "invalid_request_error",
-            "model"));
-        return;
-    }
-
     std::string base_system_prompt = system_prompt.empty()
         ? std::string(ResponsesConstants::DEFAULT_SYSTEM_PROMPT)
         : system_prompt;
@@ -1158,117 +1284,35 @@ void ResponsesController::createResponse(
             "input"));
         return;
     }
-    effective_system_prompt = ResponsesUtils::inject_summary_into_instructions(
-        base_system_prompt,
-        walk.applied_summary);
     effective_system_prompt = append_function_tool_policy_instructions(
         effective_system_prompt,
         function_tool_policy,
         expose_function_tools);
 
     const bool is_vlm = config_mgr.supportsVision(model);
+    const bool uses_private_genie_memory =
+        !is_vlm && config_mgr.getRuntime(model) == "genie";
     std::optional<int> requested_max_output_tokens =
         sdk_request.max_completion_tokens;
     std::optional<int> resolved_max_output_tokens =
         requested_max_output_tokens;
     json budget_ancestor_messages = json::array();
     json budget_current_messages = json::array();
-    auto refresh_text_budget_messages = [&]() {
+    if (!is_vlm) {
         budget_ancestor_messages =
             ResponsesUtils::build_text_runtime_messages(walk.ancestor_messages);
         budget_current_messages =
             ResponsesUtils::build_text_runtime_messages(
                 walk.current_request_messages);
-    };
-
-    if (!is_vlm) {
-        refresh_text_budget_messages();
-        bool skip_summarization =
-            previous_response_id.empty()
-            || current_turn_has_tool_response(walk.current_request_messages)
-            || branch_ends_with_tool_call(walk.ancestor_messages);
-        int context_size = config_mgr.getContextSize(model);
-        int projected_max_output_tokens = requested_max_output_tokens.value_or(
-            TokenBudgetUtils::default_max_output_tokens(context_size));
-        TokenBudgetUtils::SummarizationTriggerResult trigger =
-            TokenBudgetUtils::evaluate_summarization_trigger(
-                model,
-                budget_ancestor_messages,
-                budget_current_messages,
-                effective_system_prompt,
-                tools_for_budget,
-                projected_max_output_tokens);
-
-        if (!skip_summarization && trigger.should_summarize) {
-            ResponsesCompactionService::CompactBranchResult compact_result =
-                ResponsesCompactionService::getInstance().compactBranch(
-                    previous_response_id,
-                    model,
-                    [model](const std::string& prompt, int max_tokens) {
-                        return generate_summary_with_scheduler(
-                            model, prompt, max_tokens);
-                    });
-            if (!compact_result.ok) {
-                TokenBudgetUtils::ContextBudgetResult fallback_budget =
-                    TokenBudgetUtils::resolve_context_budget(
-                        model,
-                        budget_ancestor_messages,
-                        budget_current_messages,
-                        effective_system_prompt,
-                        tools_for_budget,
-                        requested_max_output_tokens);
-                if (!fallback_budget.ok) {
-                    callback(make_error_response(
-                        500,
-                        "summary generation failed and the request cannot proceed without it",
-                        "server_error"));
-                    return;
-                }
+        if (uses_private_genie_memory) {
+            if (!resolved_max_output_tokens.has_value()) {
                 resolved_max_output_tokens =
-                    fallback_budget.resolved_max_output_tokens;
-                LOG_WARN("[ResponsesController] Summary generation failed but "
-                         "request fits without compaction: response="
-                         << response_id
-                         << " error=\"" << compact_result.error_message << "\"");
-            } else {
-                walk = store.buildCandidateMessages(
-                    previous_response_id,
-                    request_messages);
-                if (!walk.ok) {
-                    callback(make_error_response(
-                        walk.http_status,
-                        walk.error_message,
-                        "invalid_request_error",
-                        "previous_response_id"));
-                    return;
-                }
-                function_output_error.clear();
-                if (!validate_function_call_outputs(
-                        body["input"],
-                        walk.ancestor_messages,
-                        function_output_error)) {
-                    callback(make_error_response(
-                        400,
-                        function_output_error,
-                        "invalid_request_error",
-                        "input"));
-                    return;
-                }
-                refresh_text_budget_messages();
-                effective_system_prompt =
-                    ResponsesUtils::inject_summary_into_instructions(
-                        base_system_prompt,
-                        walk.applied_summary);
-                effective_system_prompt =
-                    append_function_tool_policy_instructions(
-                        effective_system_prompt,
-                        function_tool_policy,
-                        expose_function_tools);
+                    TokenBudgetUtils::default_max_output_tokens(
+                        config_mgr.getContextSize(model));
             }
-        }
-
-        if (!resolved_max_output_tokens.has_value()
-            || resolved_max_output_tokens == requested_max_output_tokens) {
+        } else if (!resolved_max_output_tokens.has_value()
+                   || resolved_max_output_tokens ==
+                       requested_max_output_tokens) {
             TokenBudgetUtils::ContextBudgetResult budget =
                 TokenBudgetUtils::resolve_context_budget(
                     model,
@@ -1307,15 +1351,18 @@ void ResponsesController::createResponse(
         return;
     }
 
-    json runtime_ancestor_messages = is_vlm
-        ? json::array()
-        : ResponsesUtils::build_text_runtime_messages(begin.ancestor_messages);
-    json runtime_request_messages = is_vlm
-        ? ResponsesUtils::build_vlm_runtime_messages(
+    json runtime_request_messages;
+    if (is_vlm) {
+        runtime_request_messages = ResponsesUtils::build_vlm_runtime_messages(
             begin.current_request_messages,
-            begin.ancestor_messages)
-        : ResponsesUtils::build_text_runtime_messages(
-            begin.current_request_messages);
+            begin.ancestor_messages);
+    } else {
+        runtime_request_messages = combine_runtime_messages(
+            ResponsesUtils::build_text_runtime_messages(
+                begin.ancestor_messages),
+            ResponsesUtils::build_text_runtime_messages(
+                begin.current_request_messages));
+    }
 
     CreateChatCompletionRequest standard_request;
     try {
@@ -1345,10 +1392,8 @@ void ResponsesController::createResponse(
     qai_forge::GenerateOptions invoke_options;
     invoke_options.response_id = response_id;
     invoke_options.session_id = begin.session_id;
-    invoke_options.conversation_memory_read_key = previous_response_id;
-    invoke_options.conversation_memory_write_key = response_id;
-    invoke_options.use_response_history = true;
-    invoke_options.response_history = runtime_ancestor_messages;
+    invoke_options.conversation = make_response_conversation_reference(
+        begin, previous_response_id);
     if (current_turn_has_tool_response(begin.current_request_messages)
         && !previous_response_id.empty()) {
         invoke_options.previous_response_id = previous_response_id;
@@ -1868,6 +1913,8 @@ void ResponsesController::deleteResponse(
     const std::string& response_id) {
 
     LOG_INFO("[ResponsesController] Delete response: response=" << response_id);
+    const std::optional<StoredResponse> stored =
+        ResponseStore::getInstance().getResponse(response_id);
     DeleteCascadeResult result =
         ResponseStore::getInstance().deleteCascade(response_id);
 
@@ -1879,6 +1926,14 @@ void ResponsesController::deleteResponse(
                                      "invalid_request_error",
                                      param));
         return;
+    }
+
+    if (stored.has_value()) {
+        qai_forge::ConversationReference reference;
+        reference.namespace_id = "qaiserve.responses.http";
+        reference.conversation_id = stored->session_id;
+        reference.turn_id = response_id;
+        qai_forge::QaiForge::getInstance().releaseConversationSubtree(reference);
     }
 
     json response = {

@@ -410,35 +410,4 @@ int default_max_output_tokens(int context_size) {
     return static_cast<int>(context_size * 0.5);
 }
 
-int summary_max_output_tokens(int context_size) {
-    return static_cast<int>(
-        context_size * ResponsesConstants::SUMMARIZATION_SUMMARY_SIZE_RATIO);
-}
-
-SummarizationTriggerResult evaluate_summarization_trigger(
-    const std::string& model,
-    const json& ancestor_messages,
-    const json& current_messages,
-    const std::string& instructions,
-    const json& tools,
-    int max_output_tokens) {
-
-    SummarizationTriggerResult result;
-    result.context_size =
-        ModelConfigManager::getInstance().getContextSize(model);
-    result.input_tokens = count_input_tokens(
-        model, ancestor_messages, current_messages, instructions, tools);
-    result.output_reservation_tokens = static_cast<int>(
-        std::max(max_output_tokens, 0)
-        * ResponsesConstants::SUMMARIZATION_MAX_COMPLETION_MULTIPLIER);
-    result.projected_tokens =
-        result.input_tokens + result.output_reservation_tokens;
-    result.threshold_tokens = static_cast<int>(
-        result.context_size
-        * ResponsesConstants::SUMMARIZATION_CONTEXT_THRESHOLD);
-    result.should_summarize =
-        result.projected_tokens >= result.threshold_tokens;
-    return result;
-}
-
 } // namespace TokenBudgetUtils

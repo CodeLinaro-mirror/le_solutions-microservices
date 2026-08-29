@@ -16,6 +16,46 @@
 #include <sstream>
 #include <chrono>
 
+namespace {
+
+qai_forge::GenerateOptions optionsForRound(
+    const qai_forge::GenerateOptions& base_options,
+    const std::string& response_id,
+    bool resume) {
+    qai_forge::GenerateOptions options = base_options;
+    if (options.response_id.empty()) {
+        options.response_id = response_id;
+    }
+    options.internal_mcp_round = true;
+    if (resume) {
+        options.previous_response_id = response_id;
+        options.tool_output_submission = false;
+        options.allow_tool_chain_fallback = false;
+        if (options.conversation.has_value()) {
+            options.conversation->operation =
+                qai_forge::ConversationTurnOperation::Resume;
+        }
+    }
+    return options;
+}
+
+json makeAssistantMessage(const StandardResponse& response) {
+    json message = {
+        {"role", "assistant"},
+        {"content", response.content.value_or("")}
+    };
+    if (response.reasoning_content.has_value()
+        && !response.reasoning_content->empty()) {
+        message["_thinking_content"] = response.reasoning_content.value();
+    }
+    if (response.tool_calls.has_value() && !response.tool_calls->empty()) {
+        message["tool_calls"] = response.tool_calls.value();
+    }
+    return message;
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,7 +248,8 @@ void McpAgenticLoop::emitFinalMessageEvents(const McpSseEmitter& emitter,
 // ─────────────────────────────────────────────────────────────────────────────
 McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_request,
                                    const json& mcp_tools,
-                                   const std::string& response_id) {
+                                   const std::string& response_id,
+                                   const qai_forge::GenerateOptions& base_options) {
     McpLoopResult loop_result;
 
     // Build the working request (will be mutated each iteration)
@@ -225,12 +266,8 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
                  << " previous=" << previous_round_response_id);
 
         // Run one inference round
-        qai_forge::GenerateOptions invoke_options;
-        invoke_options.response_id = response_id;
-        invoke_options.previous_response_id = previous_round_response_id;
-        if (iter > 0 && !previous_round_response_id.empty()) {
-            invoke_options.tool_output_submission = true;
-        }
+        qai_forge::GenerateOptions invoke_options = optionsForRound(
+            base_options, response_id, iter > 0);
 
         StandardResponse response =
             qai_forge::QaiForge::getInstance().generate(
@@ -243,6 +280,8 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
                      << response_id << " iteration=" << loop_result.iterations
                      << " finish_reason=" << response.finish_reason);
             loop_result.final_response = response;
+            loop_result.generated_messages.push_back(
+                makeAssistantMessage(response));
             return loop_result;
         }
         previous_round_response_id = response_id.empty() ? response.id : response_id;
@@ -262,12 +301,14 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
             {"content",    ""},
             {"tool_calls", tool_calls}
         };
+        loop_result.generated_messages.push_back(assistant_msg);
 
         // Append assistant message + tool results to the message history
         json new_messages = current_request.messages;
         new_messages.push_back(assistant_msg);
         for (const auto& tr : tool_result_messages) {
             new_messages.push_back(tr);
+            loop_result.generated_messages.push_back(tr);
         }
         current_request.messages = new_messages;
         // Remove tools from subsequent turns (model already knows about them
@@ -282,20 +323,20 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
     // Run one final inference without tools to get a text response
     current_request.tools = std::nullopt;
     try {
-        qai_forge::GenerateOptions invoke_options;
-        invoke_options.response_id = response_id;
-        invoke_options.previous_response_id = previous_round_response_id;
-        if (!previous_round_response_id.empty()) {
-            invoke_options.tool_output_submission = true;
-        }
+        qai_forge::GenerateOptions invoke_options = optionsForRound(
+            base_options, response_id, true);
 
         loop_result.final_response =
             qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
+        loop_result.generated_messages.push_back(
+            makeAssistantMessage(loop_result.final_response));
     } catch (...) {
         // If final inference fails, return a synthetic response
         loop_result.final_response.content = "(Response truncated: maximum tool call iterations reached)";
         loop_result.final_response.finish_reason = "stop";
+        loop_result.generated_messages.push_back(
+            makeAssistantMessage(loop_result.final_response));
     }
 
     return loop_result;
@@ -307,7 +348,8 @@ McpLoopResult McpAgenticLoop::run(const CreateChatCompletionRequest& base_reques
 McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& base_request,
                                             const json& mcp_tools,
                                             McpSseEmitter emitter,
-                                            const std::string& response_id) {
+                                            const std::string& response_id,
+                                            const qai_forge::GenerateOptions& base_options) {
     McpLoopResult loop_result;
 
     CreateChatCompletionRequest current_request = base_request;
@@ -323,12 +365,8 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                  << " previous=" << previous_round_response_id);
 
         // Run one inference round (blocking)
-        qai_forge::GenerateOptions invoke_options;
-        invoke_options.response_id = response_id;
-        invoke_options.previous_response_id = previous_round_response_id;
-        if (iter > 0 && !previous_round_response_id.empty()) {
-            invoke_options.tool_output_submission = true;
-        }
+        qai_forge::GenerateOptions invoke_options = optionsForRound(
+            base_options, response_id, iter > 0);
 
         StandardResponse response =
             qai_forge::QaiForge::getInstance().generate(
@@ -341,6 +379,8 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                      << response_id << " iteration=" << loop_result.iterations
                      << " finish_reason=" << response.finish_reason);
             loop_result.final_response = response;
+            loop_result.generated_messages.push_back(
+                makeAssistantMessage(response));
 
             std::string final_text = response.content.value_or("");
             int output_index = static_cast<int>(loop_result.call_records.size());
@@ -365,11 +405,13 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
             {"content",    ""},
             {"tool_calls", tool_calls}
         };
+        loop_result.generated_messages.push_back(assistant_msg);
 
         json new_messages = current_request.messages;
         new_messages.push_back(assistant_msg);
         for (const auto& tr : tool_result_messages) {
             new_messages.push_back(tr);
+            loop_result.generated_messages.push_back(tr);
         }
         current_request.messages = new_messages;
         current_request.tools    = mcp_tools;
@@ -382,21 +424,21 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
     current_request.tools = std::nullopt;
     std::string final_text;
     try {
-        qai_forge::GenerateOptions invoke_options;
-        invoke_options.response_id = response_id;
-        invoke_options.previous_response_id = previous_round_response_id;
-        if (!previous_round_response_id.empty()) {
-            invoke_options.tool_output_submission = true;
-        }
+        qai_forge::GenerateOptions invoke_options = optionsForRound(
+            base_options, response_id, true);
 
         loop_result.final_response =
             qai_forge::QaiForge::getInstance().generate(
                 current_request, invoke_options);
+        loop_result.generated_messages.push_back(
+            makeAssistantMessage(loop_result.final_response));
         final_text = loop_result.final_response.content.value_or("");
     } catch (...) {
         final_text = "(Response truncated: maximum tool call iterations reached)";
         loop_result.final_response.content = final_text;
         loop_result.final_response.finish_reason = "stop";
+        loop_result.generated_messages.push_back(
+            makeAssistantMessage(loop_result.final_response));
     }
 
     int output_index = static_cast<int>(loop_result.call_records.size());

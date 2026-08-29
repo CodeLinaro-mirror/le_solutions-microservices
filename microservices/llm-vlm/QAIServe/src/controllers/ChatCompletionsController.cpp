@@ -15,19 +15,80 @@ using namespace qai_forge;
 
 namespace {
 
-// nlohmann::json's .value(key, default) only falls back to `default` when
-// the key is absent — if the key is present but explicitly null (a valid
-// shape for e.g. an assistant message's "content" field when "tool_calls"
-// is present), .value<std::string>() throws json::type_error.302. This
-// helper treats an explicit null the same as an absent key.
-std::string getStringOrDefault(const json& obj,
-                                const std::string& key,
-                                const std::string& def = "") {
-    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
-        return def;
+constexpr const char* kChatMemoryNamespace = "qaiserve.chat";
+
+std::string getStringOrDefault(const json& object,
+                               const std::string& key,
+                               const std::string& default_value = "") {
+    if (!object.is_object() || !object.contains(key)
+        || object[key].is_null() || !object[key].is_string()) {
+        return default_value;
     }
-    const json& val = obj[key];
-    return val.is_string() ? val.get<std::string>() : def;
+    return object[key].get<std::string>();
+}
+
+GenerateOptions makeChatGenerateOptions(const BeginChatTurnResult& turn,
+                                        const json& messages) {
+    GenerateOptions options;
+    options.response_id = turn.completion_id;
+    options.session_id = turn.completion_id;
+
+    ConversationReference reference;
+    reference.namespace_id = kChatMemoryNamespace;
+    reference.conversation_id = turn.completion_id;
+    reference.turn_id = turn.turn_id;
+    if (!turn.parent_turn_id.empty()) {
+        reference.parent_policy = ConversationParentPolicy::Explicit;
+        reference.parent_turn_id = turn.parent_turn_id;
+    } else {
+        reference.parent_policy = ConversationParentPolicy::Root;
+    }
+    options.conversation = std::move(reference);
+
+    for (const auto& message : messages) {
+        if (getStringOrDefault(message, "role") == "tool") {
+            options.previous_response_id = turn.completion_id;
+            options.tool_output_submission = true;
+            options.allow_tool_chain_fallback = true;
+            break;
+        }
+    }
+    return options;
+}
+
+HttpResponsePtr buildReplayResponse(const BeginChatTurnResult& turn,
+                                    const json& replay_result) {
+    json assistant_message = {
+        {"role", "assistant"},
+        {"content", getStringOrDefault(replay_result, "content")}
+    };
+    if (replay_result.contains("tool_calls")
+        && replay_result["tool_calls"].is_array()
+        && !replay_result["tool_calls"].empty()) {
+        assistant_message["tool_calls"] = replay_result["tool_calls"];
+    }
+
+    json response_json = {
+        {"id", turn.completion_id},
+        {"object", "chat.completion"},
+        {"created", std::time(nullptr)},
+        {"model", turn.model},
+        {"choices", json::array({{
+            {"index", 0},
+            {"message", assistant_message},
+            {"finish_reason", replay_result.value("finish_reason", "stop")}
+        }})},
+        {"usage", {
+            {"prompt_tokens", replay_result.value("prompt_tokens", 0)},
+            {"completion_tokens", replay_result.value("completion_tokens", 0)},
+            {"total_tokens", replay_result.value("total_tokens", 0)}
+        }}
+    };
+    auto response = HttpResponse::newHttpResponse();
+    response->setBody(response_json.dump());
+    response->setContentTypeCode(CT_APPLICATION_JSON);
+    response->addHeader("Access-Control-Allow-Origin", "*");
+    return response;
 }
 
 } // namespace
@@ -42,6 +103,10 @@ ChatCompletionsController::ChatCompletionsController()
 }
 
 ChatCompletionsController::~ChatCompletionsController() {
+    for (const std::string& completion_id : store_->getAllSessionIds()) {
+        QaiForge::getInstance().releaseConversation(
+            kChatMemoryNamespace, completion_id);
+    }
     LOG_INFO << "ChatCompletionsController destroyed";
 }
 
@@ -71,58 +136,6 @@ HttpResponsePtr ChatCompletionsController::formatErrorResponse(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Build an OpenAI-format non-streaming response directly from a cached
-// replay_result (see ChatCompletionStore::findOrCreateSession / the legacy
-// Python idempotent-retry replay-cache design). No inference call is made —
-// this is a pure cache hit for an exact retry of a previously completed
-// request, verified via both conversation-content hash AND full request
-// signature before being served.
-// ─────────────────────────────────────────────────────────────────────────────
-
-static HttpResponsePtr buildReplayResponse(
-    ChatSession* session,
-    const json& replay_result
-) {
-    json assistant_msg = {
-        {"role", "assistant"},
-        {"content", getStringOrDefault(replay_result, "content", "")}
-    };
-    bool has_tool_calls = replay_result.contains("tool_calls")
-        && replay_result["tool_calls"].is_array()
-        && !replay_result["tool_calls"].empty();
-    if (has_tool_calls) {
-        assistant_msg["tool_calls"] = replay_result["tool_calls"];
-    }
-
-    json usage_obj = {
-        {"prompt_tokens", replay_result.value("prompt_tokens", 0)},
-        {"completion_tokens", replay_result.value("completion_tokens", 0)},
-        {"total_tokens", replay_result.value("total_tokens", 0)}
-    };
-
-    json response_json = {
-        {"id", session->completion_id},
-        {"object", "chat.completion"},
-        {"created", std::time(nullptr)},
-        {"model", session->model},
-        {"choices", json::array({
-            {
-                {"index", 0},
-                {"message", assistant_msg},
-                {"finish_reason", replay_result.value("finish_reason", "stop")}
-            }
-        })},
-        {"usage", usage_obj}
-    };
-
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setBody(response_json.dump());
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->addHeader("Access-Control-Allow-Origin", "*");
-    return resp;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /v1/chat/completions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -141,6 +154,7 @@ void ChatCompletionsController::createChatCompletion(
         return;
     }
 
+    std::optional<BeginChatTurnResult> active_turn;
     try {
         // Parse request body
         std::string body_str(req->body().data(), req->body().length());
@@ -186,53 +200,29 @@ void ChatCompletionsController::createChatCompletion(
             user_hint_id = body["id"].get<std::string>();
         }
 
-        // Find or create session using hash-based lookup. Passing the full
-        // request body enables signature-verified idempotent-retry replay
-        // (see ChatCompletionStore::findOrCreateSession for the algorithm).
-        auto lookup = store_->findOrCreateSession(messages, body, user_hint_id);
-        ChatSession* session = lookup.session;
-        bool is_new = lookup.is_new;
-        if (!session) {
+        BeginChatTurnResult turn =
+            store_->beginTurn(messages, body, model, user_hint_id);
+        if (!turn.ok) {
             callback(formatErrorResponse(
-                "Failed to create or find session",
-                "internal_error",
-                k500InternalServerError
+                turn.error_message.empty()
+                    ? "Failed to create or find session"
+                    : turn.error_message,
+                "invalid_request_error",
+                k409Conflict
             ));
             return;
         }
-
-        // Always keep session->model in sync with the most recently
-        // requested model — needed for a correct, targeted
-        // QaiForge::clearSession(model_id, session_id) lookup on session
-        // delete/expiry, since that lookup is scoped to exactly one model's
-        // resident ModelRuntime (no broadcast to every loaded model).
-        session->model = model;
-
-        // Idempotent-retry replay cache hit — serve the cached response
-        // directly, no inference call. See buildReplayResponse() /
-        // ChatCompletionStore::findOrCreateSession().
-        if (lookup.replay_result.has_value()) {
-            LOG_INFO << "Serving cached replay for session " << session->completion_id;
-            callback(buildReplayResponse(session, lookup.replay_result.value()));
+        if (turn.replay_result.has_value()) {
+            callback(buildReplayResponse(turn, turn.replay_result.value()));
             return;
         }
+        active_turn = turn;
 
-        // The client resends the full conversation on every stateless request;
-        // keep the session's stored history in sync with it before the
-        // assistant reply is appended below, otherwise the hashes computed
-        // from session->messages in updateSession() would miss this turn's
-        // user message(s) entirely.
-        session->messages = messages;
-
-        LOG_INFO << "Chat completion request: session=" << session->completion_id
+        LOG_INFO << "Chat completion request: session=" << turn.completion_id
                  << " model=" << model << " stream=" << stream
-                 << " is_new=" << is_new;
+                 << " is_new=" << turn.is_new;
 
-        // Prepare qai-forge request
-        // For Chat Completions API (stateless), always pass the full conversation.
-        // The orchestrator's execute() path creates a fresh ConversationSession
-        // and processes the full messages array correctly (system in Slot 1,
-        // history in Slot 4 if provided via response_history, current turn in Slot 5).
+        // The client-supplied complete conversation remains authoritative.
         CreateChatCompletionRequest forge_request;
         forge_request.model = model;
         forge_request.messages = messages;  // Full conversation from client
@@ -264,19 +254,23 @@ void ChatCompletionsController::createChatCompletion(
             forge_request.user = body["user"].get<std::string>();
         }
 
-        // CRITICAL: Set user field to session ID to ensure isolated ConversationSession
-        // in GenieOrchestrator. Without this, the orchestrator falls back to using
-        // the model name as session ID, causing session collisions and "Failed to create dialog" errors.
-        forge_request.user = session->completion_id;
+        // Keep backend execution sessions isolated from other Chat sessions.
+        forge_request.user = turn.completion_id;
 
         // Route to streaming or non-streaming handler
         if (stream) {
-            handleStreamingRequest(session, forge_request, body, std::move(callback));
+            handleStreamingRequest(
+                turn, forge_request, body, std::move(callback));
         } else {
-            handleNonStreamingRequest(session, forge_request, body, std::move(callback));
+            handleNonStreamingRequest(
+                turn, forge_request, body, std::move(callback));
         }
 
     } catch (const json::exception& e) {
+        if (active_turn.has_value()) {
+            store_->abortTurn(
+                active_turn->completion_id, active_turn->turn_id);
+        }
         LOG_ERROR << "JSON parse error in createChatCompletion: " << e.what();
         callback(formatErrorResponse(
             std::string("Invalid JSON: ") + e.what(),
@@ -284,6 +278,10 @@ void ChatCompletionsController::createChatCompletion(
             k400BadRequest
         ));
     } catch (const std::exception& e) {
+        if (active_turn.has_value()) {
+            store_->abortTurn(
+                active_turn->completion_id, active_turn->turn_id);
+        }
         LOG_ERROR << "Exception in createChatCompletion: " << e.what();
         callback(formatErrorResponse(
             std::string("Internal error: ") + e.what(),
@@ -298,13 +296,13 @@ void ChatCompletionsController::createChatCompletion(
 // ─────────────────────────────────────────────────────────────────────────────
 
 void ChatCompletionsController::handleStreamingRequest(
-    ChatSession* session,
+    const BeginChatTurnResult& turn,
     const CreateChatCompletionRequest& request,
     const json& request_body,
     std::function<void(const HttpResponsePtr&)>&& callback
 ) {
     auto stream_resp = HttpResponse::newAsyncStreamResponse(
-        [session, request, request_body, this](drogon::ResponseStreamPtr stream_ptr) {
+        [turn, request, request_body, this](drogon::ResponseStreamPtr stream_ptr) {
             // Convert to shared_ptr for lambda capture
             auto stream = std::shared_ptr<drogon::ResponseStream>(std::move(stream_ptr));
 
@@ -316,24 +314,43 @@ void ChatCompletionsController::handleStreamingRequest(
             auto accumulated_tool_calls = std::make_shared<json>();
             auto has_tool_calls = std::make_shared<bool>(false);
 
-            callbacks.onToken = [stream, session, accumulated_content](const StreamChunk& chunk) {
+            callbacks.onToken = [stream, turn, accumulated_content,
+                                 accumulated_tool_calls,
+                                 has_tool_calls](const StreamChunk& chunk) {
                 // Accumulate content
                 if (chunk.content_delta) {
                     *accumulated_content += *chunk.content_delta;
                 }
 
+                // Build delta object
+                json delta_obj = json::object();
+                if (chunk.role.has_value()) {
+                    delta_obj["role"] = *chunk.role;
+                }
+                if (chunk.content_delta.has_value()) {
+                    delta_obj["content"] = *chunk.content_delta;
+                }
+                if (chunk.tool_calls.has_value() && chunk.tool_calls->is_array()
+                        && !chunk.tool_calls->empty()) {
+                    delta_obj["tool_calls"] = *chunk.tool_calls;
+                    *has_tool_calls = true;
+                }
+
+                // Skip empty deltas (nothing to send to client)
+                if (delta_obj.empty()) {
+                    return;
+                }
+
                 // Format as OpenAI chat completion chunk
                 json chunk_json = {
-                    {"id", session->completion_id},
+                    {"id", turn.completion_id},
                     {"object", "chat.completion.chunk"},
                     {"created", std::time(nullptr)},
-                    {"model", session->model},
+                    {"model", turn.model},
                     {"choices", json::array({
                         {
                             {"index", 0},
-                            {"delta", {
-                                {"content", chunk.content_delta.value_or("")}
-                            }},
+                            {"delta", delta_obj},
                             {"finish_reason", nullptr}
                         }
                     })}
@@ -344,7 +361,9 @@ void ChatCompletionsController::handleStreamingRequest(
                 stream->send(sse);
             };
 
-            callbacks.onComplete = [stream, session, request_body, accumulated_content, accumulated_tool_calls, has_tool_calls, this](
+            callbacks.onComplete = [stream, turn, request_body, accumulated_content,
+                                    accumulated_tool_calls, has_tool_calls,
+                                    this](
                 const StandardResponse& final_response
             ) {
                 // Use final response content if available
@@ -352,6 +371,7 @@ void ChatCompletionsController::handleStreamingRequest(
                     *accumulated_content = *final_response.content;
                 }
 
+                // Build assistant message
                 json assistant_msg = {
                     {"role", "assistant"},
                     {"content", *accumulated_content}
@@ -361,27 +381,8 @@ void ChatCompletionsController::handleStreamingRequest(
                 if (final_response.tool_calls && !final_response.tool_calls->empty()) {
                     assistant_msg["tool_calls"] = *final_response.tool_calls;
                     *has_tool_calls = true;
-
-                    // Update tool call state
-                    session->has_active_tool_call = true;
-                    session->tool_call_timestamp = std::chrono::steady_clock::now();
-
-                    // Calculate tool call hash
-                    json messages_with_tool_call = session->messages;
-                    messages_with_tool_call.push_back(assistant_msg);
-                    session->tool_call_hash = ChatCompletionUtils::hashSpecificMessages(messages_with_tool_call);
                 }
 
-                // Update session
-                session->messages.push_back(assistant_msg);
-                store_->updateSession(session->completion_id, session->messages);
-
-                // Record the signature of the request that produced this
-                // turn + its response, for idempotent-retry replay on the
-                // NEXT completed turn's retry_candidate_hash match. See
-                // ChatCompletionStore::findOrCreateSession.
-                session->last_request_signature =
-                    ChatCompletionUtils::buildRequestSignature(request_body, session->messages);
                 json replay_result = {
                     {"content", *accumulated_content},
                     {"finish_reason", *has_tool_calls ? "tool_calls" : "stop"},
@@ -389,41 +390,45 @@ void ChatCompletionsController::handleStreamingRequest(
                     {"completion_tokens", final_response.completion_tokens},
                     {"total_tokens", final_response.total_tokens}
                 };
-                if (*has_tool_calls) {
+                if (*has_tool_calls && final_response.tool_calls.has_value()) {
                     replay_result["tool_calls"] = *final_response.tool_calls;
                 }
-                session->last_replay_result = replay_result;
 
-                // Send final chunk with finish_reason. When tool calls were
-                // detected, include them in the delta so the client's
-                // streaming parser (e.g. LangChain ChatOpenAI.stream()) can
-                // populate chunk.tool_calls — without this, tool_calls are
-                // only ever visible in non-streaming responses even though
-                // they were correctly detected server-side.
+                if (!store_->completeTurn(
+                        turn.completion_id, turn.turn_id, assistant_msg,
+                        request_body, replay_result)) {
+                    LOG_WARN << "Discarding late streaming completion for session "
+                             << turn.completion_id;
+                    stream->close();
+                    return;
+                }
+
+                // Send final chunk with finish_reason
                 json final_delta = json::object();
                 if (*has_tool_calls && final_response.tool_calls.has_value()) {
                     json tool_calls_delta = json::array();
-                    int tc_idx = 0;
-                    for (const auto& tc : *final_response.tool_calls) {
-                        json function_obj = tc.value("function", json::object());
+                    int tool_index = 0;
+                    for (const auto& tool_call : *final_response.tool_calls) {
+                        const json function = tool_call.value(
+                            "function", json::object());
                         tool_calls_delta.push_back({
-                            {"index", tc_idx++},
-                            {"id", tc.value("id", "")},
-                            {"type", tc.value("type", "function")},
+                            {"index", tool_index++},
+                            {"id", tool_call.value("id", "")},
+                            {"type", tool_call.value("type", "function")},
                             {"function", {
-                                {"name", function_obj.value("name", "")},
-                                {"arguments", function_obj.value("arguments", "")}
+                                {"name", function.value("name", "")},
+                                {"arguments", function.value("arguments", "")}
                             }}
                         });
                     }
-                    final_delta["tool_calls"] = tool_calls_delta;
+                    final_delta["tool_calls"] = std::move(tool_calls_delta);
                 }
 
                 json final_chunk = {
-                    {"id", session->completion_id},
+                    {"id", turn.completion_id},
                     {"object", "chat.completion.chunk"},
                     {"created", std::time(nullptr)},
-                    {"model", session->model},
+                    {"model", turn.model},
                     {"choices", json::array({
                         {
                             {"index", 0},
@@ -440,11 +445,13 @@ void ChatCompletionsController::handleStreamingRequest(
                 stream->send(done_sse);
                 stream->close();
 
-                LOG_INFO << "Streaming completed for session " << session->completion_id;
+                LOG_INFO << "Streaming completed for session "
+                         << turn.completion_id;
             };
 
-            callbacks.onError = [stream, session](const GenAIException& error) {
-                LOG_ERROR << "Streaming error for session " << session->completion_id
+            callbacks.onError = [stream, turn, this](const GenAIException& error) {
+                store_->abortTurn(turn.completion_id, turn.turn_id);
+                LOG_ERROR << "Streaming error for session " << turn.completion_id
                           << ": " << error.message;
 
                 json error_chunk = {
@@ -459,30 +466,17 @@ void ChatCompletionsController::handleStreamingRequest(
                 stream->close();
             };
 
-            callbacks.onCancelled = [stream, session]() {
-                LOG_INFO << "Streaming cancelled for session " << session->completion_id;
+            callbacks.onCancelled = [stream, turn, this]() {
+                store_->abortTurn(turn.completion_id, turn.turn_id);
+                LOG_INFO << "Streaming cancelled for session "
+                         << turn.completion_id;
                 stream->close();
             };
 
             // Start generation
             try {
-                GenerateOptions options;
-                options.response_id = session->completion_id;
-                options.session_id = session->completion_id;
-                // No response_history needed - full conversation is in request.messages
-
-                // Detect tool output submission
-                bool has_tool_response = false;
-                for (const auto& msg : request.messages) {
-                    if (msg.is_object() && getStringOrDefault(msg, "role", "") == "tool") {
-                        has_tool_response = true;
-                        break;
-                    }
-                }
-                if (has_tool_response && !session->messages.empty()) {
-                    options.tool_output_submission = true;
-                    options.allow_tool_chain_fallback = true;
-                }
+                GenerateOptions options =
+                    makeChatGenerateOptions(turn, request.messages);
 
                 qai_forge::QaiForge::getInstance().generateStream(
                     request,
@@ -505,7 +499,7 @@ void ChatCompletionsController::handleStreamingRequest(
 
     // Set headers
     stream_resp->setStatusCode(k200OK);
-    stream_resp->setContentTypeString("text/event-stream");
+    stream_resp->addHeader("Content-Type", "text/event-stream");
     stream_resp->addHeader("Cache-Control", "no-cache");
     stream_resp->addHeader("Connection", "keep-alive");
     stream_resp->addHeader("Access-Control-Allow-Origin", "*");
@@ -518,30 +512,15 @@ void ChatCompletionsController::handleStreamingRequest(
 // ─────────────────────────────────────────────────────────────────────────────
 
 void ChatCompletionsController::handleNonStreamingRequest(
-    ChatSession* session,
+    const BeginChatTurnResult& turn,
     const CreateChatCompletionRequest& request,
     const json& request_body,
     std::function<void(const HttpResponsePtr&)>&& callback
 ) {
     try {
         // Prepare options
-        GenerateOptions options;
-        options.response_id = session->completion_id;
-        options.session_id = session->completion_id;
-        // No response_history needed - full conversation is in request.messages
-
-        // Detect tool output submission
-        bool has_tool_response = false;
-        for (const auto& msg : request.messages) {
-            if (msg.is_object() && getStringOrDefault(msg, "role", "") == "tool") {
-                has_tool_response = true;
-                break;
-            }
-        }
-        if (has_tool_response && !session->messages.empty()) {
-            options.tool_output_submission = true;
-            options.allow_tool_chain_fallback = true;
-        }
+        GenerateOptions options =
+            makeChatGenerateOptions(turn, request.messages);
 
         // Synchronous generation
         auto response = qai_forge::QaiForge::getInstance().generate(request, options);
@@ -562,29 +541,10 @@ void ChatCompletionsController::handleNonStreamingRequest(
         if (response.tool_calls && !response.tool_calls->empty()) {
             assistant_msg["tool_calls"] = *response.tool_calls;
             has_tool_calls = true;
-
-            // Update tool call state
-            session->has_active_tool_call = true;
-            session->tool_call_timestamp = std::chrono::steady_clock::now();
-
-            // Calculate tool call hash
-            json messages_with_tool_call = session->messages;
-            messages_with_tool_call.push_back(assistant_msg);
-            session->tool_call_hash = ChatCompletionUtils::hashSpecificMessages(messages_with_tool_call);
         }
 
-        // Update session
-        session->messages.push_back(assistant_msg);
-        store_->updateSession(session->completion_id, session->messages);
-
-        // Record the signature of the request that produced this turn +
-        // its response, for idempotent-retry replay on the NEXT completed
-        // turn's retry_candidate_hash match. See
-        // ChatCompletionStore::findOrCreateSession.
-        session->last_request_signature =
-            ChatCompletionUtils::buildRequestSignature(request_body, session->messages);
         json replay_result = {
-            {"content", getStringOrDefault(assistant_msg, "content", "")},
+            {"content", getStringOrDefault(assistant_msg, "content")},
             {"finish_reason", has_tool_calls ? "tool_calls" : "stop"},
             {"prompt_tokens", response.prompt_tokens},
             {"completion_tokens", response.completion_tokens},
@@ -593,7 +553,16 @@ void ChatCompletionsController::handleNonStreamingRequest(
         if (has_tool_calls) {
             replay_result["tool_calls"] = *response.tool_calls;
         }
-        session->last_replay_result = replay_result;
+
+        if (!store_->completeTurn(
+                turn.completion_id, turn.turn_id, assistant_msg,
+                request_body, replay_result)) {
+            callback(formatErrorResponse(
+                "Chat completion was cancelled or deleted",
+                "invalid_request_error",
+                k409Conflict));
+            return;
+        }
 
         // Build usage object separately to avoid nested initializer issues
         json usage_obj = {
@@ -604,10 +573,10 @@ void ChatCompletionsController::handleNonStreamingRequest(
 
         // Format OpenAI-compatible response
         json response_json = {
-            {"id", session->completion_id},
+            {"id", turn.completion_id},
             {"object", "chat.completion"},
             {"created", std::time(nullptr)},
-            {"model", session->model},
+            {"model", turn.model},
             {"choices", json::array({
                 {
                     {"index", 0},
@@ -617,16 +586,19 @@ void ChatCompletionsController::handleNonStreamingRequest(
             })},
             {"usage", usage_obj}
         };
+
         auto resp = HttpResponse::newHttpResponse();
         resp->setBody(response_json.dump());
         resp->setContentTypeCode(CT_APPLICATION_JSON);
         resp->addHeader("Access-Control-Allow-Origin", "*");
         callback(resp);
 
-        LOG_INFO << "Non-streaming completed for session " << session->completion_id;
+        LOG_INFO << "Non-streaming completed for session "
+                 << turn.completion_id;
 
     } catch (const GenAIException& e) {
-        LOG_ERROR << "Generation error for session " << session->completion_id
+        store_->abortTurn(turn.completion_id, turn.turn_id);
+        LOG_ERROR << "Generation error for session " << turn.completion_id
                   << ": " << e.message;
 
         callback(formatErrorResponse(
@@ -636,6 +608,7 @@ void ChatCompletionsController::handleNonStreamingRequest(
         ));
 
     } catch (const std::exception& e) {
+        store_->abortTurn(turn.completion_id, turn.turn_id);
         LOG_ERROR << "Exception in handleNonStreamingRequest: " << e.what();
 
         callback(formatErrorResponse(
@@ -668,8 +641,8 @@ void ChatCompletionsController::deleteChatCompletion(
 
     try {
         // Find session
-        auto session = store_->findByCompletionId(completion_id);
-        if (!session) {
+        std::optional<ChatSession> session = store_->getSession(completion_id);
+        if (!session.has_value()) {
             callback(formatErrorResponse(
                 "Session not found",
                 "not_found_error",
@@ -679,16 +652,14 @@ void ChatCompletionsController::deleteChatCompletion(
         }
 
         // Cancel active job if any
-        if (!session->active_job_id.empty()) {
-            qai_forge::QaiForge::getInstance().cancel(session->active_job_id);
+        if (!session->active_turn_id.empty()) {
+            qai_forge::QaiForge::getInstance().cancel(completion_id);
         }
 
-        // Delete session. Per-session backend state (e.g. LiteRT-LM KV
-        // cache session) is released inside ChatCompletionStore::deleteSession()
-        // itself, scoped to the session's model — centralized there rather
-        // than here so every caller of deleteSession() gets this cleanup
-        // automatically, not just this one HTTP transport.
+        // Delete session
         store_->deleteSession(completion_id);
+        QaiForge::getInstance().releaseConversation(
+            kChatMemoryNamespace, completion_id);
 
         // Return success
         json response_json = {
@@ -738,8 +709,8 @@ void ChatCompletionsController::cancelChatCompletion(
 
     try {
         // Find session
-        auto session = store_->findByCompletionId(completion_id);
-        if (!session) {
+        std::optional<ChatSession> session = store_->getSession(completion_id);
+        if (!session.has_value()) {
             callback(formatErrorResponse(
                 "Session not found",
                 "not_found_error",
@@ -750,11 +721,11 @@ void ChatCompletionsController::cancelChatCompletion(
 
         // Cancel active job
         bool cancelled = false;
-        if (!session->active_job_id.empty()) {
-            cancelled = qai_forge::QaiForge::getInstance().cancel(session->active_job_id);
+        if (!session->active_turn_id.empty()) {
+            cancelled = qai_forge::QaiForge::getInstance().cancel(completion_id);
             if (cancelled) {
-                session->active_job_id.clear();
-                store_->updateSession(completion_id, session->messages);
+                store_->abortTurn(
+                    completion_id, session->active_turn_id);
             }
         }
 

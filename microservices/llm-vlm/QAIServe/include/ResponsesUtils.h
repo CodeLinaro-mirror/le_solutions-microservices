@@ -19,8 +19,6 @@
 //   synthesize_in_progress()     — assemble Retrieve JSON for active responses
 //   normalize_input_items()      — Responses API input → input_items list
 //   paginate_input_items()       — slice input_items into a list envelope
-//   generate_compaction_id()     — generate a unique "cmp_XXXX" ID
-//   inject_summary_into_instructions() — append branch summary to instructions
 //   build_text_runtime_messages() — build model-facing text-only messages
 //   build_vlm_runtime_messages() — build model-facing VLM messages
 //   current_unix_time()          — current time as Unix timestamp (seconds)
@@ -55,22 +53,6 @@ int current_unix_time();
 // generate_response_id — generate a unique "resp_XXXXXXXXXXXXXXXX" ID
 // ─────────────────────────────────────────────────────────────────────────────
 std::string generate_response_id();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// generate_compaction_id — generate a unique "cmp_XXXXXXXXXXXXXXXX" ID
-// ─────────────────────────────────────────────────────────────────────────────
-std::string generate_compaction_id();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// inject_summary_into_instructions — append applied branch summary
-//
-// @param instructions    Effective system instructions
-// @param applied_summary Summary text returned by ResponseStore
-// @return                Instructions with summary text appended
-// ─────────────────────────────────────────────────────────────────────────────
-std::string inject_summary_into_instructions(
-    const std::string& instructions,
-    const std::string& applied_summary);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // input_to_messages — convert Responses API `input` to messages array

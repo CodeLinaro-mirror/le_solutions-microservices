@@ -139,9 +139,7 @@ BeginResponseResult ResponseStore::beginResponseFromCandidateLocked(
         }
     } else {
         if (!candidate.session_id.empty()
-            || !candidate.ancestor_messages.empty()
-            || !candidate.ancestor_message_response_ids.empty()
-            || candidate.conversation_memory.has_value()) {
+            || !candidate.ancestor_messages.empty()) {
             return makeBeginError(
                 409,
                 "Candidate does not match response lineage");
@@ -185,11 +183,8 @@ BeginResponseResult ResponseStore::beginResponseFromCandidateLocked(
     result.session_id = session_id;
     result.created_at = now;
     result.ancestor_messages = std::move(candidate.ancestor_messages);
-    result.ancestor_message_response_ids =
-        std::move(candidate.ancestor_message_response_ids);
     result.current_request_messages =
         std::move(candidate.current_request_messages);
-    result.conversation_memory = std::move(candidate.conversation_memory);
     return result;
 }
 
@@ -198,8 +193,7 @@ bool ResponseStore::completeResponse(
     const ResponseStoreJson& assistant_messages,
     const ResponseStoreJson& output_items,
     const ResponseStoreJson& response_object,
-    const ResponseStoreJson& usage,
-    const std::optional<StoredConversationMemory>& memory_update) {
+    const ResponseStoreJson& usage) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = responses_by_id_.find(response_id);
     if (it == responses_by_id_.end()
@@ -213,7 +207,6 @@ bool ResponseStore::completeResponse(
     response.output_items = output_items;
     response.response_object = response_object;
     response.usage = usage;
-    response.conversation_memory = memory_update;
     response.error = nullptr;
     response.incomplete_details = nullptr;
     response.status = StoredResponseStatus::Completed;
@@ -225,20 +218,6 @@ bool ResponseStore::completeResponse(
     if (session_it != sessions_by_id_.end()) {
         session_it->second.last_activity_at = now;
     }
-    return true;
-}
-
-bool ResponseStore::updateConversationMemory(
-    const std::string& response_id,
-    const StoredConversationMemory& memory_update) {
-    std::lock_guard<std::mutex> lock(mu_);
-    auto found = responses_by_id_.find(response_id);
-    if (found == responses_by_id_.end() ||
-        found->second.status != StoredResponseStatus::Completed) {
-        return false;
-    }
-    found->second.conversation_memory = memory_update;
-    found->second.updated_at = currentUnixTime();
     return true;
 }
 
@@ -511,7 +490,6 @@ BuildCandidateResult ResponseStore::buildCandidateMessagesLocked(
     }
 
     std::vector<const StoredResponse*> path;
-    std::unordered_map<std::string, std::size_t> index_by_id;
     std::string cursor = previous_response_id;
     while (!cursor.empty()) {
         auto it = responses_by_id_.find(cursor);
@@ -539,51 +517,16 @@ BuildCandidateResult ResponseStore::buildCandidateMessagesLocked(
         if (result.session_id.empty()) {
             result.session_id = response.session_id;
         }
-        index_by_id[response.response_id] = path.size();
         path.push_back(&response);
         cursor = response.previous_response_id;
     }
 
-    std::optional<std::size_t> watermark_index;
-    for (const StoredResponse* response : path) {
-        if (!response->conversation_memory.has_value()) {
-            continue;
-        }
-
-        const StoredConversationMemory& memory =
-            response->conversation_memory.value();
-        if (memory.summarized_until_response_id.empty()) {
-            result.conversation_memory = memory;
-            break;
-        }
-
-        auto watermark_it =
-            index_by_id.find(memory.summarized_until_response_id);
-        if (watermark_it == index_by_id.end()) {
-            continue;
-        }
-
-        result.conversation_memory = memory;
-        watermark_index = watermark_it->second;
-        break;
-    }
-
     for (std::size_t i = path.size(); i > 0; --i) {
         std::size_t path_index = i - 1;
-        if (watermark_index.has_value()
-            && path_index >= watermark_index.value()) {
-            continue;
-        }
-        appendMessagesWithSource(
-            result.ancestor_messages,
-            result.ancestor_message_response_ids,
-            path[path_index]->request_messages,
-            path[path_index]->response_id);
-        appendMessagesWithSource(
-            result.ancestor_messages,
-            result.ancestor_message_response_ids,
-            path[path_index]->assistant_messages,
-            path[path_index]->response_id);
+        appendMessages(
+            result.ancestor_messages, path[path_index]->request_messages);
+        appendMessages(
+            result.ancestor_messages, path[path_index]->assistant_messages);
     }
 
     return result;
@@ -602,22 +545,17 @@ int ResponseStore::currentUnixTime() {
         / 1000000000LL);
 }
 
-void ResponseStore::appendMessagesWithSource(
-    ResponseStoreJson& destination,
-    std::vector<std::string>& destination_response_ids,
-    const ResponseStoreJson& messages,
-    const std::string& response_id) {
+void ResponseStore::appendMessages(ResponseStoreJson& destination,
+                                   const ResponseStoreJson& messages) {
     if (messages.is_array()) {
         for (const auto& message : messages) {
             destination.push_back(message);
-            destination_response_ids.push_back(response_id);
         }
         return;
     }
 
     if (!messages.is_null()) {
         destination.push_back(messages);
-        destination_response_ids.push_back(response_id);
     }
 }
 

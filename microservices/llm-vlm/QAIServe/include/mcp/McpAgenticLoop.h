@@ -37,6 +37,7 @@
 #include "mcp/McpClientRegistry.h"
 #include "mcp/McpTypes.h"
 #include "qai_forge/InternalDTOs.h"
+#include "qai_forge/QaiForge.h"
 #include <functional>
 #include <string>
 #include <vector>
@@ -47,6 +48,7 @@
 struct McpLoopResult {
     StandardResponse          final_response;
     std::vector<McpCallRecord> call_records;    // All tool calls made
+    json                      generated_messages = json::array();
     int                        iterations = 0;  // Number of inference rounds
     bool                       truncated  = false; // true if max_iterations hit
 };
@@ -84,7 +86,8 @@ public:
      */
     McpLoopResult run(const CreateChatCompletionRequest& base_request,
                        const json& mcp_tools,
-                       const std::string& response_id = "");
+                       const std::string& response_id = "",
+                       const qai_forge::GenerateOptions& base_options = {});
 
     // ── Streaming variant ─────────────────────────────────────────────────────
 
@@ -107,7 +110,8 @@ public:
     McpLoopResult runStreaming(const CreateChatCompletionRequest& base_request,
                                 const json& mcp_tools,
                                 McpSseEmitter emitter,
-                                const std::string& response_id);
+                                const std::string& response_id,
+                                const qai_forge::GenerateOptions& base_options = {});
 
     // ── Configuration ─────────────────────────────────────────────────────────
 
