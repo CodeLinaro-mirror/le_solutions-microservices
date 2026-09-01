@@ -94,4 +94,20 @@ struct BackendCapabilities {
     //   false → LiteRT LM, ONNX Runtime: no checkpoint API available.
     //            Budget enforced by token counting only (approximate).
     bool supports_kv_save_restore        = false;
+
+    // supports_kv_session_reuse:
+    //   true  → Backend maintains a per-session KV cache across requests,
+    //            keyed by session_id. The orchestrator must call
+    //            IGenerativeBackend::generateWithSession() (not generate())
+    //            and pass session_id + kv_invalidated so the backend can
+    //            decide whether to reuse the existing session's KV state or
+    //            rebuild it from scratch (e.g. after context eviction).
+    //            Used by: LiteRT LM (worker-side g_kv_sessions map keyed by
+    //            session_id, incremental prefill across turns).
+    //   false → Backend has no concept of cross-request session KV reuse.
+    //            The orchestrator calls plain generate(). Backends that
+    //            don't set this to true never need session_id or
+    //            kv_invalidated — they are not part of the shared
+    //            IGenerativeBackend::generate() signature.
+    bool supports_kv_session_reuse       = false;
 };

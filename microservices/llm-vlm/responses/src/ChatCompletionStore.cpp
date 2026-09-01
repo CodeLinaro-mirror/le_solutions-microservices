@@ -3,6 +3,7 @@
 
 #include "ChatCompletionStore.h"
 #include "ChatCompletionUtils.h"
+#include <qai_forge/QaiForge.h>
 #include <drogon/drogon.h>
 #include <random>
 #include <sstream>
@@ -48,58 +49,47 @@ std::string ChatCompletionStore::generateUUID() {
 }
 
 void ChatCompletionStore::registerHashMappings(ChatSession& session) {
-    // Register continuation hash
     if (!session.continuation_hash.empty()) {
         hash_to_completion_id_[session.continuation_hash] = session.completion_id;
     }
-
-    // Register retry candidate hash
     if (!session.retry_candidate_hash.empty()) {
         hash_to_completion_id_[session.retry_candidate_hash] = session.completion_id;
     }
-
-    // Register tool call hash
     if (!session.tool_call_hash.empty()) {
         hash_to_completion_id_[session.tool_call_hash] = session.completion_id;
     }
-
-    // Register job ID mapping
     if (!session.active_job_id.empty()) {
         job_to_completion_id_[session.active_job_id] = session.completion_id;
     }
 }
 
 void ChatCompletionStore::unregisterHashMappings(const ChatSession& session) {
-    // Unregister continuation hash
     if (!session.continuation_hash.empty()) {
         hash_to_completion_id_.erase(session.continuation_hash);
     }
-
-    // Unregister retry candidate hash
     if (!session.retry_candidate_hash.empty()) {
         hash_to_completion_id_.erase(session.retry_candidate_hash);
     }
-
-    // Unregister tool call hash
     if (!session.tool_call_hash.empty()) {
         hash_to_completion_id_.erase(session.tool_call_hash);
     }
-
-    // Unregister job ID mapping
     if (!session.active_job_id.empty()) {
         job_to_completion_id_.erase(session.active_job_id);
     }
 }
 
-std::pair<ChatSession*, bool> ChatCompletionStore::findOrCreateSession(
+SessionLookupResult ChatCompletionStore::findOrCreateSession(
     const json& messages,
+    const json& request_body,
     const std::string& user_hint_id
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    SessionLookupResult result;
+
     if (!messages.is_array()) {
         LOG_ERROR << "findOrCreateSession: messages is not an array";
-        return {nullptr, false};
+        return result;
     }
 
     // Step 1: Check user-provided hint ID
@@ -108,70 +98,112 @@ std::pair<ChatSession*, bool> ChatCompletionStore::findOrCreateSession(
         if (it != sessions_.end()) {
             it->second.last_accessed = std::chrono::steady_clock::now();
             LOG_DEBUG << "Found session by user hint ID: " << user_hint_id;
-            return {&it->second, false};
+            result.session = &it->second;
+            result.is_new = false;
+            return result;
         }
     }
 
-    // Step 2: Check retry candidate hash (idempotent retry)
-    // Hash of ALL complete pairs - matches if client resends exact same request
-    std::string retry_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
-    if (!retry_hash.empty()) {
-        auto hash_it = hash_to_completion_id_.find(retry_hash);
-        if (hash_it != hash_to_completion_id_.end()) {
-            auto& session = sessions_[hash_it->second];
-            session.last_accessed = std::chrono::steady_clock::now();
-            LOG_DEBUG << "Found session by retry candidate hash: " << retry_hash;
-            return {&session, false};
-        }
-    }
-
-    // Step 3: Check continuation hash (next turn)
-    // Hash excluding last pair - matches if client adds a new user message
-    std::string continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
-    if (!continuation_hash.empty()) {
-        auto hash_it = hash_to_completion_id_.find(continuation_hash);
-        if (hash_it != hash_to_completion_id_.end()) {
-            auto& session = sessions_[hash_it->second];
-            session.last_accessed = std::chrono::steady_clock::now();
-            LOG_DEBUG << "Found session by continuation hash: " << continuation_hash;
-            return {&session, false};
-        }
-    }
-
-    // Step 4: Check tool call hash (tool response submission)
-    // Find last assistant message with tool_calls
+    // Step 2: Check tool-call hash (in-progress tool-calling round-trip).
+    // Checked BEFORE the rotating continuation/retry hash — an in-progress
+    // tool-calling sequence (assistant tool_calls with no final answer yet)
+    // is excluded from hashConversationPairs() entirely (see
+    // ChatCompletionUtils::identifyCompletePairs), so it must not be
+    // misrouted to an unrelated session via the general-purpose hash below.
+    // Hash is computed over ONLY the user messages in the trailing
+    // tool-calling sequence — stable regardless of assistant formatting,
+    // matching the legacy Python calculate_hash_for_specific_messages(user_messages)
+    // approach, rather than "all messages up to and including the tool-call
+    // assistant message".
     for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
         if ((*it).is_object() &&
             ChatCompletionUtils::safeGet<std::string>(*it, "role", "") == "assistant" &&
             ChatCompletionUtils::hasToolCalls(*it)) {
 
-            // Create array of messages up to and including this assistant message
-            json messages_up_to_tool_call = json::array();
+            json user_messages_only = json::array();
             for (auto msg_it = messages.begin(); msg_it != it.base(); ++msg_it) {
-                messages_up_to_tool_call.push_back(*msg_it);
+                if ((*msg_it).is_object() &&
+                    ChatCompletionUtils::safeGet<std::string>(*msg_it, "role", "") == "user") {
+                    user_messages_only.push_back(*msg_it);
+                }
             }
 
-            std::string tool_hash = ChatCompletionUtils::hashSpecificMessages(messages_up_to_tool_call);
+            std::string tool_hash = ChatCompletionUtils::hashSpecificMessages(user_messages_only);
             if (!tool_hash.empty()) {
                 auto tool_it = hash_to_completion_id_.find(tool_hash);
                 if (tool_it != hash_to_completion_id_.end()) {
-                    auto& session = sessions_[tool_it->second];
-                    session.last_accessed = std::chrono::steady_clock::now();
-                    LOG_DEBUG << "Found session by tool call hash: " << tool_hash;
-                    return {&session, false};
+                    auto session_it = sessions_.find(tool_it->second);
+                    if (session_it != sessions_.end()) {
+                        session_it->second.last_accessed = std::chrono::steady_clock::now();
+                        LOG_DEBUG << "Found session by tool call hash: " << tool_hash;
+                        result.session = &session_it->second;
+                        result.is_new = false;
+                        return result;
+                    }
                 }
             }
             break;
         }
     }
 
-    // Step 5: Create new session
+    // Step 3: Rotating hash — direct port of the legacy Python
+    // SessionManager.find_or_create_session() rotating continuation_hash /
+    // retry_candidate_hash design. Compute ONE hash from the incoming
+    // request (of ALL complete pairs currently present).
+    std::string full_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
+    if (!full_hash.empty()) {
+        auto hash_it = hash_to_completion_id_.find(full_hash);
+        if (hash_it != hash_to_completion_id_.end()) {
+            auto session_it = sessions_.find(hash_it->second);
+            if (session_it != sessions_.end()) {
+                ChatSession& session = session_it->second;
+
+                if (full_hash == session.continuation_hash) {
+                    // Next-turn continuation match.
+                    session.last_accessed = std::chrono::steady_clock::now();
+                    LOG_DEBUG << "Found session by continuation hash: " << full_hash;
+                    result.session = &session;
+                    result.is_new = false;
+                    return result;
+                }
+
+                if (full_hash == session.retry_candidate_hash) {
+                    // Hash match on the retry candidate alone is not
+                    // sufficient proof of "same request" — verify the full
+                    // request signature before replaying a cached response.
+                    // Deliberately does NOT fall back to reusing the session
+                    // on a signature mismatch (or missing cached replay) —
+                    // falls through to create a brand-new session instead,
+                    // matching the legacy Python "don't guess" behavior.
+                    if (!request_body.is_null() &&
+                        !session.last_request_signature.empty() &&
+                        !session.last_replay_result.is_null()) {
+                        std::string incoming_signature =
+                            ChatCompletionUtils::buildRequestSignature(request_body, messages);
+                        if (incoming_signature == session.last_request_signature) {
+                            session.last_accessed = std::chrono::steady_clock::now();
+                            LOG_DEBUG << "Found retry replay for session "
+                                      << session.completion_id
+                                      << " by hash " << full_hash;
+                            result.session = &session;
+                            result.is_new = false;
+                            result.replay_result = session.last_replay_result;
+                            return result;
+                        }
+                    }
+                    // Signature mismatch (or no cached replay available) —
+                    // fall through to create a new session below.
+                }
+            }
+        }
+    }
+
+    // Step 4: Create new session
     std::string new_id = generateUUID();
     ChatSession& session = sessions_[new_id];
     session.completion_id = new_id;
-    session.messages = json::array();  // Start with empty history - messages will be added after first turn
-    session.continuation_hash = continuation_hash;
-    session.retry_candidate_hash = retry_hash;
+    session.messages = json::array();
+    session.continuation_hash = full_hash;
     session.created_at = std::chrono::steady_clock::now();
     session.last_accessed = session.created_at;
 
@@ -187,7 +219,9 @@ std::pair<ChatSession*, bool> ChatCompletionStore::findOrCreateSession(
     registerHashMappings(session);
 
     LOG_INFO << "Created new session: " << new_id;
-    return {&session, true};
+    result.session = &session;
+    result.is_new = true;
+    return result;
 }
 
 ChatSession* ChatCompletionStore::findByCompletionId(const std::string& completion_id) {
@@ -228,18 +262,26 @@ void ChatCompletionStore::updateSession(const std::string& completion_id, const 
 
     ChatSession& session = it->second;
 
-    // Unregister old hash mappings
+    // Unregister old hash mappings (continuation/retry/tool-call/job-id)
     unregisterHashMappings(session);
 
     // Update messages
     session.messages = messages;
     session.last_accessed = std::chrono::steady_clock::now();
 
-    // Recalculate hashes
-    // continuation_hash = hash of ALL complete pairs (for next turn lookup)
-    // retry_candidate_hash = hash excluding last pair (for idempotent retry lookup)
-    session.continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
-    session.retry_candidate_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
+    // Rotate the hash pair — direct port of the legacy Python
+    // ConversationSession.complete_current_event() rotation:
+    //   retry_candidate_hash = (old) continuation_hash
+    //   continuation_hash    = hash of ALL complete pairs as of THIS turn
+    // A freshly computed hash can legitimately come back empty (e.g. no
+    // complete pairs yet) — in that case, do not overwrite continuation_hash,
+    // since that just means there is nothing new to key on, not that the
+    // previously-registered hash should be discarded.
+    std::string new_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
+    session.retry_candidate_hash = session.continuation_hash;
+    if (!new_hash.empty()) {
+        session.continuation_hash = new_hash;
+    }
 
     // Register new hash mappings
     registerHashMappings(session);
@@ -254,6 +296,15 @@ void ChatCompletionStore::deleteSession(const std::string& completion_id) {
     if (it == sessions_.end()) {
         LOG_WARN << "deleteSession: session not found: " << completion_id;
         return;
+    }
+
+    // Release any per-session backend state (e.g. LiteRT-LM KV cache
+    // session) scoped to the model this session actually used. Centralized
+    // here — at the store layer — rather than in individual controllers, so
+    // every current and future caller of deleteSession() (any transport)
+    // gets this cleanup automatically without needing to remember to add it.
+    if (!it->second.model.empty()) {
+        qai_forge::QaiForge::getInstance().clearSession(it->second.model, completion_id);
     }
 
     // Unregister hash mappings
@@ -283,6 +334,9 @@ size_t ChatCompletionStore::cleanupExpiredSessions(std::chrono::seconds max_age)
     for (const auto& id : expired_ids) {
         auto it = sessions_.find(id);
         if (it != sessions_.end()) {
+            if (!it->second.model.empty()) {
+                qai_forge::QaiForge::getInstance().clearSession(it->second.model, id);
+            }
             unregisterHashMappings(it->second);
             sessions_.erase(it);
         }

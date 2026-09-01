@@ -7,6 +7,9 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 
+#include <jinja2cpp/template.h>
+#include <jinja2cpp/value.h>
+
 #include <cctype>
 #include <iomanip>
 #include <random>
@@ -21,6 +24,47 @@ std::string generateEventId() {
     oss << "litert-lm-" << std::hex << std::setw(16) << std::setfill('0')
         << rng();
     return oss.str();
+}
+
+// Recursively converts an nlohmann::json value into a jinja2::Value so it
+// can be passed as template render context to jinja2cpp. Handles the shapes
+// produced by CreateChatCompletionRequest: arrays of message objects,
+// nested tool-call objects, primitive scalars, etc.
+jinja2::Value jsonToJinjaValue(const json& value) {
+    if (value.is_null()) {
+        return jinja2::Value();
+    }
+    if (value.is_boolean()) {
+        return jinja2::Value(value.get<bool>());
+    }
+    if (value.is_number_integer()) {
+        return jinja2::Value(static_cast<int64_t>(value.get<long long>()));
+    }
+    if (value.is_number_unsigned()) {
+        return jinja2::Value(static_cast<int64_t>(value.get<unsigned long long>()));
+    }
+    if (value.is_number_float()) {
+        return jinja2::Value(value.get<double>());
+    }
+    if (value.is_string()) {
+        return jinja2::Value(value.get<std::string>());
+    }
+    if (value.is_array()) {
+        jinja2::ValuesList list;
+        list.reserve(value.size());
+        for (const auto& item : value) {
+            list.push_back(jsonToJinjaValue(item));
+        }
+        return jinja2::Value(std::move(list));
+    }
+    if (value.is_object()) {
+        jinja2::ValuesMap map;
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            map[it.key()] = jsonToJinjaValue(it.value());
+        }
+        return jinja2::Value(std::move(map));
+    }
+    return jinja2::Value();
 }
 
 } // namespace
@@ -85,42 +129,35 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
                                                 const json& tools,
                                                 bool add_generation_prompt) const {
     if (!jinja_template_.empty()) {
-        if (jinja_template_.find("<|im_start|>") != std::string::npos) {
-            std::ostringstream oss;
-            for (const auto& msg : messages) {
-                oss << "<|im_start|>" << msg.value("role","user") << "\n"
-                    << msg.value("content","") << "<|im_end|>\n";
+        try {
+            jinja2::Template tmpl;
+            auto load_result = tmpl.Load(jinja_template_);
+            if (!load_result) {
+                LOG_WARN("[LiteRTLMOrchestrator] Failed to load Jinja2 template: "
+                         << load_result.error().ToString());
+            } else {
+                jinja2::ValuesMap params;
+                params["messages"] = jsonToJinjaValue(messages);
+                params["add_generation_prompt"] = add_generation_prompt;
+                params["enable_thinking"] = false;
+                if (!tools.is_null() && tools.is_array() && !tools.empty()) {
+                    params["tools"] = jsonToJinjaValue(tools);
+                }
+
+                auto render_result = tmpl.RenderAsString(params);
+                if (render_result) {
+                    return render_result.value();
+                }
+                LOG_WARN("[LiteRTLMOrchestrator] Failed to render Jinja2 template: "
+                         << render_result.error().ToString());
             }
-            if (add_generation_prompt) {
-                oss << "<|im_start|>assistant\n";
-            }
-            return oss.str();
+        } catch (const std::exception& e) {
+            LOG_WARN("[LiteRTLMOrchestrator] Jinja2 rendering threw exception: "
+                     << e.what());
         }
-        if (jinja_template_.find("<|start_of_role|>") != std::string::npos) {
-            std::ostringstream oss;
-            bool has_system = !messages.empty() &&
-                              messages[0].value("role","") == "system";
-            if (!has_system) {
-                oss << "<|start_of_role|>system<|end_of_role|>"
-                    << "You are a helpful assistant."
-                    << "<|end_of_text|>\n";
-            }
-            for (const auto& msg : messages) {
-                oss << "<|start_of_role|>" << msg.value("role","user")
-                    << "<|end_of_role|>" << msg.value("content","")
-                    << "<|end_of_text|>\n";
-            }
-            if (add_generation_prompt)
-                oss << "<|start_of_role|>assistant<|end_of_role|>";
-            return oss.str();
-        }
-        json ctx = json::object();
-        ctx["messages"] = messages;
-        ctx["add_generation_prompt"] = add_generation_prompt;
-        ctx["enable_thinking"] = false;
-        if (!tools.is_null() && tools.is_array() && !tools.empty())
-            ctx["tools"] = tools;
-        try { return renderJinja(jinja_template_, ctx); } catch (...) {}
+        // Fall through to the flat fallback formatter below on any failure —
+        // this preserves the original safety net for malformed/unsupported
+        // templates rather than propagating an exception up to the caller.
     }
     // Fallback: simple role: content format
     std::ostringstream oss;
@@ -128,73 +165,6 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
         oss << msg.value("role","user") << ": " << msg.value("content","") << "\n";
     oss << "assistant:";
     return oss.str();
-}
-
-std::string LiteRTLMOrchestrator::renderJinja(const std::string& tmpl,
-                                               const json& context) const {
-    // Minimal Jinja2 renderer — handles the subset used by LLM chat templates.
-    // Supports: {{ var }}, {% for x in y %}...{% endfor %},
-    //           {% if x %}...{% elif x %}...{% else %}...{% endif %},
-    //           whitespace control (- prefix/suffix), string filters.
-    std::string result;
-    result.reserve(tmpl.size() * 2);
-    size_t pos = 0;
-
-    auto lookup = [&](const std::string& key) -> json {
-        if (context.contains(key)) return context[key];
-        return json{};
-    };
-
-    // Simple single-pass renderer (handles top-level constructs)
-    while (pos < tmpl.size()) {
-        size_t tag_start = tmpl.find("{", pos);
-        if (tag_start == std::string::npos) {
-            result += tmpl.substr(pos);
-            break;
-        }
-        if (tag_start + 1 >= tmpl.size()) {
-            result += tmpl.substr(pos);
-            break;
-        }
-        char next = tmpl[tag_start + 1];
-        if (next == '{') {
-            result += tmpl.substr(pos, tag_start - pos);
-            size_t end = tmpl.find("}}", tag_start + 2);
-            if (end == std::string::npos) { result += tmpl.substr(tag_start); break; }
-            std::string expr = tmpl.substr(tag_start + 2, end - tag_start - 2);
-            // trim
-            size_t s = expr.find_first_not_of(" \t-");
-            size_t e = expr.find_last_not_of(" \t-");
-            if (s != std::string::npos) expr = expr.substr(s, e - s + 1);
-            // handle simple var or var.field
-            auto dot = expr.find('.');
-            if (dot != std::string::npos) {
-                std::string obj = expr.substr(0, dot);
-                std::string field = expr.substr(dot + 1);
-                auto v = lookup(obj);
-                if (v.is_object() && v.contains(field)) {
-                    auto fv = v[field];
-                    if (fv.is_string()) result += fv.get<std::string>();
-                    else result += fv.dump();
-                }
-            } else {
-                auto v = lookup(expr);
-                if (v.is_string()) result += v.get<std::string>();
-                else if (!v.is_null()) result += v.dump();
-            }
-            pos = end + 2;
-        } else if (next == '%') {
-            result += tmpl.substr(pos, tag_start - pos);
-            size_t end = tmpl.find("%}", tag_start + 2);
-            if (end == std::string::npos) { result += tmpl.substr(tag_start); break; }
-            pos = end + 2;
-            // skip block tags for now (full Jinja is complex; fall through to fallback)
-        } else {
-            result += tmpl.substr(pos, tag_start - pos + 1);
-            pos = tag_start + 1;
-        }
-    }
-    return result;
 }
 
 scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
@@ -316,7 +286,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
         stream_chunk.role.reset();
     }
 
-    backend.generate(
+    backend.generateWithSession(
         event_id, job.session_id, prompt, streaming,
         prepared->generation.max_tokens,
         prepared->generation.temperature,

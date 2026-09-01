@@ -44,6 +44,13 @@ CreateChatCompletionRequest BuildRequest(
 
 } // namespace
 
+// Note on session lifecycle: gRPC calls in this service are stateless
+// single-shot completions — BuildRequest() above never creates a
+// ChatCompletionStore/ResponseStore entry, so there is no per-session
+// backend state (e.g. LiteRT-LM KV cache session) to release here. The
+// clearSession() cleanup added to ChatCompletionStore::deleteSession() /
+// ResponseStore::deleteCascade() (see those files) does not apply to this
+// transport for that reason — not an oversight.
 grpc::Status ChatServiceImpl::CreateChatCompletion(
     grpc::ServerContext* /*context*/,
     const qai::forge::v1::ChatCompletionRequest* request,

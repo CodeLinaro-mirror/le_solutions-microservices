@@ -3,6 +3,8 @@
 
 #include "ResponseStore.h"
 
+#include <qai_forge/QaiForge.h>
+
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
@@ -349,6 +351,15 @@ DeleteCascadeResult ResponseStore::deleteCascade(
         auto it = responses_by_id_.find(id);
         if (it == responses_by_id_.end()) {
             continue;
+        }
+
+        // Release any per-response backend state (e.g. LiteRT-LM KV cache
+        // session) scoped to the model this response actually used.
+        // Centralized here — at the store layer — rather than in individual
+        // controllers, so every current and future caller of deleteCascade()
+        // (any transport) gets this cleanup automatically.
+        if (!it->second.model.empty()) {
+            qai_forge::QaiForge::getInstance().clearSession(it->second.model, id);
         }
 
         std::string session_id = it->second.session_id;

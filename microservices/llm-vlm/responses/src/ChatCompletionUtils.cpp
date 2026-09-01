@@ -6,6 +6,7 @@
 #include <openssl/sha.h>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
 #include <drogon/drogon.h>
 
 namespace ChatCompletionUtils {
@@ -34,6 +35,10 @@ std::string hashSpecificMessages(const json& messages, bool debug) {
             }
         }
 
+        // Full content participates in the hash for every role, including
+        // assistant — matches the legacy Python ConversationUtils behavior
+        // (calculate_hash_for_specific_messages) exactly: role + full content
+        // + tool-call info.
         conversation_str += role + ":" + content + tool_calls_info + "|";
     }
 
@@ -95,12 +100,25 @@ std::string hashConversationPairs(const json& messages, bool exclude_last_pair) 
         }
     }
 
-    // Identify complete pairs
+    // Identify complete pairs. Per identifyCompletePairs(), only sequences
+    // that culminate in an assistant message with real (non-null) content
+    // are ever returned here — an in-progress or unterminated tool-calling
+    // loop is excluded entirely, mirroring the legacy Python behavior.
     std::vector<MessagePair> pairs = identifyCompletePairs(non_system_messages);
 
-    // Exclude last pair if requested
+    // Exclude last pair if requested (used internally; the primary
+    // session-lookup path in ChatCompletionStore always calls with
+    // exclude_last_pair=false and instead relies on the session's
+    // rotating continuation_hash/retry_candidate_hash for matching).
     if (exclude_last_pair && !pairs.empty()) {
         pairs.pop_back();
+    }
+
+    // No complete pairs to hash - return empty string rather than hashing
+    // an empty array, which would produce the same constant hash for every
+    // such call and collide across unrelated sessions.
+    if (pairs.empty()) {
+        return "";
     }
 
     // Flatten pairs into single array
@@ -113,6 +131,28 @@ std::string hashConversationPairs(const json& messages, bool exclude_last_pair) 
 
     // Calculate hash
     return hashSpecificMessages(flattened_messages);
+}
+
+std::string buildRequestSignature(const json& request_body, const json& messages) {
+    // Direct port of Python's SessionManager.build_request_signature():
+    // start from the full request body, strip fields that legitimately vary
+    // between an original request and an idempotent retry of it without
+    // changing the request's meaning (stream/user/store), substitute in the
+    // canonical messages array, then serialize with alphabetically-sorted
+    // keys so the same logical request always produces the same string
+    // regardless of client-side key ordering.
+    json payload = request_body.is_object() ? request_body : json::object();
+    payload.erase("stream");
+    payload.erase("user");
+    payload.erase("store");
+    payload["messages"] = messages;
+
+    // nlohmann::ordered_json preserves insertion order rather than sorting
+    // keys automatically (unlike Python's json.dumps(..., sort_keys=True)).
+    // Rebuild into a plain (alphabetically-ordered) nlohmann::json object so
+    // dump() emits keys in sorted order, matching Python's determinism.
+    nlohmann::json sorted_payload = payload;
+    return sorted_payload.dump();
 }
 
 std::string getContentString(const json& message) {
@@ -211,27 +251,59 @@ std::vector<MessagePair> identifyCompletePairs(const json& messages) {
             pair.messages.push_back(msg);
             ++i;
 
-            // Look for assistant response
-            if (i < messages.size()) {
+            // Collect the ENTIRE assistant/tool sequence following this user
+            // message (which may span multiple tool-calling round-trips:
+            // assistant(tool_calls) -> tool -> assistant(tool_calls) -> tool -> ...)
+            // up to the next user message. This mirrors the legacy Python
+            // logic in ConversationUtils.calculate_conversation_hash, which
+            // collects the full assistant_sequence before deciding whether
+            // the pair is complete.
+            std::vector<json> assistant_sequence;
+            while (i < messages.size()) {
                 const auto& next_msg = messages[i];
-                if (next_msg.is_object() && safeGet<std::string>(next_msg, "role", "") == "assistant") {
-                    pair.messages.push_back(next_msg);
-                    ++i;
-
-                    // Check for tool messages following the assistant response
-                    while (i < messages.size()) {
-                        const auto& tool_msg = messages[i];
-                        if (tool_msg.is_object() && safeGet<std::string>(tool_msg, "role", "") == "tool") {
-                            pair.messages.push_back(tool_msg);
-                            ++i;
-                        } else {
-                            break;
-                        }
-                    }
+                std::string next_role = next_msg.is_object()
+                    ? safeGet<std::string>(next_msg, "role", "")
+                    : "";
+                if (next_role == "user") {
+                    break;
                 }
+                assistant_sequence.push_back(next_msg);
+                ++i;
             }
 
-            pairs.push_back(pair);
+            if (!assistant_sequence.empty()) {
+                // A pair is only COMPLETE if the tool-calling loop (if any)
+                // has actually concluded with a real final answer — i.e. the
+                // LAST assistant message in the sequence has non-null,
+                // non-empty content. A trailing assistant message that is
+                // purely a tool_calls stub (content == null/empty) means the
+                // loop is still in progress or ended without a final answer;
+                // such a sequence must NOT be counted as complete, matching
+                // Python's `final_assistant` search (search from the end for
+                // the first assistant message with non-empty content).
+                const json* final_assistant = nullptr;
+                for (auto it = assistant_sequence.rbegin();
+                     it != assistant_sequence.rend(); ++it) {
+                    const json& seq_msg = *it;
+                    if (seq_msg.is_object()
+                        && safeGet<std::string>(seq_msg, "role", "") == "assistant"
+                        && !getContentString(seq_msg).empty()) {
+                        final_assistant = &seq_msg;
+                        break;
+                    }
+                }
+
+                if (final_assistant != nullptr) {
+                    for (const auto& seq_msg : assistant_sequence) {
+                        pair.messages.push_back(seq_msg);
+                    }
+                    pairs.push_back(pair);
+                }
+                // else: incomplete tool-calling sequence (no final answer
+                // yet) — excluded from pairs entirely, per Python behavior.
+            }
+            // else: user message with no assistant response yet — this is
+            // the current pending turn, not a pair. Skip (do not push).
         } else {
             ++i;
         }

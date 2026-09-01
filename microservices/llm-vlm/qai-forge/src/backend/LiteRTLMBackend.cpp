@@ -76,6 +76,9 @@ BackendCapabilities LiteRTLMBackend::capabilities() const {
         .backend_filters_think_tokens = false,
         // KV save/restore not yet supported for LiteRT-LM
         .supports_kv_save_restore     = false,
+        // LiteRT-LM maintains per-session KV state across requests via the
+        // worker's g_kv_sessions map — generateWithSession() is meaningful.
+        .supports_kv_session_reuse    = true,
     };
 }
 
@@ -158,7 +161,7 @@ void LiteRTLMBackend::generate(
         on_token, on_done, on_error);
 }
 
-void LiteRTLMBackend::generate(
+void LiteRTLMBackend::generateWithSession(
     const std::string& event_id,
     const std::string& session_id,
     const std::string& prompt,

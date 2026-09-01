@@ -54,6 +54,10 @@ struct WsConnectionState {
     // warm in SessionManager — no lookup needed (fast path).
     std::string last_response_id;   // e.g. "resp_abc123"
     std::string last_session_id;    // corresponding SessionManager session_id
+    std::string last_model;         // model used for last_session_id — needed
+                                     // for a targeted QaiForge::clearSession()
+                                     // call on connection close (see
+                                     // WsResponsesController::handleConnectionClosed)
 
     // ── Sequential execution enforcement ─────────────────────────────────────
     // Only one response.create can be in flight at a time per connection.
@@ -80,6 +84,7 @@ struct WsConnectionState {
         , connected_at(other.connected_at)
         , last_response_id(std::move(other.last_response_id))
         , last_session_id(std::move(other.last_session_id))
+        , last_model(std::move(other.last_model))
         , response_in_flight(other.response_in_flight.load())
         , store(other.store)
     {}
@@ -90,6 +95,7 @@ struct WsConnectionState {
             connected_at       = other.connected_at;
             last_response_id   = std::move(other.last_response_id);
             last_session_id    = std::move(other.last_session_id);
+            last_model         = std::move(other.last_model);
             response_in_flight.store(other.response_in_flight.load());
             store              = other.store;
         }

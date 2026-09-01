@@ -105,7 +105,15 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) override;
 
-    void generate(
+    /**
+     * Text-only LLM inference with cross-request KV session reuse.
+     * Overrides IGenerativeBackend::generateWithSession() — this backend
+     * declares supports_kv_session_reuse=true in capabilities().
+     * Delegates to LiteRTLMWorkerManager::executeRequest() with session_id
+     * and kv_invalidated so the worker can reuse or rebuild the session's
+     * KV state (g_kv_sessions map).
+     */
+    void generateWithSession(
         const std::string& event_id,
         const std::string& session_id,
         const std::string& prompt,

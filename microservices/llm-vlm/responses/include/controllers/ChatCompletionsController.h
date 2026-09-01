@@ -6,8 +6,10 @@
 #include <drogon/HttpController.h>
 #include <memory>
 #include <string>
+#include <nlohmann/json.hpp>
 
 using namespace drogon;
+using json = nlohmann::ordered_json;
 
 // Forward declarations
 class ChatCompletionStore;
@@ -103,11 +105,13 @@ private:
      *
      * @param session Session pointer
      * @param request qai-forge request
+     * @param request_body Full parsed request body (for retry signature)
      * @param callback Response callback
      */
     void handleStreamingRequest(
         struct ChatSession* session,
         const struct CreateChatCompletionRequest& request,
+        const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);
 
     /**
@@ -117,11 +121,13 @@ private:
      *
      * @param session Session pointer
      * @param request qai-forge request
+     * @param request_body Full parsed request body (for retry signature)
      * @param callback Response callback
      */
     void handleNonStreamingRequest(
         struct ChatSession* session,
         const struct CreateChatCompletionRequest& request,
+        const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);
 
     /**

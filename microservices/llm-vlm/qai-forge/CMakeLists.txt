@@ -62,6 +62,34 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(stb)
 
+# ── jinja2cpp (Apache 2.0 — full Jinja2-compatible template engine) ──────────
+# Used by LiteRTLMOrchestrator::renderPrompt() to render each model's chat
+# template (Jinja2 syntax, as provided by the LiteRT-LM worker's METADATA
+# message) into a flat prompt string. Replaces the previous hand-rolled,
+# partial Jinja2 interpreter which silently skipped {% if %}/{% for %} blocks.
+# Built and linked as a shared library (libjinja2cpp.so) — installed
+# alongside libqai_forge.so (see the QAI_FORGE_INSTALL block below) and
+# located at runtime via the $ORIGIN RPATH set on the qai_forge target.
+set(JINJA2CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(JINJA2CPP_STRICT_WARNINGS OFF CACHE BOOL "" FORCE)
+set(JINJA2CPP_BUILD_SHARED ON CACHE BOOL "" FORCE)
+set(JINJA2CPP_DEPS_MODE "internal" CACHE STRING "" FORCE)
+FetchContent_Declare(
+    jinja2cpp
+    GIT_REPOSITORY https://github.com/jinja2cpp/Jinja2Cpp.git
+    GIT_TAG        1.3.2
+    GIT_SHALLOW    TRUE
+)
+# EXCLUDE_FROM_ALL keeps jinja2cpp's own install() rules (which reference
+# broken thirdparty header paths under its bundled nonstd/RapidJSON deps)
+# out of qai_forge's `cmake --install` — we only need the built .so file,
+# installed separately below via install(TARGETS jinja2cpp ...).
+FetchContent_GetProperties(jinja2cpp)
+if(NOT jinja2cpp_POPULATED)
+    FetchContent_Populate(jinja2cpp)
+    add_subdirectory(${jinja2cpp_SOURCE_DIR} ${jinja2cpp_BINARY_DIR} EXCLUDE_FROM_ALL)
+endif()
+
 # ── GenIE SDK paths ───────────────────────────────────────────────────────────
 # Set GENIE_INCLUDE_PATH and GENIE_LIB_PATH on the cmake command line:
 #   cmake -DGENIE_INCLUDE_PATH=/opt/genie/include -DGENIE_LIB_PATH=/opt/genie/lib
@@ -374,14 +402,28 @@ if(QAI_FORGE_BUILD_LLAMACPP)
     endif()
 endif()
 
+# jinja2cpp is linked by resolved .so path ($<TARGET_FILE:>) rather than by
+# target name to avoid install(EXPORT) requiring jinja2cpp's own file sets
+# to be exported — so its include dirs (and its nonstd::*-lite deps' dirs,
+# used by jinja2cpp's public headers) must be added explicitly.
+target_include_directories(qai_forge PRIVATE
+    ${jinja2cpp_SOURCE_DIR}/include
+    $<TARGET_PROPERTY:nonstd::expected-lite,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:nonstd::variant-lite,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:nonstd::optional-lite,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:nonstd::string-view-lite,INTERFACE_INCLUDE_DIRECTORIES>
+)
+
 target_link_libraries(qai_forge
     PUBLIC
         nlohmann_json::nlohmann_json
     PRIVATE
-        # POSIX: fork/exec, sockets, signals (implicit on Linux, explicit for clarity)
-        # pthread is needed for std::mutex, std::condition_variable
         Threads::Threads
+        # Jinja2 template engine — used by LiteRTLMOrchestrator::renderPrompt()
+        $<TARGET_FILE:jinja2cpp>
 )
+# Ensure build order since $<TARGET_FILE:> doesn't imply one under Makefiles
+add_dependencies(qai_forge jinja2cpp)
 
 if(QAI_FORGE_BUILD_LLAMACPP AND LLAMACPP_LLAMA_LIB AND LLAMACPP_GGML_LIB)
     # Important: llama-common must come before llama/ggml in the link order
@@ -408,6 +450,9 @@ set_target_properties(qai_forge PROPERTIES
     # Ensure the library exports its symbols
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
+    # $ORIGIN so libjinja2cpp.so (installed alongside) resolves at runtime
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -716,6 +761,14 @@ if(QAI_FORGE_INSTALL)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+
+    # ── Install jinja2cpp shared library (for $ORIGIN RPATH resolution) ───────
+    if(TARGET jinja2cpp)
+        install(TARGETS jinja2cpp
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif()
 
     # ── Install public headers ─────────────────────────────────────────────────
     install(DIRECTORY include/
