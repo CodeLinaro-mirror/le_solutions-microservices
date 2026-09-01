@@ -242,6 +242,38 @@ public:
      * Release per-session KV state in the worker.
      * Called when a chat session ends so the worker can free g_kv_sessions entries.
      * Default is a no-op — only LiteRTLMBackend overrides this.
+     *
+     * Transport invocation discipline (current, intentional — see
+     * docs/genai-backend-decoupling.md for the full design rationale):
+     *
+     *   HTTP (QAIServe/responses):
+     *     ChatCompletionStore::deleteSession() and ResponseStore::deleteCascade()
+     *     call QaiForge::clearSession(model_id, session_id) on explicit client
+     *     DELETE of a session/response resource. This is the only transport
+     *     with an explicit, caller-driven session-deletion lifecycle event.
+     *
+     *   WebSocket (QAIServe WsResponsesController):
+     *     WsResponsesController::handleConnectionClosed() calls clearSession()
+     *     best-effort when the underlying connection closes. There is no
+     *     explicit "session.delete" event in the WS protocol today, so this
+     *     is the closest approximation to explicit cleanup — a session left
+     *     open by an abnormal disconnect will still be cleared once the
+     *     socket-close callback fires.
+     *
+     *   gRPC (QAIServe ChatServiceImpl):
+     *     Never calls clearSession(). gRPC calls in this codebase are
+     *     stateless single-shot completions — each RPC call is a complete,
+     *     independent turn that never creates per-session backend KV state
+     *     to begin with, so there is nothing to clear. This is documented,
+     *     intentional behavior, not an oversight.
+     *
+     *   Guidance for future transports: any new transport that creates
+     *   multi-turn, per-session backend state (i.e. anything that calls
+     *   generateWithSession() rather than one-shot generate()) should
+     *   evaluate whether/how it needs to invoke clearSession() at the
+     *   appropriate point in its own connection/request lifecycle, following
+     *   one of the two patterns above (explicit delete event, or best-effort
+     *   on connection/session teardown).
      */
     virtual void clearSession(const std::string& /*session_id*/) {}
 

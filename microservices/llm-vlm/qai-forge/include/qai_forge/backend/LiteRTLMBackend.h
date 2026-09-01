@@ -45,13 +45,6 @@ public:
     LiteRTLMBackend();
     ~LiteRTLMBackend() override;
 
-    /**
-     * Legacy singleton accessor — kept for backward compatibility with
-     * BackendFactory::getGenerativeBackend("litert_lm").
-     * New code should use BackendFactory::createGenerativeBackend("litert_lm").
-     */
-    static LiteRTLMBackend& getInstance();
-
     std::string name() const override { return "LiteRTLM"; }
 
     /**

@@ -191,8 +191,12 @@ bool ModelRuntime::activate() {
                 should_notify = true;
             }
         } else {
-            LOG_WARN("[ModelRuntime] Cold activation requires a load reservation: model="
-                     << model_id_ << " state=" << stateToString(state_));
+            LOG_ERROR("[ModelRuntime] INVARIANT VIOLATION: activate() called "
+                      "without a load reservation on a cold runtime (this "
+                      "should never happen — the only caller, "
+                      "WarmModelPool::openToolLease(), only invokes the no-arg "
+                      "activate() when state is Running/Draining): model="
+                      << model_id_ << " state=" << stateToString(state_));
             return false;
         }
     }

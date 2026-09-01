@@ -27,15 +27,6 @@
 LiteRTLMBackend::LiteRTLMBackend() = default;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Singleton (legacy path — kept for BackendFactory::getGenerativeBackend)
-// ─────────────────────────────────────────────────────────────────────────────
-
-LiteRTLMBackend& LiteRTLMBackend::getInstance() {
-    static LiteRTLMBackend instance;
-    return instance;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // worker() — lazy-initialize the LiteRTLMWorkerManager
 // ─────────────────────────────────────────────────────────────────────────────
 

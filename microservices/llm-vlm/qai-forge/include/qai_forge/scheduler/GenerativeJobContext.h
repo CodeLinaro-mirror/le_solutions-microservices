@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -58,17 +59,29 @@ struct LlamaCppPreparedRequest {
     json chat_completions_body;
 };
 
+#ifdef QAI_FORGE_BUILD_LITERT_LM
 struct LiteRTLMPreparedRequest {
     json messages = json::array();
     json tools = json::array();
     GenerationConfig generation;
     bool kv_invalidated = false;  // true when context eviction occurred — worker must reset KV
+
+    // OIP raw_prompt bypass: set from CreateChatCompletionRequest::raw_prompt
+    // when the caller (OIP /generate with text_input) supplied an
+    // already-fully-formatted prompt. When set, LiteRTLMOrchestrator::execute()
+    // uses this string directly instead of calling renderPrompt() on
+    // `messages`/`tools`, so the prompt is fed to the worker verbatim.
+    std::optional<std::string> raw_prompt;
 };
+#endif
 
 using PreparedGenerativeRequest =
     std::variant<GeniePreparedRequest,
-                 LlamaCppPreparedRequest,
-                 LiteRTLMPreparedRequest>;
+                 LlamaCppPreparedRequest
+#ifdef QAI_FORGE_BUILD_LITERT_LM
+                 , LiteRTLMPreparedRequest
+#endif
+                 >;
 
 struct GenerativeJobContext {
     std::string job_id;
