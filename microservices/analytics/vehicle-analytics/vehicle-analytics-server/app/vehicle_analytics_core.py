@@ -201,7 +201,7 @@ def get_vehicle_coordinates(vehicle):
     if rectangle:
          #logger.info('using rectangle')
          coords['x'] = rectangle.x + rectangle.width / 2.0
-         coords['y'] = rectangle.y + rectangle.height
+         coords['y'] = min(1, rectangle.y + rectangle.height)
     else:
          logger.info(f'{vehicle}')
          logger.error(f'Vehicle detected without bounding box!')

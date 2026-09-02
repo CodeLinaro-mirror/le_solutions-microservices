@@ -33,6 +33,18 @@ def handle_no_db_error():
        # should fail like api
        sys.exit()
 
+def close_db_connection():
+    '''
+    Safely close the module-level db_connection, if open.
+    '''
+    global db_connection
+    if db_connection:
+        try:
+            db_connection.close()
+        except Exception as e:
+            logger.debug(f'Error closing db connection: {e}')
+        db_connection = None
+
 async def connect_to_db():
     '''
     Create a connection to the database if it is not already connected.
