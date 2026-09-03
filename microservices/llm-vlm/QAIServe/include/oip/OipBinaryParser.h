@@ -24,6 +24,12 @@
 //   <602112 bytes of raw float32 little-endian>
 //
 // Multiple tensors: binary data is concatenated in input order.
+//
+// A tensor's parameters may instead set "shared_memory_region" (+ optional
+// "shared_memory_offset") to reference a pre-registered POSIX shared memory
+// region (see shm/SharedMemoryManager.h) instead of embedding data in the
+// body. Exactly one of "data" / binary_data_size / shared_memory_region must
+// be set per tensor.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "oip/OipDTOs.h"
@@ -61,7 +67,13 @@ public:
      */
     static bool isBinaryRequest(const std::string& header_value);
 
+    /**
+     * Bytes per element for a given OIP datatype string (e.g. "FP32" -> 4).
+     * Exposed so callers resolving a shared-memory-referenced tensor
+     * (InferController) can compute the expected byte size from shape+datatype.
+     */
+    static size_t datatypeBytes(const std::string& datatype);
+
 private:
     static OipTensorInput parseTensorJson(const nlohmann::json& j);
-    static size_t datatypeBytes(const std::string& datatype);
 };

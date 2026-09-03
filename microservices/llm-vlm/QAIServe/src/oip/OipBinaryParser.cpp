@@ -33,16 +33,30 @@ OipTensorInput OipBinaryParser::parseTensorJson(const json& j) {
         }
     }
 
-    // Check for binary_data_size in parameters
+    bool has_data_array = j.contains("data") && j["data"].is_array() && !j["data"].empty();
+
+    // Check for binary_data_size / shared_memory_region in parameters
     if (j.contains("parameters") && j["parameters"].is_object()) {
         const auto& params = j["parameters"];
         if (params.contains("binary_data_size")) {
             t.binary_data_size = params["binary_data_size"].get<int64_t>();
         }
+        if (params.contains("shared_memory_region")) {
+            t.shared_memory_region = params["shared_memory_region"].get<std::string>();
+            t.shared_memory_offset = params.value("shared_memory_offset", static_cast<uint64_t>(0));
+        }
     }
 
-    // JSON data array (non-binary mode)
-    if (t.binary_data_size == 0 && j.contains("data") && j["data"].is_array()) {
+    int mode_count = (has_data_array ? 1 : 0) + (t.binary_data_size > 0 ? 1 : 0) +
+                     (!t.shared_memory_region.empty() ? 1 : 0);
+    if (mode_count > 1) {
+        throw OipBinaryParseError(
+            "Tensor '" + t.name + "' must set exactly one of: 'data', "
+            "parameters.binary_data_size, parameters.shared_memory_region");
+    }
+
+    // JSON data array (non-binary, non-shm mode)
+    if (has_data_array) {
         size_t elem_bytes = datatypeBytes(t.datatype);
         for (const auto& val : j["data"]) {
             // Store as raw bytes (little-endian)
@@ -95,11 +109,20 @@ OipInferRequest OipBinaryParser::parseJson(const std::string& body) {
         }
         if (j.contains("outputs") && j["outputs"].is_array()) {
             for (const auto& out : j["outputs"]) {
+                OipRequestedOutput ro;
                 if (out.is_string()) {
-                    req.outputs.push_back(out.get<std::string>());
-                } else if (out.is_object() && out.contains("name")) {
-                    req.outputs.push_back(out["name"].get<std::string>());
+                    ro.name = out.get<std::string>();
+                } else if (out.is_object()) {
+                    ro.name = out.value("name", "");
+                    if (out.contains("parameters") && out["parameters"].is_object()) {
+                        const auto& params = out["parameters"];
+                        if (params.contains("shared_memory_region")) {
+                            ro.shared_memory_region = params["shared_memory_region"].get<std::string>();
+                            ro.shared_memory_offset = params.value("shared_memory_offset", static_cast<uint64_t>(0));
+                        }
+                    }
                 }
+                req.outputs.push_back(std::move(ro));
             }
         }
     } catch (const json::exception& e) {

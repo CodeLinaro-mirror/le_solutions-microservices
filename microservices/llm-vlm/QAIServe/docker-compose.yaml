@@ -84,6 +84,13 @@ services:
       - QAISERVE_ADMIN_TOKEN=${QAISERVE_ADMIN_TOKEN:-}
       - GENIEX_DATADIR=${GENIEX_DATADIR:-/mnt/work/models}
 
+      # Client shared memory — set QAISERVE_ALLOW_CLIENT_SHM=1 to enable
+      # /v2/systemsharedmemory and shm-referenced /infer, /generate inputs
+      # (unset ⇒ all shm endpoints/params return an error). Requires the
+      # /dev/shm bind mount below so shm_open() by key resolves to the same
+      # tmpfs on both the client and this container.
+      - QAISERVE_ALLOW_CLIENT_SHM=${QAISERVE_ALLOW_CLIENT_SHM:-}
+
       # Generative AI workers (GenIE — LLM + VLM)
       - GENAI_WORKER_BINARY=/usr/bin/genai-inference-worker
       - GENAI_VLM_WORKER_BINARY=/usr/bin/genai-vlm-inference-worker
@@ -127,3 +134,7 @@ services:
       - ${GENAI_MODEL_DIR:-/etc/models/}:/mnt/work/models/
       # Client-supplied postprocess plugins (.so) directory — mounted read-only;
       - ${POSTPROC_PLUGINS_DIR:-/etc/postproc_plugins/}:/mnt/work/plugins/:ro
+      # Shared with same-host clients so POSIX named shared memory
+      # (shm_open by key) resolves to the same tmpfs instance on both sides —
+      # required for the /v2/systemsharedmemory zero-copy tensor extension.
+      - /dev/shm:/dev/shm

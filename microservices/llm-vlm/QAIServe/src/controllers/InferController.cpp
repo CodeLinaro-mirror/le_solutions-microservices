@@ -21,6 +21,7 @@
 #include "qai_forge/InternalDTOs.h"
 #include "postproc/PostprocRegistry.h"
 #include "postproc/PostprocConfig.h"
+#include "shm/SharedMemoryManager.h"
 #include <drogon/HttpResponse.h>
 #include <trantor/net/EventLoop.h>
 #include <nlohmann/json.hpp>
@@ -177,9 +178,38 @@ CreateChatCompletionRequest buildChatRequest(
     return req;
 }
 
+// Resolves oip_req.image_shm_refs (client shared memory) and appends the
+// copied bytes to oip_req.images, so downstream code only ever sees
+// oip_req.images regardless of how the image bytes arrived.
+// Throws std::runtime_error on malformed/unregistered/disabled shm.
+void resolveShmImageRefs(OipGenerateRequest& oip_req) {
+    if (oip_req.image_shm_refs.empty()) return;
+    if (!SharedMemoryManager::getInstance().allowClientShm()) {
+        throw std::runtime_error(
+            "Client shared memory is disabled on this server "
+            "(set QAISERVE_ALLOW_CLIENT_SHM=1 to enable).");
+    }
+    for (const auto& ref : oip_req.image_shm_refs) {
+        try {
+            auto region = SharedMemoryManager::getInstance().getRegion(
+                ref.region, ref.offset, ref.byte_size);
+            const uint8_t* ptr = static_cast<const uint8_t*>(region->mapped_addr) + ref.offset;
+            oip_req.images.emplace_back(ptr, ptr + ref.byte_size);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "Shared memory region '" + ref.region + "': " + std::string(e.what()));
+        }
+    }
+}
+
 // Parse request body (JSON or binary extension) into a TensorInferenceRequest.
+// If `requested_outputs` is non-null, the parsed request's requested outputs
+// (including any shared_memory_region directives) are copied out through it
+// — callers that care about output-side shm (InferController::infer) pass a
+// pointer; callers that don't (inferPostprocess) leave it null.
 // Throws OipBinaryParseError on malformed input (caller catches).
-TensorInferenceRequest buildInferRequest(const HttpRequestPtr& req, const std::string& model_name) {
+TensorInferenceRequest buildInferRequest(const HttpRequestPtr& req, const std::string& model_name,
+                                          std::vector<OipRequestedOutput>* requested_outputs = nullptr) {
     OipInferRequest oip_req;
     std::string infer_header = req->getHeader("Inference-Header-Content-Length");
     if (OipBinaryParser::isBinaryRequest(infer_header)) {
@@ -202,26 +232,82 @@ TensorInferenceRequest buildInferRequest(const HttpRequestPtr& req, const std::s
         tensor.name  = inp.name;
         tensor.dtype = tensorDataTypeFromString(inp.datatype);
         tensor.shape = inp.shape;
-        tensor.data  = inp.data;
+
+        if (!inp.shared_memory_region.empty()) {
+            if (!SharedMemoryManager::getInstance().allowClientShm()) {
+                throw OipBinaryParseError(
+                    "Client shared memory is disabled on this server "
+                    "(set QAISERVE_ALLOW_CLIENT_SHM=1 to enable).");
+            }
+            size_t byte_size = OipBinaryParser::datatypeBytes(inp.datatype);
+            for (int64_t d : inp.shape) byte_size *= static_cast<size_t>(d);
+            try {
+                auto region = SharedMemoryManager::getInstance().getRegion(
+                    inp.shared_memory_region, inp.shared_memory_offset, byte_size);
+                const uint8_t* ptr = static_cast<const uint8_t*>(region->mapped_addr)
+                                      + inp.shared_memory_offset;
+                tensor.data.assign(ptr, ptr + byte_size);
+            } catch (const std::exception& e) {
+                throw OipBinaryParseError(
+                    "Tensor '" + inp.name + "' shared memory error: " + e.what());
+            }
+        } else {
+            tensor.data = inp.data;
+        }
         request.inputs.push_back(std::move(tensor));
     }
-    request.output_names = oip_req.outputs;
+    for (const auto& out : oip_req.outputs) request.output_names.push_back(out.name);
+    if (requested_outputs) *requested_outputs = std::move(oip_req.outputs);
     return request;
 }
 
 // Build the OIP outputs[] JSON array from a TensorInferenceResponse.
-json buildRawOutputsJson(const TensorInferenceResponse& result) {
+// `requested` carries per-output shm directives from the request (empty by
+// default — callers with no requested-output concept, e.g. inferPostprocess's
+// include_raw echo, get plain JSON data arrays for every output).
+// Throws OipBinaryParseError if a requested output's shared_memory_region is
+// disabled/not registered/too small.
+json buildRawOutputsJson(const TensorInferenceResponse& result,
+                          const std::vector<OipRequestedOutput>& requested = {}) {
     json outputs_json = json::array();
     for (const auto& out : result.outputs) {
         std::string dt = tensorDataTypeToString(out.dtype);
         json shape_arr = json::array();
         for (auto d : out.shape) shape_arr.push_back(d);
-        outputs_json.push_back({
-            {"name",     out.name},
-            {"datatype", dt},
-            {"shape",    shape_arr},
-            {"data",     encodeDataArray(out.data, dt)},
-        });
+
+        const OipRequestedOutput* shm_out = nullptr;
+        for (const auto& r : requested) {
+            if (r.name == out.name && !r.shared_memory_region.empty()) {
+                shm_out = &r;
+                break;
+            }
+        }
+
+        json entry = {{"name", out.name}, {"datatype", dt}, {"shape", shape_arr}};
+        if (shm_out) {
+            if (!SharedMemoryManager::getInstance().allowClientShm()) {
+                throw OipBinaryParseError(
+                    "Client shared memory is disabled on this server "
+                    "(set QAISERVE_ALLOW_CLIENT_SHM=1 to enable).");
+            }
+            try {
+                auto region = SharedMemoryManager::getInstance().getRegion(
+                    shm_out->shared_memory_region, shm_out->shared_memory_offset, out.data.size());
+                uint8_t* ptr = static_cast<uint8_t*>(const_cast<void*>(region->mapped_addr))
+                                + shm_out->shared_memory_offset;
+                std::memcpy(ptr, out.data.data(), out.data.size());
+            } catch (const std::exception& e) {
+                throw OipBinaryParseError(
+                    "Output '" + out.name + "' shared memory error: " + e.what());
+            }
+            entry["parameters"] = {
+                {"shared_memory_region", shm_out->shared_memory_region},
+                {"shared_memory_offset", shm_out->shared_memory_offset},
+            };
+        } else {
+            entry["data"] = encodeDataArray(out.data, dt);
+        }
+        outputs_json.push_back(std::move(entry));
     }
     return outputs_json;
 }
@@ -272,8 +358,9 @@ void InferController::infer(
 
     // Parse request — JSON or binary extension
     TensorInferenceRequest request;
+    std::vector<OipRequestedOutput> requested_outputs;
     try {
-        request = buildInferRequest(req, model_name);
+        request = buildInferRequest(req, model_name, &requested_outputs);
     } catch (const OipBinaryParseError& e) {
         callback(makeError(400, std::string("Request parse error: ") + e.what()));
         return;
@@ -286,7 +373,8 @@ void InferController::infer(
     // socket reads of any other in-flight request pinned to the same loop
     // (observed as a stalled/slow request body upload on a concurrent request).
     auto* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
-    std::thread([request = std::move(request), loop, callback]() mutable {
+    std::thread([request = std::move(request), requested_outputs = std::move(requested_outputs),
+                 loop, callback]() mutable {
         HttpResponsePtr response;
         try {
             TensorInferenceResponse result =
@@ -295,9 +383,11 @@ void InferController::infer(
             response = makeJson({
                 {"id",         result.request_id},
                 {"model_name", result.model},
-                {"outputs",    buildRawOutputsJson(result)},
+                {"outputs",    buildRawOutputsJson(result, requested_outputs)},
             });
 
+        } catch (const OipBinaryParseError& e) {
+            response = makeError(400, std::string("Output shared memory error: ") + e.what());
         } catch (const GenAIException& e) {
             response = makeError(e.http_status, e.message);
         } catch (const std::exception& e) {
@@ -458,6 +548,7 @@ void InferController::generate(
         } else {
             oip_req = OipGenerateRequest::fromJson(json::parse(req->getBody()));
         }
+        resolveShmImageRefs(oip_req);
     } catch (const std::exception& e) {
         callback(makeError(400, std::string("Request parse error: ") + e.what()));
         return;
@@ -537,6 +628,7 @@ void InferController::generateStream(
         } else {
             oip_req = OipGenerateRequest::fromJson(json::parse(req->getBody()));
         }
+        resolveShmImageRefs(oip_req);
     } catch (const std::exception& e) {
         callback(makeError(400, std::string("Request parse error: ") + e.what()));
         return;

@@ -88,6 +88,11 @@ set(SERVER_SOURCES
     src/controllers/ResponsesController.cpp
     src/controllers/InferController.cpp
 
+    # Client-facing system shared memory (POST/GET /v2/systemsharedmemory/*,
+    # requires QAISERVE_ALLOW_CLIENT_SHM=1)
+    src/controllers/SharedMemoryController.cpp
+    src/shm/SharedMemoryManager.cpp
+
     # Admin model management (admin-only, requires X-Admin-Token)
     src/controllers/AdminController.cpp
     src/admin/AiHubClient.cpp
