@@ -19,6 +19,13 @@ services:
       - /dev/fastrpc-cdsp1
     volumes:
       - /sys/firmware/devicetree/base/model:/run/device-model
-      - /usr/share/qcom:/usr/share/qcom
+      - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
+      - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
+      - /usr/lib/dsp/cdsp/fastrpc_shell_3:/usr/lib/dsp/cdsp/fastrpc_shell_3
+      - /usr/lib/dsp/cdsp/fastrpc_shell_unsigned_3:/usr/lib/dsp/cdsp/fastrpc_shell_unsigned_3
+      - /usr/lib/dsp/cdsp1/libc++.so.1:/usr/lib/dsp/cdsp1/libc++.so.1
+      - /usr/lib/dsp/cdsp1/libc++abi.so.1:/usr/lib/dsp/cdsp1/libc++abi.so.1
+      - /usr/lib/dsp/cdsp1/fastrpc_shell_4:/usr/lib/dsp/cdsp1/fastrpc_shell_4
+      - /usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4:/usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4
       - ${T2E_MODEL_DIR:-/opt/embed_gen}:/mnt/work/models/
     command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:${GENAI_T2E_PORT}"]
