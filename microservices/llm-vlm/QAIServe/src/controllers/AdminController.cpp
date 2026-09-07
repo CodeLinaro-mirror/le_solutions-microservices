@@ -475,15 +475,19 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                     } catch (const GenieXDownloadError& e) {
                         std::string msg = e.what();
                         // GenieX rejects repos whose files it doesn't recognise
-                        // (e.g. .task/.tflite) — fall back to direct HF download.
+                        // (e.g. .task/.tflite), and also can't authenticate against
+                        // gated HF repos (e.g. Google Gemma) — fall back to direct
+                        // HF download, which does support GENIEX_HFTOKEN auth.
                         if (msg.find("no recognizable model files") != std::string::npos ||
-                            msg.find("could not infer manifest") != std::string::npos) {
+                            msg.find("could not infer manifest") != std::string::npos ||
+                            msg.find("HTTP 401") != std::string::npos ||
+                            msg.find("HTTP 403") != std::string::npos) {
                             std::cout << "[AdminController] GenieX cannot handle repo '"
                                       << model << "' (" << msg
                                       << ") — falling back to HF direct download\n";
                             use_hf_fallback = true;
                         } else {
-                            throw;  // network error or auth failure → propagate
+                            throw;  // network error → propagate
                         }
                     }
 
@@ -892,7 +896,11 @@ void AdminController::listModels(const HttpRequestPtr& req,
 
     json arr = json::array();
     for (const auto& m : models) {
-        arr.push_back(modelSummaryJson(m));
+        json entry = modelSummaryJson(m);
+        if (!m.config_file.empty()) {
+            entry["file"] = fs::path(m.config_file).filename().string();
+        }
+        arr.push_back(entry);
     }
 
     callback(jsonResp(arr));

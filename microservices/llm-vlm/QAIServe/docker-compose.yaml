@@ -83,6 +83,12 @@ services:
       # hot-reloaded into the model list.
       - QAISERVE_ADMIN_TOKEN=${QAISERVE_ADMIN_TOKEN:-}
       - GENIEX_DATADIR=${GENIEX_DATADIR:-/mnt/work/models}
+      # HuggingFace access token for GenieX SDK downloads of gated repos
+      # (e.g. Google Gemma) — required whenever `source:geniex` pulls a
+      # repo whose HF page shows "You need to agree to share your contact
+      # information...". The account that owns this token must have
+      # already accepted the repo's license on huggingface.co.
+      - GENIEX_HFTOKEN=${GENIEX_HFTOKEN:-}
 
       # Client shared memory — set QAISERVE_ALLOW_CLIENT_SHM=1 to enable
       # /v2/systemsharedmemory and shm-referenced /infer, /generate inputs

@@ -22,6 +22,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <iostream>
 
 namespace fs = std::filesystem;
@@ -234,7 +235,9 @@ std::string HfDirectClient::pull(
         }
 
         std::cout << "[HfDirectClient] Downloading " << fi.name << " from " << repo << "\n";
-        AiHubClient::download(url, dest_path.string(), file_progress);
+        const char* hf_token_env = std::getenv("GENIEX_HFTOKEN");
+        AiHubClient::download(url, dest_path.string(), file_progress, /*num_retries=*/4,
+                              hf_token_env ? hf_token_env : "");
         // Use actual file size on disk in case fi.size was 0 (HF API omitted size)
         {
             std::error_code sz_ec;

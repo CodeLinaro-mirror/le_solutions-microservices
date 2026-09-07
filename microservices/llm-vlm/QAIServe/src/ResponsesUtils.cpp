@@ -322,22 +322,35 @@ json build_vlm_runtime_messages(const json& current_messages,
         image_url = latest_image_url_from_messages(ancestor_messages);
     }
 
+    auto append_messages = [&runtime_messages](const json& messages) {
+        if (!messages.is_array()) {
+            return;
+        }
+        for (const auto& message : messages) {
+            if (!message.is_object()) {
+                continue;
+            }
+            json runtime_message = message;
+            if (runtime_message.contains("content")) {
+                runtime_message["content"] =
+                    convert_vlm_content_text_parts(runtime_message["content"]);
+            }
+            runtime_messages.push_back(std::move(runtime_message));
+        }
+    };
+
+    // Ancestor history first, then the current turn — same ordering as the
+    // text path (build_text_runtime_messages callers merge ancestor+current
+    // the same way). Without this, multi-turn /v1/responses conversations
+    // lose all prior text turns for VLM models.
+    append_messages(ancestor_messages);
+    append_messages(current_messages);
+
     int last_user_index = -1;
-    for (const auto& message : current_messages) {
-        if (!message.is_object()) {
-            continue;
+    for (std::size_t i = 0; i < runtime_messages.size(); ++i) {
+        if (getStringOrDefault(runtime_messages[i], "role", "") == "user") {
+            last_user_index = static_cast<int>(i);
         }
-
-        json runtime_message = message;
-        if (runtime_message.contains("content")) {
-            runtime_message["content"] =
-                convert_vlm_content_text_parts(runtime_message["content"]);
-        }
-
-        if (getStringOrDefault(runtime_message, "role", "") == "user") {
-            last_user_index = static_cast<int>(runtime_messages.size());
-        }
-        runtime_messages.push_back(std::move(runtime_message));
     }
 
     if (last_user_index >= 0 && !image_url.empty()) {
