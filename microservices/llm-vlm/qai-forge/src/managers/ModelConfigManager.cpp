@@ -456,8 +456,8 @@ std::string ModelConfigManager::processBundle(const std::string& bundle_path, co
 
         std::string filename = entry.path().filename().string();
 
-        // Never copy tokenizer.json — always reference the original
-        if (filename == "tokenizer.json") continue;
+        // Never copy tokenizer assets — always reference the originals
+        if (filename == "tokenizer.json" || filename == "vocab.json") continue;
 
         json data;
         try {
@@ -1001,7 +1001,9 @@ json ModelConfigManager::rewritePaths(const json& data, const std::string& bundl
         fs::path potential = fs::path(bundle_path) / val;
         if (fs::is_regular_file(potential, ec) && !ec) {
             std::string filename = potential.filename().string();
-            if (filename == "tokenizer.json") return potential.string();
+            if (filename == "tokenizer.json" || filename == "vocab.json") {
+                return potential.string();
+            }
             if (potential.extension() == ".json") return processed_config_dir + "/" + filename;
             return potential.string();
         }
