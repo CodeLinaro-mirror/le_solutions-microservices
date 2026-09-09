@@ -21,6 +21,20 @@
 
 namespace {
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 std::string generateEventId() {
     static std::mt19937_64 rng(std::random_device{}());
     std::ostringstream oss;
@@ -165,7 +179,8 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
     // Fallback: simple role: content format
     std::ostringstream oss;
     for (const auto& msg : messages)
-        oss << msg.value("role","user") << ": " << msg.value("content","") << "\n";
+        oss << getStringOrDefault(msg, "role", "user") << ": "
+            << getStringOrDefault(msg, "content", "") << "\n";
     oss << "assistant:";
     return oss.str();
 }
@@ -465,7 +480,7 @@ int LiteRTLMOrchestrator::applyContextEviction(
     int evicted = 0;
     while (messages.size() > 2 && estimateTokens(messages, tools) > limit) {
         const bool has_system =
-            messages.front().value("role", "") == "system";
+            getStringOrDefault(messages.front(), "role", "") == "system";
         const std::size_t index = has_system ? 1 : 0;
         if (index >= messages.size() - 1) {
             break;

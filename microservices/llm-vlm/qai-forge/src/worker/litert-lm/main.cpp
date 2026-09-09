@@ -58,6 +58,20 @@
 
 using json = nlohmann::ordered_json;
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+static std::string getStringOrDefault(const json& obj,
+                                       const std::string& key,
+                                       const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -535,8 +549,8 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     if (cmd.contains("inputs") && cmd["inputs"].is_array()) {
         text_input.clear();
         for (const auto& input : cmd["inputs"]) {
-            if (input.value("type", "text") == "text") {
-                text_input = input.value("content", "");
+            if (getStringOrDefault(input, "type", "text") == "text") {
+                text_input = getStringOrDefault(input, "content", "");
             }
         }
     }

@@ -45,6 +45,37 @@ namespace {
 constexpr int DEFAULT_MAX_OUTPUT_TOKENS    = 512;
 constexpr int MAX_COMPLETION_SAFETY_MARGIN = 64;
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null (a valid
+// shape for e.g. an assistant message's "content" field when "tool_calls"
+// is present), .value<std::string>() throws json::type_error.302. This
+// helper treats an explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
+// Detects whether the CURRENT turn (request.messages) contains a
+// role=="tool" message — i.e. this is Trip 2 of tool calling, where the
+// model already has the tool's result and should answer in plain language
+// rather than emit another tool call, unless it genuinely needs one.
+bool currentTurnHasToolResponse(const json& messages) {
+    if (!messages.is_array()) {
+        return false;
+    }
+    for (const auto& msg : messages) {
+        if (msg.is_object() && getStringOrDefault(msg, "role", "") == "tool") {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string generateEventId() {
     static std::mt19937_64 rng(std::random_device{}());
     std::ostringstream oss;
@@ -241,8 +272,8 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // ── Slot 1: System block (with tool instructions injected by adapter) ──────
     std::string user_system;
     for (const auto& msg : request.messages) {
-        if (msg.value("role", "") == "system") {
-            user_system = msg.value("content", "");
+        if (getStringOrDefault(msg, "role", "") == "system") {
+            user_system = getStringOrDefault(msg, "content", "");
             break;
         }
     }
@@ -250,6 +281,23 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     std::string system_content = adapter.buildSystemPrompt(chat_template, user_system, tools);
     if (!system_content.empty()) {
         prompt << system_prefix << system_content << system_suffix;
+    }
+
+    // ── Slot 1.25: Tool-continuation steering ──────────────────────────────────
+    // When the current turn contains a role=="tool" message (Trip 2 of tool
+    // calling), the standard tool-calling instructions above remain active in
+    // the prompt and can cause smaller models to re-emit another bare tool
+    // call instead of a final natural-language answer. Steer the model back
+    // toward plain-language output unless it genuinely needs another tool call.
+    if (!tools.empty() && tools.is_array() &&
+        currentTurnHasToolResponse(request.messages)) {
+        prompt << system_prefix
+               << "[Tool Result Received]: You already have the result of your "
+                  "tool call above. Use it to answer the user's question in "
+                  "plain natural language now. Do NOT output another JSON tool "
+                  "call unless you genuinely need to call a different tool to "
+                  "fully answer the question."
+               << system_suffix;
     }
 
     // ── Slot 1.5: Budget info (reasoning budget notification) ─────────────────
@@ -279,8 +327,8 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // ── Slot 4: History queue (messages not yet evicted) ──────────────────────
     auto clean_messages = session.getHistoryMessages();
     for (const auto& msg : clean_messages) {
-        std::string role = msg.value("role", "");
-        std::string content = msg.value("content", "");
+        std::string role = getStringOrDefault(msg, "role", "");
+        std::string content = getStringOrDefault(msg, "content", "");
         if (role == "user") {
             prompt << user_prefix << content << user_suffix;
         } else if (role == "assistant") {
@@ -295,8 +343,8 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // ── Slot 5: Current turn ──────────────────────────────────────────────────
     json processed_messages = adapter.preprocessVision(request.messages);
     for (const auto& msg : processed_messages) {
-        std::string role = msg.value("role", "");
-        std::string content = msg.value("content", "");
+        std::string role = getStringOrDefault(msg, "role", "");
+        std::string content = getStringOrDefault(msg, "content", "");
         if (role == "user") {
             prompt << user_prefix << content << user_suffix;
         } else if (role == "tool") {
@@ -560,7 +608,14 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     response.id = job.session_id;
     response.model = job.model_id;
     response.role = "assistant";
-    response.content = answer_content;
+    // Only populate response.content with the raw answer text when no tool
+    // calls were parsed out of it — otherwise the structured tool_calls
+    // array already carries the extracted call(s), and leaving content set
+    // to the same raw text would leak the tool-call JSON (or partial
+    // remnants of it) into the OpenAI-format response's message.content.
+    if (tool_calls.empty()) {
+        response.content = answer_content;
+    }
     if (!thinking_content.empty()) {
         response.reasoning_content = thinking_content;
     }
@@ -736,7 +791,14 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     response.id = job.session_id;
     response.model = job.model_id;
     response.role = "assistant";
-    response.content = answer_content;
+    // Only populate response.content with the raw answer text when no tool
+    // calls were parsed out of it — otherwise the structured tool_calls
+    // array already carries the extracted call(s), and leaving content set
+    // to the same raw text would leak the tool-call JSON (or partial
+    // remnants of it) into the OpenAI-format response's message.content.
+    if (tool_calls.empty()) {
+        response.content = answer_content;
+    }
     if (!thinking_content.empty()) {
         response.reasoning_content = thinking_content;
     }
@@ -885,10 +947,10 @@ GenieOrchestrator::generateSummary(
     }
 
     for (const auto& msg : messages_to_summarize) {
-        std::string role = msg.value("role", "");
+        std::string role = getStringOrDefault(msg, "role", "");
         if (role == "tool" || role == "system") continue;
 
-        std::string content = msg.value("content", "");
+        std::string content = getStringOrDefault(msg, "content", "");
         if (content.empty()) continue;
 
         int msg_tokens = estimateTokens(content);
@@ -969,9 +1031,9 @@ void GenieOrchestrator::extractFacts(
     // Build conversation text.
     std::ostringstream conv;
     for (const auto& msg : messages_to_extract) {
-        std::string role = msg.value("role", "");
+        std::string role = getStringOrDefault(msg, "role", "");
         if (role != "user" && role != "assistant") continue;
-        std::string content = msg.value("content", "");
+        std::string content = getStringOrDefault(msg, "content", "");
         if (content.empty()) continue;
         std::string label = (role == "user") ? "User" : "Assistant";
         conv << label << ": " << content << "\n";
@@ -1113,10 +1175,10 @@ void GenieOrchestrator::postTurnProcessing(
         if (remaining_tokens <= eviction_target) break;
 
         const auto& msg = session.messages[i];
-        std::string role = msg.value("role", "");
+        std::string role = getStringOrDefault(msg, "role", "");
         if (role == "system") continue;
 
-        std::string content = msg.value("content", "");
+        std::string content = getStringOrDefault(msg, "content", "");
         int msg_tokens = static_cast<int>(content.size() / 4) + 4;
 
         eviction_batch.push_back(msg);

@@ -190,6 +190,12 @@ FROM --platform=linux/arm64 ubuntu:22.04 AS builder
 
 ARG QAIRT_SDK_VERSION
 
+#
+# NOTE: ubuntu:22.04's apt-packaged cmake is 3.22.1, which is below the
+# 3.23 minimum required by qai-forge/CMakeLists.txt (needed for jinja2cpp's
+# own cmake_minimum_required). Upgrade via pip3 after the apt install,
+# mirroring the same workaround already used in the llamacpp_builder stage
+# above.
 # Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -214,8 +220,12 @@ RUN apt-get update && \
         libmd-dev \
         libyaml-dev \
         binutils \
+        python3 \
+        python3-pip \
+        python-is-python3 \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install cmake --upgrade
 
 ENV DEPLOY_DIR=/build/deploy
 

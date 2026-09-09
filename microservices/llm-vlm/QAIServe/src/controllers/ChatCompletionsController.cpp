@@ -13,6 +13,25 @@
 using json = nlohmann::ordered_json;
 using namespace qai_forge;
 
+namespace {
+
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null (a valid
+// shape for e.g. an assistant message's "content" field when "tool_calls"
+// is present), .value<std::string>() throws json::type_error.302. This
+// helper treats an explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor / Destructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,7 +85,7 @@ static HttpResponsePtr buildReplayResponse(
 ) {
     json assistant_msg = {
         {"role", "assistant"},
-        {"content", replay_result.value("content", "")}
+        {"content", getStringOrDefault(replay_result, "content", "")}
     };
     bool has_tool_calls = replay_result.contains("tool_calls")
         && replay_result["tool_calls"].is_array()
@@ -375,7 +394,31 @@ void ChatCompletionsController::handleStreamingRequest(
                 }
                 session->last_replay_result = replay_result;
 
-                // Send final chunk with finish_reason
+                // Send final chunk with finish_reason. When tool calls were
+                // detected, include them in the delta so the client's
+                // streaming parser (e.g. LangChain ChatOpenAI.stream()) can
+                // populate chunk.tool_calls — without this, tool_calls are
+                // only ever visible in non-streaming responses even though
+                // they were correctly detected server-side.
+                json final_delta = json::object();
+                if (*has_tool_calls && final_response.tool_calls.has_value()) {
+                    json tool_calls_delta = json::array();
+                    int tc_idx = 0;
+                    for (const auto& tc : *final_response.tool_calls) {
+                        json function_obj = tc.value("function", json::object());
+                        tool_calls_delta.push_back({
+                            {"index", tc_idx++},
+                            {"id", tc.value("id", "")},
+                            {"type", tc.value("type", "function")},
+                            {"function", {
+                                {"name", function_obj.value("name", "")},
+                                {"arguments", function_obj.value("arguments", "")}
+                            }}
+                        });
+                    }
+                    final_delta["tool_calls"] = tool_calls_delta;
+                }
+
                 json final_chunk = {
                     {"id", session->completion_id},
                     {"object", "chat.completion.chunk"},
@@ -384,7 +427,7 @@ void ChatCompletionsController::handleStreamingRequest(
                     {"choices", json::array({
                         {
                             {"index", 0},
-                            {"delta", json::object()},
+                            {"delta", final_delta},
                             {"finish_reason", *has_tool_calls ? "tool_calls" : "stop"}
                         }
                     })}
@@ -431,7 +474,7 @@ void ChatCompletionsController::handleStreamingRequest(
                 // Detect tool output submission
                 bool has_tool_response = false;
                 for (const auto& msg : request.messages) {
-                    if (msg.is_object() && msg.value("role", "") == "tool") {
+                    if (msg.is_object() && getStringOrDefault(msg, "role", "") == "tool") {
                         has_tool_response = true;
                         break;
                     }
@@ -490,7 +533,7 @@ void ChatCompletionsController::handleNonStreamingRequest(
         // Detect tool output submission
         bool has_tool_response = false;
         for (const auto& msg : request.messages) {
-            if (msg.is_object() && msg.value("role", "") == "tool") {
+            if (msg.is_object() && getStringOrDefault(msg, "role", "") == "tool") {
                 has_tool_response = true;
                 break;
             }
@@ -541,7 +584,7 @@ void ChatCompletionsController::handleNonStreamingRequest(
         session->last_request_signature =
             ChatCompletionUtils::buildRequestSignature(request_body, session->messages);
         json replay_result = {
-            {"content", assistant_msg.value("content", "")},
+            {"content", getStringOrDefault(assistant_msg, "content", "")},
             {"finish_reason", has_tool_calls ? "tool_calls" : "stop"},
             {"prompt_tokens", response.prompt_tokens},
             {"completion_tokens", response.completion_tokens},

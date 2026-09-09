@@ -8,6 +8,21 @@
 
 using json = nlohmann::ordered_json;
 
+// nlohmann::json's .value(key, default) only falls back to `default` when the
+// key is absent — if the key is present but explicitly null, .value<std::string>()
+// throws json::type_error.302. This inline helper treats an explicit null the
+// same as an absent key. Defined here (not in an anonymous namespace, since
+// this is a header) with an "ipc" prefix to avoid ODR / name-collision issues.
+inline std::string ipcGetStringOrDefault(const json& obj,
+                                          const std::string& key,
+                                          const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceProtocol — Layer 3 IPC Message Definitions
 //
@@ -224,8 +239,8 @@ public:
 
     static IPCTokenEvent parseToken(const json& msg) {
         return {
-            msg.value("event_id", ""),
-            msg.value("content", "")
+            ipcGetStringOrDefault(msg, "event_id", ""),
+            ipcGetStringOrDefault(msg, "content", "")
         };
     }
 

@@ -14,6 +14,20 @@
 
 namespace {
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const ResponseStoreJson& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const ResponseStoreJson& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 using CompactResult = ResponsesCompactionService::CompactBranchResult;
 
 CompactResult makeCompactError(int http_status,
@@ -107,7 +121,7 @@ std::string buildSummaryPrompt(const ResponseStoreJson& messages) {
                 continue;
             }
 
-            std::string role = message.value("role", "user");
+            std::string role = getStringOrDefault(message, "role", "user");
             if (role == "tool"
                 || message.value("type", "") == "function_call_output") {
                 continue;

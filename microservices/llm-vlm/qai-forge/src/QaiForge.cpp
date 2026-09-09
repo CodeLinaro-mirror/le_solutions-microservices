@@ -27,6 +27,20 @@ namespace qai_forge {
 
 namespace {
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 struct QaiForgeConfig {
     std::chrono::milliseconds tool_response_timeout = std::chrono::seconds(30);
     std::chrono::milliseconds checkpoint_interval = std::chrono::seconds(1);
@@ -76,7 +90,7 @@ bool requestContainsToolOutput(const CreateChatCompletionRequest& request) {
     }
 
     for (const auto& message : request.messages) {
-        if (message.is_object() && message.value("role", "") == "tool") {
+        if (message.is_object() && getStringOrDefault(message, "role", "") == "tool") {
             return true;
         }
     }

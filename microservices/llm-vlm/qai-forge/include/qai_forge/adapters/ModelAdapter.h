@@ -48,8 +48,8 @@ public:
      * This string is prepended to the system prompt to instruct the model
      * about available tools and the expected JSON call format.
      *
-     * For Qwen 2.5: uses Hermes-style tool JSON format
-     * For Qwen 3:   uses native Qwen3 tool call format
+     * For Qwen 2.5: uses Hermes-style tool JSON wrapped in <tool_call> tags.
+     * For Qwen 3:   solicits bare JSON ({"name":...,"arguments":...}).
      * For models without tool support: returns empty string
      *
      * @param tools  OpenAI-format tools array from the request
@@ -62,8 +62,8 @@ public:
      * Different models emit tool calls in different formats.
      *
      * For Qwen 2.5: parses <tool_call>{"name":...,"arguments":...}</tool_call>
-     * For Qwen 3:   parses <tool_call>{"name":...,"arguments":...}</tool_call>
-     *               (same tags but different JSON structure)
+     * For Qwen 3:   checks for <tool_call> tags first, then falls back to
+     *               extracting bare JSON objects via ToolCallJsonUtils.
      *
      * @param response_text  Raw text output from the model
      * @return               OpenAI-format tool_calls array, or empty array if none

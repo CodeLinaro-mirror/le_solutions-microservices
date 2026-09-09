@@ -2,13 +2,40 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/adapters/Qwen3Adapter.h"
+#include "qai_forge/adapters/ToolCallJsonUtils.h"
 #include "qai_forge/utils/Logger.h"
 #include <algorithm>
 #include <cctype>
 #include <sstream>
 #include <regex>
+#include <random>
 
 namespace {
+
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
+// Sequential "call_" + idx IDs collide across turns/sessions (every
+// response's first tool call is always "call_0"). Generates a random
+// 64-bit hex ID instead, matching the generateEventId() pattern used
+// elsewhere in qai-forge (e.g. LiteRTLMOrchestrator).
+std::string generateToolCallId() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "call_" << std::hex << rng();
+    return oss.str();
+}
 
 bool pushToolCall(const json& call, json& tool_calls, int& idx) {
     if (!call.is_object()) {
@@ -26,13 +53,14 @@ bool pushToolCall(const json& call, json& tool_calls, int& idx) {
         : arguments.dump();
 
     tool_calls.push_back({
-        {"id", "call_" + std::to_string(idx++)},
+        {"id", generateToolCallId()},
         {"type", "function"},
         {"function", {
             {"name", name},
             {"arguments", args_str}
         }}
     });
+    ++idx;
     return true;
 }
 
@@ -51,61 +79,17 @@ bool pushBareToolCalls(const json& parsed, json& tool_calls, int& idx) {
     return found;
 }
 
-std::string trimWhitespace(const std::string& text) {
-    auto begin = text.begin();
-    while (begin != text.end()
-           && std::isspace(static_cast<unsigned char>(*begin))) {
-        ++begin;
-    }
-
-    auto end = text.end();
-    while (end != begin
-           && std::isspace(static_cast<unsigned char>(*(end - 1)))) {
-        --end;
-    }
-    return std::string(begin, end);
-}
-
+// Extracts bare (untagged) tool-call JSON from `text` using the shared
+// balanced-brace/repair scanner in ToolCallJsonUtils.
 bool tryParseBareToolCallJson(const std::string& text,
                               json& tool_calls,
                               int& idx) {
-    std::string trimmed = trimWhitespace(text);
-    if (trimmed.empty()) {
-        return false;
+    std::vector<json> candidates = ToolCallJsonUtils::extractAllJsonObjects(text);
+    bool found = false;
+    for (const auto& parsed : candidates) {
+        found = pushBareToolCalls(parsed, tool_calls, idx) || found;
     }
-
-    try {
-        json parsed = json::parse(trimmed);
-        if (pushBareToolCalls(parsed, tool_calls, idx)) {
-            return true;
-        }
-    } catch (...) {
-        // Fall through to prefix-tolerant extraction below.
-    }
-
-    std::size_t object_pos = trimmed.find('{');
-    std::size_t array_pos = trimmed.find('[');
-    std::size_t start = std::string::npos;
-    if (object_pos != std::string::npos && array_pos != std::string::npos) {
-        start = std::min(object_pos, array_pos);
-    } else if (object_pos != std::string::npos) {
-        start = object_pos;
-    } else {
-        start = array_pos;
-    }
-
-    if (start == std::string::npos) {
-        return false;
-    }
-
-    try {
-        json parsed = json::parse(trimmed.substr(start));
-        return pushBareToolCalls(parsed, tool_calls, idx);
-    } catch (const std::exception& e) {
-        LOG_WARN("[Qwen3Adapter] Failed to parse bare tool_call JSON: "
-                 << e.what());
-        return false;
-    }
+    return found;
 }
 
 } // namespace
@@ -121,7 +105,7 @@ json Qwen3Adapter::preprocessVision(const json& messages) const {
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
 
-        std::string role = msg.value("role", "");
+        std::string role = getStringOrDefault(msg, "role", "");
         const auto& content = msg["content"];
 
         if (content.is_string()) {
@@ -196,17 +180,25 @@ std::string Qwen3Adapter::formatToolInstructions(const json& tools) const {
         oss << "Parameters:\n" << parameters.dump(2) << "\n\n";
     }
 
-    oss << "When calling a tool, your entire assistant response MUST be only "
-           "one or more <tool_call> blocks.\n";
-    oss << "Do not include explanations, markdown, labels, prefixes, suffixes, "
-           "or bare JSON outside the <tool_call> tags.\n";
-    oss << "Do not write natural language before or after a tool call.\n";
-    oss << "Use exactly this format:\n";
-    oss << "<tool_call>\n";
-    oss << "{\"name\":\"<tool_name>\",\"arguments\":{\"param\":\"value\"}}\n";
-    oss << "</tool_call>\n";
-    oss << "If multiple tool calls are needed, output multiple complete "
-           "<tool_call> blocks and nothing else.";
+    // Solicit bare JSON (no <tool_call> XML tag wrapper) — more reliably
+    // produced by this model than the tagged format. parseToolCalls() below
+    // still checks for <tool_call> tags first for backward compatibility.
+    //
+    // The arguments placeholder is intentionally "{...}" rather than a
+    // concrete example like {"param":"value"} — a concrete key name causes
+    // the model to copy it literally (e.g. emitting {"param":"Boston"}
+    // instead of {"location":"Boston"}).
+    oss << "When calling a tool, respond with ONLY the JSON object below and "
+           "nothing else — no explanations, no markdown, no text before or "
+           "after it:\n";
+    oss << "{\"name\":\"<tool_name>\",\"arguments\":{...}}\n";
+    oss << "Replace <tool_name> with the tool name and {...} with the actual "
+           "arguments as JSON, using the exact parameter names shown in the "
+           "tool signature above.\n";
+    oss << "If no tool is needed to answer the question, respond with plain "
+           "text only. Do NOT output JSON in that case.\n";
+    oss << "If multiple tool calls are needed, output multiple complete JSON "
+           "objects one after another, each on its own line, and nothing else.";
 
     return oss.str();
 }
@@ -257,8 +249,8 @@ std::string Qwen3Adapter::formatToolResponse(const json& tool_results) const {
     std::ostringstream oss;
     for (const auto& result : tool_results) {
         if (!result.is_object()) continue;
-        std::string tool_call_id = result.value("tool_call_id", "");
-        std::string content = result.value("content", "");
+        std::string tool_call_id = getStringOrDefault(result, "tool_call_id", "");
+        std::string content = getStringOrDefault(result, "content", "");
         oss << "<tool_response>\n";
         oss << "{\"tool_call_id\": \"" << tool_call_id << "\", ";
         oss << "\"result\": " << json(content).dump() << "}\n";

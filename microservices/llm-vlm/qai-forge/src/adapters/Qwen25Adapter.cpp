@@ -5,6 +5,36 @@
 #include "qai_forge/utils/Logger.h"
 #include <sstream>
 #include <regex>
+#include <random>
+
+namespace {
+
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
+// Sequential "call_" + idx IDs collide across turns/sessions (every
+// response's first tool call is always "call_0"). Generates a random
+// 64-bit hex ID instead, matching the generateEventId() pattern used
+// elsewhere in qai-forge (e.g. LiteRTLMOrchestrator).
+std::string generateToolCallId() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "call_" << std::hex << rng();
+    return oss.str();
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Qwen25Adapter — Vision Preprocessing
@@ -19,7 +49,7 @@ json Qwen25Adapter::preprocessVision(const json& messages) const {
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
 
-        std::string role = msg.value("role", "");
+        std::string role = getStringOrDefault(msg, "role", "");
         const auto& content = msg["content"];
 
         // If content is a string, pass through unchanged
@@ -130,7 +160,7 @@ json Qwen25Adapter::parseToolCalls(const std::string& response_text) const {
                 : arguments.dump();
 
             tool_calls.push_back({
-                {"id", "call_" + std::to_string(idx)},
+                {"id", generateToolCallId()},
                 {"type", "function"},
                 {"function", {
                     {"name", name},
@@ -152,8 +182,8 @@ std::string Qwen25Adapter::formatToolResponse(const json& tool_results) const {
     std::ostringstream oss;
     for (const auto& result : tool_results) {
         if (!result.is_object()) continue;
-        std::string tool_call_id = result.value("tool_call_id", "");
-        std::string content = result.value("content", "");
+        std::string tool_call_id = getStringOrDefault(result, "tool_call_id", "");
+        std::string content = getStringOrDefault(result, "content", "");
         oss << "<tool_response>\n";
         if (!tool_call_id.empty()) oss << "{\"tool_call_id\": \"" << tool_call_id << "\", ";
         oss << "\"content\": " << json(content).dump() << "}\n";

@@ -20,6 +20,20 @@
 namespace ResponsesUtils {
 namespace {
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 bool is_vlm_image_type(const std::string& type) {
     return type == "image_url" || type == "input_image";
 }
@@ -272,7 +286,7 @@ json input_to_messages(const json& input, const std::string& system_prompt) {
 
         // Standard message or content part. Preserve content arrays as-is so
         // VLM image_url parts survive the shared HTTP/WebSocket conversion.
-        std::string role = item.value("role", "user");
+        std::string role = getStringOrDefault(item, "role", "user");
         if (item.contains("content")) {
             messages.push_back({{"role", role}, {"content", item["content"]}});
         } else if (item.contains("text")) {
@@ -303,7 +317,7 @@ json build_text_runtime_messages(const json& messages) {
             && runtime_message["tool_calls"].is_array()
             && !runtime_message["tool_calls"].empty();
         bool is_tool_result =
-            runtime_message.value("role", "") == "tool"
+            getStringOrDefault(runtime_message, "role", "") == "tool"
             && runtime_message.contains("tool_call_id");
 
         if (runtime_message.contains("content")) {
@@ -311,7 +325,7 @@ json build_text_runtime_messages(const json& messages) {
                 text_runtime_content(runtime_message["content"]);
         }
 
-        std::string content = runtime_message.value("content", "");
+        std::string content = getStringOrDefault(runtime_message, "content", "");
         // Image-only text-runtime messages drop out; tool exchanges must stay paired.
         if (content.empty() && !has_tool_calls && !is_tool_result) {
             continue;
@@ -349,7 +363,7 @@ json build_vlm_runtime_messages(const json& current_messages,
                 convert_vlm_content_text_parts(runtime_message["content"]);
         }
 
-        if (runtime_message.value("role", "") == "user") {
+        if (getStringOrDefault(runtime_message, "role", "") == "user") {
             last_user_index = static_cast<int>(runtime_messages.size());
         }
         runtime_messages.push_back(std::move(runtime_message));
@@ -611,7 +625,7 @@ json normalize_input_items(const std::string& response_id,
         json normalized = item;
         normalized["id"] = make_id(i);
         normalized["type"] = "message";
-        std::string role = item.value("role", "user");
+        std::string role = getStringOrDefault(item, "role", "user");
         normalized["role"] = role;
 
         json content = json::array();

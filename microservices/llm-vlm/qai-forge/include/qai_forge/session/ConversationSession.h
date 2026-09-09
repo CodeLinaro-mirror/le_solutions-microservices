@@ -15,6 +15,24 @@
 
 using json = nlohmann::ordered_json;
 
+// nlohmann::json's .value(key, default) only falls back to `default` when the
+// key is absent — if the key is present but explicitly null (a valid shape
+// for e.g. an assistant message's "content" field when "tool_calls" is
+// present), .value<std::string>() throws json::type_error.302. This inline
+// helper treats an explicit null the same as an absent key. Defined here
+// (not in an anonymous namespace, since this is a header) with an "session"
+// prefix to avoid ODR / name-collision issues with other TUs that include
+// this header alongside their own local getStringOrDefault() helpers.
+inline std::string sessionGetStringOrDefault(const json& obj,
+                                              const std::string& key,
+                                              const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConversationSession — Pure Data Record (Section 3.A of architecture design)
 //
@@ -122,7 +140,7 @@ struct ConversationSession {
         std::vector<json> result;
         for (size_t i = evicted_message_count; i < messages.size(); ++i) {
             const auto& msg = messages[i];
-            std::string role = msg.value("role", "");
+            std::string role = sessionGetStringOrDefault(msg, "role", "");
             if (role == "system") continue;  // System messages go in Slot 1
 
             json clean_msg = json::object();
@@ -146,8 +164,8 @@ struct ConversationSession {
         int total = 0;
         for (size_t i = evicted_message_count; i < messages.size(); ++i) {
             const auto& msg = messages[i];
-            if (msg.value("role", "") == "system") continue;
-            std::string content = msg.value("content", "");
+            if (sessionGetStringOrDefault(msg, "role", "") == "system") continue;
+            std::string content = sessionGetStringOrDefault(msg, "content", "");
             total += static_cast<int>(content.size() / 4) + 4;  // +4 per-message overhead
         }
         return total;
