@@ -39,12 +39,22 @@ std::string generateToolCallId() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Qwen25Adapter — Vision Preprocessing
 //
-// Qwen 2.5-VL uses the following image token format:
-//   <|vision_start|><|image_pad|><|vision_end|>
-// The image URL is passed separately via the VLM pipeline (not embedded in text).
+// Emits the vision_start/vision_end markers adjacently in the message text.
+// Markers are read from chat_template's "vision_start"/"vision_end" fields
+// when present, falling back to the Qwen 2.5-VL defaults otherwise. The
+// image URL itself is passed separately via the VLM pipeline (not embedded
+// in text).
 // ─────────────────────────────────────────────────────────────────────────────
-json Qwen25Adapter::preprocessVision(const json& messages) const {
+json Qwen25Adapter::preprocessVision(const json& messages,
+                                      const json& chat_template) const {
     json processed = json::array();
+
+    std::string vision_start = chat_template.is_object()
+        ? chat_template.value("vision_start", "<|vision_start|>")
+        : "<|vision_start|>";
+    std::string vision_end = chat_template.is_object()
+        ? chat_template.value("vision_end", "<|vision_end|>")
+        : "<|vision_end|>";
 
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
@@ -72,8 +82,7 @@ json Qwen25Adapter::preprocessVision(const json& messages) const {
                     std::string url = image_url.value("url", "");
                     if (!url.empty()) {
                         image_urls.push_back(url);
-                        // Inject Qwen 2.5-VL image placeholder token
-                        text_content += "<|vision_start|><|image_pad|><|vision_end|>";
+                        text_content += vision_start + vision_end;
                     }
                 }
             }

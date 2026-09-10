@@ -97,10 +97,22 @@ bool tryParseBareToolCallJson(const std::string& text,
 // ─────────────────────────────────────────────────────────────────────────────
 // Qwen3Adapter — Vision Preprocessing
 //
-// Qwen 3-VL uses a simpler <|image|> token format.
+// Emits vision_start/vision_end markers adjacently in the message text when
+// the model's chat_template defines them, matching the format expected by
+// the VLM pipeline's prompt parsing. Falls back to a bare "<|image|>" token
+// for Qwen3-VL variants whose chat_template omits these markers.
 // ─────────────────────────────────────────────────────────────────────────────
-json Qwen3Adapter::preprocessVision(const json& messages) const {
+json Qwen3Adapter::preprocessVision(const json& messages,
+                                     const json& chat_template) const {
     json processed = json::array();
+
+    const bool has_vision_markers = chat_template.is_object()
+        && chat_template.contains("vision_start")
+        && chat_template.contains("vision_end");
+    std::string vision_start = has_vision_markers
+        ? chat_template.value("vision_start", "") : "";
+    std::string vision_end = has_vision_markers
+        ? chat_template.value("vision_end", "") : "";
 
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
@@ -131,8 +143,11 @@ json Qwen3Adapter::preprocessVision(const json& messages) const {
                     }
                     if (!url.empty()) {
                         image_urls.push_back(url);
-                        // Qwen 3-VL uses <|image|> token (different from Qwen 2.5)
-                        text_content += "<|image|>";
+                        if (has_vision_markers) {
+                            text_content += vision_start + vision_end;
+                        } else {
+                            text_content += "<|image|>";
+                        }
                     }
                 }
             }

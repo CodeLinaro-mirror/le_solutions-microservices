@@ -306,7 +306,7 @@ std::string render_candidate_prompt(
     }
 
     json processed_current =
-        adapter.preprocessVision(normalizeContentParts(current_messages));
+        adapter.preprocessVision(normalizeContentParts(current_messages), chat_template);
     if (processed_current.is_array()) {
         for (const auto& message : processed_current) {
             if (!message.is_object()) {

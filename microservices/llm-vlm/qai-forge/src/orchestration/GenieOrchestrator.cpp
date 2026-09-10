@@ -341,7 +341,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     }
 
     // ── Slot 5: Current turn ──────────────────────────────────────────────────
-    json processed_messages = adapter.preprocessVision(request.messages);
+    json processed_messages = adapter.preprocessVision(request.messages, chat_template);
     for (const auto& msg : processed_messages) {
         std::string role = getStringOrDefault(msg, "role", "");
         std::string content = getStringOrDefault(msg, "content", "");

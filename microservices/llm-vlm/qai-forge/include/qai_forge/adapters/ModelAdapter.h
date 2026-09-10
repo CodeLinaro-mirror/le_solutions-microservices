@@ -32,14 +32,19 @@ public:
      * Preprocess messages for vision models.
      * Transforms image_url content parts into the model-specific token format.
      *
-     * For Qwen 2.5 VL: wraps images in <|vision_start|><|image_pad|><|vision_end|>
-     * For Qwen 3 VL:   wraps images in <|image|> tokens
-     * For LLM models:  returns messages unchanged
+     * Vision start/end markers are read from chat_template's "vision_start"/
+     * "vision_end" fields when present, falling back to adapter-specific
+     * defaults otherwise.
      *
-     * @param messages  Raw OpenAI-format messages array
-     * @return          Transformed messages with model-specific image tokens
+     * For LLM (non-vision) models: returns messages unchanged.
+     *
+     * @param messages       Raw OpenAI-format messages array
+     * @param chat_template  Chat template config from ModelConfigManager
+     *                       (may be empty/omitted for non-vision call sites)
+     * @return               Transformed messages with model-specific image tokens
      */
-    virtual json preprocessVision(const json& messages) const = 0;
+    virtual json preprocessVision(const json& messages,
+                                  const json& chat_template = json::object()) const = 0;
 
     // ── Tool Calling ───────────────────────────────────────────────────────────
 
