@@ -1,4 +1,5 @@
 ARG T2E_QNP_VER=2.47.0.260601
+ARG FASTRPC_VERSION=v1.0.7
 
 ###############################################
 # Dedicated QNN SDK Downloader Stage
@@ -261,6 +262,8 @@ RUN find "${LITERT_DEPLOY_DIR}/lib" -name "*.so*" -exec strip --strip-unneeded {
 
 FROM --platform=linux/arm64 debian:trixie-slim AS fastrpc-builder
 
+ARG FASTRPC_VERSION
+
 # Install build dependencies for fastrpc
 RUN apt-get update                                                                              && \
     apt-get install -y --no-install-recommends build-essential                                  && \
@@ -270,7 +273,7 @@ RUN apt-get update                                                              
     rm -rf /var/lib/apt/lists/*
 
 # Build and install fastrpc
-RUN git clone --depth 1 https://github.com/quic/fastrpc.git                                     && \
+RUN git clone --branch ${FASTRPC_VERSION} --depth 1 https://github.com/quic/fastrpc.git         && \
     cd fastrpc                                                                                  && \
     autoreconf -is                                                                              && \
     CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"'                         \
@@ -289,22 +292,6 @@ WORKDIR /root/app/site-packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libatomic1 libbsd0 libmd0 libc++1 libc++abi1     && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
-
-# Bake fastrpc DSP path config for all supported devices into a safe path
-# that is never bind-mounted. The entrypoint copies it to
-# /usr/share/qcom/conf.d/ at runtime after the bind-mount is in place.
-RUN mkdir -p /etc/fastrpc                                                                       && \
-    {                                                                                              \
-      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.';                 \
-      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear';                                        \
-      echo 'machines:';                                                                            \
-      echo '  Qualcomm Technologies, Inc. Monaco Monza addons:';                                   \
-      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp';                              \
-      echo '  Qualcomm Technologies, Inc. Addons IQ 9075 EVK:';                                    \
-      echo '    DSP_LIBRARY_PATH: sa8775p/Qualcomm/SA8775P-RIDE/dsp';                              \
-      echo '  Qualcomm Technologies, Inc. IQ8 8275 Pro SKU EVK:';                                  \
-      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp';                              \
-    } > /etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # Create directory structure for application and make it world-accessible
 # Setting HOME to /tmp prevents KeyError: getpwuid() when running as arbitrary unnamed UID

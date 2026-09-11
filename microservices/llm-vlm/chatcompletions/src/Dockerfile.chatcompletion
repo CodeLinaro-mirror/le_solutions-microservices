@@ -1,3 +1,5 @@
+ARG FASTRPC_VERSION=v1.0.7
+
 ###############################################
 # Stage 1: Builder
 ###############################################
@@ -38,8 +40,10 @@ RUN apt-get update                                                              
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/*
 
+ARG FASTRPC_VERSION
+
 # Build and install fastrpc (sets MACHINE_NAME_PATH to /run/device-model)
-RUN git clone --depth 1 https://github.com/quic/fastrpc.git \
+RUN git clone --branch ${FASTRPC_VERSION} --depth 1 https://github.com/quic/fastrpc.git \
 && cd fastrpc \
 && autoreconf -is \
 && CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' ./configure --prefix=/usr --libdir=/usr/lib \
@@ -142,22 +146,6 @@ RUN apt-get update                                                              
         libyaml-0-2 libbsd0 libmd0                                                              && \
     apt-get clean                                                                               && \
     rm -rf /var/lib/apt/lists/* /var/tmp/*
-
-# Bake fastrpc DSP path config for all supported devices into a safe path
-# that is never bind-mounted. The entrypoint copies it to
-# /usr/share/qcom/conf.d/ at runtime after the bind-mount is in place.
-RUN mkdir -p /etc/fastrpc                                                                       && \
-    {                                                                                              \
-      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.';               \
-      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear';                                      \
-      echo 'machines:';                                                                            \
-      echo '  Qualcomm Technologies, Inc. Monaco Monza addons:';                                  \
-      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp';                             \
-      echo '  Qualcomm Technologies, Inc. Addons IQ 9075 EVK:';                                   \
-      echo '    DSP_LIBRARY_PATH: sa8775p/Qualcomm/SA8775P-RIDE/dsp';                               \
-      echo '  Qualcomm Technologies, Inc. IQ8 8275 Pro SKU EVK:';                                 \
-      echo '    DSP_LIBRARY_PATH: qcs8300/Qualcomm/QCS8300-RIDE/dsp';                             \
-    } > /etc/fastrpc/hexagon-dsp-binaries.yaml
 
 # Create directory structure for application and make it world-accessible
 # Setting HOME to /tmp prevents KeyError: getpwuid() when running as arbitrary unnamed UID
