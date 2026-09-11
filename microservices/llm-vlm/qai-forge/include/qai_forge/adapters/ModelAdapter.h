@@ -41,10 +41,17 @@ public:
      * @param messages       Raw OpenAI-format messages array
      * @param chat_template  Chat template config from ModelConfigManager
      *                       (may be empty/omitted for non-vision call sites)
+     * @param extra_images   Count of images supplied out-of-band (e.g. OIP
+     *                       raw_images/images_shm) that have no corresponding
+     *                       image_url content part in `messages`. When > 0,
+     *                       the adapter must still inject one vision marker
+     *                       pair into the current turn's text so the VLM
+     *                       backend's interleaved-image prompt path fires.
      * @return               Transformed messages with model-specific image tokens
      */
     virtual json preprocessVision(const json& messages,
-                                  const json& chat_template = json::object()) const = 0;
+                                  const json& chat_template = json::object(),
+                                  int extra_images = 0) const = 0;
 
     // ── Tool Calling ───────────────────────────────────────────────────────────
 

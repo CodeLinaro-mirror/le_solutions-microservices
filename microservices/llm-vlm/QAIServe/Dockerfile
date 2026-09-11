@@ -53,20 +53,40 @@
 #                       (litert_lm_builder). Defaults to the version validated
 #                       for this Dockerfile.
 #
+#   BUILD_LITERT_LM     Whether to build LiteRT-LM at all. When OFF
+#                       (the default), Stage 0b (litert_lm_builder) skips
+#                       build-litert-lm-incremental.sh entirely — no Bazel
+#                       invocation, no LiteRT-LM clone — and qai-forge's
+#                       litert-lm-inference-worker is not compiled. Pass
+#                       --build-arg BUILD_LITERT_LM=ON to build and
+#                       ship LiteRT-LM support again.
+#
 #   BUILD_LITERT_LM_CLI_TOOLS  Build the litert-lm / litert-lm-advanced
 #                       on-device debugging/benchmarking CLI binaries
-#                       (Stage 0b). QAIServe never calls these at runtime —
-#                       it drives LiteRT-LM inference via
+#                       (Stage 0b). Only relevant when
+#                       BUILD_LITERT_LM=ON — QAIServe never calls
+#                       these at runtime, it drives LiteRT-LM inference via
 #                       liblitert_lm_c_api.so through litert-lm-inference-worker.
 #                       Left off by default to keep the image small; pass
 #                       --build-arg BUILD_LITERT_LM_CLI_TOOLS=true to build
 #                       and ship them again.
 #
+#   BUILD_LLAMACPP      Whether to build llama.cpp with Hexagon NPU support.
+#                       Defaults to ON (the current NPU backend). When OFF,
+#                       the llama.cpp build step in Stage 1 (builder) skips
+#                       build-llamacpp-hexagon.sh entirely — no Hexagon SDK
+#                       cross-toolchain setup, no llama.cpp clone/compile —
+#                       and qai-forge's llamacpp-inference-worker is not
+#                       compiled. Pass --build-arg BUILD_LLAMACPP=OFF to skip
+#                       it.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 ARG QAIRT_SDK_VERSION=2.48.0.260626
 ARG LITERT_VERSION=2.1.6
 ARG LITERT_LM_VERSION=0.14.0
+ARG BUILD_LITERT_LM=ON
 ARG BUILD_LITERT_LM_CLI_TOOLS=false
+ARG BUILD_LLAMACPP=ON
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage -1: qairt_fetcher
@@ -190,7 +210,11 @@ RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-liter
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0b: litert_lm_builder
 #
-# Builds LiteRT-LM incrementally on top of the already-built LiteRT.
+# Builds LiteRT-LM incrementally on top of the already-built LiteRT, but only
+# when BUILD_LITERT_LM=ON. When OFF, this stage does not clone
+# LiteRT-LM or invoke Bazel at all — it just stages an empty directory tree so
+# the unconditional `COPY --from=litert_lm_builder` lines below the builder
+# stage still succeed.
 # Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM litert_builder AS litert_lm_builder
@@ -198,6 +222,7 @@ FROM litert_builder AS litert_lm_builder
 # Re-declare to bring the global ARGs into this stage's scope, then export as
 # ENV so build-litert-lm-incremental.sh (a plain RUN, not a build-arg-aware
 # step) can read them.
+ARG BUILD_LITERT_LM
 ARG BUILD_LITERT_LM_CLI_TOOLS
 ARG LITERT_LM_VERSION
 ENV BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS}
@@ -210,10 +235,18 @@ ENV LITERT_SRC_DIR=/mnt/work/src/litert
 ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
 
+# Always create the deploy tree (zero-cost) so downstream COPY --from= lines
+# succeed whether or not LiteRT-LM was actually built below.
+RUN mkdir -p ${LITERT_LM_DEPLOY_DIR}/lib ${LITERT_LM_DEPLOY_DIR}/bin ${LITERT_LM_DEPLOY_DIR}/include
+
 COPY qai-forge/scripts/deps/build-litert-lm-incremental.sh /tmp/
 COPY qai-forge/scripts/deps/build-rust-wrappers.sh /tmp/
 RUN chmod +x /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh && \
-    /tmp/build-litert-lm-incremental.sh && \
+    if [ "$BUILD_LITERT_LM" = "ON" ]; then \
+        /tmp/build-litert-lm-incremental.sh; \
+    else \
+        echo "=== Skipping LiteRT-LM build (BUILD_LITERT_LM=OFF) ==="; \
+    fi && \
     rm /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,15 +357,26 @@ COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/lib ${DEPLOY_DIR}/usr/lib
 COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/include /usr/include
 COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/bin ${DEPLOY_DIR}/usr/bin
 
-# ── Build llama.cpp (provides llama-server + libllama.so + libggml*.so) ───────
-# Uses modular script for maintainability and reusability
+# ── Build llama.cpp (provides llama-server + libllama.so + libggml*.so) ──
+# Uses modular script for maintainability and reusability. Skipped entirely
+# when BUILD_LLAMACPP=OFF — no Hexagon SDK cross-toolchain setup, no
+# llama.cpp clone/compile.
 ENV LLAMACPP_INSTALL_DIR=/build/llamacpp-install
-COPY qai-forge/scripts/deps/build-llamacpp.sh /tmp/
-RUN chmod +x /tmp/build-llamacpp.sh && /tmp/build-llamacpp.sh && rm /tmp/build-llamacpp.sh
+ARG BUILD_LLAMACPP
+COPY qai-forge/scripts/deps/build-llamacpp-hexagon.sh /tmp/
+RUN chmod +x /tmp/build-llamacpp-hexagon.sh && \
+    if [ "$BUILD_LLAMACPP" = "ON" ]; then \
+        /tmp/build-llamacpp-hexagon.sh; \
+    else \
+        echo "=== Skipping llama.cpp build (BUILD_LLAMACPP=OFF) ==="; \
+    fi && \
+    rm /tmp/build-llamacpp-hexagon.sh
 
 # ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
 WORKDIR /build
 COPY qai-forge /build/qai-forge
+
+ARG BUILD_LITERT_LM
 
 RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DCMAKE_BUILD_TYPE=Release \
@@ -344,15 +388,31 @@ RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DQAI_FORGE_BUILD_SNPE=ON \
         -DQAI_FORGE_BUILD_LITERT=ON \
         -DLITERT_INCLUDE_PATH=/usr/include \
-        -DQAI_FORGE_BUILD_LITERT_LM=ON \
+        -DQAI_FORGE_BUILD_LITERT_LM=${BUILD_LITERT_LM} \
         -DLITERT_LM_INCLUDE_PATH=/usr/include \
-        -DQAI_FORGE_BUILD_LLAMACPP=ON \
+        -DQAI_FORGE_BUILD_LLAMACPP=${BUILD_LLAMACPP} \
         -DLLAMACPP_INCLUDE_PATH=${LLAMACPP_INSTALL_DIR}/include \
         -DLLAMACPP_LIB_PATH=${LLAMACPP_INSTALL_DIR}/lib \
         -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
         -DCMAKE_PREFIX_PATH=${DEPLOY_DIR}/usr && \
     cmake --build /build/qai-forge/build -j$(nproc) && \
     cmake --install /build/qai-forge/build --prefix ${DEPLOY_DIR}/usr
+
+# When BUILD_LITERT_LM=OFF, neither litert_lm_builder (Stage 0b,
+# skipped above) nor qai-forge's CMakeLists (litert-lm-inference-worker,
+# gated on the same flag) produce any LiteRT-LM binaries — stage stubs for
+# all three so the unconditional `COPY --from=builder ...` lines below still
+# succeed, matching the stub convention build-litert-lm-incremental.sh
+# already uses for litert-lm/litert-lm-advanced when
+# BUILD_LITERT_LM_CLI_TOOLS=false.
+RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
+    for tool in litert-lm-inference-worker litert-lm litert-lm-advanced; do \
+        if [ ! -f ${DEPLOY_DIR}/usr/bin/${tool} ]; then \
+            printf '#!/bin/sh\necho "%s was not built into this image (BUILD_LITERT_LM=OFF)."\nexit 1\n' "${tool}" \
+                > ${DEPLOY_DIR}/usr/bin/${tool} && \
+            chmod +x ${DEPLOY_DIR}/usr/bin/${tool}; \
+        fi; \
+    done
 
 # ── Install QAIServe-specific build deps (CURL + libzip) ─────────────────────
 # Placed here (just before COPY QAIServe) so that changes to this step do not
@@ -522,9 +582,10 @@ FROM --platform=linux/arm64 gcr.io/distroless/cc-debian13 AS qaiserve-runtime
 #                 libGenie.so, QNN, SNPE,
 #                 liblitert_runtime_c_api.so, liblitertengine.so,
 #                 LiteRT dispatch + compiler plugin .so files,
+#                 libllama.so, libggml*.so (llama.cpp, CPU/Hexagon backends),
 #                 libcdsprpc.so*, libadsprpc.so*,
 #                 cherry-picked system .so files
-#   /usr/lib/rfsa/adsp/ - Hexagon DSP blobs (v68/v73/v75)
+#   /usr/lib/rfsa/adsp/ - Hexagon DSP blobs (v68/v73/v75, incl. libggml-htp-v*.so)
 #   /etc/fastrpc/       - hexagon-dsp-binaries.yaml
 COPY --from=stager /export /
 

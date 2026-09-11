@@ -103,7 +103,8 @@ bool tryParseBareToolCallJson(const std::string& text,
 // for Qwen3-VL variants whose chat_template omits these markers.
 // ─────────────────────────────────────────────────────────────────────────────
 json Qwen3Adapter::preprocessVision(const json& messages,
-                                     const json& chat_template) const {
+                                     const json& chat_template,
+                                     int extra_images) const {
     json processed = json::array();
 
     const bool has_vision_markers = chat_template.is_object()
@@ -114,6 +115,14 @@ json Qwen3Adapter::preprocessVision(const json& messages,
     std::string vision_end = has_vision_markers
         ? chat_template.value("vision_end", "") : "";
 
+    // OIP raw_images/images_shm carry image bytes outside of `messages`, so
+    // there is no image_url content part to trigger marker insertion below.
+    // Inject one marker pair into the current turn's text instead — the VLM
+    // pipeline only needs a single vision_start/vision_end occurrence to
+    // switch from concatenating the image before the whole prompt to
+    // interleaving it at the right spot in the token sequence.
+    bool needs_extra_marker = extra_images > 0;
+
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
 
@@ -121,7 +130,16 @@ json Qwen3Adapter::preprocessVision(const json& messages,
         const auto& content = msg["content"];
 
         if (content.is_string()) {
-            processed.push_back(msg);
+            if (role == "user" && needs_extra_marker) {
+                std::string marker = has_vision_markers
+                    ? (vision_start + vision_end) : std::string("<|image|>");
+                json new_msg = msg;
+                new_msg["content"] = marker + content.get<std::string>();
+                processed.push_back(new_msg);
+                needs_extra_marker = false;
+            } else {
+                processed.push_back(msg);
+            }
             continue;
         }
 

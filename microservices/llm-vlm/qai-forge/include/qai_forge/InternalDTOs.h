@@ -119,6 +119,17 @@ struct CreateChatCompletionRequest {
     // directly without applying the chat template.
     std::optional<std::string> raw_prompt;
 
+    // ── OIP raw image bytes ───────────────────────────────────────────────────
+    // Set by InferController::buildChatRequest from OipGenerateRequest::images
+    // (already resolved from multipart/base64/images_shm — see
+    // InferController::resolveShmImageRefs). Compressed image bytes (e.g. JPEG),
+    // already in memory. GenieOrchestrator::preprocessImagesToBuffers feeds
+    // these straight to ImageUtils::preprocessImage(), bypassing the
+    // URL/base64-string parsing that `messages[].content[].image_url` goes
+    // through — this is what makes the images_shm extension zero-copy on the
+    // server side instead of just avoiding the HTTP body transfer.
+    std::vector<std::vector<uint8_t>> raw_images;
+
     static CreateChatCompletionRequest from_json(const json& j) {
         CreateChatCompletionRequest req;
         req.model = j.at("model").get<std::string>();

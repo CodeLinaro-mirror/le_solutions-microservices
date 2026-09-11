@@ -46,7 +46,8 @@ std::string generateToolCallId() {
 // in text).
 // ─────────────────────────────────────────────────────────────────────────────
 json Qwen25Adapter::preprocessVision(const json& messages,
-                                      const json& chat_template) const {
+                                      const json& chat_template,
+                                      int extra_images) const {
     json processed = json::array();
 
     std::string vision_start = chat_template.is_object()
@@ -56,6 +57,14 @@ json Qwen25Adapter::preprocessVision(const json& messages,
         ? chat_template.value("vision_end", "<|vision_end|>")
         : "<|vision_end|>";
 
+    // OIP raw_images/images_shm carry image bytes outside of `messages`, so
+    // there is no image_url content part to trigger marker insertion below.
+    // Inject one marker pair into the current turn's text instead — the VLM
+    // pipeline only needs a single vision_start/vision_end occurrence to
+    // switch from concatenating the image before the whole prompt to
+    // interleaving it at the right spot in the token sequence.
+    bool needs_extra_marker = extra_images > 0;
+
     for (const auto& msg : messages) {
         if (!msg.is_object()) { processed.push_back(msg); continue; }
 
@@ -64,7 +73,14 @@ json Qwen25Adapter::preprocessVision(const json& messages,
 
         // If content is a string, pass through unchanged
         if (content.is_string()) {
-            processed.push_back(msg);
+            if (role == "user" && needs_extra_marker) {
+                json new_msg = msg;
+                new_msg["content"] = vision_start + vision_end + content.get<std::string>();
+                processed.push_back(new_msg);
+                needs_extra_marker = false;
+            } else {
+                processed.push_back(msg);
+            }
             continue;
         }
 
