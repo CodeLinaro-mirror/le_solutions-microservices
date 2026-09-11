@@ -260,6 +260,7 @@ set(QAI_FORGE_SOURCES
     src/backend/BackendFactory.cpp
 
     # Predictive AI backends (Layer 3 — IInferenceBackend implementations)
+    src/backend/PredictiveSharedMemory.cpp
     src/backend/QNNBackend.cpp
     src/backend/SNPEBackend.cpp
     src/backend/LiteRTBackend.cpp

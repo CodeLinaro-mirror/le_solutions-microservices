@@ -8,11 +8,16 @@
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace scheduler {
 
@@ -31,6 +36,44 @@ GenAIException executionError(const std::string& model_id,
         GenAIErrorCode::INFERENCE_FAILED,
         "Inference failed for model '" + model_id + "': " + error.what(),
         500);
+}
+
+size_t requestBatchSize(const TensorInferenceRequest& request) {
+    if (request.inputs.empty() || request.inputs.front().shape.empty() ||
+        request.inputs.front().shape.front() <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(request.inputs.front().shape.front());
+}
+
+bool canAppend(const TensorInferenceRequest& candidate,
+               size_t used,
+               size_t capacity) {
+    const size_t candidate_batch = requestBatchSize(candidate);
+    return candidate_batch > 0 && candidate_batch <= capacity - used;
+}
+
+std::chrono::milliseconds batchWaitDuration() {
+    long value = 10;
+    if (const char* env = std::getenv("PREDICTIVE_BATCH_WAIT_MS")) {
+        try {
+            value = std::stol(env);
+        } catch (...) {
+        }
+    }
+    return std::chrono::milliseconds(std::max(0L, value));
+}
+
+uint8_t paddingValue(const ModelTensorSpec& spec, TensorDataType dtype) {
+    if (dtype == TensorDataType::UINT8) {
+        return static_cast<uint8_t>(
+            std::max(0, std::min(255, spec.quant_zero_point)));
+    }
+    if (dtype == TensorDataType::INT8) {
+        const int value = std::max(-128, std::min(127, spec.quant_zero_point));
+        return static_cast<uint8_t>(static_cast<int8_t>(value));
+    }
+    return 0;
 }
 
 void waitForDspMemoryReclaim(const std::string& model_id,
@@ -127,7 +170,13 @@ bool PredictiveModelRuntime::enqueue(PredictiveJobPtr job,
         if (max_queue_depth > 0 && queue_.size() >= max_queue_depth) {
             return false;
         }
-        queue_.push_back(std::move(job));
+        queue_.push_back(
+            {std::move(job), std::chrono::steady_clock::now()});
+        const auto& queued = queue_.back().job;
+        LOG_INFO("[PredictiveModelRuntime] Enqueued inference: model="
+                 << model_id_ << " request=" << queued->job_id
+                 << " batch=" << requestBatchSize(queued->prepared)
+                 << " queue_depth=" << queue_.size());
     }
     cv_.notify_one();
     return true;
@@ -143,7 +192,10 @@ void PredictiveModelRuntime::stop(bool force) {
             return;
         }
         stop_requested_ = true;
-        queued.swap(queue_);
+        while (!queue_.empty()) {
+            queued.push_back(std::move(queue_.front().job));
+            queue_.pop_front();
+        }
         should_join = executor_thread_.joinable();
     }
 
@@ -199,69 +251,258 @@ PredictiveModelRuntime::lastUsedAt() const {
 
 void PredictiveModelRuntime::executorLoop() {
     while (true) {
-        PredictiveJobPtr job;
+        std::vector<scheduler::PredictiveBatchEntry> batch;
+        size_t capacity = 1;
+        size_t used = 0;
+        const ModelConfig* stored_config =
+            ModelConfigManager::getInstance().getModelConfig(model_id_);
+        const std::optional<ModelConfig> config =
+            stored_config ? std::optional<ModelConfig>(*stored_config)
+                          : std::nullopt;
+        if (config && !config->input_specs.empty() &&
+            !config->input_specs.front().shape.empty() &&
+            config->input_specs.front().shape.front() > 1) {
+            capacity = static_cast<size_t>(
+                config->input_specs.front().shape.front());
+            for (const auto& spec : config->input_specs) {
+                if (spec.shape.empty() || spec.shape.front() <= 0 ||
+                    static_cast<size_t>(spec.shape.front()) != capacity) {
+                    capacity = 1;
+                    break;
+                }
+            }
+        }
+
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this]() {
                 return stop_requested_ || !queue_.empty();
             });
-            if (stop_requested_) {
-                break;
-            }
-            job = std::move(queue_.front());
-            queue_.pop_front();
-            running_job_ = job;
-            last_used_at_ = std::chrono::steady_clock::now();
-        }
+            if (stop_requested_) break;
 
-        try {
-            ensureModelLoaded();
-            setState(ModelRuntimeState::Running);
-            TensorInferenceResponse response =
-                orchestrator_->execute(*job, *backend_);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                running_job_.reset();
-                last_used_at_ = std::chrono::steady_clock::now();
-            }
-            setState(ModelRuntimeState::Idle);
-            notifyComplete(job, response);
-        } catch (const GenAIException& error) {
-            const ModelRuntimeState failed_state = state();
-            if (failed_state != ModelRuntimeState::Failed) {
-                if (error.http_status >= 500) {
-                    recoverBackend();
-                } else {
-                    setState(ModelRuntimeState::Idle);
+            const auto anchor_enqueued_at = queue_.front().enqueued_at;
+            PredictiveJobPtr first = std::move(queue_.front().job);
+            queue_.pop_front();
+            used = requestBatchSize(first->prepared);
+            if (used == 0 || used > capacity) capacity = used ? used : 1;
+            batch.push_back({first, 0, used});
+            running_job_ = first;
+            last_used_at_ = std::chrono::steady_clock::now();
+
+            const auto deadline = anchor_enqueued_at + batchWaitDuration();
+            constexpr size_t kBatchLookahead = 32;
+            while (capacity > 1 && used < capacity) {
+                // For the small bounded queue, subset-sum over the scanned
+                // prefix finds the fullest combination while the oldest job
+                // remains the mandatory anchor.
+                std::vector<std::list<QueuedJob>::iterator> candidates;
+                size_t inspected = 0;
+                for (auto it = queue_.begin();
+                     it != queue_.end() && inspected < kBatchLookahead;
+                     ++it, ++inspected) {
+                    if (canAppend(it->job->prepared, used, capacity)) {
+                        candidates.push_back(it);
+                    }
+                }
+
+                const size_t remaining = capacity - used;
+                std::vector<int> previous(remaining + 1, -1);
+                std::vector<int> picked_by(remaining + 1, -1);
+                previous[0] = 0;
+                for (size_t index = 0; index < candidates.size(); ++index) {
+                    const size_t count =
+                        requestBatchSize(candidates[index]->job->prepared);
+                    for (size_t total = remaining; total >= count; --total) {
+                        if (previous[total] == -1 &&
+                            previous[total - count] != -1) {
+                            previous[total] = static_cast<int>(total - count);
+                            picked_by[total] = static_cast<int>(index);
+                        }
+                        if (total == count) break;
+                    }
+                }
+
+                size_t best = remaining;
+                while (best > 0 && previous[best] == -1) --best;
+                const bool deadline_reached =
+                    std::chrono::steady_clock::now() >= deadline;
+                // Do not commit a partial combination before the deadline:
+                // a later arrival may produce an exact fill with fewer dummy
+                // slots. At the deadline, commit the fullest available subset.
+                if (best == remaining || (deadline_reached && best > 0)) {
+                    std::vector<size_t> selected;
+                    for (size_t total = best; total > 0;) {
+                        const int index = picked_by[total];
+                        selected.push_back(static_cast<size_t>(index));
+                        total = static_cast<size_t>(previous[total]);
+                    }
+                    std::sort(selected.begin(), selected.end());
+                    std::vector<scheduler::PredictiveBatchEntry> additions;
+                    additions.reserve(selected.size());
+                    size_t offset = used;
+                    for (const size_t index : selected) {
+                        const size_t count =
+                            requestBatchSize(candidates[index]->job->prepared);
+                        additions.push_back(
+                            {candidates[index]->job, offset, count});
+                        offset += count;
+                    }
+                    // Erasing one std::list node does not invalidate iterators
+                    // to any other node, so preserve arrival order directly.
+                    for (const size_t index : selected) {
+                        queue_.erase(candidates[index]);
+                    }
+                    batch.insert(batch.end(),
+                                 additions.begin(), additions.end());
+                    used = offset;
+                    break;
+                }
+
+                if (deadline_reached) break;
+                const size_t old_size = queue_.size();
+                cv_.wait_until(lock, deadline, [this, old_size]() {
+                    return stop_requested_ || queue_.size() != old_size;
+                });
+                if (stop_requested_) break;
+                if (queue_.size() == old_size &&
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
                 }
             }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                running_job_.reset();
-                last_used_at_ = std::chrono::steady_clock::now();
+        }
+
+        if (stop_requested_) {
+            for (const auto& entry : batch)
+                notifyError(entry.job, stoppedError(model_id_));
+            break;
+        }
+
+        LOG_INFO("[PredictiveModelRuntime] Selected physical batch: model="
+                 << model_id_ << " capacity=" << capacity
+                 << " samples=" << used << " requests=" << batch.size());
+        for (const auto& entry : batch) {
+            LOG_INFO("[PredictiveModelRuntime] Batch entry: model=" << model_id_
+                     << " request=" << entry.job->job_id
+                     << " offset=" << entry.batch_offset
+                     << " count=" << entry.batch_count);
+        }
+
+        auto clear_running = [this]() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_job_.reset();
+            last_used_at_ = std::chrono::steady_clock::now();
+        };
+
+        try {
+            scheduler::PredictiveBatch batch_context{model_id_, capacity, batch};
+            ensureModelLoaded();
+            setState(ModelRuntimeState::Running);
+            const auto started_at = std::chrono::steady_clock::now();
+            LOG_INFO("[PredictiveModelRuntime] Physical inference started: model="
+                     << model_id_ << " capacity=" << capacity
+                     << " samples=" << used << " requests=" << batch.size());
+            TensorInferenceResponse combined =
+                orchestrator_->executeBatch(batch_context, *backend_);
+            const auto finished_at = std::chrono::steady_clock::now();
+            const double physical_latency_ms =
+                std::chrono::duration<double, std::milli>(
+                    finished_at - started_at)
+                    .count();
+            LOG_INFO("[PredictiveModelRuntime] Physical inference completed: model="
+                     << model_id_ << " latency_ms="
+                     << physical_latency_ms
+                     << " outputs=" << combined.outputs.size());
+            std::vector<TensorInferenceResponse> responses;
+            responses.reserve(batch.size());
+            for (const auto& entry : batch) {
+                const auto& requested = entry.job->prepared.output_names;
+                const std::unordered_set<std::string> wanted(
+                    requested.begin(), requested.end());
+                std::unordered_set<std::string> returned;
+                TensorInferenceResponse response;
+                response.model = entry.job->model_id;
+                response.request_id = entry.job->job_id;
+                response.stats.latency_ms =
+                    std::chrono::duration<double, std::milli>(
+                        finished_at - started_at).count();
+                response.stats.backend_name = combined.stats.backend_name;
+                for (const auto& output : combined.outputs) {
+                    if (!wanted.empty() && wanted.count(output.name) == 0) continue;
+                    if (output.shape.empty() ||
+                        output.shape.front() != static_cast<int64_t>(capacity) ||
+                        output.data.size() % capacity != 0 ||
+                        entry.batch_offset > capacity ||
+                        entry.batch_count > capacity - entry.batch_offset) {
+                        throw std::runtime_error(
+                            "Backend returned an output that cannot be demultiplexed");
+                    }
+                    returned.insert(output.name);
+                    const size_t bytes_per_sample = output.data.size() / capacity;
+                    const size_t begin_offset = entry.batch_offset * bytes_per_sample;
+                    const size_t output_length = entry.batch_count * bytes_per_sample;
+                    OutputTensor split = output;
+                    split.shape.front() = static_cast<int64_t>(entry.batch_count);
+                    split.data.assign(
+                        output.data.begin() + static_cast<std::ptrdiff_t>(begin_offset),
+                        output.data.begin() + static_cast<std::ptrdiff_t>(
+                            begin_offset + output_length));
+                    response.outputs.push_back(std::move(split));
+                }
+                for (const auto& name : requested) {
+                    if (!returned.count(name)) {
+                        throw GenAIException(
+                            GenAIErrorCode::INFERENCE_FAILED,
+                            "Backend did not return requested output tensor: " + name,
+                            500);
+                    }
+                }
+                LOG_INFO("[PredictiveModelRuntime] Demultiplexed response: model="
+                         << model_id_ << " request=" << entry.job->job_id
+                         << " batch=" << entry.batch_count
+                         << " outputs=" << response.outputs.size());
+                responses.push_back(std::move(response));
             }
-            notifyError(job, error);
+            clear_running();
+            setState(ModelRuntimeState::Idle);
+            for (size_t index = 0; index < batch.size(); ++index) {
+                if (batch[index].job->callbacks.on_complete) {
+                    try {
+                        batch[index].job->callbacks.on_complete(responses[index]);
+                    } catch (...) {
+                    }
+                }
+                LOG_INFO("[PredictiveModelRuntime] Inference succeeded: model="
+                         << model_id_ << " request=" << batch[index].job->job_id
+                         << " batch=" << batch[index].batch_count);
+            }
+        } catch (const GenAIException& error) {
+            LOG_ERROR("[PredictiveModelRuntime] Inference failed: model="
+                      << model_id_ << " requests=" << batch.size()
+                      << " status=" << error.http_status
+                      << " error=" << error.message);
+            if (state() != ModelRuntimeState::Failed) {
+                if (error.http_status >= 500) recoverBackend();
+                else setState(ModelRuntimeState::Idle);
+            }
+            clear_running();
+            for (const auto& entry : batch) notifyError(entry.job, error);
         } catch (const std::exception& error) {
+            LOG_ERROR("[PredictiveModelRuntime] Inference exception: model="
+                      << model_id_ << " requests=" << batch.size()
+                      << " error=" << error.what());
             recoverBackend();
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                running_job_.reset();
-                last_used_at_ = std::chrono::steady_clock::now();
-            }
-            notifyError(job, executionError(model_id_, error));
+            clear_running();
+            const GenAIException converted = executionError(model_id_, error);
+            for (const auto& entry : batch) notifyError(entry.job, converted);
         } catch (...) {
+            LOG_ERROR("[PredictiveModelRuntime] Inference failed with unknown exception: model="
+                      << model_id_ << " requests=" << batch.size());
             recoverBackend();
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                running_job_.reset();
-                last_used_at_ = std::chrono::steady_clock::now();
-            }
-            notifyError(
-                job,
-                GenAIException(
-                    GenAIErrorCode::INFERENCE_FAILED,
-                    "Inference failed for model '" + model_id_ + "'",
-                    500));
+            clear_running();
+            const GenAIException converted(
+                GenAIErrorCode::INFERENCE_FAILED,
+                "Inference failed for model '" + model_id_ + "'", 500);
+            for (const auto& entry : batch) notifyError(entry.job, converted);
         }
     }
 }

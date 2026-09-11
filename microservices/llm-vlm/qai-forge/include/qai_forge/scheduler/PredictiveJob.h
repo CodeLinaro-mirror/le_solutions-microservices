@@ -8,7 +8,9 @@
 
 #include <functional>
 #include <memory>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 namespace scheduler {
 
@@ -39,5 +41,17 @@ struct PredictiveJob {
 };
 
 using PredictiveJobPtr = std::shared_ptr<PredictiveJob>;
+
+struct PredictiveBatchEntry {
+    PredictiveJobPtr job;
+    size_t batch_offset = 0;
+    size_t batch_count = 0;
+};
+
+struct PredictiveBatch {
+    std::string model_id;
+    size_t capacity = 1;
+    std::vector<PredictiveBatchEntry> entries;
+};
 
 } // namespace scheduler

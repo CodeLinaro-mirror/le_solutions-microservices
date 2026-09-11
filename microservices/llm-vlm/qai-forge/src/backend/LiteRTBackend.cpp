@@ -19,6 +19,8 @@
 #include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 // Default worker binary path — overridable via LITERT_WORKER_BINARY env var
@@ -27,10 +29,25 @@ static const char* DEFAULT_LITERT_WORKER = "/usr/local/bin/litert-inference-work
 // Default library directories — overridable via env vars
 static const char* DEFAULT_DISPATCH_DIR        = "/usr/lib";
 static const char* DEFAULT_COMPILER_PLUGIN_DIR = "/usr/lib";
+constexpr size_t kDefaultShmDirBytes = 32u * 1024 * 1024;
+constexpr size_t kShmAlign = 128;
+
+static size_t predictiveShmDirBytes() {
+    if (const char* env = std::getenv("GENAI_PREDICTIVE_SHM_BYTES")) {
+        const size_t bytes = std::strtoull(env, nullptr, 10);
+        if (bytes > 0) return bytes;
+    }
+    return kDefaultShmDirBytes;
+}
+
+static size_t alignUp(size_t offset, size_t align) {
+    return (offset + align - 1) / align * align;
+}
 
 LiteRTBackend::LiteRTBackend() {
     const char* binary = std::getenv("LITERT_WORKER_BINARY");
     if (!binary) binary = DEFAULT_LITERT_WORKER;
+
     worker_ = std::make_unique<PredictiveWorkerManager>(binary, "litert");
 }
 
@@ -73,7 +90,9 @@ void LiteRTBackend::initialize(const std::string& model_id,
         {"hw_accelerators",     hw_accelerators}
     };
 
-    worker_->ensureWorkerRunning(model_id, init_params);
+    if (!shared_memory_) shared_memory_ = std::make_unique<PredictiveSharedMemory>(predictiveShmDirBytes());
+    worker_->ensureWorkerRunning(model_id, init_params,
+        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()});
     current_model_id_ = model_id;
 
     LOG_INFO("[LiteRTBackend] Initialized model: " << model_id
@@ -82,8 +101,46 @@ void LiteRTBackend::initialize(const std::string& model_id,
              << " hw_accel=" << hw_accelerators);
 }
 
-TensorInferenceResponse LiteRTBackend::infer(const TensorInferenceRequest& request) {
-    // Ensure worker is running (auto-restart if crashed)
+PredictiveExecuteRequest LiteRTBackend::prepareWorkerRequest(
+    const SegmentedTensorInferenceRequest& request) {
+    if (!shared_memory_) {
+        throw std::runtime_error("LiteRTBackend: shared memory is not initialized");
+    }
+    PredictiveExecuteRequest worker_request{
+        request.model, request.request_id,
+        nlohmann::ordered_json::array(), nlohmann::ordered_json::array()};
+    size_t write_offset = 0;
+    for (const auto& tensor : request.inputs) {
+        const size_t offset = alignUp(write_offset, kShmAlign);
+        const size_t len = tensor.byte_size;
+        if (len == 0) throw std::runtime_error("LiteRTBackend: invalid batched tensor size");
+        if (offset + len > shared_memory_->dirBytes()) {
+            throw std::runtime_error("LiteRTBackend: batched input exceeds shared-memory capacity");
+        }
+        uint8_t* destination = shared_memory_->data() + offset;
+        size_t copied = 0;
+        for (const auto& segment : tensor.segments) {
+            if ((!segment.data && segment.size) || copied + segment.size > len) {
+                throw std::runtime_error("LiteRTBackend: invalid batched input segment");
+            }
+            std::memcpy(destination + copied, segment.data, segment.size);
+            copied += segment.size;
+        }
+        std::memset(destination + copied, tensor.padding_value, len - copied);
+        nlohmann::ordered_json input = {
+            {"name", tensor.name},
+            {"dtype", tensorDataTypeToString(tensor.dtype)},
+            {"data_ref", {{"offset", offset}, {"len", len}}},
+            {"shape", tensor.shape}};
+        worker_request.inputs.push_back(std::move(input));
+        write_offset = offset + len;
+    }
+    for (const auto& name : request.output_names) worker_request.output_names.push_back(name);
+    return worker_request;
+}
+
+TensorInferenceResponse LiteRTBackend::infer(
+    const SegmentedTensorInferenceRequest& request) {
     if (!worker_->isWorkerRunning() || worker_->getCurrentModelId() != request.model) {
         initialize(request.model, "");
     }
@@ -95,9 +152,10 @@ TensorInferenceResponse LiteRTBackend::infer(const TensorInferenceRequest& reque
     std::string error_msg;
     bool had_error = false;
 
+    const PredictiveExecuteRequest worker_request = prepareWorkerRequest(request);
     worker_->executeInfer(
         event_id,
-        request,
+        worker_request,
         [&result](const TensorInferenceResponse& r) {
             result = r;
         },
@@ -118,5 +176,15 @@ bool LiteRTBackend::isHealthy() const {
 }
 
 void LiteRTBackend::shutdown() {
-    worker_->shutdown();
+    try { worker_->shutdown(); }
+    catch (...) {
+        try { worker_->terminateWorker(true); } catch (...) {}
+        worker_->clearSharedMemory();
+        shared_memory_.reset();
+        current_model_id_.clear();
+        throw;
+    }
+    worker_->clearSharedMemory();
+    shared_memory_.reset();
+    current_model_id_.clear();
 }

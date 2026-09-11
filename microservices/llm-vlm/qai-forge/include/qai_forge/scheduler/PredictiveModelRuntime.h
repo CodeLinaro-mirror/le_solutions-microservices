@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,6 +67,11 @@ private:
     static void notifyError(const PredictiveJobPtr& job,
                             const GenAIException& error);
 
+    struct QueuedJob {
+        PredictiveJobPtr job;
+        std::chrono::steady_clock::time_point enqueued_at;
+    };
+
     const std::string model_id_;
     std::unique_ptr<IInferenceBackend> backend_;
     std::shared_ptr<PredictiveOrchestrator> orchestrator_;
@@ -76,7 +82,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::thread executor_thread_;
-    std::deque<PredictiveJobPtr> queue_;
+    std::list<QueuedJob> queue_;
     PredictiveJobPtr running_job_;
 
     bool started_ = false;

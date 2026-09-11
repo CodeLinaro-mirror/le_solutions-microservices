@@ -14,8 +14,8 @@ public:
         scheduler::PredictiveJobContext context,
         scheduler::PredictiveCallbacks callbacks) const;
 
-    /** @brief Execute and normalize a prepared predictive inference job. */
-    TensorInferenceResponse execute(
-        scheduler::PredictiveJob& job,
+    /**  Execute a scheduler-created batch and return the combined response. */
+    TensorInferenceResponse executeBatch(
+        const scheduler::PredictiveBatch& batch,
         IInferenceBackend& backend) const;
 };

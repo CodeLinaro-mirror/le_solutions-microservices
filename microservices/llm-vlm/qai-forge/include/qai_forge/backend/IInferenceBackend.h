@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "qai_forge/backend/PredictiveSharedMemory.h"
 #include "qai_forge/dto/TensorDTOs.h"
 #include <string>
 
@@ -45,14 +46,20 @@ public:
                             const std::string& model_file) = 0;
 
     /**
-     * Run blocking inference.
-     * Returns when all requested outputs are ready.
-     * Throws std::runtime_error on inference failure.
-     *
-     * @param request  Input tensors (raw bytes) + output names to return
-     * @return         Output tensors (raw bytes) + inference stats
+     * Run inference from non-owning tensor segments. Implementations write the
+     * segments and padding directly into backend-owned shared memory.
      */
-    virtual TensorInferenceResponse infer(const TensorInferenceRequest& request) = 0;
+    virtual TensorInferenceResponse infer(
+        const SegmentedTensorInferenceRequest& request) = 0;
+
+    /**
+     * Write request input bytes directly into backend-owned shared memory and
+     * return a compact worker IPC request containing only data references.
+     * Throws std::runtime_error if the input layout exceeds the shared-memory
+     * input capacity.
+     */
+    virtual PredictiveExecuteRequest prepareWorkerRequest(
+        const SegmentedTensorInferenceRequest& request) = 0;
 
     /**
      * Returns true if the backend worker subprocess is alive and responsive.

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -34,16 +35,40 @@ size_t elementWidth(TensorDataType dtype) {
     return 0;
 }
 
+uint8_t paddingValue(const ModelTensorSpec& spec, TensorDataType dtype) {
+    if (dtype == TensorDataType::UINT8) {
+        return static_cast<uint8_t>(
+            std::max(0, std::min(255, spec.quant_zero_point)));
+    }
+
+    if (dtype == TensorDataType::INT8) {
+        const int value =
+            std::max(-128, std::min(127, spec.quant_zero_point));
+        return static_cast<uint8_t>(static_cast<int8_t>(value));
+    }
+
+    return 0;
+}
+
 bool shapeMatches(const std::vector<int64_t>& expected,
                   const std::vector<int64_t>& actual) {
     if (expected.size() != actual.size()) {
         return false;
     }
     for (size_t index = 0; index < expected.size(); ++index) {
-        if (expected[index] > 0 && expected[index] != actual[index]) {
+        if (actual[index] <= 0) {
             return false;
         }
-        if (actual[index] <= 0) {
+
+        // The leading dimension is the batch dimension. A model compiled for
+        // batch N accepts client batches in [1, N]; every other fixed
+        // dimension must match exactly. Non-positive expected dimensions
+        // continue to represent dynamic dimensions.
+        if (index == 0 && expected[index] > 0) {
+            if (actual[index] > expected[index]) {
+                return false;
+            }
+        } else if (expected[index] > 0 && expected[index] != actual[index]) {
             return false;
         }
     }
@@ -119,6 +144,7 @@ void validateRequest(const scheduler::PredictiveJobContext& context) {
             400);
     }
 
+    std::optional<int64_t> request_batch_size;
     for (size_t index = 0; index < config.input_specs.size(); ++index) {
         const ModelTensorSpec& spec = config.input_specs[index];
         const InputTensor* input = findInput(context.request, spec, index);
@@ -133,6 +159,20 @@ void validateRequest(const scheduler::PredictiveJobContext& context) {
                 GenAIErrorCode::INVALID_REQUEST,
                 "Input tensor '" + input->name + "' has the wrong shape",
                 400);
+        }
+        if (!input->shape.empty()) {
+            const int64_t batch_size = input->shape.front();
+            if (request_batch_size.has_value() &&
+                request_batch_size.value() != batch_size) {
+                throw GenAIException(
+                    GenAIErrorCode::INVALID_REQUEST,
+                    "Input tensor '" + input->name + "' has batch size " +
+                        std::to_string(batch_size) +
+                        " but previous inputs use batch size " +
+                        std::to_string(request_batch_size.value()),
+                    400);
+            }
+            request_batch_size = batch_size;
         }
         const std::string actual_dtype = tensorDataTypeToString(input->dtype);
         if (spec.dtype != actual_dtype) {
@@ -178,12 +218,33 @@ void validateRequest(const scheduler::PredictiveJobContext& context) {
     }
 }
 
+void normalizeRequest(scheduler::PredictiveJobContext& context) {
+    const ModelConfig* config = ModelConfigManager::getInstance().getModelConfig(context.model_id);
+    if (!config) return;
+    std::vector<InputTensor> ordered;
+    ordered.reserve(config->input_specs.size());
+    for (size_t index = 0; index < config->input_specs.size(); ++index) {
+        const ModelTensorSpec& spec = config->input_specs[index];
+        if (!spec.name.empty()) {
+            const auto input = std::find_if(
+                context.request.inputs.begin(), context.request.inputs.end(),
+                [&spec](const InputTensor& value) { return value.name == spec.name; });
+            if (input != context.request.inputs.end())
+                ordered.push_back(std::move(*input));
+        } else if (index < context.request.inputs.size()) {
+            ordered.push_back(std::move(context.request.inputs[index]));
+        }
+    }
+    context.request.inputs = std::move(ordered);
+}
+
 } // namespace
 
 scheduler::PredictiveJobPtr PredictiveOrchestrator::createJob(
     scheduler::PredictiveJobContext context,
     scheduler::PredictiveCallbacks callbacks) const {
     validateRequest(context);
+    normalizeRequest(context);
 
     auto job = std::make_shared<scheduler::PredictiveJob>();
     job->job_id = context.job_id;
@@ -194,47 +255,117 @@ scheduler::PredictiveJobPtr PredictiveOrchestrator::createJob(
     return job;
 }
 
-TensorInferenceResponse PredictiveOrchestrator::execute(
-    scheduler::PredictiveJob& job,
+TensorInferenceResponse PredictiveOrchestrator::executeBatch(
+    const scheduler::PredictiveBatch& batch,
     IInferenceBackend& backend) const {
-    const auto started_at = std::chrono::steady_clock::now();
-    TensorInferenceResponse response = backend.infer(job.prepared);
-    const auto finished_at = std::chrono::steady_clock::now();
-
-    response.model = job.model_id;
-    response.request_id = job.job_id;
-    response.stats.latency_ms =
-        std::chrono::duration<double, std::milli>(finished_at - started_at)
-            .count();
-    response.stats.backend_name = backend.name();
-
-    if (job.prepared.output_names.empty()) {
-        return response;
+    if (batch.entries.empty()) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Cannot execute an empty predictive batch", 400);
+    }
+    if (batch.capacity == 0) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Predictive batch capacity must be greater than zero", 400);
     }
 
-    std::unordered_set<std::string> requested(
-        job.prepared.output_names.begin(),
-        job.prepared.output_names.end());
-    std::unordered_set<std::string> returned;
-    std::vector<OutputTensor> filtered;
-    filtered.reserve(response.outputs.size());
-    for (OutputTensor& output : response.outputs) {
-        if (requested.count(output.name) == 0) {
-            continue;
+    const auto& first_job = batch.entries.front().job;
+    if (!first_job) {
+        throw std::runtime_error("Predictive batch contains a null job");
+    }
+    const auto& first_request = first_job->prepared;
+    if (first_job->model_id != batch.model_id) {
+        throw std::runtime_error("Predictive batch model mismatch");
+    }
+    size_t expected_offset = 0;
+    for (const auto& entry : batch.entries) {
+        if (!entry.job || entry.job->model_id != batch.model_id || entry.batch_count == 0 ||
+            entry.batch_offset != expected_offset ||
+            expected_offset > batch.capacity ||
+            entry.batch_count > batch.capacity - expected_offset) {
+            throw std::runtime_error("Invalid predictive batch layout");
         }
-        returned.insert(output.name);
-        filtered.push_back(std::move(output));
+        expected_offset += entry.batch_count;
+    }
+    SegmentedTensorInferenceRequest request;
+    request.model = batch.model_id;
+    request.request_id = first_job->job_id;
+    request.inputs.reserve(first_request.inputs.size());
+
+    for (size_t input_index = 0; input_index < first_request.inputs.size(); ++input_index) {
+        const auto& first = first_request.inputs[input_index];
+        if (first.shape.empty() || first.shape.front() <= 0) {
+            throw std::runtime_error("Predictive batch input has an invalid batch dimension");
+        }
+        const size_t first_batch = static_cast<size_t>(first.shape.front());
+        if (first.data.size() % first_batch != 0) {
+            throw std::runtime_error("Predictive batch input byte count is not divisible by its batch size");
+        }
+        const size_t bytes_per_sample = first.data.size() / first_batch;
+        if (bytes_per_sample == 0 ||
+            batch.capacity > std::numeric_limits<size_t>::max() / bytes_per_sample) {
+            throw std::runtime_error("Predictive batch input byte count overflows");
+        }
+
+        SegmentedInputTensor input;
+        input.name = first.name;
+        input.shape = first.shape;
+        input.shape.front() = static_cast<int64_t>(batch.capacity);
+        input.dtype = first.dtype;
+        input.byte_size = batch.capacity * bytes_per_sample;
+
+        for (const auto& entry : batch.entries) {
+            if (!entry.job || entry.job->prepared.inputs.size() != first_request.inputs.size() ||
+                entry.batch_offset > batch.capacity ||
+                entry.batch_count > batch.capacity - entry.batch_offset) {
+                throw std::runtime_error("Invalid predictive batch entry");
+            }
+            const auto& source = entry.job->prepared.inputs[input_index];
+            if (source.name != first.name || source.dtype != first.dtype ||
+                source.shape.size() != first.shape.size() || source.shape.empty() ||
+                source.shape.front() <= 0 ||
+                static_cast<size_t>(source.shape.front()) != entry.batch_count ||
+                source.data.size() % static_cast<size_t>(source.shape.front()) != 0 ||
+                source.data.size() != entry.batch_count * bytes_per_sample) {
+                throw std::runtime_error("Predictive batch inputs are incompatible");
+            }
+            for (size_t dimension = 1; dimension < first.shape.size(); ++dimension) {
+                if (source.shape[dimension] != first.shape[dimension]) {
+                    throw std::runtime_error("Predictive batch input shapes are incompatible");
+                }
+            }
+            input.segments.push_back({source.data.data(), source.data.size()});
+        }
+
+        const ModelConfig* config =
+            ModelConfigManager::getInstance().getModelConfig(batch.model_id);
+        if (config && input_index < config->input_specs.size()) {
+            input.padding_value = paddingValue(
+                config->input_specs[input_index], input.dtype);
+        }
+        request.inputs.push_back(std::move(input));
     }
 
-    for (const std::string& output_name : job.prepared.output_names) {
-        if (returned.count(output_name) == 0) {
-            throw GenAIException(
-                GenAIErrorCode::INFERENCE_FAILED,
-                "Backend did not return requested output tensor '" +
-                    output_name + "'",
-                500);
+    bool all_outputs = false;
+    std::vector<std::string> output_names;
+    std::unordered_set<std::string> seen_outputs;
+    for (const auto& entry : batch.entries) {
+        if (!entry.job) throw std::runtime_error("Predictive batch contains a null job");
+        if (entry.job->prepared.output_names.empty()) {
+            all_outputs = true;
+            break;
+        }
+        for (const auto& name : entry.job->prepared.output_names) {
+            if (seen_outputs.insert(name).second) output_names.push_back(name);
         }
     }
-    response.outputs = std::move(filtered);
-    return response;
+    if (!all_outputs) request.output_names = output_names;
+
+    if (expected_offset == 0) {
+        throw std::runtime_error("Predictive batch contains no samples");
+    }
+
+    TensorInferenceResponse combined = backend.infer(request);
+    combined.stats.backend_name = backend.name();
+    return combined;
 }

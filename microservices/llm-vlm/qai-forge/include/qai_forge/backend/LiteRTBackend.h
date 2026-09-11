@@ -45,7 +45,10 @@ public:
     void initialize(const std::string& model_id,
                     const std::string& model_file) override;
 
-    TensorInferenceResponse infer(const TensorInferenceRequest& request) override;
+    TensorInferenceResponse infer(
+        const SegmentedTensorInferenceRequest& request) override;
+    PredictiveExecuteRequest prepareWorkerRequest(
+        const SegmentedTensorInferenceRequest& request) override;
 
     bool isHealthy() const override;
     void shutdown() override;
@@ -54,6 +57,7 @@ private:
     LiteRTBackend(const LiteRTBackend&)            = delete;
     LiteRTBackend& operator=(const LiteRTBackend&) = delete;
 
+    std::unique_ptr<PredictiveSharedMemory> shared_memory_;
     std::unique_ptr<PredictiveWorkerManager> worker_;
     std::string current_model_id_;
 };

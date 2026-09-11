@@ -47,16 +47,11 @@ constexpr size_t kDefaultShmDirBytes = 32u * 1024 * 1024;  // 32MB per direction
 // ─────────────────────────────────────────────────────────────────────────────
 
 PredictiveWorkerManager::PredictiveWorkerManager(
-    const std::string& worker_binary,
-    const std::string& process_type)
+    const std::string&                 worker_binary,
+    const std::string&                 process_type)
     : worker_binary_(worker_binary)
     , process_type_(process_type)
 {
-    shm_dir_bytes_ = kDefaultShmDirBytes;
-    if (const char* env = std::getenv("GENAI_PREDICTIVE_SHM_BYTES")) {
-        size_t bytes = std::strtoull(env, nullptr, 10);
-        if (bytes > 0) shm_dir_bytes_ = bytes;
-    }
 }
 
 PredictiveWorkerManager::~PredictiveWorkerManager() {
@@ -76,13 +71,27 @@ std::string PredictiveWorkerManager::generateSocketPath(
 
 void PredictiveWorkerManager::ensureWorkerRunning(
     const std::string& model_id,
-    const json&        init_params)
+    const json&        init_params,
+    const PredictiveSharedMemoryView& shared_memory)
 {
+    if (shared_memory.fd < 0 || shared_memory.ptr == nullptr || shared_memory.dir_bytes == 0) throw std::invalid_argument("[PredictiveWorkerManager] invalid backend-owned shared-memory view");
+    const bool memory_changed = shm_fd_ != shared_memory.fd || shm_ptr_ != shared_memory.ptr || shm_dir_bytes_ != shared_memory.dir_bytes;
+    if (memory_changed && isWorkerRunning()) cleanupWorker(true);
+    shm_ptr_ = shared_memory.ptr;
+    shm_fd_ = shared_memory.fd;
+    shm_dir_bytes_ = shared_memory.dir_bytes;
+
     // If model changed or worker crashed, restart
     if (current_model_id_ != model_id || !isWorkerRunning()) {
         cleanupWorker(true);
         startWorker(model_id, init_params);
     }
+}
+
+void PredictiveWorkerManager::clearSharedMemory() noexcept {
+    shm_ptr_ = nullptr;
+    shm_fd_ = -1;
+    shm_dir_bytes_ = 0;
 }
 
 void PredictiveWorkerManager::startWorker(
@@ -97,32 +106,10 @@ void PredictiveWorkerManager::startWorker(
         throw std::runtime_error("[PredictiveWorkerManager] socketpair failed: "
                                  + std::string(strerror(errno)));
 
-    // Create the zero-copy tensor shared-memory region before fork() so both
-    // sides inherit the same fd number across fork/exec (mirrors sv[] above).
-    // No MFD_CLOEXEC — the fd must survive execl() in the child.
-    int shm_fd = memfd_create("qai-forge-predictive-shm", 0);
-    if (shm_fd < 0) {
-        close(sv[0]); close(sv[1]);
-        throw std::runtime_error("[PredictiveWorkerManager] memfd_create failed: "
-                                 + std::string(strerror(errno)));
-    }
-    size_t shm_total_bytes = 2 * shm_dir_bytes_;
-    if (ftruncate(shm_fd, static_cast<off_t>(shm_total_bytes)) < 0) {
-        close(shm_fd); close(sv[0]); close(sv[1]);
-        throw std::runtime_error("[PredictiveWorkerManager] ftruncate failed: "
-                                 + std::string(strerror(errno)));
-    }
-    void* shm_ptr = mmap(nullptr, shm_total_bytes, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, shm_fd, 0);
-    if (shm_ptr == MAP_FAILED) {
-        close(shm_fd); close(sv[0]); close(sv[1]);
-        throw std::runtime_error("[PredictiveWorkerManager] mmap failed: "
-                                 + std::string(strerror(errno)));
-    }
-
+    // The backend created and mapped this region. Its fd is deliberately not
+    // close-on-exec so the child can inherit it across execl().
     pid_t pid = fork();
     if (pid < 0) {
-        munmap(shm_ptr, shm_total_bytes); close(shm_fd);
         close(sv[0]); close(sv[1]);
         throw std::runtime_error("[PredictiveWorkerManager] fork failed");
     }
@@ -134,7 +121,7 @@ void PredictiveWorkerManager::startWorker(
         // Pass socket fd and shm fd/size via environment variables — same
         // fd-number-plus-env-var convention for both.
         setenv("CONV_SOCKET_FD", std::to_string(sv[1]).c_str(), 1);
-        setenv("CONV_SHM_FD", std::to_string(shm_fd).c_str(), 1);
+        setenv("CONV_SHM_FD", std::to_string(shm_fd_).c_str(), 1);
         setenv("CONV_SHM_DIR_BYTES", std::to_string(shm_dir_bytes_).c_str(), 1);
 
         // Exec worker binary
@@ -146,8 +133,6 @@ void PredictiveWorkerManager::startWorker(
     close(sv[1]);
     sock_fd_    = sv[0];
     worker_pid_ = pid;
-    shm_ptr_    = shm_ptr;
-    shm_fd_     = shm_fd;
 
     // Wait for initial READY
     try {
@@ -200,14 +185,6 @@ void PredictiveWorkerManager::cleanupWorker(bool force) {
         close(sock_fd_);
         sock_fd_ = -1;
     }
-    if (shm_ptr_ != nullptr) {
-        munmap(shm_ptr_, 2 * shm_dir_bytes_);
-        shm_ptr_ = nullptr;
-    }
-    if (shm_fd_ >= 0) {
-        close(shm_fd_);
-        shm_fd_ = -1;
-    }
     read_buf_.clear();
     current_model_id_.clear();
 }
@@ -253,50 +230,19 @@ json PredictiveWorkerManager::readMessage(int timeout_seconds) {
 }
 
 void PredictiveWorkerManager::executeInfer(
-    const std::string&            event_id,
-    const TensorInferenceRequest& request,
-    PredictiveResultCallback    on_result,
-    PredictiveErrorCallback     on_error)
+    const std::string&              event_id,
+    const PredictiveExecuteRequest& request,
+    PredictiveResultCallback        on_result,
+    PredictiveErrorCallback         on_error)
 {
-    // Build EXECUTE command — input tensor bytes are memcpy'd into the shm
-    // input half at 128-byte-aligned offsets; JSON carries only a data_ref
-    // {offset,len} pointing into that region instead of the bytes themselves.
-    json inputs_json = json::array();
-    size_t write_offset = 0;
-    for (const auto& tensor : request.inputs) {
-        size_t aligned_offset = alignUp(write_offset, kShmAlign);
-        size_t len = tensor.data.size();
-        if (aligned_offset + len > shm_dir_bytes_) {
-            on_error("Input tensor '" + tensor.name + "' exceeds shared-memory "
-                     "capacity (" + std::to_string(shm_dir_bytes_) + " bytes per direction)");
-            return;
-        }
-        std::memcpy(static_cast<uint8_t*>(shm_ptr_) + aligned_offset,
-                    tensor.data.data(), len);
-
-        json t;
-        t["name"]     = tensor.name;
-        t["dtype"]    = tensorDataTypeToString(tensor.dtype);
-        t["data_ref"] = {{"offset", aligned_offset}, {"len", len}};
-
-        json shape_arr = json::array();
-        for (auto d : tensor.shape) shape_arr.push_back(d);
-        t["shape"] = shape_arr;
-
-        inputs_json.push_back(t);
-        write_offset = aligned_offset + len;
-    }
-
-    json output_names = json::array();
-    for (const auto& name : request.output_names)
-        output_names.push_back(name);
-
+    // The backend has already placed raw input bytes in its mapping. The
+    // compact request contains only protocol metadata and shared-memory refs.
     json exec_cmd = {
         {"type",         "EXECUTE"},
         {"event_id",     event_id},
         {"model",        request.model},
-        {"inputs",       inputs_json},
-        {"output_names", output_names}
+        {"inputs",       request.inputs},
+        {"output_names", request.output_names}
     };
 
     try {

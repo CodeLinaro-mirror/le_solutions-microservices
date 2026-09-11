@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "qai_forge/backend/PredictiveSharedMemory.h"
 #include "qai_forge/dto/TensorDTOs.h"
 #include <string>
 #include <vector>
@@ -22,18 +23,16 @@ using json = nlohmann::ordered_json;
 //   Server → Worker: INIT, EXECUTE, SHUTDOWN
 //   Worker → Server: READY, RESULT, ERROR
 //
-// Tensor bytes do not travel inline in JSON. Before fork()/exec(), the parent
-// creates an anonymous memfd-backed shared-memory region (2 * per-direction
-// capacity: input half + output half) and mmaps it; the fd number and
-// per-direction byte capacity are handed to the child the same way the
-// CONV_SOCKET_FD socket is — via inherited fd + env vars (CONV_SHM_FD,
-// CONV_SHM_DIR_BYTES). EXECUTE/RESULT tensor entries carry only a
-// {"offset":..,"len":..} "data_ref" pointing into that region; the server
-// memcpy's input tensors into the input half before sending EXECUTE, and the
-// worker writes outputs directly into the output half before replying
-// RESULT. The region is fixed-size (GENAI_PREDICTIVE_SHM_BYTES per
-// direction) — a request whose tensors don't fit fails with ERROR/on_error
-// rather than falling back to inline encoding.
+// Tensor bytes do not travel inline in JSON. The backend owns an anonymous
+// memfd-backed shared-memory region (input half + output half), writes request
+// input bytes directly into it, and gives this manager a borrowed descriptor,
+// mapping, and per-direction capacity. During fork()/exec(), this manager
+// passes the inherited fd and capacity through CONV_SHM_FD and
+// CONV_SHM_DIR_BYTES. EXECUTE/RESULT tensor entries carry only a
+// {"offset":..,"len":..} "data_ref"; the worker writes outputs directly into
+// the output half before replying RESULT. The fixed capacity comes from
+// GENAI_PREDICTIVE_SHM_BYTES; oversized requests fail rather than falling back
+// to inline encoding.
 //
 // Subprocess isolation: if the worker crashes (DSP fault, OOM), the socket
 // closes, the error callback is invoked, and the next call to
@@ -49,9 +48,11 @@ public:
      * @param worker_binary  Path to the worker binary
      *                       (e.g. /usr/local/bin/qnn-inference-worker)
      * @param process_type   Human-readable type for logging ("qnn", "snpe")
+     * @param shared_memory  Backend-owned shared-memory region. It must remain
+     *                       valid for this manager's entire lifetime.
      */
-    PredictiveWorkerManager(const std::string& worker_binary,
-                               const std::string& process_type);
+    PredictiveWorkerManager(const std::string&                 worker_binary,
+                            const std::string&                 process_type);
     ~PredictiveWorkerManager();
 
     // Non-copyable
@@ -68,21 +69,29 @@ public:
      *                     For SNPE: {"model_file":..., "delegate":..., "output_tensors":[...]}
      */
     void ensureWorkerRunning(const std::string& model_id,
-                             const json&        init_params);
+                             const json&        init_params,
+                             const PredictiveSharedMemoryView& shared_memory);
+
+    void clearSharedMemory() noexcept;
 
     /**
      * Execute a Predictive AI inference request.
      * Blocks until the RESULT or ERROR response is received.
      *
+     * The request is prepared by the backend after it writes all raw input
+     * tensor bytes directly into backend-owned shared memory. `inputs` carries
+     * only tensor metadata and data_ref offsets/lengths, so the manager never
+     * receives raw input buffers.
+     *
      * @param event_id   Unique ID for this inference event
-     * @param request    Input tensors (raw bytes) + output names
+     * @param request    Compact model/request-ID/input-reference/output request
      * @param on_result  Called with the output tensors on success
      * @param on_error   Called with an error message on failure
      */
-    void executeInfer(const std::string&              event_id,
-                      const TensorInferenceRequest&   request,
-                      PredictiveResultCallback      on_result,
-                      PredictiveErrorCallback       on_error);
+    void executeInfer(const std::string&                  event_id,
+                      const PredictiveExecuteRequest&     request,
+                      PredictiveResultCallback            on_result,
+                      PredictiveErrorCallback             on_error);
 
     /**
      * Terminate the worker subprocess immediately (SIGKILL).
@@ -111,11 +120,8 @@ private:
     // multiple/partial lines without re-reading one byte at a time.
     std::string read_buf_;
 
-    // memfd-backed shared-memory region used for zero-copy tensor transport.
-    // Split into two halves of shm_dir_bytes_ each: [0, shm_dir_bytes_) is the
-    // input half (this process writes, worker reads), [shm_dir_bytes_,
-    // 2*shm_dir_bytes_) is the output half (worker writes, this process
-    // reads). Created fresh per startWorker() call.
+    // Backend-owned memfd-backed tensor transport region. The manager borrows
+    // it and never unmaps or closes it.
     void*  shm_ptr_      = nullptr;
     int    shm_fd_        = -1;
     size_t shm_dir_bytes_ = 0;
