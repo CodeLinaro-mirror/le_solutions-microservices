@@ -132,6 +132,13 @@ private:
                            McpSseEmitter* emitter,
                            int output_index_start);
 
+    // Emit the final message before any indexed content events so streaming
+    // clients can construct the corresponding output[] slot.
+    void emitFinalMessageEvents(const McpSseEmitter& emitter,
+                                const std::string& response_id,
+                                int output_index,
+                                const std::string& final_text);
+
     // Generate a unique call ID: "mcpcall_{counter}"
     std::string generateCallId();
 

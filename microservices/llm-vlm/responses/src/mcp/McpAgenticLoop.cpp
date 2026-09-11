@@ -99,6 +99,15 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
                  << call_id << " name=" << func_name
                  << " output_index=" << output_index);
 
+        auto [server_label, bare_name] = [&func_name]() {
+            auto pos = func_name.find("__");
+            if (pos == std::string::npos) {
+                return std::make_pair(std::string(""), func_name);
+            }
+            return std::make_pair(
+                func_name.substr(0, pos), func_name.substr(pos + 2));
+        }();
+
         // Parse arguments
         json arguments;
         try {
@@ -107,24 +116,28 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
             arguments = json::object();
         }
 
-        // Emit in_progress SSE event
+        // Reserve the output slot before emitting events that reference it.
         if (emitter) {
-            auto [server_label, bare_name] = [&func_name]() {
-                auto pos = func_name.find("__");
-                if (pos == std::string::npos) return std::make_pair(std::string(""), func_name);
-                return std::make_pair(func_name.substr(0, pos), func_name.substr(pos + 2));
-            }();
+            json in_progress_item = {
+                {"type",         "mcp_call"},
+                {"id",           call_id},
+                {"server_label", server_label},
+                {"name",         bare_name},
+                {"arguments",    args_str},
+                {"output",       nullptr},
+                {"error",        nullptr}
+            };
+
+            (*emitter)("response.output_item.added", {
+                {"type",         "response.output_item.added"},
+                {"output_index", output_index},
+                {"item",         in_progress_item}
+            });
 
             (*emitter)("response.mcp_call.in_progress", {
                 {"type",         "response.mcp_call.in_progress"},
                 {"output_index", output_index},
-                {"item", {
-                    {"type",         "mcp_call"},
-                    {"id",           call_id},
-                    {"server_label", server_label},
-                    {"name",         bare_name},
-                    {"arguments",    args_str}
-                }}
+                {"item",         in_progress_item}
             });
         }
 
@@ -145,6 +158,12 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
 
             (*emitter)(event_type, {
                 {"type",         event_type},
+                {"output_index", output_index},
+                {"item",         record.to_output_item()}
+            });
+
+            (*emitter)("response.output_item.done", {
+                {"type",         "response.output_item.done"},
                 {"output_index", output_index},
                 {"item",         record.to_output_item()}
             });
@@ -170,6 +189,47 @@ json McpAgenticLoop::executeToolCalls(const json& tool_calls,
     }
 
     return tool_result_messages;
+}
+
+void McpAgenticLoop::emitFinalMessageEvents(
+    const McpSseEmitter& emitter,
+    const std::string& response_id,
+    int output_index,
+    const std::string& final_text) {
+    emitter("response.output_item.added", {
+        {"type",         "response.output_item.added"},
+        {"output_index", output_index},
+        {"item", {
+            {"type",    "message"},
+            {"id",      "msg_" + response_id},
+            {"role",    "assistant"},
+            {"content", json::array()},
+            {"status",  "in_progress"}
+        }}
+    });
+
+    emitter("response.content_part.added", {
+        {"type",          "response.content_part.added"},
+        {"output_index",  output_index},
+        {"content_index", 0},
+        {"part",          {{"type", "output_text"}, {"text", ""}}}
+    });
+
+    if (!final_text.empty()) {
+        emitter("response.output_text.delta", {
+            {"type",          "response.output_text.delta"},
+            {"output_index",  output_index},
+            {"content_index", 0},
+            {"delta",         final_text}
+        });
+    }
+
+    emitter("response.output_text.done", {
+        {"type",          "response.output_text.done"},
+        {"output_index",  output_index},
+        {"content_index", 0},
+        {"text",          final_text}
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,32 +373,8 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
 
             std::string final_text = response.content.value_or("");
             int output_index = static_cast<int>(loop_result.call_records.size());
-
-            // Emit content_part.added
-            emitter("response.content_part.added", {
-                {"type",          "response.content_part.added"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"part",          {{"type", "output_text"}, {"text", ""}}}
-            });
-
-            // Emit the full text as a single delta (could be chunked in future)
-            if (!final_text.empty()) {
-                emitter("response.output_text.delta", {
-                    {"type",          "response.output_text.delta"},
-                    {"output_index",  output_index},
-                    {"content_index", 0},
-                    {"delta",         final_text}
-                });
-            }
-
-            // Emit output_text.done
-            emitter("response.output_text.done", {
-                {"type",          "response.output_text.done"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"text",          final_text}
-            });
+            emitFinalMessageEvents(
+                emitter, response_id, output_index, final_text);
 
             return loop_result;
         }
@@ -356,7 +392,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
         // Build next turn messages
         json assistant_msg = {
             {"role",       "assistant"},
-            {"content",    nullptr},
+            {"content",    ""},
             {"tool_calls", tool_calls}
         };
         loop_result.generated_messages.push_back(assistant_msg);
@@ -376,6 +412,7 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
     LOG_WARN("[McpAgenticLoop] Streaming max iterations reached: response="
              << response_id << " max_iterations=" << max_iterations_);
     current_request.tools = std::nullopt;
+    std::string final_text;
     try {
         qai_forge::GenerateOptions invoke_options = optionsForRound(
             base_options, response_id, true);
@@ -385,29 +422,18 @@ McpLoopResult McpAgenticLoop::runStreaming(const CreateChatCompletionRequest& ba
                 current_request, invoke_options);
         loop_result.generated_messages.push_back(
             makeAssistantMessage(loop_result.final_response));
-        std::string final_text = loop_result.final_response.content.value_or("");
-        int output_index = static_cast<int>(loop_result.call_records.size());
-
-        if (!final_text.empty()) {
-            emitter("response.output_text.delta", {
-                {"type",          "response.output_text.delta"},
-                {"output_index",  output_index},
-                {"content_index", 0},
-                {"delta",         final_text}
-            });
-        }
-        emitter("response.output_text.done", {
-            {"type",          "response.output_text.done"},
-            {"output_index",  output_index},
-            {"content_index", 0},
-            {"text",          final_text}
-        });
+        final_text = loop_result.final_response.content.value_or("");
     } catch (...) {
-        loop_result.final_response.content = "(Response truncated: maximum tool call iterations reached)";
+        final_text =
+            "(Response truncated: maximum tool call iterations reached)";
+        loop_result.final_response.content = final_text;
         loop_result.final_response.finish_reason = "stop";
         loop_result.generated_messages.push_back(
             makeAssistantMessage(loop_result.final_response));
     }
+
+    int output_index = static_cast<int>(loop_result.call_records.size());
+    emitFinalMessageEvents(emitter, response_id, output_index, final_text);
 
     return loop_result;
 }

@@ -1082,6 +1082,9 @@ void ResponsesController::createResponse(
                             }}
                         });
 
+                        // McpAgenticLoop emits output_item.added after the
+                        // final message's actual output index is known.
+
                         McpLoopResult loop_result;
                         bool had_error = false;
                         std::string error_msg;
@@ -1111,24 +1114,27 @@ void ResponsesController::createResponse(
                         }
 
                         if (!had_error) {
+                            std::string final_text =
+                                loop_result.final_response.content.value_or("");
+                            int output_index = static_cast<int>(
+                                loop_result.call_records.size());
+
+                            emit_event("response.output_item.done", {
+                                {"type",         "response.output_item.done"},
+                                {"output_index", output_index},
+                                {"item", {
+                                    {"type",    "message"},
+                                    {"id",      "msg_" + response_id},
+                                    {"role",    "assistant"},
+                                    {"content", {{{"type", "output_text"},
+                                                  {"text", final_text}}}},
+                                    {"status",  "completed"}
+                                }}
+                            });
+
                             json output = ResponsesUtils::build_output_array(
                                 loop_result.final_response,
                                 loop_result.call_records);
-
-                            for (std::size_t i = loop_result.call_records.size();
-                                 i < output.size();
-                                 ++i) {
-                                emit_event("response.output_item.added", {
-                                    {"type",         "response.output_item.added"},
-                                    {"output_index", i},
-                                    {"item",         output[i]}
-                                });
-                                emit_event("response.output_item.done", {
-                                    {"type",         "response.output_item.done"},
-                                    {"output_index", i},
-                                    {"item",         output[i]}
-                                });
-                            }
 
                             json response_obj = ResponsesUtils::build_response_object(
                                 response_id,
@@ -1193,7 +1199,7 @@ void ResponsesController::createResponse(
                         stream->close();
                     }
                 );
-                resp->addHeader("Content-Type", "text/event-stream");
+                resp->setContentTypeString("text/event-stream");
                 resp->addHeader("Cache-Control", "no-cache");
                 resp->addHeader("Connection", "keep-alive");
                 callback(resp);

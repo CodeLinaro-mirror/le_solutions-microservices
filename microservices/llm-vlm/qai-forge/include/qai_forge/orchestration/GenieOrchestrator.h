@@ -85,11 +85,14 @@ private:
      *   Slot 3 — Episodic summary:  rolling summary of evicted history
      *   Slot 4 — History queue:     recent turns not yet evicted, oldest-first
      *   Slot 5 — Current turn:      new user/tool messages
+     *
+     * @param has_tool_response Whether the submitted round contains tool output.
      */
     std::string buildContextPrompt(const ConversationSession& session,
                                    const CreateChatCompletionRequest& request,
                                    int thinking_budget = 0,
-                                   int answer_budget = 0) const;
+                                   int answer_budget = 0,
+                                   bool has_tool_response = false) const;
 
     StandardResponse executeBlockingPrepared(
         scheduler::GenerativeJob& job,

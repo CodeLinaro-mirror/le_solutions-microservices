@@ -311,7 +311,8 @@ void GenieOrchestrator::validateRequest(
 std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& session,
                                                    const CreateChatCompletionRequest& request,
                                                    int thinking_budget,
-                                                   int answer_budget) const {
+                                                   int answer_budget,
+                                                   bool has_tool_response) const {
     // OIP raw_prompt bypass: when the caller supplied an already-formatted
     // prompt (OIP /generate with text_input), feed it through verbatim
     // without applying the chat template. Safe to return early regardless
@@ -355,8 +356,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // the prompt and can cause smaller models to re-emit another bare tool
     // call instead of a final natural-language answer. Steer the model back
     // toward plain-language output unless it genuinely needs another tool call.
-    if (!tools.empty() && tools.is_array() &&
-        currentTurnHasToolResponse(request.messages)) {
+    if (!tools.empty() && tools.is_array() && has_tool_response) {
         prompt << system_prefix
                << "[Tool Result Received]: You already have the result of your "
                   "tool call above. Use it to answer the user's question in "
@@ -459,6 +459,8 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
 
     json post_turn_messages = complete_messages;
     CreateChatCompletionRequest prompt_request = request;
+    const bool has_tool_response =
+        currentTurnHasToolResponse(complete_messages);
     if (uses_private_memory && !is_vlm) {
         post_turn_messages = canonicalConversationMessages(complete_messages);
         if (!memoryMatchesTranscript(input_memory, post_turn_messages)) {
@@ -492,7 +494,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
 
     if (use_reasoning) {
         const std::string preliminary_prompt =
-            buildContextPrompt(session, prompt_request);
+            buildContextPrompt(session, prompt_request, 0, 0, has_tool_response);
         const std::string effort =
             request.reasoning_effort.value_or("medium");
         const ReasoningBudgetResult budget =
@@ -519,7 +521,11 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
 
     scheduler::GeniePreparedRequest prepared;
     prepared.final_prompt = buildContextPrompt(
-        session, prompt_request, thinking_budget, answer_budget);
+        session,
+        prompt_request,
+        thinking_budget,
+        answer_budget,
+        has_tool_response);
     prepared.generation.max_tokens = max_tokens;
     prepared.generation.temperature = request.temperature.value_or(1.0f);
     prepared.generation.top_p = request.top_p.value_or(1.0f);
