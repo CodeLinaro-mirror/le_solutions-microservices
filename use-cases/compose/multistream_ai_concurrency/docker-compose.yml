@@ -1,0 +1,29 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+services:
+  qimsdk:
+    image: qimsdk:latest
+    platform: arm64
+    container_name: qimsdk-multistream-ai-concurrency
+    hostname: qimsdk-multistream-ai-concurrency
+    restart: always
+    env_file:
+      - /etc/docker/env/qimsdk.env
+    command: >
+      gst-ai-stream-concurrency
+      --num-streams=${NUM_STREAMS:-4}
+      --input=${INPUT_CONFIG:-/etc/media/Draw_1080p_180s_30FPS.mp4}
+      --model=${MODEL_PATH_MULTISTREAM:-/etc/models/yolox-yolo-x-w8a8.tflite}
+      --labels=${LABELS_PATH_MULTISTREAM:-/etc/labels/yolov8n.json}
+      --confidence=${CONFIDENCE_MULTISTREAM:-51.0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - qualcomm.com/device=qimsdk
+              capabilities:
+                - hw-acc
+    network_mode: host
