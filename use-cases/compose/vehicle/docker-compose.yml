@@ -79,16 +79,6 @@ services:
     container_name: qimsdk-vehicle-detection
     hostname: qimsdk-vehicle-detection
     restart: always
-    environment:
-      - INPUT_TYPE=${INPUT_TYPE:-video}
-      - INPUT_URL=${INPUT_URL:-/etc/media/sample-videos/Street_Bridge.ts}
-      - REDIS_DETECTION_CHANNEL=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.vehicle}:0
-      - MODEL_PATH_VEHICLE=${MODEL_PATH_VEHICLE:-/etc/models/yolox-yolo-x-w8a8.tflite}
-      - MODEL_OFFSETS_VEHICLE=${MODEL_OFFSETS_VEHICLE:-<38.0,0.0,0.0>}
-      - MODEL_SCALES_VEHICLE=${MODEL_SCALES_VEHICLE:-<3.6124823093414307,0.003626860911026597,1.0>}
-      - LABELS_PATH_VEHICLE=${LABELS_PATH_VEHICLE:-/etc/labels/yolov8n.labels}
-      - REDIS_OUT_PORT=${REDIS_OUT_PORT:-6379}
-      - OUT_PORT=${OUT_PORT:-8900}
     env_file:
       - /etc/docker/env/qimsdk.env
     volumes:
@@ -96,7 +86,22 @@ services:
       - /etc/models:/etc/models
       - /etc/labels:/etc/labels
       - /etc/configs:/etc/configs
-    command: bash /etc/media/qimsdk_vehicle_detect.sh
+    command: >
+      microservices-vehicle-detection
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/Street_Bridge.ts}
+      --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8900}
+      --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
+      --model-path=${MODEL_PATH_VEHICLE:-/etc/models/yolox-yolo-x-w8a8.tflite}
+      --labels-path=${LABELS_PATH_VEHICLE:-/etc/labels/yolov8n.json}
+      --confidence=${CONFIDENCE_VEHICLE:-51.0}
+      --results=${RESULTS_VEHICLE:-30}
+      --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
+      --redis-host=${REDIS_HOST:-127.0.0.1}
+      --redis-port=${REDIS_OUT_PORT:-6379}
+      --redis-channel=${REDIS_DETECTION_CHANNEL_PREFIX:-detection.vehicle}:0
+      --webrtc-id=${WEBRTC_ID:-1010}
+      --no-display=${NO_DISPLAY_ARG:-0}
+      --no-output-overlay=${NO_OUT_OVERLAY_ARG:-0}
     deploy:
       resources:
         reservations:
