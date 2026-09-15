@@ -99,6 +99,7 @@ services:
       --webrtc-id=${WEBRTC_ID:-1010}
       --no-display=${NO_DISPLAY_ARG:-0}
       --no-output-overlay=${NO_OUT_OVERLAY_ARG:-0}
+      --no-zone-overlay=${NO_ZONE_OVERLAY_ARG:-1}
       --no-debug=${NO_DEBUG_ARG:-0}
     deploy:
       resources:
