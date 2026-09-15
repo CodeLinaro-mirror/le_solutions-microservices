@@ -89,6 +89,29 @@ TOKEN_ESTIMATION_BUFFER_RATIO = float(os.getenv("TOKEN_ESTIMATION_BUFFER_RATIO",
 # Override via DEFAULT_MAX_COMPLETION_TOKENS env variable.
 DEFAULT_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_MAX_COMPLETION_TOKENS", "512"))
 
+# Streaming tool-call detection: maximum characters to buffer while deciding
+# whether a streamed response is a potential native tool call, before giving
+# up and flushing the buffer as regular content. Must be generous enough to
+# absorb a realistic conversational preamble (e.g. "Sure, let me check that
+# for you...") that a model may emit before the actual native call marker or
+# tool name — a low threshold silently defeats tool-call detection for any
+# model that doesn't immediately open with the native marker.
+TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS = int(
+    os.getenv("TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS", "200")
+)
+
+# Force all models to use the generic OpenAI-JSON tool-calling format
+# ({"tool_calls":[{"type":"function","function":{...}}]}) instead of their
+# model-family-specific native convention (e.g. Qwen's <tool_call> XML,
+# Gemma's <|tool_call> function syntax). On-device experimentation showed
+# some models achieve better tool-calling accuracy with the more explicit,
+# verbose OpenAI JSON convention than with their own native format.
+# Default: enabled. Set to "false" to restore per-model native format
+# dispatch (via ToolHandler._get_format_adapter()'s regex-based registry).
+FORCE_GENERIC_TOOL_FORMAT = os.getenv("FORCE_GENERIC_TOOL_FORMAT", "true").lower() in (
+    "true", "1", "yes", "on"
+)
+
 # Fraction of raw image token count to use for VLM budget estimation.
 # The raw patch count (864 for a 512×342 image) may overestimate the actual tokens
 # consumed by the LLM after preprocessing optimizations (patch merging, compression).

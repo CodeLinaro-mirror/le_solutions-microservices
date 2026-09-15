@@ -251,14 +251,38 @@ class TextEventHelpers:
 
         content = getattr(session, 'system_prompt_content', None) or ""
         if not content:
-            return "You are a helpful assistant."
+            content = "You are a helpful assistant."
+
+        # Keep the response language aligned with the user's language unless
+        # the user explicitly requests a different language. This applies to
+        # ordinary answers, tool calls, and tool results on every turn.
+        language_guardrail = (
+            "\n\nResponse language rule: Always respond in the same language "
+            "as the user's message unless the user explicitly asks for a "
+            "different language. Do not switch languages on your own."
+        )
+        if language_guardrail not in content:
+            content += language_guardrail
 
         tokens = TokenCounter.estimate_tokens(content)
         if tokens <= ceiling_tokens:
             return content
 
-        # Truncate: ~3 chars per token heuristic
+        # Retain the mandatory language rule when truncating the caller's
+        # system prompt; otherwise the unconditional guardrail could be lost.
         char_limit = ceiling_tokens * 3
+        guardrail_start = content.rfind(language_guardrail)
+        if guardrail_start > 0:
+            available_prompt_chars = max(
+                char_limit - len(language_guardrail) - len(" [truncated]"),
+                0,
+            )
+            truncated = content[:available_prompt_chars]
+            logger.warning(
+                f"System prompt truncated from {tokens} to ~{ceiling_tokens} tokens"
+            )
+            return truncated + " [truncated]" + language_guardrail
+
         truncated = content[:char_limit]
         logger.warning(
             f"System prompt truncated from {tokens} to ~{ceiling_tokens} tokens"
