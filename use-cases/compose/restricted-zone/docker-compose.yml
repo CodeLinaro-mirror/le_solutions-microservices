@@ -9,8 +9,8 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ~/configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
-      - ~/configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
+      - ~/.configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ~/.configs/nginx/solutions/region-analytics-api.conf:/etc/nginx/solutions/region-analytics-api.conf
   mariadb:
     image: mariadb:11.6.2
     platform: arm64
@@ -79,18 +79,15 @@ services:
     env_file:
       - /etc/docker/env/qimsdk.env
     volumes:
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
-      - /etc/labels:/etc/labels
-      - /etc/configs:/etc/configs
+      - ${HOME}/Downloads/qimsdk_samples:/home/qimsdk/Downloads/qimsdk_samples
     command: >
       microservices-restricted-zone
-      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/rz_video.mp4}
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/home/qimsdk/Downloads/qimsdk_samples/media/rz_video.mp4}
       --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8554}
       --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
-      --model-path=${MODEL_PATH_PERSON:-/etc/models/foot_track_net_quantized.tflite}
-      --labels-path=${LABELS_PATH_PERSON:-/etc/labels/foot_track_net.json}
-      --settings-path=${SETTINGS_PATH_PERSON:-/etc/labels/foot_track_net_settings.json}
+      --model-path=${MODEL_PATH_PERSON:-/home/qimsdk/Downloads/qimsdk_samples/models/foot_track_net_quantized.tflite}
+      --labels-path=${LABELS_PATH_PERSON:-/home/qimsdk/Downloads/qimsdk_samples/labels/foot_track_net.json}
+      --settings-path=${SETTINGS_PATH_PERSON:-/home/qimsdk/Downloads/qimsdk_samples/labels/foot_track_net_settings.json}
       --restricted-zone-boundaries=${ZONE_BOUNDARIES:-"Zones,Zone1=<<960,540>,<1920,540>,<1920,1080>,<960,1080>>;"}
       --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
       --redis-host=${REDIS_HOST:-127.0.0.1}

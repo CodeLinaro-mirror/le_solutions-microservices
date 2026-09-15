@@ -9,8 +9,8 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - ~/configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
-      - ~/configs/nginx/solutions/vehicle-analytics-api.conf:/etc/nginx/solutions/vehicle-analytics-api.conf
+      - ~/.configs/nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ~/.configs/nginx/solutions/vehicle-analytics-api.conf:/etc/nginx/solutions/vehicle-analytics-api.conf
   mariadb:
     image: mariadb:11.6.2
     platform: arm64
@@ -82,17 +82,14 @@ services:
     env_file:
       - /etc/docker/env/qimsdk.env
     volumes:
-      - /etc/media:/etc/media
-      - /etc/models:/etc/models
-      - /etc/labels:/etc/labels
-      - /etc/configs:/etc/configs
+      - ${HOME}/Downloads/qimsdk_samples:/home/qimsdk/Downloads/qimsdk_samples
     command: >
       microservices-vehicle-detection
-      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/etc/media/Street_Bridge.ts}
+      --input-type=${INPUT_TYPE:-file} --input-config=${INPUT_CONFIG:-/home/qimsdk/Downloads/qimsdk_samples/media/Street_Bridge.ts}
       --output-type=${OUTPUT_TYPE:-rtsp} --output-config=${OUTPUT_CONFIG:-8900}
       --width=${WIDTH:-1920} --height=${HEIGHT:-1080} --framerate=${FRAMERATE:-30}
-      --model-path=${MODEL_PATH_VEHICLE:-/etc/models/yolox-yolo-x-w8a8.tflite}
-      --labels-path=${LABELS_PATH_VEHICLE:-/etc/labels/yolov8n.json}
+      --model-path=${MODEL_PATH_VEHICLE:-/home/qimsdk/Downloads/qimsdk_samples/models/yolox-yolo-x-w8a8.tflite}
+      --labels-path=${LABELS_PATH_VEHICLE:-/home/qimsdk/Downloads/qimsdk_samples/labels/yolov8n.json}
       --confidence=${CONFIDENCE_VEHICLE:-51.0}
       --results=${RESULTS_VEHICLE:-30}
       --enable-redis-meta=${ENABLE_REDIS_META_ARG:-1}
