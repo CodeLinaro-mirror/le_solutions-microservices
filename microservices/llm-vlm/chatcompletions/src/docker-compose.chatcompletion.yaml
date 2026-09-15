@@ -65,14 +65,6 @@ services:
       - /dev/fastrpc-cdsp1
     volumes:
       - /sys/firmware/devicetree/base/model:/run/device-model
-      - /usr/lib/dsp/cdsp/libc++.so.1:/usr/lib/dsp/cdsp/libc++.so.1
-      - /usr/lib/dsp/cdsp/libc++abi.so.1:/usr/lib/dsp/cdsp/libc++abi.so.1
-      - /usr/lib/dsp/cdsp/fastrpc_shell_3:/usr/lib/dsp/cdsp/fastrpc_shell_3
-      - /usr/lib/dsp/cdsp/fastrpc_shell_unsigned_3:/usr/lib/dsp/cdsp/fastrpc_shell_unsigned_3
-      # Uncomment the following to run the container on IQ9
-      # - /usr/lib/dsp/cdsp1/libc++.so.1:/usr/lib/dsp/cdsp1/libc++.so.1
-      # - /usr/lib/dsp/cdsp1/libc++abi.so.1:/usr/lib/dsp/cdsp1/libc++abi.so.1
-      # - /usr/lib/dsp/cdsp1/fastrpc_shell_4:/usr/lib/dsp/cdsp1/fastrpc_shell_4
-      # - /usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4:/usr/lib/dsp/cdsp1/fastrpc_shell_unsigned_4
+      - ${QCOM:-/usr/share/qcom}:${HOST_QCOM:-/run/host-qcom}:ro
       - ${GENAI_MODEL_DIR:-/etc/models/}:/mnt/work/models/
     command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:${GENAI_PORT:-9001}"]

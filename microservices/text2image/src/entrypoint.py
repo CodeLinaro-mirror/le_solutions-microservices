@@ -7,11 +7,13 @@
 #   1. Detect the real GIDs of fastrpc and dmaheap devices on the host platform
 #   2. Detect the UID/GID of the mounted models directory
 #   3. Add target user to those supplementary groups dynamically
-#   4. Drop privileges to the target user and exec the container command
+#   4. Merge the read-only host qcom config into a private, writable qcom
+#      directory (without ever writing back to the host)
+#   5. Drop privileges to the target user and exec the container command
 
 import glob
-import shutil
 import os
+import shutil
 import subprocess
 import sys
 
@@ -20,6 +22,73 @@ def get_gid(path):
         return os.stat(path).st_gid
     except FileNotFoundError:
         return None
+
+def setup_qcom_conf():
+    """
+    Build a private, writable /usr/share/qcom inside the container from the
+    read-only host mount (HOST_QCOM, default /run/host-qcom), then layer our
+    own baked fastrpc DSP config on top.
+
+    We intentionally never bind-mount /usr/share/qcom directly onto itself
+    (read-write) because that would let the container write into the host's
+    real config directory. Instead HOST_QCOM is mounted read-only, and we
+    reconstruct a container-local QCOM directory here:
+      - Top-level entries (except conf.d) are symlinked from HOST_QCOM into
+        QCOM, so any host-provided libraries/binaries remain visible.
+      - conf.d entries must be regular files -- fastrpc skips symlinks when
+        scanning conf.d -- so *.yaml/*.yml files are copied instead.
+      - Our own baked config (/etc/fastrpc/hexagon-dsp-binaries.yaml, built
+        into the image) is copied in last as 00-hexagon-dsp-binaries.yaml.
+    """
+    os.umask(0o022)
+
+    host_qcom = os.environ.get("HOST_QCOM", "/run/host-qcom")
+    qcom = os.environ.get("QCOM", "/usr/share/qcom")
+
+    try:
+        os.makedirs(os.path.join(qcom, "conf.d"), exist_ok=True)
+    except OSError as e:
+        print(f"[entrypoint] WARNING: Could not create {qcom}/conf.d: {e}", flush=True)
+        return
+
+    if os.path.isdir(host_qcom):
+        for name in os.listdir(host_qcom):
+            if name == "conf.d":
+                continue
+            src = os.path.join(host_qcom, name)
+            dst = os.path.join(qcom, name)
+            try:
+                if os.path.islink(dst) or os.path.exists(dst):
+                    if os.path.isdir(dst) and not os.path.islink(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.remove(dst)
+                os.symlink(src, dst)
+            except OSError as e:
+                print(f"[entrypoint] WARNING: Could not symlink {src} -> {dst}: {e}", flush=True)
+
+        host_confd = os.path.join(host_qcom, "conf.d")
+        if os.path.isdir(host_confd):
+            for name in os.listdir(host_confd):
+                if not name.endswith((".yaml", ".yml")):
+                    continue
+                src = os.path.join(host_confd, name)
+                if os.path.isfile(src):
+                    try:
+                        shutil.copy2(src, os.path.join(qcom, "conf.d", name))
+                    except OSError as e:
+                        print(f"[entrypoint] WARNING: Could not copy {src}: {e}", flush=True)
+    else:
+        print(f"[entrypoint] {host_qcom} not present; skipping host qcom merge.", flush=True)
+
+    fastrpc_src = "/etc/fastrpc/hexagon-dsp-binaries.yaml"
+    if os.path.isfile(fastrpc_src):
+        try:
+            dst = os.path.join(qcom, "conf.d", "00-hexagon-dsp-binaries.yaml")
+            shutil.copy2(fastrpc_src, dst)
+            print(f"[entrypoint] Deployed {fastrpc_src} -> {dst}", flush=True)
+        except OSError as e:
+            print(f"[entrypoint] WARNING: Could not deploy fastrpc config: {e}", flush=True)
 
 def main():
     print("[entrypoint] Starting Python-based group ID configuration...", flush=True)
@@ -37,13 +106,13 @@ def main():
             print(f"[entrypoint] Found {dev} owned by host GID {gid}", flush=True)
             supplementary_gids.add(gid)
 
-    # Detect GID of /usr/share/qcom (bind-mounted from host) so the process
-    # inherits the same group access as seen on the host.
-    qcom_share = "/usr/share/qcom"
-    qcom_gid = get_gid(qcom_share)
-    if qcom_gid is not None:
-        print(f"[entrypoint] Found {qcom_share} owned by host GID {qcom_gid}", flush=True)
-        supplementary_gids.add(qcom_gid)
+    # Detect GID of the read-only host qcom mount so the process inherits the
+    # same group access as seen on the host.
+    host_qcom = os.environ.get("HOST_QCOM", "/run/host-qcom")
+    host_qcom_gid = get_gid(host_qcom)
+    if host_qcom_gid is not None:
+        print(f"[entrypoint] Found {host_qcom} owned by host GID {host_qcom_gid}", flush=True)
+        supplementary_gids.add(host_qcom_gid)
 
     # 2. Detect target UID/GID from models directory, or fallback to 10000
     TARGET_UID = 10000
@@ -73,6 +142,12 @@ def main():
                 except OSError as e:
                     print(f"[entrypoint] WARNING: Could not chmod {dev_path}: {e}", flush=True)
 
+        # Merge the read-only host qcom config into our private, writable
+        # qcom directory, layering in our own baked fastrpc DSP config, while
+        # we still have root privileges.
+        setup_qcom_conf()
+
+        print(f"[entrypoint] Dropping privileges from root to UID {TARGET_UID} / GID {TARGET_GID}...", flush=True)
         try:
             os.setgroups(list(supplementary_gids))
             os.setresgid(TARGET_GID, TARGET_GID, TARGET_GID)
