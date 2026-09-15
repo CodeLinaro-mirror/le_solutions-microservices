@@ -25,6 +25,7 @@ import base64
 import asyncio
 from typing import Union, Optional, Tuple, List, Dict, Any
 
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from openapi_server.models.create_chat_completion_request import CreateChatCompletionRequest
 from openapi_server.models.create_chat_completion_response import CreateChatCompletionResponse
@@ -32,13 +33,14 @@ from openapi_server.models.chat_completion_response_message import ChatCompletio
 from openapi_server.models.create_chat_completion_response_choices_inner import CreateChatCompletionResponseChoicesInner
 from openapi_server.models.error import Error
 from openapi_server.logger.logger_config import LoggerConfig
-from openapi_server.impl.constant import Parameters
+from openapi_server.impl.constant import Parameters, TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS
 from openapi_server.session.token_counter import TokenCounter
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.utils.image_cache import get_image_cache
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.managers.metrics_manager import MetricsManager
 from openapi_server.impl.genie_wrapper.vlm_process_manager import VLMProcessManager
+from openapi_server.session.tool_handler import ToolHandler
 
 # Initialize logger
 LoggerConfig.initialize()
@@ -49,7 +51,13 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
     """Integrated VLM chat completion handler using subprocess architecture."""
 
     @staticmethod
-    def build_vlm_prompt_for_turn(messages: List, text_prompt: str, has_image: bool, model_id: str) -> str:
+    def build_vlm_prompt_for_turn(
+        messages: List,
+        text_prompt: str,
+        has_image: bool,
+        model_id: str,
+        tools: Optional[List] = None,
+    ) -> str:
         """
         Build complete VLM prompt for a single turn with proper chat template.
         Supports custom system prompts from the messages array.
@@ -85,7 +93,38 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             'content': text_prompt
         })
 
-        # Use unified builder
+        # Seed an absent system message from the model metadata before adding
+        # tools. ToolHandler's legacy no-system fallback is intentionally not
+        # used here because it would override metadata.genie.chat_template's
+        # default_system_prompt.
+        if tools and not any(
+            (
+                msg.get("role") if isinstance(msg, dict)
+                else getattr(msg, "role", None)
+            ) == "system"
+            for msg in prompt_messages
+        ):
+            template = CommonUtils.get_chat_template(model_id)
+            prompt_messages.insert(0, {
+                "role": "system",
+                "content": template.get(
+                    "default_system_prompt",
+                    "You are a helpful assistant.",
+                ),
+            })
+
+        # Tool instructions are added to the system message using the same
+        # model-family adapter as the text-only LLM path. The adapter/template
+        # remains metadata-driven through CommonUtils/ModelConfigManager.
+        if tools:
+            prompt_messages = ToolHandler.inject_tool_instructions(
+                prompt_messages,
+                tools,
+                model_id=model_id,
+            )
+
+        # Use unified builder. Vision markers are included only when an image
+        # is actually being sent with this request.
         complete_prompt = CommonUtils.build_chat_prompt(
             model_id=model_id,
             messages=prompt_messages,
@@ -309,7 +348,13 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                                        completion_callback=None,
                                        event_id: Optional[str] = None,
                                        event_state: Optional[str] = None,
-                                       event_object=None) -> Union[CreateChatCompletionResponse, StreamingResponse, Error]:
+                                       event_object=None,
+                                       prompt_override: Optional[str] = None,
+                                       image_bytes_override: Optional[bytes] = None,
+                                       stream_override: Optional[bool] = None,
+                                       max_completion_override: Optional[int] = None,
+                                       preserve_pipeline_state_override: Optional[bool] = None,
+                                       reset_after_request_override: Optional[bool] = None) -> Union[CreateChatCompletionResponse, StreamingResponse, Error]:
         """
         Main entry point for VLM chat completion using subprocess architecture.
 
@@ -339,12 +384,27 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             image_cache_key = f"{session_id}:{model_id or 'unknown-model'}"
             image_cache = get_image_cache()
 
-            # Extract image and text from current message
-            image_input, text_prompt = GenieWrapperCreateVLMChatCompletionIntegrated.extract_image_and_text_from_messages(
-                request_data.messages, raw_json
-            )
+            # Continuations can provide an already assembled prompt and image
+            # buffer. This avoids extracting text from the trailing tool
+            # message and avoids re-downloading an image.
+            if prompt_override is not None:
+                text_prompt = ""
+                image_input = None
+                preprocessed_image_bytes = image_bytes_override
+                preprocessing_time_ms = 0.0
+            else:
+                image_input, text_prompt = (
+                    GenieWrapperCreateVLMChatCompletionIntegrated
+                    .extract_image_and_text_from_messages(
+                        request_data.messages, raw_json
+                    )
+                )
+                preprocessed_image_bytes = None
+                preprocessing_time_ms = 0.0
 
-            if not text_prompt:
+            if prompt_override is not None:
+                complete_prompt = prompt_override
+            elif not text_prompt:
                 return Error(
                     code="400",
                     message="No text prompt found in the request",
@@ -352,10 +412,9 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     type=Parameters.INTERNAL_TYPE
                 )
 
-            preprocessed_image_bytes = None
-            preprocessing_time_ms = 0.0
-
-            if image_input:
+            if prompt_override is not None:
+                pass
+            elif image_input:
                 image_source_desc = GenieWrapperCreateVLMChatCompletionIntegrated._describe_image_source(image_input)
                 logger.info(f"Tier 1: Image found in current message, preprocessing from {image_source_desc}...")
                 preprocessing_start = time.time()
@@ -416,53 +475,81 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                                 type=Parameters.INTERNAL_TYPE
                             )
                     else:
-                        logger.warning(
-                            f"Tier 4: No image found in current message, cache, or history for {image_cache_key}"
-                        )
-                        return Error(
-                            code="400",
-                            message="No image found in current message or conversation history. "
-                                    "Please include an image in your request.",
-                            param=Parameters.INTERNAL_TYPE,
-                            type=Parameters.INTERNAL_TYPE
+                        # Images are optional for VLM. A request may be a
+                        # text-only turn or a follow-up after the image cache
+                        # has expired. Continue without an image buffer.
+                        logger.info(
+                            f"No image found in current message, cache, or history "
+                            f"for {image_cache_key}; continuing as text-only VLM request"
                         )
 
-            if not preprocessed_image_bytes:
-                return Error(
-                    code="400",
-                    message="Failed to resolve image data for VLM request.",
-                    param=Parameters.INTERNAL_TYPE,
-                    type=Parameters.INTERNAL_TYPE
+            # Build complete formatted prompt. Vision markers are only emitted
+            # when an image buffer will accompany the text content item.
+            if prompt_override is None:
+                complete_prompt = (
+                    GenieWrapperCreateVLMChatCompletionIntegrated
+                    .build_vlm_prompt_for_turn(
+                        messages=request_data.messages,
+                        text_prompt=text_prompt,
+                        has_image=preprocessed_image_bytes is not None,
+                        model_id=model_id,
+                        tools=getattr(request_data, "tools", None),
+                    )
                 )
-
-            # Build complete formatted prompt
-            complete_prompt = GenieWrapperCreateVLMChatCompletionIntegrated.build_vlm_prompt_for_turn(
-                messages=request_data.messages,
-                text_prompt=text_prompt,
-                has_image=True,
-                model_id=model_id
-            )
 
             # Get VLM process manager
             vlm_manager = VLMProcessManager.get_instance()
 
-            # Handle streaming vs non-streaming
-            streaming = getattr(request_data, "stream", False)
+            # A tool-enabled initial request must preserve native VLM state
+            # because the response may require a continuation. A continuation
+            # explicitly controls its own lifecycle so that it can preserve
+            # state while sending no image payload, then reset after the turn.
+            preserve_pipeline_state = (
+                preserve_pipeline_state_override
+                if preserve_pipeline_state_override is not None
+                else bool(getattr(request_data, "tools", None))
+            )
+            reset_after_request = (
+                reset_after_request_override
+                if reset_after_request_override is not None
+                else not bool(getattr(request_data, "tools", None))
+            )
 
-            # Determine max completion tokens fallback from context size
+            # Handle streaming vs non-streaming
+            streaming = (
+                stream_override
+                if stream_override is not None
+                else getattr(request_data, "stream", False)
+            )
+
+            # Determine max completion tokens fallback from context size. The
+            # event may provide an already-capped value after applying the
+            # service-level context budget.
             config_manager = ModelConfigManager()
             context_size = config_manager.get_context_size(model_id)
             default_max_completion_tokens = int(context_size * 0.5)
+            effective_max_completion_tokens = (
+                max_completion_override
+                if max_completion_override is not None
+                else (
+                    request_data.max_completion_tokens
+                    or default_max_completion_tokens
+                )
+            )
 
             if streaming:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, default_max_completion_tokens
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, effective_max_completion_tokens,
+                    preserve_pipeline_state=preserve_pipeline_state,
+                    reset_after_request=reset_after_request
                 )
             else:
                 return await GenieWrapperCreateVLMChatCompletionIntegrated._handle_non_streaming_response(
                     vlm_manager, request_data, complete_prompt, preprocessed_image_bytes,
-                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, default_max_completion_tokens
+                    session_id, preprocessing_time_ms, completion_callback, event_id, event_state, event_object, effective_max_completion_tokens,
+                    preserve_pipeline_state=preserve_pipeline_state,
+                    reset_after_request=reset_after_request
                 )
 
         except Exception as e:
@@ -486,7 +573,9 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
         event_object=None,
-        default_max_completion_tokens: int = 300
+        default_max_completion_tokens: int = 300,
+        preserve_pipeline_state: bool = False,
+        reset_after_request: bool = True
     ) -> StreamingResponse:
         """Handle streaming response using VLMProcessManager via decoupled Producer/Consumer."""
         created = int(time.time())
@@ -509,6 +598,17 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             full_response_content = []
             stream_outcome = "pending"
             stream_failure: Optional[Exception] = None
+            tools_requested = bool(getattr(request_data, "tools", None))
+            # Known tool names, used as a secondary detection signal so
+            # ordinary answers stream normally even with tools bound.
+            tool_names = {
+                getattr(getattr(tool, "function", None), "name", "").lower()
+                for tool in (getattr(request_data, "tools", None) or [])
+                if getattr(getattr(tool, "function", None), "name", "")
+            }
+            is_potential_tool_call = False
+            tool_check_buffer = []
+            tool_check_completed = not tools_requested
 
             # First chunk: role
             first_chunk = {
@@ -534,12 +634,14 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     prompt=prompt,
                     image_bytes=image_bytes,
                     streaming=True,
-                    max_tokens=request_data.max_completion_tokens or default_max_completion_tokens,
+                    max_tokens=default_max_completion_tokens,
                     temperature=request_data.temperature or 0.7,
                     top_p=request_data.top_p or 0.9,
                     top_k=getattr(request_data, "top_k", None),
                     presence_penalty=request_data.presence_penalty or 0.0,
-                    frequency_penalty=request_data.frequency_penalty or 0.0
+                    frequency_penalty=request_data.frequency_penalty or 0.0,
+                    preserve_pipeline_state=preserve_pipeline_state,
+                    reset_after_request=reset_after_request
                 ):
                     now = time.time()
                     if ttft_timestamp is None:
@@ -559,39 +661,252 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                     except Exception:
                         pass
 
-                    # Content chunk
-                    content_chunk = {
+                    # Buffer only while uncertain; once a tool-call signal
+                    # is detected keep holding, otherwise flush as content.
+                    if not tool_check_completed:
+                        tool_check_buffer.append(token)
+                        current_text = "".join(tool_check_buffer).lstrip()
+                        if current_text:
+                            adapter = ToolHandler._get_format_adapter(model)
+                            if adapter.looks_like_attempted_tool_call(current_text):
+                                is_potential_tool_call = True
+                                tool_check_completed = True
+                                logger.info(
+                                    f"VLM Event {event_id}: Potential native tool call "
+                                    "detected in stream"
+                                )
+                            elif any(name in current_text.lower() for name in tool_names):
+                                is_potential_tool_call = True
+                                tool_check_completed = True
+                                logger.info(
+                                    f"VLM Event {event_id}: Known tool name detected "
+                                    "in stream"
+                                )
+                            elif len(current_text) > TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS:
+                                is_potential_tool_call = False
+                                tool_check_completed = True
+                                for buf_token in tool_check_buffer:
+                                    chunk = {
+                                        "id": session_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": buf_token},
+                                            "finish_reason": None,
+                                            "logprobs": None,
+                                        }],
+                                    }
+                                    await token_queue.put(f"data: {json.dumps(chunk)}\n\n")
+                                tool_check_buffer = []
+                        continue
+
+                    if is_potential_tool_call:
+                        continue
+                    else:
+                        content_chunk = {
+                            "id": session_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": token},
+                                "finish_reason": None,
+                                "logprobs": None
+                            }]
+                        }
+                        await token_queue.put(f"data: {json.dumps(content_chunk)}\n\n")
+
+                final_response = "".join(full_response_content)
+                parsed_tool_calls = (
+                    ToolHandler.parse_tool_response(
+                        final_response,
+                        tools=getattr(request_data, "tools", None),
+                        model_id=model,
+                    )
+                    if is_potential_tool_call else None
+                )
+
+                if parsed_tool_calls:
+                    if event_object:
+                        event_object._is_tool_calling = True
+                        event_object._pending_tool_calls = parsed_tool_calls
+
+                        # Streaming requests bypass EventBasedChatHandler's
+                        # normal result-processing branch. Persist the
+                        # assistant tool-call message here so tool-result
+                        # continuation and chained-call hashing see the same
+                        # history as non-streaming requests.
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": parsed_tool_calls,
+                        }
+                        assistant_index = event_object.session.add_message(
+                            assistant_message
+                        )
+                        if assistant_index not in event_object.message_indices:
+                            event_object.message_indices.append(assistant_index)
+
+                        user_messages = [
+                            event_object.session.messages[idx]
+                            for idx in event_object.message_indices
+                            if idx < len(event_object.session.messages)
+                            and event_object.session.messages[idx].get("role") == "user"
+                        ]
+                        event_hash = (
+                            __import__(
+                                "openapi_server.session.conversation_utils",
+                                fromlist=["ConversationUtils"],
+                            )
+                            .ConversationUtils.calculate_hash_for_specific_messages(user_messages)
+                        )
+                        from openapi_server.managers.session_manager import SessionManager
+                        from openapi_server.impl.constant import TOOL_RESPONSE_TIMEOUT_SECONDS
+                        SessionManager.get_instance().register_tool_calling_event(
+                            event_hash, event_object.session.session_id
+                        )
+                        event_object.start_tool_response_timeout(
+                            TOOL_RESPONSE_TIMEOUT_SECONDS
+                        )
+
+                    tool_chunk = {
                         "id": session_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
                         "choices": [{
                             "index": 0,
-                            "delta": {"content": token},
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "id": tc.id,
+                                    "type": tc.type,
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                } for idx, tc in enumerate(parsed_tool_calls)]
+                            },
                             "finish_reason": None,
+                            "logprobs": None,
+                        }],
+                    }
+                    await token_queue.put(f"data: {json.dumps(tool_chunk)}\n\n")
+
+                    final_chunk = {
+                        "id": session_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls",
+                            "logprobs": None,
+                        }],
+                    }
+                    await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
+                else:
+                    # A tool call was detected but could not be parsed —
+                    # surface loudly instead of silently downgrading.
+                    if (
+                        is_potential_tool_call
+                        and not ToolHandler.is_empty_tool_response(final_response)
+                        and ToolHandler._get_format_adapter(model)
+                        .looks_like_attempted_tool_call(final_response)
+                    ):
+                        if reset_after_request is False:
+                            await vlm_manager.reset_pipeline()
+                        logger.error(
+                            f"VLM Event {event_id}: TOOL_CALL_PARSE_FAILED "
+                            f"raw_response={final_response!r}"
+                        )
+                        raise ValueError(
+                            "The model attempted a tool call but produced "
+                            "output that could not be parsed "
+                            "(tool_call_parse_failed)"
+                        )
+
+                    # Tool-enabled inference only preserves native state when
+                    # a tool continuation is actually required. If parsing
+                    # produced a normal final answer, release the preserved
+                    # pipeline state now.
+                    if tools_requested and reset_after_request is False:
+                        await vlm_manager.reset_pipeline()
+
+                    # An explicit empty tool_calls array means the model
+                    # selected no tool. Suppress the raw control JSON so
+                    # clients never see a literal '{"tool_calls":[]}' string.
+                    if ToolHandler.is_empty_tool_response(final_response):
+                        final_response = ""
+                        full_response_content = [final_response]
+
+                    if is_potential_tool_call:
+                        # Flush the buffered content now that we know it is
+                        # not (or could not be resolved as) a tool call.
+                        chunk_size = 100
+                        for i in range(0, len(final_response), chunk_size):
+                            content_chunk = {
+                                "id": session_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": final_response[i:i + chunk_size]},
+                                    "finish_reason": None,
+                                    "logprobs": None
+                                }]
+                            }
+                            await token_queue.put(f"data: {json.dumps(content_chunk)}\n\n")
+                    elif tool_check_buffer:
+                        for buf_token in tool_check_buffer:
+                            content_chunk = {
+                                "id": session_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": buf_token},
+                                    "finish_reason": None,
+                                    "logprobs": None
+                                }]
+                            }
+                            await token_queue.put(f"data: {json.dumps(content_chunk)}\n\n")
+                        tool_check_buffer = []
+
+                    final_chunk = {
+                        "id": session_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
                             "logprobs": None
                         }]
                     }
-                    await token_queue.put(f"data: {json.dumps(content_chunk)}\n\n")
+                    await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
 
-                # Final chunk with stop reason
-                final_chunk = {
-                    "id": session_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                        "logprobs": None
-                    }]
-                }
-                await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
-
-                # Append text directly to the assistant content to aid downstream processing
-                if event_object:
-                    event_object.assistant_message = "".join(full_response_content)
+                # Persist a normal streamed assistant response before the
+                # event is completed. Tool-call responses were persisted above
+                # and remain active while waiting for tool output.
+                if event_object and not parsed_tool_calls:
+                    event_object.assistant_message = final_response
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": final_response,
+                    }
+                    assistant_index = event_object.session.add_message(
+                        assistant_message
+                    )
+                    if assistant_index not in event_object.message_indices:
+                        event_object.message_indices.append(assistant_index)
 
                 await token_queue.put("data: [DONE]\n\n")
                 stream_outcome = "success"
@@ -698,6 +1013,11 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                             elif stream_outcome == "failure":
                                 logger.info(f"VLM Event {event_id}: Marking event as failed from inference producer")
                                 event_object.fail_turn(stream_failure or Exception("Stream aborted or failed"))
+                            elif getattr(event_object, "_is_tool_calling", False):
+                                logger.info(
+                                    f"VLM Event {event_id}: Tool call response received; "
+                                    "leaving event ACTIVE for tool continuation"
+                                )
                             else:
                                 logger.info(f"VLM Event {event_id}: Completing event from inference producer")
                                 event_object.complete_turn()
@@ -791,11 +1111,14 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
         event_id: Optional[str] = None,
         event_state: Optional[str] = None,
         event_object=None,
-        default_max_completion_tokens: int = 300
+        default_max_completion_tokens: int = 300,
+        preserve_pipeline_state: bool = False,
+        reset_after_request: bool = True
     ) -> Union[CreateChatCompletionResponse, Error]:
         """Handle non-streaming response using VLMProcessManager."""
         request_outcome = "pending"
         request_failure: Optional[Exception] = None
+        finish_reason = "stop"
         try:
             # Accumulate tokens from VLM process
             accumulated_content = []
@@ -811,12 +1134,14 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 prompt=prompt,
                 image_bytes=image_bytes,
                 streaming=False,
-                max_tokens=request_data.max_completion_tokens or default_max_completion_tokens,
+                max_tokens=default_max_completion_tokens,
                 temperature=request_data.temperature or 0.7,
                 top_p=request_data.top_p or 0.9,
                 top_k=getattr(request_data, "top_k", None),
                 presence_penalty=request_data.presence_penalty or 0.0,
-                frequency_penalty=request_data.frequency_penalty or 0.0
+                frequency_penalty=request_data.frequency_penalty or 0.0,
+                preserve_pipeline_state=preserve_pipeline_state,
+                reset_after_request=reset_after_request
             ):
                 now = time.time()
                 if ttft_timestamp is None:
@@ -855,17 +1180,72 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
             except Exception as metrics_err:
                 logger.error(f"VLM Event {event_id}: Failed to record non-streaming metrics: {metrics_err}")
 
-            # Build response
+            # Build response. Normalize model-native tool output into the
+            # OpenAI-compatible response shape before returning to the event
+            # layer. The event handler will keep the turn active while waiting
+            # for the external tool result.
             full_content = ''.join(accumulated_content)
-
-            message = ChatCompletionResponseMessage(
-                role="assistant",
-                content=full_content,
-                refusal=None
+            parsed_tool_calls = ToolHandler.parse_tool_response(
+                full_content,
+                tools=getattr(request_data, "tools", None),
+                model_id=request_data.model,
             )
 
+            if parsed_tool_calls:
+                message = ChatCompletionResponseMessage(
+                    role="assistant",
+                    content=None,
+                    refusal=None,
+                    tool_calls=parsed_tool_calls,
+                )
+                finish_reason = "tool_calls"
+            elif (
+                bool(getattr(request_data, "tools", None))
+                and not ToolHandler.is_empty_tool_response(full_content)
+                and ToolHandler._get_format_adapter(request_data.model)
+                .looks_like_attempted_tool_call(full_content)
+            ):
+                # Model attempted a native tool call but it couldn't be
+                # parsed — surface loudly instead of silently downgrading.
+                if reset_after_request is False:
+                    await vlm_manager.reset_pipeline()
+                logger.error(
+                    f"VLM Event {event_id}: TOOL_CALL_PARSE_FAILED "
+                    f"raw_response={full_content!r}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": (
+                            "The model attempted a tool call but produced "
+                            "output that could not be parsed."
+                        ),
+                        "type": "server_error",
+                        "code": "tool_call_parse_failed",
+                    },
+                )
+            else:
+                # A tool-enabled request may still complete without asking
+                # for a tool. In that case no continuation will occur, so
+                # release the native VLM state before returning.
+                if getattr(request_data, "tools", None) and reset_after_request is False:
+                    await vlm_manager.reset_pipeline()
+
+                # An explicit empty tool_calls array means the model selected
+                # no tool. Suppress the raw control JSON so clients never see
+                # a literal '{"tool_calls":[]}' string as the answer.
+                if ToolHandler.is_empty_tool_response(full_content):
+                    full_content = ""
+
+                message = ChatCompletionResponseMessage(
+                    role="assistant",
+                    content=full_content,
+                    refusal=None
+                )
+                finish_reason = "stop"
+
             choice = CreateChatCompletionResponseChoicesInner(
-                finish_reason="stop",
+                finish_reason=finish_reason,
                 index=0,
                 message=message,
                 logprobs=None
@@ -879,8 +1259,16 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                 choices=[choice]
             )
 
-            logger.info(f"VLM Event {event_id}: Non-streaming completed, {len(full_content)} chars")
+            logger.info(
+                f"VLM Event {event_id}: Non-streaming completed, "
+                f"{len(full_content)} chars, finish_reason={finish_reason}"
+            )
             request_outcome = "success"
+
+            # Tool-call Trip 1 must leave the event ACTIVE while the caller
+            # executes the requested tools and submits their results.
+            if finish_reason == "tool_calls":
+                return response
 
             return response
 
@@ -926,6 +1314,11 @@ class GenieWrapperCreateVLMChatCompletionIntegrated:
                         elif request_outcome == "failure":
                             logger.info(f"VLM Event {event_id}: Marking event as failed from non-streaming response")
                             event_object.fail_turn(request_failure or Exception("VLM request failed"))
+                        elif finish_reason == "tool_calls":
+                            logger.info(
+                                f"VLM Event {event_id}: Tool call response received; "
+                                "leaving event ACTIVE for tool continuation"
+                            )
                         else:
                             logger.info(f"VLM Event {event_id}: Completing event from non-streaming response")
                             event_object.complete_turn()

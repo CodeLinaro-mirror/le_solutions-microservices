@@ -68,7 +68,9 @@ class InferenceProtocol:
         frequency_penalty: float = 0.0,
         image_data_b64: Optional[str] = None,
         image_size: Optional[int] = None,
-        pipe_path: Optional[str] = None
+        pipe_path: Optional[str] = None,
+        preserve_pipeline_state: bool = False,
+        reset_after_request: bool = True
     ) -> Dict[str, Any]:
         """
         Create EXECUTE command to run inference.
@@ -84,6 +86,8 @@ class InferenceProtocol:
             frequency_penalty: Frequency penalty
             image_data_b64: Base64-encoded image data (VLM only)
             image_size: Size of image data in bytes (VLM only)
+            preserve_pipeline_state: Keep VLM image/pipeline state for a continuation
+            reset_after_request: Reset VLM pipeline after this request
 
         Returns:
             EXECUTE command dictionary
@@ -98,7 +102,9 @@ class InferenceProtocol:
             "top_p": top_p,
             "top_k": top_k,
             "presence_penalty": presence_penalty,
-            "frequency_penalty": frequency_penalty
+            "frequency_penalty": frequency_penalty,
+            "preserve_pipeline_state": preserve_pipeline_state,
+            "reset_after_request": reset_after_request
         }
 
         # Add image data for VLM

@@ -159,9 +159,18 @@ class VLMProcess:
         self.sock_file_write.write(InferenceProtocol.serialize(response))
         self.sock_file_write.flush()
 
-    def _send_error(self, event_id: Optional[str], message: str):
+    def _send_error(
+        self,
+        event_id: Optional[str],
+        message: str,
+        command_id: Optional[str] = None,
+    ):
         """Send an error response."""
-        response = InferenceProtocol.create_error_response(event_id, message)
+        response = InferenceProtocol.create_error_response(
+            event_id,
+            message,
+            command_id=command_id,
+        )
         self._send_response(response)
 
     def _handle_init(self, command: dict):
@@ -270,6 +279,8 @@ const char* vlm_get_last_error(VLMHandle handle);
             top_k = command.get("top_k", -1)
             presence_penalty = command.get("presence_penalty", 0.0)
             frequency_penalty = command.get("frequency_penalty", 0.0)
+            preserve_pipeline_state = command.get("preserve_pipeline_state", False)
+            reset_after_request = command.get("reset_after_request", True)
             pipe_path = command.get("pipe_path")
 
             # Extract image data
@@ -279,6 +290,8 @@ const char* vlm_get_last_error(VLMHandle handle);
             logger.info(f"[{event_id}] Executing VLM request")
             logger.info(f"[{event_id}]   Streaming: {streaming}")
             logger.info(f"[{event_id}]   Has image: {image_data_b64 is not None}")
+            logger.info(f"[{event_id}]   Preserve pipeline state: {preserve_pipeline_state}")
+            logger.info(f"[{event_id}]   Reset after request: {reset_after_request}")
             logger.info(f"[{event_id}]   Pipe path: {pipe_path}")
             logger.info(f"[{event_id}]   Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}")
 
@@ -330,6 +343,8 @@ const char* vlm_get_last_error(VLMHandle handle);
             CommonUtils.copy_py_int_to_c_field(self.ffi, query, 'top_k', top_k)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'presence_penalty', presence_penalty)
             CommonUtils.copy_py_float_to_c_field(self.ffi, query, 'frequency_penalty', frequency_penalty)
+            query.preserve_pipeline_state = preserve_pipeline_state
+            query.reset_after_request = reset_after_request
 
             logger.info(f"[{event_id}] Query prepared, executing VLM...")
 
@@ -384,8 +399,8 @@ const char* vlm_get_last_error(VLMHandle handle);
                             token_response = InferenceProtocol.create_token_response(event_id, content)
                             self._send_response(token_response)
 
-                    # Handle final token with finish_reason="stop"
-                    if finish_reason == "stop":
+                    # "stop" and "length" both terminate the stream
+                    if finish_reason in ("stop", "length"):
                         # Send final token content if any
                         if content:
                             if pipe_handle:
@@ -471,18 +486,27 @@ const char* vlm_get_last_error(VLMHandle handle);
                 logger.error(f"[{event_id}] Error sending READY response: {e}")
 
     def _handle_reset(self, command: dict):
-        """Handle RESET command - (No-op for VLM as it is standalone)."""
+        """Handle RESET command and clear native VLM pipeline state."""
+        command_id = command.get("command_id")
         try:
-            logger.info("VLM received RESET command, ignoring as VLM is standalone")
+            if not self.vlm_handle or not self.lib:
+                raise RuntimeError("VLM not initialized")
 
-            # Send READY response
-            response = InferenceProtocol.create_ready_response()
+            logger.info(
+                f"Resetting native VLM pipeline"
+                f"{f' for command {command_id}' if command_id else ''}"
+            )
+            self.lib.vlm_reset_pipeline(self.vlm_handle)
+
+            response = InferenceProtocol.create_ready_response(
+                command_id=command_id
+            )
             self._send_response(response)
-            logger.info("Sent READY response after ignoring reset")
+            logger.info("Sent READY response after native VLM reset")
 
         except Exception as e:
             logger.error(f"Error handling reset for VLM: {e}", exc_info=True)
-            self._send_error(None, f"Reset failed: {e}")
+            self._send_error(None, f"Reset failed: {e}", command_id=command_id)
 
     def _cleanup(self):
         """Cleanup resources."""

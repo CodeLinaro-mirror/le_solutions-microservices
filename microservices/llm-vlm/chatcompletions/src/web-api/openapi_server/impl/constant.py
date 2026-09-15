@@ -342,6 +342,15 @@ class GenieErrorMappings:
         "cannot proceed even after evicting all idle processes",
     )
 
+    # Marker string emitted by VLMObject::vlm_chat_completion_create() (see
+    # src/genai-lib/src/vlm-service.cpp) when the Genie SDK log callback
+    # detects "Context Size was exceeded" during generation. Mapped to an
+    # explicit HTTP 400 (matching OpenAI's context_length_exceeded contract)
+    # instead of falling through to a generic 500, so clients get a clear,
+    # actionable error on the turn that actually exhausted the context
+    # instead of degenerate/truncated content or an empty follow-up response.
+    CONTEXT_LENGTH_EXCEEDED_MARKER = "CONTEXT_LENGTH_EXCEEDED"
+
     @classmethod
     def extract_error_code(cls, error_string: str) -> Optional[str]:
         """Extract first known Genie SDK code found in error_string."""
@@ -371,12 +380,24 @@ class GenieErrorMappings:
         return any(pattern in error_lower for pattern in cls.SERVICE_UNAVAILABLE_PATTERNS)
 
     @classmethod
+    def is_context_length_exceeded_error(cls, error_string: str) -> bool:
+        """
+        Determine whether an error originated from VLMObject's context-exceeded
+        detection (see CONTEXT_LENGTH_EXCEEDED_MARKER / vlm-service.cpp).
+        """
+        if not error_string:
+            return False
+        return cls.CONTEXT_LENGTH_EXCEEDED_MARKER in str(error_string)
+
+    @classmethod
     def get_http_status_code(
         cls,
         error_string: str,
         default_status: int = HttpStatusCodes.INTERNAL_SERVER_ERROR,
     ) -> int:
         """Map error_string to an HTTP status while preserving non-resource defaults."""
+        if cls.is_context_length_exceeded_error(error_string):
+            return HttpStatusCodes.BAD_REQUEST
         if cls.is_service_unavailable_error(error_string):
             return HttpStatusCodes.SERVICE_UNAVAILABLE
         return default_status
@@ -387,6 +408,16 @@ class GenieErrorMappings:
         import re
         if not error_string:
             return None
+
+        if cls.is_context_length_exceeded_error(error_string):
+            # Strip the internal marker prefix, leaving the human-readable
+            # explanation that follows it (see vlm-service.cpp's throw site).
+            message = str(error_string)
+            marker = cls.CONTEXT_LENGTH_EXCEEDED_MARKER + ":"
+            idx = message.find(marker)
+            if idx != -1:
+                message = message[idx + len(marker):].strip()
+            return message
 
         for code, message in cls.MAPPINGS.items():
             if re.search(rf'\b{code}\b', str(error_string)):

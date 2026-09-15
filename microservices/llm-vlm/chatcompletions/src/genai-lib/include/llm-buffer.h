@@ -82,6 +82,10 @@ typedef struct {
     float seed;
     float presence_penalty;
     float frequency_penalty;
+
+    /* VLM turn lifecycle controls. These are ignored by LLM callers. */
+    bool preserve_pipeline_state;
+    bool reset_after_request;
 } Query;
 
 typedef struct {

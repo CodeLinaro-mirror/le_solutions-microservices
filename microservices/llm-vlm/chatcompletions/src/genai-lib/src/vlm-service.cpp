@@ -21,6 +21,15 @@
 #include <cstdlib>  // For std::getenv
 #include <cstdarg>  // For va_list, vsnprintf
 
+// Tracks the VLMObject that is currently executing a request, so the free
+// function customGenieLogCallback (bound to the Genie SDK logger, which has
+// no per-call userData parameter) can flag SDK-detected conditions such as
+// "Context Size was exceeded" back onto the owning object. Safe because VLM
+// execution is fully serialized (one subprocess handles one request at a
+// time via VLMProcessManager's async lock on the Python side), and there is
+// only ever one VLMObject instance alive per subprocess.
+static VLMObject* g_activeVlmObject = nullptr;
+
 static void customGenieLogCallback(
     const _GenieLog_Handle_t* handle,
     const char* format,
@@ -48,6 +57,20 @@ static void customGenieLogCallback(
 
     std::fprintf(stdout, "[GenIE-SDK] [%s] %s\n", levelStr, buffer);
     std::fflush(stdout);
+
+    // Detect "Context Size was exceeded" (and similar wording) so the
+    // caller can convert an otherwise-silent degenerate/truncated
+    // generation into an explicit error returned to the client, instead of
+    // returning partial/degenerate content or (on the following request)
+    // an empty response.
+    if (g_activeVlmObject && buffer[0] != '\0') {
+        std::string lower(buffer);
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("context") != std::string::npos &&
+            lower.find("exceed") != std::string::npos) {
+            g_activeVlmObject->contextExceeded = true;
+        }
+    }
 }
 
 Log::Log(GenieLog_Level_t logLevel) {
@@ -737,12 +760,27 @@ void VLMObject::vlm_chat_completion_create() {
         throw std::runtime_error("VLMObject query not initialized.");
     }
 
-    // Clear previous image data to ensure fresh state for each
-    // request. This prevents stale image data from previous
-    // requests
-    currentImageData.clear();
-    std::cout << "[VLMObject::vlm_chat_completion_create] "
-              << "Cleared previous image data buffer" << std::endl;
+    // Reset per-request state used for context-exceeded detection (via the
+    // log callback) and client-side max_completion_tokens enforcement
+    // (via textOutputCallback, since GenieNode/GeniePipeline expose no
+    // dialog-level setMaxNumTokens()/abort() equivalent for node pipelines).
+    contextExceeded = false;
+    emittedTokenCount = 0;
+    lengthLimitReached = false;
+    g_activeVlmObject = this;
+
+    // Keep the image and pipeline state alive across tool-calling trips.
+    // A continuation may intentionally omit the image content item while
+    // reusing the image already installed on the image encoder node.
+    if (!query->preserve_pipeline_state) {
+        currentImageData.clear();
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Cleared previous image data buffer" << std::endl;
+    } else {
+        std::cout << "[VLMObject::vlm_chat_completion_create] "
+                  << "Preserving image/pipeline state for continuation"
+                  << std::endl;
+    }
 
     // Check if Sampling Parameters are used
     if (query->temperature != 1 || query->top_p != 1 ||
@@ -924,45 +962,68 @@ void VLMObject::vlm_chat_completion_create() {
         execution_error = std::current_exception();
     }
 
-    // Always attempt to reset pipeline state, even on error
-    try {
-        pipeline->reset();
-        std::cout << "Pipeline reset completed successfully"
-                  << std::endl;
+    // Reset only when this request completes the full turn, or after an
+    // error. Tool-call trip 1 sets reset_after_request=false so the image
+    // and native pipeline state survive into the continuation trip.
+    if (query->reset_after_request || !execution_succeeded) {
+        try {
+            pipeline->reset();
+            std::cout << "Pipeline reset completed successfully"
+                      << std::endl;
 
-        // Add delay to ensure hardware resources (DSP/NPU) are
-        // fully released
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cout << "Hardware stabilization delay completed, "
-                  << "ready for next request" << std::endl;
+            // Add delay to ensure hardware resources (DSP/NPU) are
+            // fully released
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::cout << "Hardware stabilization delay completed, "
+                      << "ready for next request" << std::endl;
 
-        if (!execution_succeeded) {
-            std::cout << "Pipeline reset completed after "
-                      << "execution failure" << std::endl;
-        }
-    } catch (const std::exception& e) {
-        std::cout << "ERROR: Failed to reset pipeline: "
-                  << e.what() << std::endl;
+            if (!execution_succeeded) {
+                std::cout << "Pipeline reset completed after "
+                          << "execution failure" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "ERROR: Failed to reset pipeline: "
+                      << e.what() << std::endl;
 
-        if (!execution_succeeded) {
-            // Both execution and reset failed - critical state
-            throw std::runtime_error(
-                "Pipeline in inconsistent state: execution "
-                "failed and reset failed. Pipeline may need to "
-                "be recreated.");
-        } else {
-            // Execution succeeded but reset failed - warn but
-            // don't fail the request
-            std::cout << "WARNING: Request completed but pipeline "
-                      << "reset failed. Next request may encounter "
-                      << "issues." << std::endl;
+            if (!execution_succeeded) {
+                // Both execution and reset failed - critical state
+                throw std::runtime_error(
+                    "Pipeline in inconsistent state: execution "
+                    "failed and reset failed. Pipeline may need to "
+                    "be recreated.");
+            } else {
+                // Execution succeeded but reset failed - warn but
+                // don't fail the request
+                std::cout << "WARNING: Request completed but pipeline "
+                          << "reset failed. Next request may encounter "
+                          << "issues." << std::endl;
+            }
         }
     }
 
     // Re-throw execution error if one occurred
     if (execution_error) {
+        g_activeVlmObject = nullptr;
         std::rethrow_exception(execution_error);
     }
+
+    // If the SDK log callback detected "Context Size was exceeded" during
+    // this request, surface it as an explicit error instead of silently
+    // returning degenerate/truncated content. This also prevents the
+    // subsequent request on this subprocess from receiving an empty
+    // response, since the client will now see a clear error on the turn
+    // that actually exhausted the context and is expected to start a new
+    // conversation (which will use a fresh session/subprocess as needed).
+    if (contextExceeded) {
+        contextExceeded = false;
+        g_activeVlmObject = nullptr;
+        throw std::runtime_error(
+            "CONTEXT_LENGTH_EXCEEDED: The conversation exceeded the "
+            "model's context window and generation was stopped. Please "
+            "start a new conversation.");
+    }
+
+    g_activeVlmObject = nullptr;
 }
 
 /*--------------------------------------------------------------------
@@ -1009,35 +1070,82 @@ Genie_Status_t VLMObject::textOutputCallback(
                   << isEndOfSentence << ", isEndOfStream: "
                   << isEndOfStream << std::endl;
 
-        // Per-token callback: use lightweight TokenResponse
-        if (responseStr && !isEndOfSentence) {
-            if (udata->vlmObj->tokenCallback) {
+        // Enforce query->max_completion_tokens at the callback layer.
+        // GenieNode/GeniePipeline expose no equivalent to
+        // GenieDialog_setMaxNumTokens()/GenieDialog_signal(ABORT) for
+        // node-pipeline based (VLM) execution, so the underlying SDK
+        // continues generating internally even past this limit and there
+        // is no safe way to abort it early: VLMUserData (and the
+        // cv/mtx/request_in_progress it points to) is stack-allocated in
+        // vlm_chat_completion_create() and MUST remain valid for as long as
+        // the SDK might still invoke this callback. Signalling completion
+        // before the SDK's genuine end-of-stream would let
+        // vlm_chat_completion_create() return and its stack frame be reused
+        // while the SDK is still calling back into it — a dangling-pointer
+        // use-after-return.
+        //
+        // Instead, we only suppress *forwarding* tokens to the client once
+        // the limit is reached, and still wait for the SDK's real
+        // isEndOfStream before unblocking the waiting thread. When that
+        // real end-of-stream arrives, we report finish_reason="length"
+        // instead of "stop" if the limit was hit, matching standard OpenAI
+        // truncation semantics from the client's point of view. The
+        // trade-off is that the client only receives the length-truncated
+        // response once the underlying (unbounded) generation actually
+        // finishes — this still fixes token-count correctness, though not
+        // wall-clock latency, which is documented as a known limitation.
+        VLMObject* vlmObj = udata->vlmObj;
+        int maxTokens = vlmObj->query ? vlmObj->query->max_completion_tokens : 0;
+
+        if (!vlmObj->lengthLimitReached && !isEndOfSentence && responseStr) {
+            vlmObj->emittedTokenCount++;
+        }
+
+        if (!vlmObj->lengthLimitReached && maxTokens > 0 &&
+            vlmObj->emittedTokenCount >= maxTokens && !isEndOfSentence) {
+            vlmObj->lengthLimitReached = true;
+            std::cout << "[textOutputCallback] max_completion_tokens ("
+                      << maxTokens << ") reached after "
+                      << vlmObj->emittedTokenCount
+                      << " tokens; suppressing further token forwarding "
+                      << "until the SDK's genuine end-of-stream is reached"
+                      << std::endl;
+        }
+
+        // Per-token callback: use lightweight TokenResponse.
+        // Suppressed once the length limit has been reached.
+        if (responseStr && !isEndOfSentence && !vlmObj->lengthLimitReached) {
+            if (vlmObj->tokenCallback) {
                 std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
-                strlcpy(token->id, udata->vlmObj->id, sizeof(token->id));
-                strlcpy(token->model, udata->vlmObj->modelSelected, sizeof(token->model));
+                strlcpy(token->id, vlmObj->id, sizeof(token->id));
+                strlcpy(token->model, vlmObj->modelSelected, sizeof(token->model));
                 strlcpy(token->content, responseStr, sizeof(token->content));
                 token->finish_reason[0] = '\0';  // Empty for intermediate tokens
 
-                udata->vlmObj->tokenCallback(token.get());
+                vlmObj->tokenCallback(token.get());
             } else {
                 std::cout << "[textOutputCallback] WARNING: tokenCallback is null, token lost!" << std::endl;
             }
         }
 
-        // Send final token with finish_reason
+        // Send final token with finish_reason once the SDK genuinely ends
+        // the sentence. Report "length" instead of "stop" if we suppressed
+        // tokens past the client-requested max_completion_tokens limit.
         if (isEndOfSentence) {
-            if (udata->vlmObj->tokenCallback) {
+            if (vlmObj->tokenCallback) {
                 std::unique_ptr<TokenResponse> token = std::make_unique<TokenResponse>();
-                strlcpy(token->id, udata->vlmObj->id, sizeof(token->id));
-                strlcpy(token->model, udata->vlmObj->modelSelected, sizeof(token->model));
-                if (responseStr) {
+                strlcpy(token->id, vlmObj->id, sizeof(token->id));
+                strlcpy(token->model, vlmObj->modelSelected, sizeof(token->model));
+                if (!vlmObj->lengthLimitReached && responseStr) {
                     strlcpy(token->content, responseStr, sizeof(token->content));
                 } else {
                     token->content[0] = '\0';
                 }
-                strlcpy(token->finish_reason, "stop", sizeof(token->finish_reason));
+                strlcpy(token->finish_reason,
+                        vlmObj->lengthLimitReached ? "length" : "stop",
+                        sizeof(token->finish_reason));
 
-                udata->vlmObj->tokenCallback(token.get());
+                vlmObj->tokenCallback(token.get());
             } else {
                 std::cout << "[textOutputCallback] WARNING: tokenCallback is null, final token lost!" << std::endl;
             }

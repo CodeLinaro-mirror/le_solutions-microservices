@@ -69,11 +69,17 @@ class VLMProcessManager(InferenceProcessManager):
         )
 
     def _send_reset_and_wait(self):
-        """
-        Override to prevent sending RESET command.
-        VLM is standalone by nature and does not support/need KV cache resets.
-        """
-        logger.info("VLM does not support/need reset. Skipping.")
+        """Reset the native VLM pipeline and wait for its READY response."""
+        logger.info("Resetting native VLM pipeline state")
+        super()._send_reset_and_wait()
+
+    async def reset_pipeline(self):
+        """Serialize and asynchronously reset the native VLM pipeline."""
+        if not hasattr(self, '_async_lock'):
+            self._async_lock = asyncio.Lock()
+
+        async with self._async_lock:
+            await asyncio.to_thread(self._send_reset_and_wait)
 
     def _create_execute_command(
         self,
@@ -92,6 +98,8 @@ class VLMProcessManager(InferenceProcessManager):
         # Extract VLM-specific parameters
         image_data_b64 = kwargs.get('image_data_b64')
         image_size = kwargs.get('image_size')
+        preserve_pipeline_state = kwargs.get('preserve_pipeline_state', False)
+        reset_after_request = kwargs.get('reset_after_request', True)
 
         return InferenceProtocol.create_execute_command(
             event_id=event_id,
@@ -104,7 +112,9 @@ class VLMProcessManager(InferenceProcessManager):
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             image_data_b64=image_data_b64,
-            image_size=image_size
+            image_size=image_size,
+            preserve_pipeline_state=preserve_pipeline_state,
+            reset_after_request=reset_after_request
         )
 
     async def execute_request(
@@ -121,7 +131,9 @@ class VLMProcessManager(InferenceProcessManager):
         top_p: float = 0.9,
         top_k: int = -1,
         presence_penalty: float = 0.0,
-        frequency_penalty: float = 0.0
+        frequency_penalty: float = 0.0,
+        preserve_pipeline_state: bool = False,
+        reset_after_request: bool = True
     ) -> AsyncGenerator[str, None]:
         """
         Execute VLM request and stream tokens.
@@ -140,6 +152,8 @@ class VLMProcessManager(InferenceProcessManager):
             top_k: Top-k sampling
             presence_penalty: Presence penalty
             frequency_penalty: Frequency penalty
+            preserve_pipeline_state: Preserve VLM state for a continuation
+            reset_after_request: Reset VLM state after this request
 
         Yields:
             Generated tokens
@@ -156,8 +170,16 @@ class VLMProcessManager(InferenceProcessManager):
             config_path = CommonUtils.get_model_config_path(model)
             sampler_config = SAMPLER_CONFIG_PATH
 
-            # Ensure process is running with correct model/session
-            await self._ensure_process_running(model, config_path, sampler_config, session_id)
+            # Ensure process is running with correct model/session. A
+            # continuation must not perform an automatic pre-execution reset,
+            # otherwise the native image/pipeline state from trip 1 is lost.
+            await self._ensure_process_running(
+                model,
+                config_path,
+                sampler_config,
+                session_id,
+                preserve_pipeline_state=preserve_pipeline_state,
+            )
 
             # Encode image data if provided
             image_data_b64 = None
@@ -177,19 +199,26 @@ class VLMProcessManager(InferenceProcessManager):
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 image_data_b64=image_data_b64,
-                image_size=image_size
+                image_size=image_size,
+                preserve_pipeline_state=preserve_pipeline_state,
+                reset_after_request=reset_after_request
             )
 
-            # Execute and yield tokens
+            # Execute and yield tokens. A failed request must always reset
+            # native state, even when the successful path is preserving state
+            # for a tool continuation.
+            request_succeeded = False
             try:
                 async for token in self._execute_request_internal(event_id, execute_cmd):
                     yield token
+                request_succeeded = True
             finally:
-                from openapi_server.impl.constant import ADHOC_MODE
-                if ADHOC_MODE:
-                    logger.info("ADHOC_MODE: Launching eager background RESET task to hide latency for next request")
-                    self._eager_reset_task = asyncio.create_task(asyncio.to_thread(self._send_reset_and_wait))
-                    self._just_eager_reset = True
+                if reset_after_request or not request_succeeded:
+                    logger.info(
+                        f"Event {event_id}: Resetting VLM pipeline after "
+                        f"{'successful' if request_succeeded else 'failed'} request"
+                    )
+                    await asyncio.to_thread(self._send_reset_and_wait)
 
     async def _execute_request_internal(
         self,
