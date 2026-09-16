@@ -25,8 +25,7 @@ struct ChatSession {
     std::string active_job_id;           // Current qai-forge job ID (if any)
 
     // Hash-based lookup keys (for stateless session identification)
-    std::string continuation_hash;       // For next-turn lookup
-    std::string retry_candidate_hash;    // For idempotent retry
+    std::string continuation_hash;       // Hash of all complete pairs — for next-turn and retry lookup
     std::string tool_call_hash;          // For tool response submission
 
     // Tool calling state

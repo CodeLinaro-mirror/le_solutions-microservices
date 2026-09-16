@@ -34,7 +34,16 @@ std::string hashSpecificMessages(const json& messages, bool debug) {
             }
         }
 
-        conversation_str += role + ":" + content + tool_calls_info + "|";
+        // Exclude assistant content from hash. The client cannot be expected
+        // to reproduce the exact bytes the server generated. Only the role
+        // marker is included so turn structure is captured.
+        // user/system/tool content IS included because those come from the
+        // client and must match exactly for the conversation to be the same.
+        if (role == "assistant") {
+            conversation_str += "assistant:" + tool_calls_info + "|";
+        } else {
+            conversation_str += role + ":" + content + tool_calls_info + "|";
+        }
     }
 
     if (debug) {
@@ -235,10 +244,12 @@ std::vector<MessagePair> identifyCompletePairs(const json& messages) {
                             break;
                         }
                     }
-                }
-            }
 
-            pairs.push_back(pair);
+                    // Only count as complete pair if it has an assistant response
+                    pairs.push_back(pair);
+                }
+                // user without assistant response is the current (incomplete) turn, skip
+            }
         } else {
             ++i;
         }

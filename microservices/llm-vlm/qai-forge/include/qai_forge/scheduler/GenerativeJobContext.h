@@ -62,6 +62,7 @@ struct LiteRTLMPreparedRequest {
     json messages = json::array();
     json tools = json::array();
     GenerationConfig generation;
+    bool kv_invalidated = false;  // true when context eviction occurred — worker must reset KV
 };
 
 using PreparedGenerativeRequest =

@@ -97,6 +97,13 @@ public:
     ModelPoolSnapshot snapshot() const;
     void stop(bool force = false);
 
+    /**
+     * Broadcast clearSession(session_id) to the backend of every resident
+     * ModelRuntime. Intended for LiteRT-LM Conversation API cleanup; all
+     * other backends ignore it (default no-op in IGenerativeBackend).
+     */
+    void clearSession(const std::string& session_id);
+
 private:
     struct RuntimeRecord {
         std::unique_ptr<ModelRuntime> runtime;

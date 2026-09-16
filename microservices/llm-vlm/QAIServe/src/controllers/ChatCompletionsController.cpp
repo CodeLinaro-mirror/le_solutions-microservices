@@ -265,7 +265,6 @@ void ChatCompletionsController::handleStreamingRequest(
                     *accumulated_content = *final_response.content;
                 }
 
-                // Build assistant message
                 json assistant_msg = {
                     {"role", "assistant"},
                     {"content", *accumulated_content}
@@ -470,7 +469,6 @@ void ChatCompletionsController::handleNonStreamingRequest(
             })},
             {"usage", usage_obj}
         };
-
         auto resp = HttpResponse::newHttpResponse();
         resp->setBody(response_json.dump());
         resp->setContentTypeCode(CT_APPLICATION_JSON);
@@ -536,6 +534,9 @@ void ChatCompletionsController::deleteChatCompletion(
         if (!session->active_job_id.empty()) {
             qai_forge::QaiForge::getInstance().cancel(session->active_job_id);
         }
+
+        // Release per-session Conversation API state in LiteRT-LM workers
+        qai_forge::QaiForge::getInstance().clearSession(completion_id);
 
         // Delete session
         store_->deleteSession(completion_id);

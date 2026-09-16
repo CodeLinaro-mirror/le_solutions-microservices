@@ -43,6 +43,7 @@ public:
      * scheduler-owned instances. Each ModelRuntime owns its own LiteRTLMBackend.
      */
     LiteRTLMBackend();
+    ~LiteRTLMBackend() override;
 
     /**
      * Legacy singleton accessor — kept for backward compatibility with
@@ -104,20 +105,22 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) override;
 
-    void generateStructured(
+    void generate(
         const std::string& event_id,
-        const json& messages,
-        const json& tools,
-        bool streaming,
-        int max_tokens,
-        float temperature,
-        float top_p,
-        int top_k,
-        float presence_penalty,
-        float frequency_penalty,
-        std::function<void(const IPCTokenEvent&)> on_token,
-        std::function<void(const IPCDoneEvent&)> on_done,
-        std::function<void(const IPCErrorEvent&)> on_error);
+        const std::string& session_id,
+        const std::string& prompt,
+        bool               streaming,
+        int                max_tokens,
+        float              temperature,
+        float              top_p,
+        int                top_k,
+        float              presence_penalty,
+        float              frequency_penalty,
+        bool               use_reasoning,
+        std::function<void(const IPCTokenEvent&)>  on_token,
+        std::function<void(const IPCDoneEvent&)>   on_done,
+        std::function<void(const IPCErrorEvent&)>  on_error,
+        bool               kv_invalidated = false) override;
 
     /**
      * VLM inference — not supported by LiteRT-LM (LLM-only backend).
@@ -157,6 +160,7 @@ public:
     void saveKv(const std::string& name)    override;
     void restoreKv(const std::string& name) override;
     void resetKv()                          override;
+    void clearSession(const std::string& session_id) override;
 
     /**
      * Terminate the worker subprocess.

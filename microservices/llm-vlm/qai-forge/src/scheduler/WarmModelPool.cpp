@@ -388,6 +388,17 @@ ModelPoolSnapshot WarmModelPool::snapshot() const {
     return snapshotLocked();
 }
 
+void WarmModelPool::clearSession(const std::string& session_id) {
+    // No mutex needed — ModelRuntime::clearSession() is lock-free on the
+    // backend side; runtimes_ is not modified here.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [model_id, record] : runtimes_) {
+        if (record.runtime) {
+            record.runtime->clearSession(session_id);
+        }
+    }
+}
+
 ModelPoolSnapshot WarmModelPool::snapshotLocked() const {
 
     ModelPoolSnapshot snapshot;

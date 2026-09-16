@@ -113,7 +113,8 @@ services:
 
       # LiteRT-LM generative AI worker (LLM inference via LiteRT-LM on Qualcomm NPU)
       - LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
-      - LITERT_LM_BACKEND=${LITERT_LM_BACKEND:-npu}
+      - LITERT_LM_BACKEND=${LITERT_LM_BACKEND:-cpu}
+      - LITERT_LM_DISPATCH_LIB_DIR=${LITERT_LM_DISPATCH_LIB_DIR:-/usr/lib}
 
     volumes:
       # fastrpc reads the device model name from this file to select the

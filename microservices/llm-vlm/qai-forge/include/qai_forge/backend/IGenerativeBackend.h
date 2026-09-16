@@ -123,6 +123,30 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) = 0;
 
+    // Overload with session_id and kv_invalidated for cross-request KV cache.
+    // Default falls back to stateless generate().
+    virtual void generate(
+        const std::string& event_id,
+        const std::string& session_id,
+        const std::string& prompt,
+        bool               streaming,
+        int                max_tokens,
+        float              temperature,
+        float              top_p,
+        int                top_k,
+        float              presence_penalty,
+        float              frequency_penalty,
+        bool               use_reasoning,
+        std::function<void(const IPCTokenEvent&)>  on_token,
+        std::function<void(const IPCDoneEvent&)>   on_done,
+        std::function<void(const IPCErrorEvent&)>  on_error,
+        bool               kv_invalidated = false) {
+        (void)session_id; (void)kv_invalidated;
+        generate(event_id, prompt, streaming, max_tokens, temperature,
+                 top_p, top_k, presence_penalty, frequency_penalty,
+                 use_reasoning, on_token, on_done, on_error);
+    }
+
     /**
      * Run vision-language (VLM) inference.
      *
@@ -195,6 +219,13 @@ public:
     virtual void saveKv(const std::string& name)    { (void)name; }
     virtual void restoreKv(const std::string& name) { (void)name; }
     virtual void resetKv()                          {}
+
+    /**
+     * Release per-session KV state in the worker.
+     * Called when a chat session ends so the worker can free g_kv_sessions entries.
+     * Default is a no-op — only LiteRTLMBackend overrides this.
+     */
+    virtual void clearSession(const std::string& /*session_id*/) {}
 
     /**
      * Terminate the worker subprocess.

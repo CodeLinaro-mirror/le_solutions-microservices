@@ -36,14 +36,14 @@ using json = nlohmann::ordered_json;
 
 // ── Command types (Server → Worker) ──────────────────────────────────────────
 namespace CommandType {
-    constexpr const char* INIT       = "INIT";
-    constexpr const char* EXECUTE    = "EXECUTE";
-    constexpr const char* RESET      = "RESET";
-    constexpr const char* SAVE_KV    = "SAVE_KV";
-    constexpr const char* RESTORE_KV = "RESTORE_KV";
-    constexpr const char* SHUTDOWN   = "SHUTDOWN";
+    constexpr const char* INIT          = "INIT";
+    constexpr const char* EXECUTE       = "EXECUTE";
+    constexpr const char* RESET         = "RESET";
+    constexpr const char* SAVE_KV       = "SAVE_KV";
+    constexpr const char* RESTORE_KV    = "RESTORE_KV";
+    constexpr const char* SHUTDOWN      = "SHUTDOWN";
+    constexpr const char* CLEAR_SESSION = "CLEAR_SESSION";
 }
-
 // ── Response types (Worker → Server) ─────────────────────────────────────────
 namespace ResponseType {
     constexpr const char* READY = "READY";
@@ -122,8 +122,10 @@ public:
                                       int top_k = 40,
                                       float presence_penalty = 0.0f,
                                       float frequency_penalty = 0.0f,
-                                      bool bypass_think_filter = false) {
-        return {
+                                      bool bypass_think_filter = false,
+                                      const std::string& session_id = "",
+                                      bool kv_invalidated = false) {
+        json cmd = {
             {"type", CommandType::EXECUTE},
             {"event_id", event_id},
             {"prompt_ref", prompt_ref},
@@ -134,10 +136,15 @@ public:
             {"top_k", top_k},
             {"presence_penalty", presence_penalty},
             {"frequency_penalty", frequency_penalty},
-            // Section 4.C: bypass_think_filter=true passes raw <think> tokens
-            // to Layer 2's ReasoningRouter instead of filtering them in C++.
             {"bypass_think_filter", bypass_think_filter}
         };
+        if (!session_id.empty()) {
+            cmd["session_id"] = session_id;
+        }
+        if (kv_invalidated) {
+            cmd["kv_invalidated"] = true;
+        }
+        return cmd;
     }
 
     static json createStructuredExecuteCommand(
@@ -194,6 +201,16 @@ public:
 
     static json createShutdownCommand() {
         return {{"type", CommandType::SHUTDOWN}};
+    }
+
+    static json createClearSessionCommand(const std::string& session_id,
+                                           const std::string& command_id = "") {
+        json cmd = {
+            {"type",       CommandType::CLEAR_SESSION},
+            {"session_id", session_id}
+        };
+        if (!command_id.empty()) cmd["command_id"] = command_id;
+        return cmd;
     }
 
     // ── Response parsers ──────────────────────────────────────────────────────

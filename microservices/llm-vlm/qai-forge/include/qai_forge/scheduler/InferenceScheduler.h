@@ -126,6 +126,8 @@ public:
                           std::function<void()> task);
     CancelResult cancel(const std::string& job_id);
 
+    void clearSession(const std::string& session_id);
+
     bool openToolLease(const std::string& model_id,
                        const std::string& chain_id,
                        std::chrono::milliseconds ttl);

@@ -48,44 +48,24 @@ std::string ChatCompletionStore::generateUUID() {
 }
 
 void ChatCompletionStore::registerHashMappings(ChatSession& session) {
-    // Register continuation hash
     if (!session.continuation_hash.empty()) {
         hash_to_completion_id_[session.continuation_hash] = session.completion_id;
     }
-
-    // Register retry candidate hash
-    if (!session.retry_candidate_hash.empty()) {
-        hash_to_completion_id_[session.retry_candidate_hash] = session.completion_id;
-    }
-
-    // Register tool call hash
     if (!session.tool_call_hash.empty()) {
         hash_to_completion_id_[session.tool_call_hash] = session.completion_id;
     }
-
-    // Register job ID mapping
     if (!session.active_job_id.empty()) {
         job_to_completion_id_[session.active_job_id] = session.completion_id;
     }
 }
 
 void ChatCompletionStore::unregisterHashMappings(const ChatSession& session) {
-    // Unregister continuation hash
     if (!session.continuation_hash.empty()) {
         hash_to_completion_id_.erase(session.continuation_hash);
     }
-
-    // Unregister retry candidate hash
-    if (!session.retry_candidate_hash.empty()) {
-        hash_to_completion_id_.erase(session.retry_candidate_hash);
-    }
-
-    // Unregister tool call hash
     if (!session.tool_call_hash.empty()) {
         hash_to_completion_id_.erase(session.tool_call_hash);
     }
-
-    // Unregister job ID mapping
     if (!session.active_job_id.empty()) {
         job_to_completion_id_.erase(session.active_job_id);
     }
@@ -112,28 +92,18 @@ std::pair<ChatSession*, bool> ChatCompletionStore::findOrCreateSession(
         }
     }
 
-    // Step 2: Check retry candidate hash (idempotent retry)
-    // Hash of ALL complete pairs - matches if client resends exact same request
-    std::string retry_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
-    if (!retry_hash.empty()) {
-        auto hash_it = hash_to_completion_id_.find(retry_hash);
+    // Step 2: Check session hash
+    // Hash of all complete user/assistant pairs in messages.
+    // Matches both idempotent retries (same messages) and next-turn continuations
+    // (new messages appended after a completed turn), since the new user message
+    // does not form a complete pair and is excluded from the hash.
+    std::string session_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
+    if (!session_hash.empty()) {
+        auto hash_it = hash_to_completion_id_.find(session_hash);
         if (hash_it != hash_to_completion_id_.end()) {
             auto& session = sessions_[hash_it->second];
             session.last_accessed = std::chrono::steady_clock::now();
-            LOG_DEBUG << "Found session by retry candidate hash: " << retry_hash;
-            return {&session, false};
-        }
-    }
-
-    // Step 3: Check continuation hash (next turn)
-    // Hash excluding last pair - matches if client adds a new user message
-    std::string continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
-    if (!continuation_hash.empty()) {
-        auto hash_it = hash_to_completion_id_.find(continuation_hash);
-        if (hash_it != hash_to_completion_id_.end()) {
-            auto& session = sessions_[hash_it->second];
-            session.last_accessed = std::chrono::steady_clock::now();
-            LOG_DEBUG << "Found session by continuation hash: " << continuation_hash;
+            LOG_DEBUG << "Found session by hash: " << session_hash;
             return {&session, false};
         }
     }
@@ -165,13 +135,12 @@ std::pair<ChatSession*, bool> ChatCompletionStore::findOrCreateSession(
         }
     }
 
-    // Step 5: Create new session
+    // Step 4: Create new session
     std::string new_id = generateUUID();
     ChatSession& session = sessions_[new_id];
     session.completion_id = new_id;
-    session.messages = json::array();  // Start with empty history - messages will be added after first turn
-    session.continuation_hash = continuation_hash;
-    session.retry_candidate_hash = retry_hash;
+    session.messages = json::array();
+    session.continuation_hash = session_hash;
     session.created_at = std::chrono::steady_clock::now();
     session.last_accessed = session.created_at;
 
@@ -235,24 +204,11 @@ void ChatCompletionStore::updateSession(const std::string& completion_id, const 
     session.messages = messages;
     session.last_accessed = std::chrono::steady_clock::now();
 
-    // Recalculate hashes.
-    // continuation_hash = hash of ALL complete pairs (for next turn lookup)
-    // retry_candidate_hash = hash excluding last pair (for idempotent retry lookup)
-    //
-    // A freshly computed hash can legitimately come back empty (e.g. once a
-    // conversation's only pair becomes "complete", excluding the last pair
-    // leaves nothing to hash) — that just means there's nothing new to key
-    // on, NOT that the previously-registered hash should be discarded. Keep
-    // the previous value in that case so idempotent-retry / continuation
-    // matching for this session keeps working across turns.
-    std::string new_continuation_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
-    if (!new_continuation_hash.empty()) {
-        session.continuation_hash = new_continuation_hash;
-    }
-
-    std::string new_retry_candidate_hash = ChatCompletionUtils::hashConversationPairs(messages, true);
-    if (!new_retry_candidate_hash.empty()) {
-        session.retry_candidate_hash = new_retry_candidate_hash;
+    // Recalculate continuation_hash from updated messages.
+    // Hash of all complete pairs â€” used for next-turn and retry lookup.
+    std::string new_hash = ChatCompletionUtils::hashConversationPairs(messages, false);
+    if (!new_hash.empty()) {
+        session.continuation_hash = new_hash;
     }
 
     // Register new hash mappings

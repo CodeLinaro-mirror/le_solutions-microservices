@@ -842,4 +842,8 @@ bool QaiForge::enqueueStoreTask(std::string idempotency_key,
         std::move(task));
 }
 
+void QaiForge::clearSession(const std::string& session_id) {
+    scheduler::InferenceScheduler::getInstance().clearSession(session_id);
+}
+
 } // namespace qai_forge

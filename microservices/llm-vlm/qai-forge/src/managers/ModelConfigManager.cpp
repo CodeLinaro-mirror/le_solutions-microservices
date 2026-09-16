@@ -284,6 +284,18 @@ void ModelConfigManager::scanModelBundles() {
             continue;
         }
 
+        // Skip if the parent directory has a manifest file (geniex.json or
+        // hf_manifest.json) — the bundle was already registered by an earlier
+        // scan branch with a different (canonical) model id.
+        {
+            fs::path parent = entry.path().parent_path();
+            if (fs::exists(parent / "geniex.json") || fs::exists(parent / "hf_manifest.json")) {
+                LOG_DEBUG("[ModelConfigManager] Skipping .litertlm auto-discovery for '"
+                          << model_id << "' — parent directory has a manifest");
+                continue;
+            }
+        }
+
         try {
             ModelConfig config;
             config.id                  = model_id;

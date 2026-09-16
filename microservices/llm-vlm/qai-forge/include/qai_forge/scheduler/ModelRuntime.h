@@ -99,6 +99,12 @@ public:
     std::string modelId() const;
     ModelRuntimeState state() const;
 
+    /**
+     * Forward clearSession(session_id) to the backend.
+     * Thread-safe — acquires no locks, backend is responsible for its own sync.
+     */
+    void clearSession(const std::string& session_id);
+
 private:
     enum class DrainMode {
         None,

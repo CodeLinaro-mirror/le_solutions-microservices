@@ -46,6 +46,8 @@ LiteRTLMWorkerManager& LiteRTLMBackend::worker() {
     return *worker_;
 }
 
+LiteRTLMBackend::~LiteRTLMBackend() = default;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // capabilities()
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,12 +55,20 @@ LiteRTLMWorkerManager& LiteRTLMBackend::worker() {
 BackendCapabilities LiteRTLMBackend::capabilities() const {
     auto& cfg = ModelConfigManager::getInstance();
     return BackendCapabilities{
-        // LiteRT-LM uses a stateful KV cache — reset after context compaction
-        .context_strategy             = ContextStrategy::RESET_KV,
+        // LiteRT-LM uses per-request sessions (stateless).
+        // FULL_RECOMPUTE tells the scheduler NOT to call resetKv() after each inference.
+        .context_strategy             = ContextStrategy::FULL_RECOMPUTE,
         .context_window               = current_model_id_.empty()
-                                            ? 4096
+                                            ? []() -> int {
+                                                const char* env = std::getenv("LITERT_LM_DEFAULT_CONTEXT_LENGTH");
+                                                return (env && std::atoi(env) > 0) ? std::atoi(env) : 4096;
+                                              }()
                                             : cfg.getContextSize(current_model_id_),
-        .compaction_threshold         = 0.70f,
+        .compaction_threshold         = []() -> float {
+            const char* env = std::getenv("LITERT_LM_COMPACTION_THRESHOLD");
+            if (env) { float v = std::stof(env); if (v > 0.0f && v < 1.0f) return v; }
+            return 0.75f;
+        }(),
         // Qualcomm NPU: only one inference at a time per backend instance
         .concurrency_model            = ConcurrencyModel::EXCLUSIVE,
         .max_concurrent               = 1,
@@ -141,49 +151,37 @@ void LiteRTLMBackend::generate(
     std::function<void(const IPCErrorEvent&)>  on_error)
 {
     worker().executeRequest(
-        event_id,
-        prompt,
-        streaming,
-        max_tokens,
-        temperature,
-        top_p,
-        top_k,
-        presence_penalty,
-        frequency_penalty,
-        false, // bypass_think_filter — not applicable for LiteRT-LM
-        on_token,
-        on_done,
-        on_error);
+        event_id, prompt, streaming,
+        max_tokens, temperature, top_p, top_k,
+        presence_penalty, frequency_penalty,
+        false,
+        on_token, on_done, on_error);
 }
 
-void LiteRTLMBackend::generateStructured(
+void LiteRTLMBackend::generate(
     const std::string& event_id,
-    const json& messages,
-    const json& tools,
-    bool streaming,
-    int max_tokens,
-    float temperature,
-    float top_p,
-    int top_k,
-    float presence_penalty,
-    float frequency_penalty,
-    std::function<void(const IPCTokenEvent&)> on_token,
-    std::function<void(const IPCDoneEvent&)> on_done,
-    std::function<void(const IPCErrorEvent&)> on_error) {
-    worker().executeStructuredRequest(
-        event_id,
-        messages,
-        tools,
-        streaming,
-        max_tokens,
-        temperature,
-        top_p,
-        top_k,
-        presence_penalty,
-        frequency_penalty,
-        std::move(on_token),
-        std::move(on_done),
-        std::move(on_error));
+    const std::string& session_id,
+    const std::string& prompt,
+    bool               streaming,
+    int                max_tokens,
+    float              temperature,
+    float              top_p,
+    int                top_k,
+    float              presence_penalty,
+    float              frequency_penalty,
+    bool               /*use_reasoning*/,
+    std::function<void(const IPCTokenEvent&)>  on_token,
+    std::function<void(const IPCDoneEvent&)>   on_done,
+    std::function<void(const IPCErrorEvent&)>  on_error,
+    bool               kv_invalidated)
+{
+    worker().executeRequest(
+        event_id, prompt, streaming,
+        max_tokens, temperature, top_p, top_k,
+        presence_penalty, frequency_penalty,
+        false,
+        on_token, on_done, on_error,
+        session_id, kv_invalidated);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,13 +243,17 @@ void LiteRTLMBackend::resetKvAsync() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void LiteRTLMBackend::saveKv(const std::string& name) {
-    // LiteRT-LM KV save not yet supported — log and continue
-    LOG_WARN("[LiteRTLMBackend] saveKv('" << name << "') not supported for LiteRT-LM");
+    // saveKv/restoreKv are not implemented for LiteRT-LM.
+    // The LiteRT-LM C API (engine.h) does not expose SessionAdvanced::SaveCheckpoint /
+    // RewindToCheckpoint. Cross-request KV cache is instead provided by keeping
+    // LiteRtLmSession* alive in the worker's g_kv_sessions map with incremental prefill.
+    // TODO: refactor to use saveKv/restoreKv once the SDK exposes these as C API —
+    //       that would also enable sharing a system-prompt checkpoint across sessions.
+    (void)name;
 }
 
 void LiteRTLMBackend::restoreKv(const std::string& name) {
-    // LiteRT-LM KV restore not yet supported — log and continue
-    LOG_WARN("[LiteRTLMBackend] restoreKv('" << name << "') not supported for LiteRT-LM");
+    (void)name;
 }
 
 void LiteRTLMBackend::resetKv() {
@@ -259,6 +261,16 @@ void LiteRTLMBackend::resetKv() {
         worker().sendReset();
     } catch (const std::exception& e) {
         LOG_WARN("[LiteRTLMBackend] resetKv failed: " << e.what());
+    }
+}
+
+void LiteRTLMBackend::clearSession(const std::string& session_id) {
+    if (worker_) {
+        try {
+            worker_->sendClearSession(session_id);
+        } catch (const std::exception& e) {
+            LOG_WARN("[LiteRTLMBackend] clearSession failed: " << e.what());
+        }
     }
 }
 

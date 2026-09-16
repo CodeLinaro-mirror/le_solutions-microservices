@@ -49,6 +49,8 @@ struct LiteRTLMMetadata {
     int         max_context_length      = 4096;
     std::string tool_call_delimiter;
     std::string tool_response_delimiter;
+    std::string think_start;   // e.g. "<think>"  — empty if model has no thinking mode
+    std::string think_end;     // e.g. "</think>" — empty if model has no thinking mode
     bool        received                = false;
 };
 

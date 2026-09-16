@@ -97,18 +97,22 @@ struct ModelFetchJob {
 
     nlohmann::json toJson() const {
         FetchStatus s = status.load();
+        std::string effective_source = source.empty() ? "aihub" : source;
         nlohmann::json j = {
             {"job_id",           job_id},
             {"model",            model},
             {"runtime",          runtime},
             {"precision",        precision},
-            {"version",          version},
-            {"source",           source.empty() ? "aihub" : source},
+            {"source",           effective_source},
             {"status",           statusString(s)},
             {"bytes_downloaded", bytes_downloaded.load()},
-            {"total_bytes",      total_bytes.load()},
-            {"progress",         progress()},
         };
+        // version, total_bytes, progress only meaningful for AI Hub
+        if (effective_source == "aihub") {
+            j["version"]    = version;
+            j["total_bytes"] = total_bytes.load();
+            j["progress"]    = progress();
+        }
         if (!chipset.empty()) j["chipset"] = chipset;
 
         std::lock_guard<std::mutex> lock(state_mutex);
