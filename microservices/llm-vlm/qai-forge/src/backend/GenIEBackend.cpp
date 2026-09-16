@@ -31,15 +31,6 @@ GenIEBackend::GenIEBackend() = default;
 
 GenIEBackend::~GenIEBackend() = default;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Singleton
-// ─────────────────────────────────────────────────────────────────────────────
-
-GenIEBackend& GenIEBackend::getInstance() {
-    static GenIEBackend instance;
-    return instance;
-}
-
 InferenceWorkerManager& GenIEBackend::llmWorker() {
     if (!llm_worker_) {
         llm_worker_ = std::make_unique<InferenceWorkerManager>("llm");
@@ -76,6 +67,8 @@ BackendCapabilities GenIEBackend::capabilities() const {
         .backend_filters_think_tokens = true,
         // LLM supports KV save/restore (GenieDialog_save/restore); VLM does not
         .supports_kv_save_restore     = !current_is_vlm_.load(),
+        // Mirrors current_is_vlm_ — tells orchestrators to call generateVlm()
+        .supports_vision              = current_is_vlm_.load(),
     };
 }
 

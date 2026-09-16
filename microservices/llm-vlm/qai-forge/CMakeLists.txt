@@ -29,7 +29,7 @@
 #   QAI_FORGE_INSTALL        — Install targets (default ON)
 # ─────────────────────────────────────────────────────────────────────────────
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.23)
 project(qai_forge VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -65,29 +65,32 @@ FetchContent_MakeAvailable(stb)
 # ── jinja2cpp (Apache 2.0 — full Jinja2-compatible template engine) ──────────
 # Used by LiteRTLMOrchestrator::renderPrompt() to render each model's chat
 # template (Jinja2 syntax, as provided by the LiteRT-LM worker's METADATA
-# message) into a flat prompt string. Replaces the previous hand-rolled,
-# partial Jinja2 interpreter which silently skipped {% if %}/{% for %} blocks.
+# message) into a flat prompt string. Only needed when LiteRT-LM support is
+# enabled — LiteRTLMOrchestrator.cpp (the only consumer) is compiled behind
+# QAI_FORGE_BUILD_LITERT_LM, so this dependency is fetched/built only then.
 # Built and linked as a shared library (libjinja2cpp.so) — installed
 # alongside libqai_forge.so (see the QAI_FORGE_INSTALL block below) and
 # located at runtime via the $ORIGIN RPATH set on the qai_forge target.
-set(JINJA2CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(JINJA2CPP_STRICT_WARNINGS OFF CACHE BOOL "" FORCE)
-set(JINJA2CPP_BUILD_SHARED ON CACHE BOOL "" FORCE)
-set(JINJA2CPP_DEPS_MODE "internal" CACHE STRING "" FORCE)
-FetchContent_Declare(
-    jinja2cpp
-    GIT_REPOSITORY https://github.com/jinja2cpp/Jinja2Cpp.git
-    GIT_TAG        1.3.2
-    GIT_SHALLOW    TRUE
-)
-# EXCLUDE_FROM_ALL keeps jinja2cpp's own install() rules (which reference
-# broken thirdparty header paths under its bundled nonstd/RapidJSON deps)
-# out of qai_forge's `cmake --install` — we only need the built .so file,
-# installed separately below via install(TARGETS jinja2cpp ...).
-FetchContent_GetProperties(jinja2cpp)
-if(NOT jinja2cpp_POPULATED)
-    FetchContent_Populate(jinja2cpp)
-    add_subdirectory(${jinja2cpp_SOURCE_DIR} ${jinja2cpp_BINARY_DIR} EXCLUDE_FROM_ALL)
+if(QAI_FORGE_BUILD_LITERT_LM)
+    set(JINJA2CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(JINJA2CPP_STRICT_WARNINGS OFF CACHE BOOL "" FORCE)
+    set(JINJA2CPP_BUILD_SHARED ON CACHE BOOL "" FORCE)
+    set(JINJA2CPP_DEPS_MODE "internal" CACHE STRING "" FORCE)
+    FetchContent_Declare(
+        jinja2cpp
+        GIT_REPOSITORY https://github.com/jinja2cpp/Jinja2Cpp.git
+        GIT_TAG        1.3.2
+        GIT_SHALLOW    TRUE
+    )
+    # EXCLUDE_FROM_ALL keeps jinja2cpp's own install() rules (which reference
+    # broken thirdparty header paths under its bundled nonstd/RapidJSON deps)
+    # out of qai_forge's `cmake --install` — we only need the built .so file,
+    # installed separately below via install(TARGETS jinja2cpp ...).
+    FetchContent_GetProperties(jinja2cpp)
+    if(NOT jinja2cpp_POPULATED)
+        FetchContent_Populate(jinja2cpp)
+        add_subdirectory(${jinja2cpp_SOURCE_DIR} ${jinja2cpp_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
 endif()
 
 # ── GenIE SDK paths ───────────────────────────────────────────────────────────
@@ -212,6 +215,7 @@ set(QAI_FORGE_SOURCES
     src/adapters/ModelAdapterFactory.cpp
     src/adapters/Qwen25Adapter.cpp
     src/adapters/Qwen3Adapter.cpp
+    src/adapters/ToolCallJsonUtils.cpp
 
     # Vision Preprocessing Adapters (Layer 2 — VLM Patch Ordering)
     src/adapters/VisionPreprocessAdapterFactory.cpp
@@ -241,7 +245,6 @@ set(QAI_FORGE_SOURCES
 
     # Orchestration (Layer 2)
     src/orchestration/GenieOrchestrator.cpp
-    src/orchestration/LiteRTLMOrchestrator.cpp
     src/orchestration/PredictiveOrchestrator.cpp
 
     # Reasoning (Layer 2)
@@ -265,15 +268,34 @@ set(QAI_FORGE_SOURCES
     src/backend/SNPEBackend.cpp
     src/backend/LiteRTBackend.cpp
 
-    # Generative AI backends (Layer 3 — IGenerativeBackend implementations)
-    src/backend/LiteRTLMBackend.cpp
-
     # Worker management (Layer 3)
     src/worker/InferenceWorkerManager.cpp
     src/worker/VlmInferenceWorkerManager.cpp
     src/worker/PredictiveWorkerManager.cpp
-    src/worker/LiteRTLMWorkerManager.cpp
 )
+
+# ── Conditionally add LiteRT-LM generative backend sources ───────────────────
+# LiteRTLMOrchestrator.cpp depends on jinja2cpp (see the jinja2cpp
+# FetchContent block above, itself gated on this same flag) — gating these
+# together ensures a non-LiteRT-LM build never pulls in the jinja2cpp
+# dependency or its stricter CMake version requirement.
+if(QAI_FORGE_BUILD_LITERT_LM)
+    list(APPEND QAI_FORGE_SOURCES
+        # LiteRT-LM backend (Layer 3 — IGenerativeBackend implementation)
+        src/backend/LiteRTLMBackend.cpp
+
+        # LiteRT-LM orchestrator (Layer 2)
+        src/orchestration/LiteRTLMOrchestrator.cpp
+
+        # LiteRT-LM worker management (Layer 3)
+        src/worker/LiteRTLMWorkerManager.cpp
+    )
+
+    # Define preprocessor macro for conditional compilation
+    add_compile_definitions(QAI_FORGE_BUILD_LITERT_LM)
+
+    message(STATUS "[qai-forge] LiteRT-LM generative backend support enabled")
+endif()
 
 # ── Conditionally add llama.cpp backend sources ──────────────────────────────
 if(QAI_FORGE_BUILD_LLAMACPP)
@@ -321,7 +343,7 @@ if(QAI_FORGE_BUILD_LLAMACPP)
             "  Example: -DLLAMACPP_INCLUDE_PATH=/install/include")
     endif()
 
-    target_include_directories(qai_forge PRIVATE 
+    target_include_directories(qai_forge PRIVATE
             ${LLAMACPP_INCLUDE_PATH}
 	    ${LLAMACPP_INCLUDE_PATH}/ggml/include
     )
@@ -405,25 +427,31 @@ endif()
 # jinja2cpp is linked by resolved .so path ($<TARGET_FILE:>) rather than by
 # target name to avoid install(EXPORT) requiring jinja2cpp's own file sets
 # to be exported — so its include dirs (and its nonstd::*-lite deps' dirs,
-# used by jinja2cpp's public headers) must be added explicitly.
-target_include_directories(qai_forge PRIVATE
-    ${jinja2cpp_SOURCE_DIR}/include
-    $<TARGET_PROPERTY:nonstd::expected-lite,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:nonstd::variant-lite,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:nonstd::optional-lite,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:nonstd::string-view-lite,INTERFACE_INCLUDE_DIRECTORIES>
-)
+# used by jinja2cpp's public headers) must be added explicitly. Only needed
+# when LiteRTLMOrchestrator.cpp (the sole consumer) is actually compiled.
+if(QAI_FORGE_BUILD_LITERT_LM)
+    target_include_directories(qai_forge PRIVATE
+        ${jinja2cpp_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:nonstd::expected-lite,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:nonstd::variant-lite,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:nonstd::optional-lite,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:nonstd::string-view-lite,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+
+    target_link_libraries(qai_forge PRIVATE
+        # Jinja2 template engine — used by LiteRTLMOrchestrator::renderPrompt()
+        $<TARGET_FILE:jinja2cpp>
+    )
+    # Ensure build order since $<TARGET_FILE:> doesn't imply one under Makefiles
+    add_dependencies(qai_forge jinja2cpp)
+endif()
 
 target_link_libraries(qai_forge
     PUBLIC
         nlohmann_json::nlohmann_json
     PRIVATE
         Threads::Threads
-        # Jinja2 template engine — used by LiteRTLMOrchestrator::renderPrompt()
-        $<TARGET_FILE:jinja2cpp>
 )
-# Ensure build order since $<TARGET_FILE:> doesn't imply one under Makefiles
-add_dependencies(qai_forge jinja2cpp)
 
 if(QAI_FORGE_BUILD_LLAMACPP AND LLAMACPP_LLAMA_LIB AND LLAMACPP_GGML_LIB)
     # Important: llama-common must come before llama/ggml in the link order

@@ -114,6 +114,15 @@ public:
     // Returns the runtime identifier for a model ("genie", "litert_lm", "onnxrt").
     // Returns "genie" if the model is not found (safe default — existing behaviour).
     // Used by BackendFactory to select the correct IGenerativeBackend implementation.
+    //
+    // WARNING: Callers MUST check validateModel() or getModelConfig() first —
+    // this method does not distinguish a registered "genie" model from an
+    // unregistered model_id. Both cases return "genie". Do not rely on this
+    // method to detect missing models; it exists purely to resolve a known-
+    // valid model_id to its runtime, with "genie" as a legacy fallback for
+    // backward compatibility. All current callers (BackendFactory,
+    // QaiForge::validateSchedulableOrThrow()) already validate the model
+    // before calling getRuntime() — any new caller must do the same.
     std::string getRuntime(const std::string& model_id) const;
 
     // Returns the model type ("generative" or "predictive").

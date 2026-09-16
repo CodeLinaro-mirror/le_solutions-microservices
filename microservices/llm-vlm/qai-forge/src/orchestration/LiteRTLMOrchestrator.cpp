@@ -5,6 +5,7 @@
 
 #include "qai_forge/backend/LiteRTLMBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/reasoning/ReasoningRouter.h"
 #include "qai_forge/utils/Logger.h"
 
 #include <jinja2cpp/template.h>
@@ -12,9 +13,11 @@
 
 #include <cctype>
 #include <iomanip>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -198,6 +201,7 @@ scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
     prepared.messages = std::move(messages);
     prepared.tools = std::move(tools);
     prepared.kv_invalidated = (evicted > 0);
+    prepared.raw_prompt = context.request.raw_prompt;
     prepared.generation.max_tokens =
         context.request.max_completion_tokens.value_or([]() {
             const char* e = std::getenv("LITERT_LM_MAX_TOKENS");
@@ -261,8 +265,12 @@ StandardResponse LiteRTLMOrchestrator::execute(
     const std::string event_id = generateEventId();
     const bool streaming = prepared->generation.streaming;
 
-    // Render messages to a flat prompt string for the session API worker.
-    std::string prompt = renderPrompt(prepared->messages, prepared->tools, true);
+    // OIP raw_prompt bypass: if the caller supplied an already-formatted
+    // prompt (OIP /generate with text_input), use it verbatim instead of
+    // rendering the Jinja2 chat template from messages/tools.
+    std::string prompt = prepared->raw_prompt.has_value()
+        ? prepared->raw_prompt.value()
+        : renderPrompt(prepared->messages, prepared->tools, true);
 
     std::string accumulated_text;
     std::string finish_reason = "stop";
@@ -270,10 +278,31 @@ StandardResponse LiteRTLMOrchestrator::execute(
     bool inference_error = false;
     std::string error_message;
 
-    // Streaming: buffer tokens until </think> exits so clients never see
-    // raw reasoning tokens.
-    bool streaming_think_done = think_end_.empty();
-    std::string streaming_buf;
+    // Reasoning routing: only meaningful when the model declares both a
+    // think-start and think-end tag. ReasoningRouter's find()-based state
+    // machine treats an empty tag as matching at every position, which would
+    // infinite-loop on a non-empty buffer — so the router is only
+    // constructed/used when both tags are non-empty, exactly mirroring the
+    // guard the old hand-rolled splitting logic used.
+    const bool has_thinking = !think_start_.empty() && !think_end_.empty();
+    std::optional<ReasoningRouter> router;
+    if (has_thinking) {
+        router.emplace(job.session_id, job.model_id, think_start_, think_end_, -1);
+    }
+    // Tracks whether the first non-empty answer-channel chunk has been
+    // emitted yet, so we can strip the leading "\n\r" that typically follows
+    // </think> — matching the old manual splitter's trim behavior — without
+    // trimming subsequent answer chunks.
+    bool answer_started = false;
+    // The old hand-rolled splitter withheld ALL streaming output — including
+    // any pre-<think> preamble and reasoning content itself — until
+    // </think> had been seen at least once in the raw stream (it searched
+    // the running buffer for think_end_ and emitted nothing to the client
+    // until found; if the model never emitted a thinking block at all,
+    // nothing was ever streamed). Replicate that gating exactly: content
+    // before the model has entered+exited a thinking block is never
+    // forwarded, and reasoning_content chunks are never forwarded either.
+    bool saw_reasoning = false;
 
     StreamChunk stream_chunk;
     stream_chunk.id    = job.session_id;
@@ -303,23 +332,47 @@ StandardResponse LiteRTLMOrchestrator::execute(
                 backend.terminateWorker(true);
                 return;
             }
+
+            // Always feed the router (regardless of streaming/tool-call
+            // state) so getThinkingContent()/getAnswerContent() reflect the
+            // complete response afterward — matching the old blocking-path
+            // behavior of splitting over the *entire* accumulated_text
+            // unconditionally.
+            std::vector<StreamChunk> chunks;
+            if (has_thinking) {
+                chunks = router->route(token.content);
+            }
+
             if (!streaming || !job.callbacks.on_token) return;
             if (!tool_call_delimiter_.empty() &&
                     accumulated_text.find(tool_call_delimiter_) != std::string::npos)
                 return;
-            if (!streaming_think_done) {
-                streaming_buf += token.content;
-                auto pos = streaming_buf.find(think_end_);
-                if (pos != std::string::npos) {
-                    streaming_think_done = true;
-                    std::string after = streaming_buf.substr(pos + think_end_.size());
-                    size_t start = after.find_first_not_of("\n\r");
-                    if (start != std::string::npos) after = after.substr(start);
-                    if (!after.empty()) {
-                        stream_chunk.content_delta = after;
-                        stream_chunk.finish_reason.reset();
-                        job.callbacks.on_token(stream_chunk);
+
+            if (has_thinking) {
+                // Only forward answer-channel chunks that arrive AFTER the
+                // model has emitted at least one reasoning chunk — matches
+                // the old manual buffering behavior exactly: it withheld
+                // *everything* (including any pre-<think> preamble) until
+                // </think> was found in the growing buffer, and reasoning
+                // content itself was never forwarded to the client.
+                for (auto& chunk : chunks) {
+                    if (chunk.reasoning_content.has_value()) {
+                        saw_reasoning = true;
+                        continue;  // reasoning content never reaches the client
                     }
+                    if (!chunk.content_delta.has_value()) continue;
+                    if (!saw_reasoning) continue;  // suppress pre-think preamble
+                    if (!answer_started) {
+                        std::string& delta = chunk.content_delta.value();
+                        size_t start = delta.find_first_not_of("\n\r");
+                        delta = (start != std::string::npos)
+                            ? delta.substr(start) : std::string();
+                        if (delta.empty()) continue;  // still trimming
+                        answer_started = true;
+                    }
+                    chunk.id = job.session_id;
+                    chunk.model = job.model_id;
+                    job.callbacks.on_token(chunk);
                 }
             } else {
                 stream_chunk.content_delta = token.content;
@@ -343,20 +396,19 @@ StandardResponse LiteRTLMOrchestrator::execute(
             500);
     }
 
-    // Split think block from content
-    std::string content_text = accumulated_text;
+    // Extract thinking/answer content — via ReasoningRouter when the model
+    // declares thinking tags (fed token-by-token above in both streaming and
+    // blocking modes), otherwise the full accumulated text is the answer.
+    std::string content_text;
     std::string reasoning_text;
-    if (!think_start_.empty() && !think_end_.empty()) {
-        auto ts = accumulated_text.find(think_start_);
-        auto te = accumulated_text.find(think_end_);
-        if (ts != std::string::npos && te != std::string::npos && te > ts) {
-            reasoning_text = accumulated_text.substr(
-                ts + think_start_.size(), te - ts - think_start_.size());
-            content_text = accumulated_text.substr(te + think_end_.size());
-            size_t first = content_text.find_first_not_of("\n\r \t");
-            if (first != std::string::npos) content_text = content_text.substr(first);
-            else content_text.clear();
-        }
+    if (has_thinking) {
+        reasoning_text = router->getThinkingContent();
+        content_text = router->getAnswerContent();
+        size_t first = content_text.find_first_not_of("\n\r \t");
+        content_text = (first != std::string::npos)
+            ? content_text.substr(first) : std::string();
+    } else {
+        content_text = accumulated_text;
     }
 
     StandardResponse response;

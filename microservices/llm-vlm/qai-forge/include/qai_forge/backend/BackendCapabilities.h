@@ -110,4 +110,17 @@ struct BackendCapabilities {
     //            kv_invalidated — they are not part of the shared
     //            IGenerativeBackend::generate() signature.
     bool supports_kv_session_reuse       = false;
+
+    // supports_vision:
+    //   true  → Backend is currently serving a vision-language (VLM) model
+    //            and orchestrators should call generateVlm() instead of
+    //            generate(). Mirrors GenIEBackend's internal current_is_vlm_
+    //            flag / ModelConfigManager::supportsVision(model_id) — exposed
+    //            here so orchestrators can query it via the capability-flag
+    //            pattern instead of calling ModelConfigManager directly.
+    //   false → Backend does not support (or is not currently serving) a
+    //            vision-language model. Orchestrators call generate().
+    //            Default for backends without VLM support (LiteRT LM,
+    //            LlamaCpp, ONNX Runtime).
+    bool supports_vision                 = false;
 };

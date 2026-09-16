@@ -34,12 +34,6 @@ class VlmInferenceWorkerManager;
 
 class GenIEBackend : public IGenerativeBackend {
 public:
-    /**
-     * Returns the singleton GenIEBackend instance.
-     * Thread-safe via Meyers singleton (C++11 guarantee).
-     */
-    static GenIEBackend& getInstance();
-
     GenIEBackend();
     ~GenIEBackend() override;
 

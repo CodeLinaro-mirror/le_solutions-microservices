@@ -215,6 +215,16 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
                                                    const CreateChatCompletionRequest& request,
                                                    int thinking_budget,
                                                    int answer_budget) const {
+    // OIP raw_prompt bypass: when the caller supplied an already-formatted
+    // prompt (OIP /generate with text_input), feed it through verbatim
+    // without applying the chat template. Safe to return early regardless
+    // of thinking_budget/answer_budget — createJob() may call this once for
+    // preliminary token estimation (with budgets both 0) and again with the
+    // computed budgets; both calls must return the identical fixed string.
+    if (request.raw_prompt.has_value()) {
+        return request.raw_prompt.value();
+    }
+
     auto& config_mgr = ModelConfigManager::getInstance();
     json chat_template = config_mgr.getChatTemplate(request.model);
     const auto& adapter = ModelAdapterFactory::getAdapter(request.model);
@@ -442,8 +452,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     scheduler::GenerativeJob& job,
     const scheduler::GeniePreparedRequest& prepared,
     IGenerativeBackend& backend) const {
-    const bool is_vlm =
-        ModelConfigManager::getInstance().supportsVision(job.model_id);
+    const bool is_vlm = backend.capabilities().supports_vision;
     const auto& generation = prepared.generation;
     const std::string event_id = generateEventId();
     std::string full_response;
@@ -587,8 +596,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     scheduler::GenerativeJob& job,
     const scheduler::GeniePreparedRequest& prepared,
     IGenerativeBackend& backend) const {
-    const bool is_vlm =
-        ModelConfigManager::getInstance().supportsVision(job.model_id);
+    const bool is_vlm = backend.capabilities().supports_vision;
     const auto& generation = prepared.generation;
     auto& callback = job.callbacks.on_token;
 

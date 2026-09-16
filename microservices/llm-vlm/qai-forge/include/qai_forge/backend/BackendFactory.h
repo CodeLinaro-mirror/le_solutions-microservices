@@ -93,13 +93,6 @@ public:
      */
     static RuntimePair createRuntimePair(const std::string& model_id);
 
-    /**
-     * Legacy singleton access.
-     *
-     * Kept until the old ChatOrchestratorImpl fallback path is removed.
-     */
-    static IGenerativeBackend& getGenerativeBackend(const std::string& runtime);
-
     // ── Predictive AI backends ────────────────────────────────────────────────
 
     /**

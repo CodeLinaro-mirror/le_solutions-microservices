@@ -19,14 +19,17 @@
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/backend/GenIEBackend.h"
 #include "qai_forge/backend/LiteRTBackend.h"
-#include "qai_forge/backend/LiteRTLMBackend.h"
 #include "qai_forge/backend/QNNBackend.h"
 #include "qai_forge/backend/SNPEBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/GenieOrchestrator.h"
-#include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
+
+#ifdef QAI_FORGE_BUILD_LITERT_LM
+#include "qai_forge/backend/LiteRTLMBackend.h"
+#include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
+#endif
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 #include "qai_forge/backend/LlamaCppBackend.h"
@@ -46,10 +49,12 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
         return std::make_unique<GenIEBackend>();
     }
 
+#ifdef QAI_FORGE_BUILD_LITERT_LM
     if (runtime == "litert_lm") {
         // Phase 3: Scheduler-owned LiteRTLMBackend instance
         return std::make_unique<LiteRTLMBackend>();
     }
+#endif
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
     if (runtime == "llamacpp") {
@@ -84,9 +89,11 @@ BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
         return std::make_shared<GenieOrchestrator>();
     }
 
+#ifdef QAI_FORGE_BUILD_LITERT_LM
     if (runtime == "litert_lm") {
         return std::make_shared<LiteRTLMOrchestrator>();
     }
+#endif
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
     if (runtime == "llamacpp") {
@@ -131,26 +138,6 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
     pair.backend = createGenerativeBackend(model_config->runtime);
     pair.orchestrator = createGenerativeOrchestrator(model_config->runtime);
     return pair;
-}
-
-IGenerativeBackend& BackendFactory::getGenerativeBackend(const std::string& runtime) {
-    if (runtime == "genie") {
-        return GenIEBackend::getInstance();
-    }
-
-    if (runtime == "litert_lm") {
-        return LiteRTLMBackend::getInstance();
-    }
-
-    // ── Future backends ───────────────────────────────────────────────────────
-    // if (runtime == "onnxrt") {
-    //     return OnnxRTBackend::getInstance();
-    // }
-
-    // Safe default: fall back to GenIEBackend for unknown runtime values.
-    LOG_WARN("[BackendFactory] Unknown runtime '" << runtime
-             << "' — falling back to GenIEBackend");
-    return GenIEBackend::getInstance();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
