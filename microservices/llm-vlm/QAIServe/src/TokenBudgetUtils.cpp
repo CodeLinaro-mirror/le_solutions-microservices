@@ -18,6 +18,20 @@ namespace {
 
 using json = TokenBudgetJson;
 
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 std::string replaceAll(std::string text,
                        const std::string& needle,
                        const std::string& value) {
@@ -225,7 +239,7 @@ int estimate_tool_response_tokens(const json& messages) {
             continue;
         }
 
-        bool is_tool = message.value("role", "") == "tool"
+        bool is_tool = getStringOrDefault(message, "role", "") == "tool"
             || message.value("type", "") == "function_call_output";
         if (!is_tool) {
             continue;
@@ -280,7 +294,7 @@ std::string render_candidate_prompt(
     std::vector<json> history;
     appendMessages(history, normalizeContentParts(ancestor_messages));
     for (const auto& message : cleanMessages(history)) {
-        std::string role = message.value("role", "");
+        std::string role = getStringOrDefault(message, "role", "");
         std::string content = message.contains("content")
             ? contentText(message["content"])
             : std::string();
@@ -299,7 +313,7 @@ std::string render_candidate_prompt(
                 continue;
             }
 
-            std::string role = message.value("role", "");
+            std::string role = getStringOrDefault(message, "role", "");
             std::string content = message.contains("content")
                 ? contentText(message["content"])
                 : std::string();

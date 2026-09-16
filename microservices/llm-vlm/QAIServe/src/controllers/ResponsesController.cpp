@@ -47,6 +47,24 @@
 
 using json = nlohmann::ordered_json;
 
+namespace {
+
+// nlohmann::json's .value(key, default) only falls back to `default` when
+// the key is absent — if the key is present but explicitly null,
+// .value<std::string>() throws json::type_error.302. This helper treats an
+// explicit null the same as an absent key.
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +181,7 @@ static bool current_turn_has_tool_response(const json& messages) {
         return false;
     }
     for (const auto& message : messages) {
-        if (message.is_object() && message.value("role", "") == "tool") {
+        if (message.is_object() && getStringOrDefault(message, "role", "") == "tool") {
             return true;
         }
     }
@@ -175,7 +193,7 @@ static bool branch_ends_with_tool_call(const json& ancestor_messages) {
         return false;
     }
     const auto& last = ancestor_messages.back();
-    if (!last.is_object() || last.value("role", "") != "assistant") {
+    if (!last.is_object() || getStringOrDefault(last, "role", "") != "assistant") {
         return false;
     }
     return last.contains("tool_calls")

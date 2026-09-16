@@ -16,6 +16,16 @@ namespace {
 
 using json = TokenBudgetJson;
 
+std::string getStringOrDefault(const json& obj,
+                                const std::string& key,
+                                const std::string& def = "") {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+    const json& val = obj[key];
+    return val.is_string() ? val.get<std::string>() : def;
+}
+
 std::string replaceAll(std::string text,
                        const std::string& needle,
                        const std::string& value) {
