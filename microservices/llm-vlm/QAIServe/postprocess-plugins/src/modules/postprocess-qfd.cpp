@@ -9,6 +9,8 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -27,7 +29,7 @@ const float kBboxSizeTreshold        = 400.0f; // 20x20 px
 
 } // namespace
 
-std::string FaceDetPostprocess::process(
+std::string FaceDetPostprocess::processSingle(
     const std::vector<OutputTensor>& raw,
     const RequestConfig&             cfg) const {
 
@@ -243,6 +245,14 @@ std::string FaceDetPostprocess::process(
     return result.dump();
 }
 
+std::string FaceDetPostprocess::process(const std::vector<OutputTensor>& raw, const RequestConfig& cfg) const {
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& sample_raw : PostprocessUtils::batchSlices(raw)) {
+        results.push_back(nlohmann::json::parse(processSingle(sample_raw, cfg)));
+    }
+    return nlohmann::json{{"results", std::move(results)}}.dump();
+}
+
 postproc_abi::PluginDescription FaceDetPostprocess::pluginInfo() const {
     postproc_abi::PluginDescription d;
     d.name = "face_detect_qfd";
@@ -257,25 +267,25 @@ postproc_abi::PluginDescription FaceDetPostprocess::pluginInfo() const {
         "resolved at runtime from tensor count and channel dims";
     d.layouts = {
         {   // layout 0
-            {{1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
         {   // layout 1
-            {{1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
         {   // layout 2
-            {{1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,60,80, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
         {   // layout 3
-            {{1,120,160, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,120,160,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,120,160, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160, 1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160,10}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160, 4}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
     };
     d.parameters = {

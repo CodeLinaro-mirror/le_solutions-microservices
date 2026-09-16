@@ -12,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <stdexcept>
 
 using PostprocessUtils::Detection;
 using PostprocessUtils::Keypoint;
@@ -53,7 +54,7 @@ const float kBboxSizeTreshold        = 400.0f; // 20x20 px
 
 } // namespace
 
-std::string PersonDetPostprocess::process(
+std::string PersonDetPostprocess::processSingle(
     const std::vector<OutputTensor>& raw,
     const RequestConfig&             cfg) const {
 
@@ -287,6 +288,14 @@ std::string PersonDetPostprocess::process(
     return result.dump();
 }
 
+std::string PersonDetPostprocess::process(const std::vector<OutputTensor>& raw, const RequestConfig& cfg) const {
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& sample_raw : PostprocessUtils::batchSlices(raw)) {
+        results.push_back(nlohmann::json::parse(processSingle(sample_raw, cfg)));
+    }
+    return nlohmann::json{{"results", std::move(results)}}.dump();
+}
+
 postproc_abi::PluginDescription PersonDetPostprocess::pluginInfo() const {
     postproc_abi::PluginDescription d;
     d.name = "person_detect_qpd";
@@ -306,10 +315,10 @@ postproc_abi::PluginDescription PersonDetPostprocess::pluginInfo() const {
         "names come from the `landmarks` request query param (JSON)";
     d.layouts = {
         {   // layout 0 — only supported tensor arrangement.
-            {{1,120,160, 3},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,120,160,12},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,120,160,34},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
-            {{1,120,160,17},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160, 3},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160,12},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160,34},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1,120,160,17},  {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
     };
     d.parameters = {

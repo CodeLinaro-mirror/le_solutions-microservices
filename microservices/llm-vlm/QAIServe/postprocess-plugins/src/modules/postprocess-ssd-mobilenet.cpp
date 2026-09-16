@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <stdexcept>
 
 using PostprocessUtils::Detection;
 using postproc_abi::DataType;
@@ -27,7 +28,7 @@ const float kDefaultThreshold = 0.70f;
 
 } // namespace
 
-std::string MobilenetSsdPostprocess::process(
+std::string MobilenetSsdPostprocess::processSingle(
     const std::vector<OutputTensor>& raw,
     const RequestConfig&             cfg) const {
 
@@ -89,6 +90,14 @@ std::string MobilenetSsdPostprocess::process(
     return result.dump();
 }
 
+std::string MobilenetSsdPostprocess::process(const std::vector<OutputTensor>& raw, const RequestConfig& cfg) const {
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& sample_raw : PostprocessUtils::batchSlices(raw)) {
+        results.push_back(nlohmann::json::parse(processSingle(sample_raw, cfg)));
+    }
+    return nlohmann::json{{"results", std::move(results)}}.dump();
+}
+
 postproc_abi::PluginDescription MobilenetSsdPostprocess::pluginInfo() const {
     postproc_abi::PluginDescription d;
     d.name = "mobilenet_softmax";
@@ -101,7 +110,7 @@ postproc_abi::PluginDescription MobilenetSsdPostprocess::pluginInfo() const {
         "wildcard.";
     d.layouts = {
         {   // layout 0 — only supported tensor arrangement.
-            {{1, -1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1, -1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
     };
     d.parameters = {

@@ -42,4 +42,8 @@ public:
     std::string process(
         const std::vector<postproc_abi::OutputTensor>& raw,
         const postproc_abi::RequestConfig&              cfg) const override;
+
+private:
+    std::string processSingle(const std::vector<postproc_abi::OutputTensor>& raw,
+                              const postproc_abi::RequestConfig& cfg) const;
 };

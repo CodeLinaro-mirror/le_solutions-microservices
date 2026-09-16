@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -48,7 +49,7 @@ std::vector<std::pair<int, int>> parseConnections(const std::string& json_str) {
 
 } // namespace
 
-std::string HrnetPostprocess::process(
+std::string HrnetPostprocess::processSingle(
     const std::vector<OutputTensor>& raw,
     const RequestConfig&             cfg) const {
 
@@ -197,6 +198,14 @@ std::string HrnetPostprocess::process(
     return result.dump();
 }
 
+std::string HrnetPostprocess::process(const std::vector<OutputTensor>& raw, const RequestConfig& cfg) const {
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& sample_raw : PostprocessUtils::batchSlices(raw)) {
+        results.push_back(nlohmann::json::parse(processSingle(sample_raw, cfg)));
+    }
+    return nlohmann::json{{"results", std::move(results)}}.dump();
+}
+
 postproc_abi::PluginDescription HrnetPostprocess::pluginInfo() const {
     postproc_abi::PluginDescription d;
     d.name = "hrnet";
@@ -220,7 +229,7 @@ postproc_abi::PluginDescription HrnetPostprocess::pluginInfo() const {
         "not hardcoded.";
     d.layouts = {
         {   // layout 0 — only supported tensor arrangement.
-            {{1, -1, -1, -1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
+            {{-1, -1, -1, -1}, {DataType::UINT8, DataType::FLOAT16, DataType::FLOAT32}},
         },
     };
     d.parameters = {

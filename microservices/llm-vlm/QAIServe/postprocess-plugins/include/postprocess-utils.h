@@ -21,6 +21,10 @@ namespace PostprocessUtils {
 float readFloat(const postproc_abi::OutputTensor& t, size_t idx,
                  float quant_scale, int32_t quant_zero_point);
 
+postproc_abi::OutputTensor batchSlice(const postproc_abi::OutputTensor& t, size_t sample_index);
+
+std::vector<std::vector<postproc_abi::OutputTensor>> batchSlices(const std::vector<postproc_abi::OutputTensor>& raw);
+
 // Pull a typed param from RequestConfig::extra with a fallback default.
 // Fails closed: missing or malformed input returns default_val, never throws.
 float getFloat(const postproc_abi::RequestConfig& cfg, const std::string& key, float default_val);

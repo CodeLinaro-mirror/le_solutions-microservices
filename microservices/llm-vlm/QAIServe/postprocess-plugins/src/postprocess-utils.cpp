@@ -96,6 +96,39 @@ float readFloat(const postproc_abi::OutputTensor& t, size_t idx, float quant_sca
     }
 }
 
+postproc_abi::OutputTensor batchSlice(const postproc_abi::OutputTensor& t, size_t sample_index) {
+    if (t.shape.empty() || t.shape.front() <= 0) throw std::invalid_argument("batchSlice: invalid batch dimension");
+    const size_t batch = static_cast<size_t>(t.shape.front());
+    if (sample_index >= batch || t.data_len % batch != 0) throw std::out_of_range("batchSlice: invalid sample index or tensor size");
+    postproc_abi::OutputTensor out = t;
+    const size_t bytes_per_sample = t.data_len / batch;
+    out.shape.front() = 1;
+    out.data = t.data + sample_index * bytes_per_sample;
+    out.data_len = bytes_per_sample;
+    return out;
+}
+
+std::vector<std::vector<postproc_abi::OutputTensor>> batchSlices(const std::vector<postproc_abi::OutputTensor>& raw) {
+    if (raw.empty() || raw.front().shape.empty() || raw.front().shape.front() <= 0) {
+        throw std::invalid_argument("batchSlices: invalid output batch");
+    }
+    const size_t batch = static_cast<size_t>(raw.front().shape.front());
+    std::vector<std::vector<postproc_abi::OutputTensor>> slices;
+    slices.reserve(batch);
+    for (const auto& tensor : raw) {
+        if (tensor.shape.empty() || tensor.shape.front() != static_cast<int64_t>(batch)) {
+            throw std::invalid_argument("batchSlices: inconsistent output batch dimensions");
+        }
+    }
+    for (size_t sample = 0; sample < batch; ++sample) {
+        std::vector<postproc_abi::OutputTensor> slice;
+        slice.reserve(raw.size());
+        for (const auto& tensor : raw) slice.push_back(batchSlice(tensor, sample));
+        slices.push_back(std::move(slice));
+    }
+    return slices;
+}
+
 float getFloat(const postproc_abi::RequestConfig& cfg, const std::string& key, float default_val) {
     auto it = cfg.extra.find(key);
     if (it == cfg.extra.end()) return default_val;
