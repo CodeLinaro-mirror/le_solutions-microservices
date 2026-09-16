@@ -26,11 +26,13 @@ private:
     bool initMetadataIfNeeded(IGenerativeBackend& backend) const;
 
     // ── Prompt rendering ───────────────────────────────────────────────────────
+    // Renders the model's Jinja2 chat template (as provided by the LiteRT-LM
+    // worker's METADATA message) via jinja2cpp — a full Jinja2-compatible
+    // template engine. Falls back to a flat "role: content" formatter if the
+    // template is empty or fails to load/render.
     std::string renderPrompt(const json& messages,
                              const json& tools,
                              bool add_generation_prompt = true) const;
-    std::string renderJinja(const std::string& tmpl,
-                            const json& context) const;
 
     // ── Context management ─────────────────────────────────────────────────────
     int estimateTokens(const json& messages, const json& tools) const;

@@ -52,6 +52,58 @@ HttpResponsePtr ChatCompletionsController::formatErrorResponse(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Build an OpenAI-format non-streaming response directly from a cached
+// replay_result (see ChatCompletionStore::findOrCreateSession / the legacy
+// Python idempotent-retry replay-cache design). No inference call is made —
+// this is a pure cache hit for an exact retry of a previously completed
+// request, verified via both conversation-content hash AND full request
+// signature before being served.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static HttpResponsePtr buildReplayResponse(
+    ChatSession* session,
+    const json& replay_result
+) {
+    json assistant_msg = {
+        {"role", "assistant"},
+        {"content", replay_result.value("content", "")}
+    };
+    bool has_tool_calls = replay_result.contains("tool_calls")
+        && replay_result["tool_calls"].is_array()
+        && !replay_result["tool_calls"].empty();
+    if (has_tool_calls) {
+        assistant_msg["tool_calls"] = replay_result["tool_calls"];
+    }
+
+    json usage_obj = {
+        {"prompt_tokens", replay_result.value("prompt_tokens", 0)},
+        {"completion_tokens", replay_result.value("completion_tokens", 0)},
+        {"total_tokens", replay_result.value("total_tokens", 0)}
+    };
+
+    json response_json = {
+        {"id", session->completion_id},
+        {"object", "chat.completion"},
+        {"created", std::time(nullptr)},
+        {"model", session->model},
+        {"choices", json::array({
+            {
+                {"index", 0},
+                {"message", assistant_msg},
+                {"finish_reason", replay_result.value("finish_reason", "stop")}
+            }
+        })},
+        {"usage", usage_obj}
+    };
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setBody(response_json.dump());
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->addHeader("Access-Control-Allow-Origin", "*");
+    return resp;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /v1/chat/completions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -115,8 +167,12 @@ void ChatCompletionsController::createChatCompletion(
             user_hint_id = body["id"].get<std::string>();
         }
 
-        // Find or create session using hash-based lookup
-        auto [session, is_new] = store_->findOrCreateSession(messages, user_hint_id);
+        // Find or create session using hash-based lookup. Passing the full
+        // request body enables signature-verified idempotent-retry replay
+        // (see ChatCompletionStore::findOrCreateSession for the algorithm).
+        auto lookup = store_->findOrCreateSession(messages, body, user_hint_id);
+        ChatSession* session = lookup.session;
+        bool is_new = lookup.is_new;
         if (!session) {
             callback(formatErrorResponse(
                 "Failed to create or find session",
@@ -126,9 +182,20 @@ void ChatCompletionsController::createChatCompletion(
             return;
         }
 
-        // Update session model if not set
-        if (session->model.empty()) {
-            session->model = model;
+        // Always keep session->model in sync with the most recently
+        // requested model — needed for a correct, targeted
+        // QaiForge::clearSession(model_id, session_id) lookup on session
+        // delete/expiry, since that lookup is scoped to exactly one model's
+        // resident ModelRuntime (no broadcast to every loaded model).
+        session->model = model;
+
+        // Idempotent-retry replay cache hit — serve the cached response
+        // directly, no inference call. See buildReplayResponse() /
+        // ChatCompletionStore::findOrCreateSession().
+        if (lookup.replay_result.has_value()) {
+            LOG_INFO << "Serving cached replay for session " << session->completion_id;
+            callback(buildReplayResponse(session, lookup.replay_result.value()));
+            return;
         }
 
         // The client resends the full conversation on every stateless request;
@@ -185,9 +252,9 @@ void ChatCompletionsController::createChatCompletion(
 
         // Route to streaming or non-streaming handler
         if (stream) {
-            handleStreamingRequest(session, forge_request, std::move(callback));
+            handleStreamingRequest(session, forge_request, body, std::move(callback));
         } else {
-            handleNonStreamingRequest(session, forge_request, std::move(callback));
+            handleNonStreamingRequest(session, forge_request, body, std::move(callback));
         }
 
     } catch (const json::exception& e) {
@@ -214,10 +281,11 @@ void ChatCompletionsController::createChatCompletion(
 void ChatCompletionsController::handleStreamingRequest(
     ChatSession* session,
     const CreateChatCompletionRequest& request,
+    const json& request_body,
     std::function<void(const HttpResponsePtr&)>&& callback
 ) {
     auto stream_resp = HttpResponse::newAsyncStreamResponse(
-        [session, request, this](drogon::ResponseStreamPtr stream_ptr) {
+        [session, request, request_body, this](drogon::ResponseStreamPtr stream_ptr) {
             // Convert to shared_ptr for lambda capture
             auto stream = std::shared_ptr<drogon::ResponseStream>(std::move(stream_ptr));
 
@@ -257,7 +325,7 @@ void ChatCompletionsController::handleStreamingRequest(
                 stream->send(sse);
             };
 
-            callbacks.onComplete = [stream, session, accumulated_content, accumulated_tool_calls, has_tool_calls, this](
+            callbacks.onComplete = [stream, session, request_body, accumulated_content, accumulated_tool_calls, has_tool_calls, this](
                 const StandardResponse& final_response
             ) {
                 // Use final response content if available
@@ -288,6 +356,24 @@ void ChatCompletionsController::handleStreamingRequest(
                 // Update session
                 session->messages.push_back(assistant_msg);
                 store_->updateSession(session->completion_id, session->messages);
+
+                // Record the signature of the request that produced this
+                // turn + its response, for idempotent-retry replay on the
+                // NEXT completed turn's retry_candidate_hash match. See
+                // ChatCompletionStore::findOrCreateSession.
+                session->last_request_signature =
+                    ChatCompletionUtils::buildRequestSignature(request_body, session->messages);
+                json replay_result = {
+                    {"content", *accumulated_content},
+                    {"finish_reason", *has_tool_calls ? "tool_calls" : "stop"},
+                    {"prompt_tokens", final_response.prompt_tokens},
+                    {"completion_tokens", final_response.completion_tokens},
+                    {"total_tokens", final_response.total_tokens}
+                };
+                if (*has_tool_calls) {
+                    replay_result["tool_calls"] = *final_response.tool_calls;
+                }
+                session->last_replay_result = replay_result;
 
                 // Send final chunk with finish_reason
                 json final_chunk = {
@@ -391,6 +477,7 @@ void ChatCompletionsController::handleStreamingRequest(
 void ChatCompletionsController::handleNonStreamingRequest(
     ChatSession* session,
     const CreateChatCompletionRequest& request,
+    const json& request_body,
     std::function<void(const HttpResponsePtr&)>&& callback
 ) {
     try {
@@ -446,6 +533,24 @@ void ChatCompletionsController::handleNonStreamingRequest(
         // Update session
         session->messages.push_back(assistant_msg);
         store_->updateSession(session->completion_id, session->messages);
+
+        // Record the signature of the request that produced this turn +
+        // its response, for idempotent-retry replay on the NEXT completed
+        // turn's retry_candidate_hash match. See
+        // ChatCompletionStore::findOrCreateSession.
+        session->last_request_signature =
+            ChatCompletionUtils::buildRequestSignature(request_body, session->messages);
+        json replay_result = {
+            {"content", assistant_msg.value("content", "")},
+            {"finish_reason", has_tool_calls ? "tool_calls" : "stop"},
+            {"prompt_tokens", response.prompt_tokens},
+            {"completion_tokens", response.completion_tokens},
+            {"total_tokens", response.total_tokens}
+        };
+        if (has_tool_calls) {
+            replay_result["tool_calls"] = *response.tool_calls;
+        }
+        session->last_replay_result = replay_result;
 
         // Build usage object separately to avoid nested initializer issues
         json usage_obj = {
@@ -535,10 +640,11 @@ void ChatCompletionsController::deleteChatCompletion(
             qai_forge::QaiForge::getInstance().cancel(session->active_job_id);
         }
 
-        // Release per-session Conversation API state in LiteRT-LM workers
-        qai_forge::QaiForge::getInstance().clearSession(completion_id);
-
-        // Delete session
+        // Delete session. Per-session backend state (e.g. LiteRT-LM KV
+        // cache session) is released inside ChatCompletionStore::deleteSession()
+        // itself, scoped to the session's model — centralized there rather
+        // than here so every caller of deleteSession() gets this cleanup
+        // automatically, not just this one HTTP transport.
         store_->deleteSession(completion_id);
 
         // Return success

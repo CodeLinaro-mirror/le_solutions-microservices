@@ -6,8 +6,10 @@
 #include <drogon/HttpController.h>
 #include <memory>
 #include <string>
+#include <nlohmann/json.hpp>
 
 using namespace drogon;
+using json = nlohmann::ordered_json;
 
 // Forward declarations
 class ChatCompletionStore;
@@ -108,6 +110,7 @@ private:
     void handleStreamingRequest(
         struct ChatSession* session,
         const struct CreateChatCompletionRequest& request,
+        const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);
 
     /**
@@ -122,6 +125,7 @@ private:
     void handleNonStreamingRequest(
         struct ChatSession* session,
         const struct CreateChatCompletionRequest& request,
+        const json& request_body,
         std::function<void(const HttpResponsePtr&)>&& callback);
 
     /**

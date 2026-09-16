@@ -352,8 +352,9 @@ CancelResult InferenceScheduler::cancel(const std::string& job_id) {
     return generative_pool_.cancel(job_id);
 }
 
-void InferenceScheduler::clearSession(const std::string& session_id) {
-    generative_pool_.clearSession(session_id);
+void InferenceScheduler::clearSession(const std::string& model_id,
+                                       const std::string& session_id) {
+    generative_pool_.clearSession(model_id, session_id);
 }
 
 bool InferenceScheduler::openToolLease(

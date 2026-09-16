@@ -193,11 +193,22 @@ public:
                           std::function<void()> task);
 
     /**
-     * Release per-session Conversation API state across all loaded LiteRT-LM
-     * models. Called when an HTTP chat session ends (DELETE /v1/sessions/{id}).
-     * No-op for non-LiteRT-LM backends.
+     * Release per-session Conversation API state for one model's backend
+     * (e.g. LiteRT-LM's persistent KV cache session). Called when a chat
+     * session ends (DELETE /v1/chat/completions/{id}, DELETE
+     * /v1/responses/{id}, or a WebSocket/gRPC-equivalent teardown).
+     *
+     * Scoped to model_id — looks up only that model's resident ModelRuntime
+     * rather than broadcasting to every loaded model, since a session's
+     * per-request backend state (if any) only ever lives on the one model
+     * that session actually used. No-op if model_id has no resident runtime,
+     * or if that model's backend does not support per-session state.
+     *
+     * @param model_id    The model the session was using (ChatSession::model /
+     *                    StoredResponse::model). If empty, this is a no-op.
+     * @param session_id  The session/completion/response ID to release.
      */
-    void clearSession(const std::string& session_id);
+    void clearSession(const std::string& model_id, const std::string& session_id);
 
     QaiForge(const QaiForge&) = delete;
     QaiForge& operator=(const QaiForge&) = delete;

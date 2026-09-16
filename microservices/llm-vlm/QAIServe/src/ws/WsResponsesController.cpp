@@ -173,9 +173,25 @@ void WsResponsesController::handleConnectionClosed(
     std::string conn_id = getConnectionId(conn);
     if (conn_id.empty()) return;
 
+    std::string last_session_id;
+    std::string last_model;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
+        auto it = states_.find(conn_id);
+        if (it != states_.end()) {
+            last_session_id = it->second.last_session_id;
+            last_model = it->second.last_model;
+        }
         states_.erase(conn_id);
+    }
+
+    // Best-effort cleanup of any per-session backend state (e.g. LiteRT-LM
+    // KV cache session) opened on this connection. There is no explicit
+    // "session.delete" event in the WS protocol, so connection close is the
+    // only signal available — release it here if a response was ever
+    // created on this connection (last_session_id/last_model both set).
+    if (!last_session_id.empty() && !last_model.empty()) {
+        qai_forge::QaiForge::getInstance().clearSession(last_model, last_session_id);
     }
 
     std::cout << "[WsResponsesController] Connection closed: " << conn_id << "\n";
@@ -399,6 +415,7 @@ void WsResponsesController::runWarmup(
         if (it != states_.end()) {
             it->second.last_response_id = response_id;
             it->second.last_session_id  = new_session_id;
+            it->second.last_model       = model;
         }
     }
 
@@ -610,6 +627,7 @@ void WsResponsesController::runResponse(
         if (it != states_.end()) {
             it->second.last_response_id = response_id;
             it->second.last_session_id  = new_session_id;
+            it->second.last_model       = model;
             it->second.response_in_flight.store(false);
         }
     }

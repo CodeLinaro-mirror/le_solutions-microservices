@@ -123,9 +123,26 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) = 0;
 
-    // Overload with session_id and kv_invalidated for cross-request KV cache.
-    // Default falls back to stateless generate().
-    virtual void generate(
+    /**
+     * Run text-only (LLM) inference with cross-request KV session reuse.
+     *
+     * Only meaningful when capabilities().supports_kv_session_reuse == true.
+     * Callers (orchestrators) MUST check this capability flag before calling
+     * this method — backends that don't support session-based KV reuse throw
+     * std::runtime_error from the default implementation below. This keeps
+     * session_id/kv_invalidated out of the shared generate() signature that
+     * every backend (GenIE, QNN, SNPE, LiteRT, LlamaCpp) must implement,
+     * since only LiteRT-LM currently has a meaningful use for them.
+     *
+     * @param session_id      Stable session identifier used by the backend to
+     *                        key its cross-request KV cache (e.g. worker-side
+     *                        g_kv_sessions map).
+     * @param kv_invalidated  true if context eviction occurred since the last
+     *                        request in this session — the backend should
+     *                        rebuild its KV state from scratch rather than
+     *                        incrementally reusing the cached session state.
+     */
+    virtual void generateWithSession(
         const std::string& event_id,
         const std::string& session_id,
         const std::string& prompt,
@@ -141,10 +158,11 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error,
         bool               kv_invalidated = false) {
-        (void)session_id; (void)kv_invalidated;
-        generate(event_id, prompt, streaming, max_tokens, temperature,
-                 top_p, top_k, presence_penalty, frequency_penalty,
-                 use_reasoning, on_token, on_done, on_error);
+        (void)session_id; (void)streaming; (void)max_tokens; (void)temperature;
+        (void)top_p; (void)top_k; (void)presence_penalty; (void)frequency_penalty;
+        (void)use_reasoning; (void)on_token; (void)on_done; (void)kv_invalidated;
+        (void)prompt;
+        on_error({event_id, "", name() + " does not support session-based KV reuse"});
     }
 
     /**

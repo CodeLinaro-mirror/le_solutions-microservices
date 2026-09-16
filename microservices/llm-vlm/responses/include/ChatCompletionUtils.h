@@ -44,6 +44,24 @@ std::string hashSpecificMessages(const json& messages, bool debug = false);
 std::string hashConversationPairs(const json& messages, bool exclude_last_pair = true);
 
 /**
+ * @brief Build a deterministic signature string for an incoming chat completion request.
+ *
+ * Direct port of Python's SessionManager.build_request_signature(). Used to verify
+ * that an exact-retry hash match (retry_candidate_hash) actually corresponds to the
+ * same request before serving a cached replay response — a conversation-content hash
+ * collision alone is not treated as sufficient proof of "same request".
+ *
+ * Strips "stream"/"user"/"store" (fields that legitimately vary between an original
+ * request and its retry without changing the request's meaning), substitutes in the
+ * given messages array, and serializes with alphabetically-sorted keys for determinism.
+ *
+ * @param request_body Full parsed JSON request body as received from the client
+ * @param messages     The messages array to embed in the signature
+ * @return Deterministic, sorted-key JSON string
+ */
+std::string buildRequestSignature(const json& request_body, const json& messages);
+
+/**
  * @brief Extract content string from a message object
  *
  * Handles both string content and array content (for multimodal messages).

@@ -98,11 +98,15 @@ public:
     void stop(bool force = false);
 
     /**
-     * Broadcast clearSession(session_id) to the backend of every resident
-     * ModelRuntime. Intended for LiteRT-LM Conversation API cleanup; all
-     * other backends ignore it (default no-op in IGenerativeBackend).
+     * Forward clearSession(session_id) to the one resident ModelRuntime for
+     * model_id, if any. Scoped lookup — does NOT broadcast to every loaded
+     * model, since a session's per-request backend state (if any) only
+     * ever lives on the one model that session actually used. No-op if
+     * model_id has no resident runtime. Intended for LiteRT-LM Conversation
+     * API cleanup; all other backends ignore it (default no-op in
+     * IGenerativeBackend).
      */
-    void clearSession(const std::string& session_id);
+    void clearSession(const std::string& model_id, const std::string& session_id);
 
 private:
     struct RuntimeRecord {
