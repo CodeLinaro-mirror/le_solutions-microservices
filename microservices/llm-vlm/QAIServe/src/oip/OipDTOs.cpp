@@ -63,6 +63,20 @@ OipGenerateRequest OipGenerateRequest::fromJson(const json& j) {
         }
     }
 
+    // Shared-memory image references (alternative to base64 "images") —
+    // resolved by InferController, which appends the copied bytes to
+    // r.images before inference.
+    if (j.contains("images_shm") && j["images_shm"].is_array()) {
+        for (const auto& ref : j["images_shm"]) {
+            if (!ref.is_object() || !ref.contains("region")) continue;
+            OipShmImageRef shm_ref;
+            shm_ref.region    = ref.value("region", "");
+            shm_ref.offset    = ref.value("offset", static_cast<uint64_t>(0));
+            shm_ref.byte_size = ref.value("byte_size", static_cast<uint64_t>(0));
+            r.image_shm_refs.push_back(std::move(shm_ref));
+        }
+    }
+
     r.parameters = OipGenerateParameters::fromJson(j);
     return r;
 }

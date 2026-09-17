@@ -5,6 +5,7 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/PrivilegeDrop.h"
 #include "qai_forge/QaiForge.h"
+#include "shm/SharedMemoryManager.h"
 #include "mcp/McpClientRegistry.h"
 #include "mcp/NativeToolRegistry.h"
 #include "postproc/PostprocRegistry.h"
@@ -48,6 +49,20 @@ int main() {
     } else {
         std::cout << "[main] Admin model management: DISABLED "
                   << "(set QAISERVE_ADMIN_TOKEN to enable /admin/models/* endpoints)" << std::endl;
+    }
+
+    // Client-facing shared memory (/v2/systemsharedmemory + shm-referenced
+    // /infer and /generate inputs). Same-host trust boundary — a client with
+    // a valid region name can make the server shm_open() any key it names —
+    // so this is gated independently of QAISERVE_ADMIN_TOKEN.
+    const char* allow_shm_env = std::getenv("QAISERVE_ALLOW_CLIENT_SHM");
+    bool allow_client_shm = allow_shm_env && std::string(allow_shm_env) == "1";
+    SharedMemoryManager::getInstance().setAllowClientShm(allow_client_shm);
+    if (allow_client_shm) {
+        std::cout << "[main] Client shared memory: ENABLED (/v2/systemsharedmemory)" << std::endl;
+    } else {
+        std::cout << "[main] Client shared memory: DISABLED "
+                  << "(set QAISERVE_ALLOW_CLIENT_SHM=1 to enable /v2/systemsharedmemory)" << std::endl;
     }
 
     std::cout << "[main] Starting QAIServe unified inference server on port " << port
