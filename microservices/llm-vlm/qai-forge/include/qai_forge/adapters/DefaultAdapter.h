@@ -14,7 +14,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 class DefaultAdapter : public ModelAdapter {
 public:
-    json preprocessVision(const json& messages) const override { return messages; }
+    json preprocessVision(const json& messages,
+                          const json& chat_template = json::object()) const override {
+        (void)chat_template;
+        return messages;
+    }
     std::string formatToolInstructions(const json& tools) const override { return ""; }
     json parseToolCalls(const std::string& response_text) const override { return json::array(); }
     std::string formatToolResponse(const json& tool_results) const override { return ""; }

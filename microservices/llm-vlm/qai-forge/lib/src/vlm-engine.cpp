@@ -360,56 +360,90 @@ void VlmEngine::generate(const std::string& prompt,
         }
     }
 
-    // ── Re-apply static custom inputs (required before each execute) ──────────
-    for (size_t i = 0; i < m_impl->model_config.custom_inputs.size(); ++i) {
-        if (i >= m_impl->static_buffers.size()) break;
-        const auto& ci = m_impl->model_config.custom_inputs[i];
-        GenieNode_Handle_t target =
-            (ci.node == "imageEncoder")  ? m_impl->image_encoder_node  :
-            (ci.node == "lutEncoder")    ? m_impl->lut_encoder_node    :
-            (ci.node == "textGenerator") ? m_impl->text_generator_node : nullptr;
-        if (!target) continue;
-        GenieNode_IOName_t io = stringToNodeIO(ci.input_type);
-        GenieNode_setData(target, io,
-                          m_impl->static_buffers[i].get(),
-                          m_impl->static_buffer_sizes[i],
-                          nullptr);
-    }
-
-    // ── Set image data ────────────────────────────────────────────────────────
-    // Keep a local copy alive for the duration of the call.
+    // ── Combine all image buffers into a single contiguous buffer ─────────────
+    // The image encoder expects all supplied images concatenated into one
+    // buffer. Keep a local copy alive for the duration of the call.
     std::vector<uint8_t> image_copy;
-    if (!images.empty() && images[0].data && images[0].size > 0) {
-        const auto& img = images[0];  // VLM currently supports one image
-        image_copy.assign(img.data, img.data + img.size);
-        GenieNode_setData(m_impl->image_encoder_node,
-                          GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
-                          image_copy.data(),
-                          image_copy.size(),
-                          nullptr);
+    {
+        size_t total_image_bytes = 0;
+        for (const auto& img : images) {
+            if (img.data && img.size > 0) total_image_bytes += img.size;
+        }
+        if (total_image_bytes > 0) {
+            image_copy.reserve(total_image_bytes);
+            for (const auto& img : images) {
+                if (img.data && img.size > 0) {
+                    image_copy.insert(image_copy.end(), img.data, img.data + img.size);
+                }
+            }
+        }
     }
 
-    // ── Set text prompt ───────────────────────────────────────────────────────
+    // ── Set text prompt + image + static inputs ────────────────────────────────
+    // The image encoder and LUT (text) encoder both feed the same
+    // GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT on the text generator node;
+    // the pipeline assembles the final embedding sequence in the order these
+    // setData() calls arrive across nodes, so call order matters here.
     const std::string& vStart = m_impl->model_config.visionStartToken;
     const std::string& vEnd   = m_impl->model_config.visionEndToken;
     size_t startPos = prompt.find(vStart);
     size_t endPos   = prompt.find(vEnd);
 
+    auto reapplyStaticCustomInputs = [&]() {
+        for (size_t i = 0; i < m_impl->model_config.custom_inputs.size(); ++i) {
+            if (i >= m_impl->static_buffers.size()) break;
+            const auto& ci = m_impl->model_config.custom_inputs[i];
+            GenieNode_Handle_t target =
+                (ci.node == "imageEncoder")  ? m_impl->image_encoder_node  :
+                (ci.node == "lutEncoder")    ? m_impl->lut_encoder_node    :
+                (ci.node == "textGenerator") ? m_impl->text_generator_node : nullptr;
+            if (!target) continue;
+            GenieNode_IOName_t io = stringToNodeIO(ci.input_type);
+            GenieNode_setData(target, io,
+                              m_impl->static_buffers[i].get(),
+                              m_impl->static_buffer_sizes[i],
+                              nullptr);
+        }
+    };
+
     if (!images.empty() &&
         startPos != std::string::npos &&
         endPos   != std::string::npos &&
         endPos > startPos) {
-        // Interleaved path: pre-vision text → image → post-vision text
+        // Interleaved path: pre-vision text → image → reload static inputs
+        // → post-vision text.
         std::string preText  = prompt.substr(0, startPos + vStart.size());
         std::string postText = prompt.substr(endPos);
+
         GenieNode_setData(m_impl->lut_encoder_node, GENIE_NODE_TEXT_ENCODER_TEXT_INPUT,
                           preText.c_str(), preText.size(), nullptr);
+
+        if (!image_copy.empty()) {
+            GenieNode_setData(m_impl->image_encoder_node,
+                              GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
+                              image_copy.data(),
+                              image_copy.size(),
+                              nullptr);
+        }
+
+        reapplyStaticCustomInputs();
+
         GenieNode_setData(m_impl->lut_encoder_node, GENIE_NODE_TEXT_ENCODER_TEXT_INPUT,
                           postText.c_str(), postText.size(), nullptr);
     } else {
-        // Non-interleaved / text-only path
+        // Non-interleaved path: image → full prompt → reload static inputs.
+        if (!image_copy.empty()) {
+            GenieNode_setData(m_impl->image_encoder_node,
+                              GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
+                              image_copy.data(),
+                              image_copy.size(),
+                              nullptr);
+        }
+
         GenieNode_setData(m_impl->lut_encoder_node, GENIE_NODE_TEXT_ENCODER_TEXT_INPUT,
                           prompt.c_str(), prompt.size(), nullptr);
+
+        reapplyStaticCustomInputs();
     }
 
     // ── Execute pipeline ──────────────────────────────────────────────────────
