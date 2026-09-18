@@ -58,7 +58,10 @@ struct GeniePreparedRequest {
 };
 
 struct LlamaCppPreparedRequest {
-    json chat_completions_body;
+    json messages = json::array();
+    json tools = json::array();
+    GenerationConfig generation;
+    PreparedVisionInputs vision;
 };
 
 #ifdef QAI_FORGE_BUILD_LITERT_LM

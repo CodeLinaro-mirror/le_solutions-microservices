@@ -14,43 +14,19 @@ using json = nlohmann::ordered_json;
 
 namespace qai_forge {
 
-/**
- * @brief Stateless orchestrator for llama.cpp backend
- *
- * Implements IGenerativeOrchestrator with backend injection.
- * The backend is passed as a parameter to execute() — this orchestrator
- * does NOT store a backend reference.
- *
- * Design:
- * - Stateless: No member variables for backend, session, or state
- * - Backend Injection: Backend passed to execute(), not stored
- * - Complete transcript forwarding through request.messages
- * - Direct Message Passing: Passes messages to llama-server (no Jinja in C++)
- * - SSE Parsing: Parses Server-Sent Events from llama-server
- * - Callback Invocation: Calls OrchestratorStreamCallback with StreamChunk
- * - StandardResponse Return: Returns complete response even in streaming mode
- *
- * Pattern follows LiteRTLMOrchestrator implementation.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// LlamaCppOrchestrator — stateless orchestrator for the direct-libllama
+// LlamaCppBackend. Structurally identical to LiteRTLMOrchestrator: merges
+// response history into messages, applies context eviction, delegates
+// generation to LlamaCppBackend::generateStructured(), and reuses the same
+// delimiter-based tool-call parsing (models embed a tool_call_delimiter in
+// their chat template the same way litert-lm models do).
+// ─────────────────────────────────────────────────────────────────────────────
 class LlamaCppOrchestrator : public IGenerativeOrchestrator {
 public:
     LlamaCppOrchestrator() = default;
     ~LlamaCppOrchestrator() override = default;
 
-    /**
-     * Execute one inference turn.
-     *
-     * The backend is injected as a parameter — this orchestrator does NOT
-     * store a backend reference. This follows the stateless orchestrator
-     * pattern where ModelRuntime owns the backend and passes it per call.
-     *
-     * @param request          Chat completion request (model, messages, params)
-     * @param options          Scheduler invoke options
-     * @param backend          Backend instance (injected, not stored)
-     * @param callback         Stream callback (nullptr for blocking mode)
-     * @param cancel           Cancellation predicate
-     * @return                 StandardResponse with content, tool_calls, usage
-     */
     scheduler::GenerativeJobPtr createJob(
         scheduler::GenerativeJobContext context,
         scheduler::GenerativeCallbacks callbacks) const override;
@@ -60,58 +36,19 @@ public:
         IGenerativeBackend& backend) const override;
 
 private:
-    /**
-     * @brief Build OpenAI chat completions JSON request
-     * @param request Original request
-     * @param merged_messages Complete messages supplied by the caller
-     * @return JSON request body for /v1/chat/completions
-     */
-    json buildChatCompletionsRequest(
-        const CreateChatCompletionRequest& request,
-        json merged_messages) const;
+    int estimateTokens(const json& messages, const json& tools) const;
+    int applyContextEviction(json& messages,
+                             const json& tools,
+                             int max_context_length) const;
+    json parseToolCalls(const std::string& text,
+                        const std::string& delimiter) const;
+    std::string extractPreToolContent(
+        const std::string& text,
+        const std::string& delimiter) const;
+    std::vector<std::vector<uint8_t>> extractImagesFromMessages(
+        json& messages) const;
 
-    /**
-     * @brief Parse SSE chunk and invoke callback
-     * @param sse_chunk Raw SSE data ("data: {...}\n\n")
-     * @param callback Stream callback to invoke
-     * @param event_id Event ID for StreamChunk
-     * @param model Model name for StreamChunk
-     * @param accumulated_content Reference to accumulate content
-     * @param accumulated_tool_calls Reference to accumulate tool calls
-     * @param finish_reason Reference to store finish reason
-     * @param prompt_tokens Reference to count prompt tokens
-     * @param completion_tokens Reference to count completion tokens
-     */
-    void handleSseChunk(
-        const std::string& sse_chunk,
-        const std::function<void(const StreamChunk&)>& callback,
-        const std::string& event_id,
-        const std::string& model,
-        std::string& accumulated_content,
-        json& accumulated_tool_calls,
-        std::string& finish_reason,
-        int& prompt_tokens,
-        int& completion_tokens) const;
-
-    /**
-     * @brief Build StandardResponse from accumulated data
-     * @param event_id Event ID
-     * @param model Model name
-     * @param accumulated_content Accumulated content
-     * @param accumulated_tool_calls Accumulated tool calls
-     * @param finish_reason Finish reason
-     * @param prompt_tokens Prompt token count
-     * @param completion_tokens Completion token count
-     * @return StandardResponse
-     */
-    StandardResponse buildStandardResponse(
-        const std::string& event_id,
-        const std::string& model,
-        const std::string& accumulated_content,
-        const json& accumulated_tool_calls,
-        const std::string& finish_reason,
-        int prompt_tokens,
-        int completion_tokens) const;
+    static constexpr float kCompactionThreshold = 0.70f;
 };
 
 } // namespace qai_forge

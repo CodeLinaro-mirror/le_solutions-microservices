@@ -452,6 +452,20 @@ if(QAI_FORGE_BUILD_LLAMACPP)
             /usr/local/lib
             /usr/lib/aarch64-linux-gnu
     )
+    # mtmd: multimodal (vision/--mmproj) support, only linked into
+    # llamacpp-inference-worker (see its target block below) — llama.cpp
+    # builds this by default alongside libllama/libggml.
+    find_library(LLAMACPP_MTMD_LIB
+        NAMES mtmd libmtmd
+        HINTS
+            ${LLAMACPP_INCLUDE_PATH}/../lib
+            ${CMAKE_PREFIX_PATH}/lib
+            ${CMAKE_PREFIX_PATH}
+        PATHS
+            /usr/lib
+            /usr/local/lib
+            /usr/lib/aarch64-linux-gnu
+    )
 
     if (NOT LLAMACPP_LLAMA_LIB OR NOT LLAMACPP_GGML_LIB)
         message(WARNING "[qai-forge] Core llama.cpp libraries (libllama/libggml) not found. Build may fail during linking.")
@@ -467,6 +481,11 @@ if(QAI_FORGE_BUILD_LLAMACPP)
         endif()
         if (LLAMACPP_COMMON_LIB)
             message(STATUS "[qai-forge] Found libllama-common: ${LLAMACPP_COMMON_LIB}")
+        endif()
+        if (LLAMACPP_MTMD_LIB)
+            message(STATUS "[qai-forge] Found libmtmd: ${LLAMACPP_MTMD_LIB}")
+        else()
+            message(WARNING "[qai-forge] libmtmd not found — llamacpp-inference-worker will build without vision/mmproj support.")
         endif()
     endif()
 endif()
@@ -823,6 +842,67 @@ if(QAI_FORGE_BUILD_LITERT_LM)
     endif() # LITERT_LM_LIB
 
 endif() # QAI_FORGE_BUILD_LITERT_LM
+
+# ─────────────────────────────────────────────────────────────────────────────
+# llama.cpp worker (generative AI — LLM inference via direct libllama API)
+#
+# llamacpp-inference-worker links libllama/libggml/libllama-common directly
+# (no llama-server, no HTTP/SSE) — mirrors litert-lm-inference-worker's
+# structure. Reuses the libllama/libggml libraries already located above for
+# qai_forge's own GgufMetadataReader.
+# ─────────────────────────────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_LLAMACPP AND LLAMACPP_LLAMA_LIB AND LLAMACPP_GGML_LIB)
+    add_executable(llamacpp-inference-worker
+        src/worker/llamacpp/main.cpp
+    )
+    target_include_directories(llamacpp-inference-worker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${LLAMACPP_INCLUDE_PATH}
+        ${LLAMACPP_INCLUDE_PATH}/ggml/include
+    )
+    target_compile_definitions(llamacpp-inference-worker PRIVATE
+        QAI_FORGE_BUILD_LLAMACPP
+    )
+
+    # Important: llama-common must come before llama/ggml in the link order
+    # to resolve GGUF symbols properly (matches qai_forge's own link order above).
+    if(LLAMACPP_COMMON_LIB)
+        target_link_libraries(llamacpp-inference-worker PRIVATE ${LLAMACPP_COMMON_LIB})
+    endif()
+
+    target_link_libraries(llamacpp-inference-worker PRIVATE
+        ${LLAMACPP_LLAMA_LIB}
+        ${LLAMACPP_GGML_LIB}
+    )
+
+    if(LLAMACPP_GGML_BASE_LIB)
+        target_link_libraries(llamacpp-inference-worker PRIVATE ${LLAMACPP_GGML_BASE_LIB})
+    endif()
+    if(LLAMACPP_GGML_CPU_LIB)
+        target_link_libraries(llamacpp-inference-worker PRIVATE ${LLAMACPP_GGML_CPU_LIB})
+    endif()
+
+    # mtmd: vision/--mmproj support. Guarded (not a hard requirement) so a
+    # build missing libmtmd still produces a text-only worker instead of
+    # failing the whole llamacpp backend.
+    if(LLAMACPP_MTMD_LIB)
+        target_compile_definitions(llamacpp-inference-worker PRIVATE
+            QAI_FORGE_LLAMACPP_MTMD
+        )
+        target_link_libraries(llamacpp-inference-worker PRIVATE ${LLAMACPP_MTMD_LIB})
+    endif()
+
+    target_link_libraries(llamacpp-inference-worker PRIVATE
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS llamacpp-inference-worker
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
+endif() # QAI_FORGE_BUILD_LLAMACPP
 
 # Note: Transport servers (gRPC, D-Bus, HTTP) are built as standalone
 # applications in their own top-level directories (grpc-server/, dbus-server/,

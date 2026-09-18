@@ -41,6 +41,7 @@ struct ModelConfig {
     std::string config_file;                // Absolute path to the processed genie_config.json in /tmp/configs
     std::string sampler_config_file;        // Absolute path to the processed sampler config (if present)
     std::string bundle_path;                // Absolute path to the on-disk model bundle directory (source of truth for DELETE/lock lookup)
+    std::string mmproj_path;                // Absolute path to the paired mmproj GGUF (llama.cpp VLM models), empty if none
     int context_size = 4096;                // Max context window in tokens (after capping)
     int memory_requirement_mb = 4096;       // Estimated memory footprint in MB
     bool supports_vision = false;           // True for VLM models
@@ -234,6 +235,7 @@ private:
      */
     std::string generateVlmGenieConfig(const json& metadata, const json& genie,
                                        const json& pipeline_nodes,
+                                       const std::string& bundle_path,
                                        const std::string& processed_config_dir);
 
     /**

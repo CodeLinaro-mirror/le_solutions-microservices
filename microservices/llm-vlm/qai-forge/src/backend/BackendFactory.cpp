@@ -57,7 +57,8 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
     if (runtime == "llamacpp") {
-        return std::make_unique<qai_forge::LlamaCppBackend>("/usr/bin/llama-server");
+        // Phase 4: Scheduler-owned LlamaCppBackend instance
+        return std::make_unique<qai_forge::LlamaCppBackend>();
     }
 #endif
 

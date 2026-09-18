@@ -73,7 +73,9 @@ InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
             size_t bytes = std::strtoull(env, nullptr, 10);
             if (bytes > 0) prompt_shm_bytes_ = bytes;
         }
+    }
 
+    if (process_type_ == "vlm" || process_type_ == "llamacpp") {
         image_shm_bytes_ = kDefaultImageShmBytes;
         if (const char* env = std::getenv("GENAI_IMAGE_SHM_BYTES")) {
             size_t bytes = std::strtoull(env, nullptr, 10);
@@ -197,7 +199,8 @@ void InferenceWorkerManager::startWorker(
 
     int   image_shm_fd  = -1;
     void* image_shm_ptr = nullptr;
-    if (is_vlm_worker) {
+    const bool needs_image_shm = (process_type_ == "vlm" || process_type_ == "llamacpp");
+    if (needs_image_shm) {
         image_shm_fd = memfd_create("qai-forge-image-shm", 0);
         if (image_shm_fd < 0) {
             if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
@@ -237,6 +240,10 @@ void InferenceWorkerManager::startWorker(
         worker_bin_env = std::getenv("LITERT_LM_WORKER_BINARY");
         default_bin    = "/usr/local/bin/litert-lm-inference-worker";
         socket_fd_var  = "LLM_SOCKET_FD=" + std::to_string(child_fd);
+    } else if (process_type_ == "llamacpp") {
+        worker_bin_env = std::getenv("LLAMACPP_WORKER_BINARY");
+        default_bin    = "/usr/local/bin/llamacpp-inference-worker";
+        socket_fd_var  = "LLM_SOCKET_FD=" + std::to_string(child_fd);
     } else {
         // Default: LLM (genai-inference-worker)
         worker_bin_env = std::getenv("GENAI_WORKER_BINARY");
@@ -252,9 +259,20 @@ void InferenceWorkerManager::startWorker(
     std::string image_shm_fd_var     = "IMAGE_SHM_FD=" + std::to_string(image_shm_fd);
     std::string image_shm_bytes_var  = "IMAGE_SHM_BYTES=" + std::to_string(image_shm_bytes_);
 
+    // llama.cpp's ggml-hexagon backend reads GGML_HEXAGON_NDEV (a device
+    // count, not GGML_HEXAGON_DEVICES) at ggml_backend_hexagon_reg() time to
+    // decide how many HTP sessions to reserve on the CDSP domain. It defaults
+    // to 1 if unset, capped at GGML_HEXAGON_MAX_SESSIONS (16).
+    std::string hexagon_ndev_var;
+    if (process_type_ == "llamacpp") {
+        const char* existing_hexagon_ndev = std::getenv("GGML_HEXAGON_NDEV");
+        hexagon_ndev_var = "GGML_HEXAGON_NDEV=" +
+            std::string(existing_hexagon_ndev ? existing_hexagon_ndev : "2");
+    }
+
     pid_t pid = ::fork();
     if (pid < 0) {
-        if (is_vlm_worker) { munmap(image_shm_ptr, image_shm_bytes_); ::close(image_shm_fd); }
+        if (needs_image_shm) { munmap(image_shm_ptr, image_shm_bytes_); ::close(image_shm_fd); }
         if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
         if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
         ::close(sv[0]);
@@ -268,11 +286,14 @@ void InferenceWorkerManager::startWorker(
 
         // Set the socket FD environment variable.
         ::putenv(const_cast<char*>(env_var.c_str()));
-        if (is_vlm_worker) {
+        if (needs_image_shm) {
             ::putenv(const_cast<char*>(prompt_shm_fd_var.c_str()));
             ::putenv(const_cast<char*>(prompt_shm_bytes_var.c_str()));
             ::putenv(const_cast<char*>(image_shm_fd_var.c_str()));
             ::putenv(const_cast<char*>(image_shm_bytes_var.c_str()));
+        }
+        if (process_type_ == "llamacpp") {
+            ::putenv(const_cast<char*>(hexagon_ndev_var.c_str()));
         }
 
         // Exec the worker binary
@@ -288,7 +309,7 @@ void InferenceWorkerManager::startWorker(
     ::close(child_fd);
     worker_pid_ = pid;
     sock_fd_ = parent_fd;
-    if (is_vlm_worker) {
+    if (needs_image_shm) {
         prompt_shm_ptr_ = prompt_shm_ptr;
         prompt_shm_fd_ = prompt_shm_fd;
         image_shm_ptr_ = image_shm_ptr;
@@ -790,12 +811,22 @@ void InferenceWorkerManager::executeStructuredRequest(
     float frequency_penalty,
     TokenCallback on_token,
     DoneCallback on_done,
-    ErrorCallback on_error) {
+    ErrorCallback on_error,
+    const std::vector<std::vector<uint8_t>>& images) {
     waitForPendingReset(session_id);
 
     std::shared_lock<std::shared_mutex> lock(mutex_);
 
     ActiveRequestGuard active_guard{active_request_count_};
+    json image_refs;
+    if (!images.empty()) {
+        try {
+            image_refs = writeImagesToShm(images);
+        } catch (const std::exception& e) {
+            on_error({event_id, "", e.what()});
+            return;
+        }
+    }
 
     json execute_cmd = InferenceProtocol::createStructuredExecuteCommand(
         event_id,
@@ -809,6 +840,9 @@ void InferenceWorkerManager::executeStructuredRequest(
         presence_penalty,
         frequency_penalty,
         session_id);
+    if (!images.empty()) {
+        execute_cmd["image_refs"] = image_refs;
+    }
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
 }
 

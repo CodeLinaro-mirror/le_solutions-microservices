@@ -9,7 +9,17 @@
 # This variant includes Hexagon SDK, DSP toolchain, and cross-compilation setup.
 #
 # Environment Variables:
-#   LLAMACPP_VERSION=master                       llama.cpp version/branch to build
+#   LLAMACPP_VERSION=2fb989b9e79bf4da8159855e24892c8f4c20300f
+#                                                  llama.cpp version/branch/commit to build.
+#                                                  Pinned (not "master") — commit d9f918d2d
+#                                                  ("common: add json.h abstraction", 2026-08-22)
+#                                                  changed common_chat_msgs_parse_oaicompat/
+#                                                  common_chat_tools_parse_oaicompat to route
+#                                                  through a new common_json wrapper that no
+#                                                  longer accepts a raw nlohmann::ordered_json,
+#                                                  breaking qai-forge/src/worker/llamacpp/main.cpp.
+#                                                  This pin is 2fb989b9e — its parent commit,
+#                                                  last known-good before that break.
 #   HEXAGON_SDK_VERSION=6.6.0.0                   Hexagon SDK version
 #   HEXAGON_TOOLS_VERSION=19.0.02                 Hexagon tools version
 #   HEXAGON_ARCH=v73                              Hexagon architecture (v68, v73, v75)
@@ -30,7 +40,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
 # ─────────────────────────────────────────────────────────────────────────────
-LLAMACPP_VERSION="${LLAMACPP_VERSION:-master}"
+LLAMACPP_VERSION="${LLAMACPP_VERSION:-2fb989b9e79bf4da8159855e24892c8f4c20300f}"
 HEXAGON_SDK_VERSION="${HEXAGON_SDK_VERSION:-6.6.0.0}"
 HEXAGON_TOOLS_VERSION="${HEXAGON_TOOLS_VERSION:-19.0.02}"
 HEXAGON_ARCH="${HEXAGON_ARCH:-v73}"
@@ -152,8 +162,16 @@ chmod +x "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic"
 echo "Cloning llama.cpp @ ${LLAMACPP_VERSION}..."
 mkdir -p /build
 cd /build
-git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+# `git clone --branch` only resolves branch/tag refs, not raw commit SHAs —
+# LLAMACPP_VERSION is pinned to a commit (see comment above) to avoid
+# floating on master and re-hitting upstream API breaks, so clone+fetch by
+# ref instead. Works for branch/tag names too.
+mkdir llama.cpp
 cd llama.cpp
+git init -q
+git remote add origin https://github.com/ggerganov/llama.cpp.git
+git fetch --depth 1 origin "${LLAMACPP_VERSION}"
+git checkout -q FETCH_HEAD
 
 # Patch GGML_SCHED_MAX_SPLIT_INPUTS for better performance
 echo "Patching GGML_SCHED_MAX_SPLIT_INPUTS..."
@@ -172,6 +190,7 @@ cmake -S . -B build \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
     -DLLAMA_BUILD_SERVER="${LLAMACPP_BUILD_SERVER}" \
+    -DLLAMA_BUILD_COMMON=ON \
     -DHEXAGON_SDK_ROOT="${HEXAGON_SDK_ROOT}" \
     -DHEXAGON_TOOLS_ROOT="${HEXAGON_TOOLS_ROOT}" \
     -DHEXAGON_CMAKE_ROOT="${HEXAGON_CMAKE_ROOT}" \
@@ -228,6 +247,44 @@ find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -name 'libggml-htp-v*.so' \
 # Copy headers
 cp -r /build/llama.cpp/ggml/include/* "${LLAMACPP_INSTALL_DIR}/include/ggml/include/" 2>/dev/null || true
 cp -r /build/llama.cpp/include/* "${LLAMACPP_INSTALL_DIR}/include/" 2>/dev/null || true
+# common/*.h (and its jinja/ subdirectory, which common/chat.h pulls in via
+# quoted same-directory includes) — needed by llamacpp-inference-worker for
+# common_chat_templates_apply()/sampler-chain construction. These are plain
+# source headers, not CMake-installed PUBLIC_HEADERs, so stage them by hand.
+mkdir -p "${LLAMACPP_INSTALL_DIR}/include/common"
+cp -r /build/llama.cpp/common/*.h "${LLAMACPP_INSTALL_DIR}/include/common/" 2>/dev/null || true
+if [ -d /build/llama.cpp/common/jinja ]; then
+    cp -r /build/llama.cpp/common/jinja "${LLAMACPP_INSTALL_DIR}/include/common/"
+fi
+
+# mtmd.h/mtmd-helper.h (multimodal/vision support, --mmproj) — the mtmd
+# library itself is already built by default (tools/mtmd is added
+# unconditionally whenever LLAMA_BUILD_COMMON+LLAMA_BUILD_TOOLS are ON, both
+# set above) and its .so is already swept up by the "*.so*" staging loop
+# below, but these plain source headers live under tools/mtmd/ and aren't
+# copied by the directory copies above — stage them by hand like common/*.h.
+cp /build/llama.cpp/tools/mtmd/mtmd.h /build/llama.cpp/tools/mtmd/mtmd-helper.h \
+    "${LLAMACPP_INSTALL_DIR}/include/" 2>/dev/null || true
+
+# nlohmann/json.hpp — must be llama.cpp's OWN vendored copy (vendor/nlohmann),
+# not the system nlohmann-json3-dev package qai-forge's own CMakeLists.txt
+# pulls in via find_package(nlohmann_json). nlohmann/json encodes its release
+# version into an ABI-tagged inline namespace (nlohmann::json_abi_vMAJOR_MINOR_PATCH),
+# so common_chat_msgs_parse_oaicompat(nlohmann::ordered_json const&) mangles
+# differently depending on which json.hpp compiled it. libllama-common.so is
+# built against llama.cpp's vendored version (currently 3.12.0 ->
+# json_abi_v3_12_0); if llamacpp-inference-worker's main.cpp instead resolves
+# <nlohmann/json.hpp> to the system package (e.g. Ubuntu's 3.11.3 ->
+# json_abi_v3_11_3), the two sides produce differently-mangled symbols for the
+# "same" function, and linking fails with "undefined reference to
+# common_chat_msgs_parse_oaicompat(...)" even though the function exists in
+# libllama-common.so under the other namespace. Staging it here — ahead of
+# LLAMACPP_INCLUDE_PATH's ggml/include entries in qai-forge's own
+# target_include_directories() — makes #include <nlohmann/json.hpp> resolve
+# to this copy first for any TU compiled against LLAMACPP_INCLUDE_PATH.
+mkdir -p "${LLAMACPP_INSTALL_DIR}/include/nlohmann"
+cp -v /build/llama.cpp/vendor/nlohmann/json.hpp /build/llama.cpp/vendor/nlohmann/json_fwd.hpp \
+    "${LLAMACPP_INSTALL_DIR}/include/nlohmann/"
 
 # Strip binaries and non-DSP shared libraries (stripping the Hexagon HTP
 # blobs would corrupt them — they're compiled for the DSP core, not ARM64,

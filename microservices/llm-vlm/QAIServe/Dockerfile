@@ -357,7 +357,7 @@ COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/lib ${DEPLOY_DIR}/usr/lib
 COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/include /usr/include
 COPY --from=litert_lm_builder ${LITERT_LM_DEPLOY_DIR}/bin ${DEPLOY_DIR}/usr/bin
 
-# ── Build llama.cpp (provides llama-server + libllama.so + libggml*.so) ──
+# ── Build llama.cpp (provides llamacpp-inference-worker + libllama.so + libggml*.so) ──
 # Uses modular script for maintainability and reusability. Skipped entirely
 # when BUILD_LLAMACPP=OFF — no Hexagon SDK cross-toolchain setup, no
 # llama.cpp clone/compile.
@@ -433,6 +433,16 @@ RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
             chmod +x ${DEPLOY_DIR}/usr/bin/${tool}; \
         fi; \
     done
+
+# When BUILD_LLAMACPP=OFF, qai-forge's CMakeLists (gated on the same flag) doesn't
+# build it — stage a stub so the unconditional `COPY --from=builder 
+# .../llamacpp-inference-worker` below still succeeds.
+RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
+    if [ ! -f ${DEPLOY_DIR}/usr/bin/llamacpp-inference-worker ]; then \
+        printf '#!/bin/sh\necho "llamacpp-inference-worker was not built into this image (BUILD_LLAMACPP=OFF)."\nexit 1\n' \
+            > ${DEPLOY_DIR}/usr/bin/llamacpp-inference-worker && \
+        chmod +x ${DEPLOY_DIR}/usr/bin/llamacpp-inference-worker; \
+    fi
 
 # ── Install QAIServe-specific build deps (CURL + libzip) ─────────────────────
 # Placed here (just before COPY QAIServe) so that changes to this step do not
@@ -557,7 +567,7 @@ COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-inference-worker /export/usr/bi
 COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm-inference-worker /export/usr/bin/
 COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm /export/usr/bin/
 COPY --from=builder ${DEPLOY_DIR}/usr/bin/litert-lm-advanced /export/usr/bin/
-COPY --from=builder ${DEPLOY_DIR}/usr/bin/llama-server /export/usr/bin/
+COPY --from=builder ${DEPLOY_DIR}/usr/bin/llamacpp-inference-worker /export/usr/bin/
 COPY --from=builder ${DEPLOY_DIR}/usr/lib /export/usr/lib
 
 # Cherry-pick only the required system .so files (with symlinks preserved).
@@ -597,7 +607,8 @@ FROM --platform=linux/arm64 gcr.io/distroless/cc-debian13 AS qaiserve-runtime
 # Single COPY brings in:
 #   /usr/bin/   - qaiserve, genai-inference-worker, genai-vlm-inference-worker,
 #                 qnn-inference-worker, snpe-inference-worker, litert-inference-worker,
-#                 litert-lm-inference-worker, litert-lm, litert-lm-advanced
+#                 litert-lm-inference-worker, litert-lm, litert-lm-advanced,
+#                 llamacpp-inference-worker
 #   /usr/lib/   - libqai_forge.so, libdrogon.so, libtrantor.so,
 #                 libGenie.so, QNN, SNPE,
 #                 liblitert_runtime_c_api.so, liblitertengine.so,
@@ -627,6 +638,7 @@ ENV LITERT_COMPILER_PLUGIN_DIR=/usr/lib
 ENV LITERT_HW_ACCELERATORS=5
 ENV LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
 ENV LITERT_LM_BACKEND=npu
+ENV LLAMACPP_WORKER_BINARY=/usr/bin/llamacpp-inference-worker
 ENV LOG_LEVEL=ERROR
 ENV ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 ENV CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp

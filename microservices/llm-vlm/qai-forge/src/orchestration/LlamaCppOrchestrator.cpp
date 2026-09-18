@@ -5,10 +5,26 @@
 
 #include "qai_forge/orchestration/LlamaCppOrchestrator.h"
 #include "qai_forge/backend/LlamaCppBackend.h"
+#include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
+
+#include <cctype>
+#include <iomanip>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 
 namespace qai_forge {
+
+namespace {
+std::string generateEventId() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "evt-" << std::hex << rng();
+    return oss.str();
+}
+} // namespace
 
 scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
     scheduler::GenerativeJobContext context,
@@ -18,16 +34,40 @@ scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
         merged_messages = json::array();
     }
 
-    scheduler::LlamaCppPreparedRequest prepared;
-    prepared.chat_completions_body =
-        buildChatCompletionsRequest(
-            context.request, std::move(merged_messages));
-    prepared.chat_completions_body["stream"] =
-        static_cast<bool>(callbacks.on_token);
-    if (callbacks.on_token) {
-        prepared.chat_completions_body["stream_options"] =
-            {{"include_usage", true}};
+    std::vector<std::vector<uint8_t>> inline_images =
+        extractImagesFromMessages(merged_messages);
+
+    json tools = std::move(context.request.tools).value_or(json::array());
+    const int evicted = applyContextEviction(
+        merged_messages,
+        tools,
+        ModelConfigManager::getInstance().getContextSize(context.model_id));
+    if (evicted > 0) {
+        LOG_INFO("[LlamaCppOrchestrator] Evicted " << evicted
+                 << " messages while preparing model=" << context.model_id);
     }
+
+    scheduler::LlamaCppPreparedRequest prepared;
+    prepared.messages = std::move(merged_messages);
+    prepared.tools = std::move(tools);
+    prepared.vision.buffers = std::move(context.request.raw_images);
+    if (!inline_images.empty()) {
+        prepared.vision.buffers.insert(
+            prepared.vision.buffers.end(),
+            std::make_move_iterator(inline_images.begin()),
+            std::make_move_iterator(inline_images.end()));
+    }
+    prepared.generation.max_tokens =
+        context.request.max_completion_tokens.value_or(512);
+    prepared.generation.temperature =
+        context.request.temperature.value_or(0.7f);
+    prepared.generation.top_p = context.request.top_p.value_or(0.9f);
+    prepared.generation.top_k = context.request.top_k.value_or(40);
+    prepared.generation.presence_penalty =
+        context.request.presence_penalty.value_or(0.0f);
+    prepared.generation.frequency_penalty =
+        context.request.frequency_penalty.value_or(0.0f);
+    prepared.generation.streaming = static_cast<bool>(callbacks.on_token);
 
     auto job = std::make_shared<scheduler::GenerativeJob>();
     job->response_id = context.caller.response_id.empty()
@@ -50,11 +90,10 @@ scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
 StandardResponse LlamaCppOrchestrator::execute(
     scheduler::GenerativeJob& job,
     IGenerativeBackend& backend) const {
-
-    // Cast to LlamaCppBackend to access HTTP methods
     auto* llama_backend = dynamic_cast<LlamaCppBackend*>(&backend);
     if (!llama_backend) {
-        throw std::runtime_error("LlamaCppOrchestrator requires LlamaCppBackend");
+        throw std::runtime_error(
+            "LlamaCppOrchestrator requires LlamaCppBackend");
     }
 
     const auto* prepared =
@@ -63,271 +102,282 @@ StandardResponse LlamaCppOrchestrator::execute(
         throw std::runtime_error(
             "LlamaCppOrchestrator received a non-llama.cpp prepared request");
     }
-    const json& chat_request = prepared->chat_completions_body;
-    const bool streaming = static_cast<bool>(job.callbacks.on_token);
 
-    // Accumulation variables for streaming
-    std::string accumulated_content;
-    json accumulated_tool_calls = json::array();
-    std::string finish_reason;
-    int prompt_tokens = 0;
+    const bool streaming = prepared->generation.streaming;
+    json profile =
+        ModelConfigManager::getInstance().getChatTemplate(job.model_id);
+    const std::string tool_call_delimiter =
+        profile.value("tool_call_delimiter", "<|tool_call|>");
+
+    std::string accumulated_text;
+    std::string finish_reason = "stop";
     int completion_tokens = 0;
+    bool inference_error = false;
+    std::string error_message;
 
-    if (streaming) {
-        // Streaming mode: use httpPostStreaming
-        llama_backend->httpPostStreaming("/v1/chat/completions", chat_request,
-            [&](const std::string& sse_chunk) {
-                // Check cancellation
-                if (job.isCancelled()) {
-                    return;
-                }
+    if (streaming && job.callbacks.on_token) {
+        StreamChunk role_chunk;
+        role_chunk.id = job.session_id;
+        role_chunk.model = job.model_id;
+        role_chunk.role = "assistant";
+        job.callbacks.on_token(role_chunk);
+    }
 
-                try {
-                    // Parse SSE chunk and invoke callback
-                    handleSseChunk(sse_chunk, job.callbacks.on_token, job.response_id,
-                                 job.model_id,
-                                 accumulated_content, accumulated_tool_calls,
-                                 finish_reason, prompt_tokens, completion_tokens);
-                } catch (const std::exception& e) {
-                    LOG_ERROR("[LlamaCppOrchestrator] handleSseChunk threw: "
-                              + std::string(e.what())
-                              + " chunk=" + sse_chunk.substr(0, 128));
-                } catch (...) {
-                    LOG_ERROR("[LlamaCppOrchestrator] handleSseChunk threw unknown exception"
-                              " chunk=" + sse_chunk.substr(0, 128));
-                }
-            });
+    llama_backend->generateStructured(
+        job.response_id,
+        job.session_id,
+        prepared->messages,
+        prepared->tools,
+        streaming,
+        prepared->generation.max_tokens,
+        prepared->generation.temperature,
+        prepared->generation.top_p,
+        prepared->generation.top_k,
+        prepared->generation.presence_penalty,
+        prepared->generation.frequency_penalty,
+        [&](const IPCTokenEvent& token) {
+            accumulated_text += token.content;
+            ++completion_tokens;
+            if (job.isCancelled()) {
+                backend.terminateWorker(true);
+                return;
+            }
+            if (!streaming || !job.callbacks.on_token ||
+                accumulated_text.find(tool_call_delimiter) !=
+                    std::string::npos) {
+                return;
+            }
+            StreamChunk chunk;
+            chunk.id = job.session_id;
+            chunk.model = job.model_id;
+            chunk.content_delta = token.content;
+            job.callbacks.on_token(chunk);
+        },
+        [&](const IPCDoneEvent& done) {
+            finish_reason = done.finish_reason.empty()
+                ? "stop" : done.finish_reason;
+        },
+        [&](const IPCErrorEvent& error) {
+            inference_error = true;
+            error_message = error.message;
+        },
+        prepared->vision.buffers);
+
+    backend.resetKvAsync();
+    if (inference_error) {
+        throw GenAIException(
+            GenAIErrorCode::INFERENCE_FAILED,
+            "llama.cpp inference failed: " + error_message,
+            500);
+    }
+
+    StandardResponse response;
+    response.id = job.session_id;
+    response.model = job.model_id;
+    response.role = "assistant";
+    response.finish_reason = finish_reason;
+    response.prompt_tokens = estimateTokens(
+        prepared->messages, prepared->tools);
+    response.completion_tokens = completion_tokens;
+    response.total_tokens = response.prompt_tokens + completion_tokens;
+
+    const bool has_tool_call = !tool_call_delimiter.empty() &&
+        accumulated_text.find(tool_call_delimiter) != std::string::npos;
+    if (has_tool_call) {
+        json tool_calls = parseToolCalls(
+            accumulated_text, tool_call_delimiter);
+        if (tool_calls.is_array() && !tool_calls.empty()) {
+            response.tool_calls = std::move(tool_calls);
+            response.finish_reason = "tool_calls";
+            const std::string content = extractPreToolContent(
+                accumulated_text, tool_call_delimiter);
+            if (!content.empty()) {
+                response.content = content;
+            }
+        } else {
+            response.content = accumulated_text;
+        }
     } else {
-        // Blocking mode: use httpPostBlocking
-        json response = llama_backend->httpPostBlocking("/v1/chat/completions", chat_request);
+        response.content = accumulated_text;
+    }
 
-        // Extract content from response
-        if (response.contains("choices") && response["choices"].is_array() && !response["choices"].empty()) {
-            const auto& choice = response["choices"][0];
-            if (choice.contains("message")) {
-                const auto& message = choice["message"];
-                if (message.contains("content") && message["content"].is_string()) {
-                    accumulated_content = message["content"].get<std::string>();
-                }
-                if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
-                    accumulated_tool_calls = message["tool_calls"];
-                }
+    if (streaming && job.callbacks.on_token) {
+        StreamChunk finish_chunk;
+        finish_chunk.id = job.session_id;
+        finish_chunk.model = job.model_id;
+        finish_chunk.finish_reason = response.finish_reason;
+        job.callbacks.on_token(finish_chunk);
+    }
+
+    return response;
+}
+
+int LlamaCppOrchestrator::estimateTokens(
+    const json& messages,
+    const json& tools) const {
+    const std::size_t characters = messages.dump().size() + tools.dump().size();
+    return static_cast<int>(characters / 4) + 1;
+}
+
+std::vector<std::vector<uint8_t>> LlamaCppOrchestrator::extractImagesFromMessages(
+    json& messages) const {
+    std::vector<std::vector<uint8_t>> images;
+    if (!messages.is_array()) {
+        return images;
+    }
+
+    for (auto& message : messages) {
+        if (!message.is_object()) {
+            continue;
+        }
+        auto content_it = message.find("content");
+        if (content_it == message.end() || !content_it->is_array()) {
+            continue;
+        }
+
+        std::string combined_text;
+        bool has_image = false;
+        for (auto& part : *content_it) {
+            if (!part.is_object()) {
+                continue;
             }
-            if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) {
-                finish_reason = choice["finish_reason"].get<std::string>();
+            const std::string type = part.value("type", "");
+            if (type != "image_url" && type != "input_image") {
+                if (type == "text") {
+                    if (!combined_text.empty()) {
+                        combined_text += "\n";
+                    }
+                    combined_text += part.value("text", "");
+                }
+                continue;
+            }
+
+            has_image = true;
+            auto image_url = part.value("image_url", json::object());
+            const std::string url = image_url.is_string()
+                ? image_url.get<std::string>()
+                : image_url.value("url", "");
+            if (url.empty()) {
+                continue;
+            }
+            try {
+                ImageData image_data = ImageUtils::resolveImage(url);
+                images.push_back(ImageUtils::base64Decode(image_data.base64_data));
+            } catch (const std::exception& error) {
+                LOG_WARN("[LlamaCppOrchestrator] Failed to resolve inline image: "
+                         << error.what());
             }
         }
 
-        // Extract token usage
-        if (response.contains("usage") && response["usage"].is_object()) {
-            const auto& usage = response["usage"];
-            if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number()) {
-                prompt_tokens = usage["prompt_tokens"].get<int>();
-            }
-            if (usage.contains("completion_tokens") && usage["completion_tokens"].is_number()) {
-                completion_tokens = usage["completion_tokens"].get<int>();
-            }
+        if (has_image) {
+            *content_it = combined_text;
         }
     }
-
-    // Build and return StandardResponse
-    return buildStandardResponse(job.response_id, job.model_id,
-                                accumulated_content, accumulated_tool_calls,
-                                finish_reason, prompt_tokens, completion_tokens);
+    return images;
 }
 
-json LlamaCppOrchestrator::buildChatCompletionsRequest(
-    const CreateChatCompletionRequest& request,
-    json merged_messages) const {
-
-    json chat_request = json::object();
-    chat_request["model"] = request.model;
-    chat_request["messages"] = std::move(merged_messages);
-
-    // Add generation parameters
-    int max_tokens = request.max_completion_tokens.value_or(0);
-    if (max_tokens > 0) {
-        chat_request["max_tokens"] = max_tokens;
-    }
-    if (request.temperature.has_value()) {
-        chat_request["temperature"] = request.temperature.value();
-    }
-    if (request.top_p.has_value()) {
-        chat_request["top_p"] = request.top_p.value();
-    }
-    if (request.presence_penalty.has_value()) {
-        chat_request["presence_penalty"] = request.presence_penalty.value();
-    }
-    if (request.frequency_penalty.has_value()) {
-        chat_request["frequency_penalty"] = request.frequency_penalty.value();
+int LlamaCppOrchestrator::applyContextEviction(
+    json& messages,
+    const json& tools,
+    int max_context_length) const {
+    if (max_context_length <= 0) {
+        return 0;
     }
 
-    // Add tools if present
-    if (request.tools.has_value() && request.tools.value().is_array() && !request.tools.value().empty()) {
-        chat_request["tools"] = request.tools.value();
+    const int limit = static_cast<int>(
+        max_context_length * kCompactionThreshold);
+    int evicted = 0;
+    while (messages.size() > 2 && estimateTokens(messages, tools) > limit) {
+        const bool has_system =
+            messages.front().value("role", "") == "system";
+        const std::size_t index = has_system ? 1 : 0;
+        if (index >= messages.size() - 1) {
+            break;
+        }
+        messages.erase(index);
+        ++evicted;
     }
-
-    // Disable Qwen3 thinking when reasoning effort is "none"
-    if (request.reasoning_effort.has_value() && request.reasoning_effort.value() == "none") {
-        chat_request["chat_template_kwargs"] = {{"enable_thinking", false}};
-    }
-
-    return chat_request;
+    return evicted;
 }
 
-void LlamaCppOrchestrator::handleSseChunk(
-    const std::string& sse_chunk,
-    const std::function<void(const StreamChunk&)>& callback,
-    const std::string& event_id,
-    const std::string& model,
-    std::string& accumulated_content,
-    json& accumulated_tool_calls,
-    std::string& finish_reason,
-    int& prompt_tokens,
-    int& completion_tokens) const {
-
-    // Parse SSE format: "data: {...}\n\n"
-    if (sse_chunk.find("data: [DONE]") != std::string::npos) {
-        return;
+json LlamaCppOrchestrator::parseToolCalls(
+    const std::string& text,
+    const std::string& delimiter) const {
+    const std::size_t delimiter_position = text.find(delimiter);
+    if (delimiter_position == std::string::npos) {
+        return nullptr;
     }
 
-    size_t data_pos = sse_chunk.find("data: ");
-    if (data_pos == std::string::npos) {
-        return;
-    }
-
-    std::string json_str = sse_chunk.substr(data_pos + 6);
-    // Remove trailing whitespace
-    while (!json_str.empty() && (json_str.back() == '\n' || json_str.back() == '\r')) {
-        json_str.pop_back();
-    }
-
-    if (json_str.empty()) {
-        return;
+    std::string payload = text.substr(
+        delimiter_position + delimiter.size());
+    while (!payload.empty() &&
+           std::isspace(static_cast<unsigned char>(payload.front()))) {
+        payload.erase(payload.begin());
     }
 
     try {
-        json chunk_data = json::parse(json_str);
-
-        // Extract delta from choices[0].delta
-        if (chunk_data.contains("choices") && chunk_data["choices"].is_array() && !chunk_data["choices"].empty()) {
-            const auto& choice = chunk_data["choices"][0];
-
-            if (choice.contains("delta") && choice["delta"].is_object()) {
-                const auto& delta = choice["delta"];
-
-                // Accumulate content
-                if (delta.contains("content") && delta["content"].is_string()) {
-                    std::string content_delta = delta["content"].get<std::string>();
-                    accumulated_content += content_delta;
-
-                    // Invoke callback with content chunk
-                    StreamChunk stream_chunk;
-                    stream_chunk.id = event_id;
-                    stream_chunk.model = model;
-                    stream_chunk.content_delta = content_delta;
-                    stream_chunk.finish_reason = std::nullopt;
-                    callback(stream_chunk);
-                }
-
-                // Accumulate tool calls and stream them to the client
-                if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
-                    for (const auto& tool_call_delta : delta["tool_calls"]) {
-                        // Merge tool call deltas (simplified - assumes index-based merging)
-                        if (tool_call_delta.contains("index") && tool_call_delta["index"].is_number()) {
-                            int index = tool_call_delta["index"].get<int>();
-
-                            // Ensure array is large enough
-                            while (accumulated_tool_calls.size() <= static_cast<size_t>(index)) {
-                                accumulated_tool_calls.push_back(json::object());
-                            }
-
-                            // Merge fields
-                            if (tool_call_delta.contains("id")) {
-                                accumulated_tool_calls[index]["id"] = tool_call_delta["id"];
-                            }
-                            if (tool_call_delta.contains("type")) {
-                                accumulated_tool_calls[index]["type"] = tool_call_delta["type"];
-                            }
-                            if (tool_call_delta.contains("function")) {
-                                if (!accumulated_tool_calls[index].contains("function")) {
-                                    accumulated_tool_calls[index]["function"] = json::object();
-                                }
-                                const auto& func_delta = tool_call_delta["function"];
-                                if (func_delta.contains("name")) {
-                                    accumulated_tool_calls[index]["function"]["name"] = func_delta["name"];
-                                }
-                                if (func_delta.contains("arguments")) {
-                                    std::string args_delta = func_delta["arguments"].get<std::string>();
-                                    if (!accumulated_tool_calls[index]["function"].contains("arguments")) {
-                                        accumulated_tool_calls[index]["function"]["arguments"] = "";
-                                    }
-                                    accumulated_tool_calls[index]["function"]["arguments"] =
-                                        accumulated_tool_calls[index]["function"]["arguments"].get<std::string>() + args_delta;
-                                }
-                            }
-                        }
-                    }
-
-                    // Stream the tool_calls delta to the client so Hermes/clients
-                    // receive the tool call payload in the streaming response
-                    StreamChunk tool_chunk;
-                    tool_chunk.id = event_id;
-                    tool_chunk.model = model;
-                    tool_chunk.tool_calls = delta["tool_calls"];
-                    callback(tool_chunk);
-                }
-            }
-
-            // Extract finish_reason
-            if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
-                finish_reason = choice["finish_reason"].get<std::string>();
-            }
+        std::size_t start = payload.find('[');
+        if (start == std::string::npos) {
+            start = payload.find('{');
+        }
+        if (start == std::string::npos) {
+            return nullptr;
         }
 
-        // Extract token usage (if present in streaming)
-        if (chunk_data.contains("usage") && chunk_data["usage"].is_object()) {
-            const auto& usage = chunk_data["usage"];
-            if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number()) {
-                prompt_tokens = usage["prompt_tokens"].get<int>();
-            }
-            if (usage.contains("completion_tokens") && usage["completion_tokens"].is_number()) {
-                completion_tokens = usage["completion_tokens"].get<int>();
+        std::string candidate = payload.substr(start);
+        const char opening = candidate.front();
+        const char closing = opening == '[' ? ']' : '}';
+        int depth = 0;
+        std::size_t end = std::string::npos;
+        for (std::size_t index = 0; index < candidate.size(); ++index) {
+            if (candidate[index] == opening) {
+                ++depth;
+            } else if (candidate[index] == closing && --depth == 0) {
+                end = index + 1;
+                break;
             }
         }
+        if (end == std::string::npos) {
+            return nullptr;
+        }
 
-    } catch (const json::exception& e) {
-        LOG_ERROR("[LlamaCppOrchestrator] Failed to parse SSE chunk: " + std::string(e.what()));
+        json parsed = json::parse(candidate.substr(0, end));
+        if (parsed.is_object()) {
+            parsed = json::array({parsed});
+        }
+        if (!parsed.is_array()) {
+            return nullptr;
+        }
+
+        for (auto& tool_call : parsed) {
+            if (!tool_call.contains("id")) {
+                tool_call["id"] = generateEventId();
+            }
+            if (!tool_call.contains("type")) {
+                tool_call["type"] = "function";
+            }
+        }
+        return parsed;
+    } catch (const std::exception& error) {
+        LOG_WARN("[LlamaCppOrchestrator] Tool call parsing failed: "
+                 << error.what());
+        return nullptr;
     }
 }
 
-StandardResponse LlamaCppOrchestrator::buildStandardResponse(
-    const std::string& event_id,
-    const std::string& model,
-    const std::string& accumulated_content,
-    const json& accumulated_tool_calls,
-    const std::string& finish_reason,
-    int prompt_tokens,
-    int completion_tokens) const {
-
-    StandardResponse response;
-    response.id = event_id;
-    response.model = model;
-    response.content = accumulated_content;
-    response.finish_reason = finish_reason.empty() ? "stop" : finish_reason;
-
-    // Add tool calls if present
-    if (accumulated_tool_calls.is_array() && !accumulated_tool_calls.empty()) {
-        response.tool_calls = accumulated_tool_calls;
+std::string LlamaCppOrchestrator::extractPreToolContent(
+    const std::string& text,
+    const std::string& delimiter) const {
+    const std::size_t delimiter_position = text.find(delimiter);
+    if (delimiter_position == std::string::npos) {
+        return text;
     }
-
-    // Add usage information
-    response.prompt_tokens = prompt_tokens;
-    response.completion_tokens = completion_tokens;
-    response.total_tokens = prompt_tokens + completion_tokens;
-    response.reasoning_tokens = 0;
-
-    return response;
+    std::string content = text.substr(0, delimiter_position);
+    while (!content.empty() &&
+           std::isspace(static_cast<unsigned char>(content.back()))) {
+        content.pop_back();
+    }
+    return content;
 }
 
 } // namespace qai_forge

@@ -1,6 +1,12 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
+// -----------------------------------------------------------------------------
+// LlamaCppBackend  IGenerativeBackend implementation wrapping the direct-
+// libllama llamacpp-inference-worker subprocess (no llama-server, no HTTP).
+// Mirrors LiteRTLMBackend's structure.
+// -----------------------------------------------------------------------------
+
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 
 #include "qai_forge/backend/LlamaCppBackend.h"
@@ -8,48 +14,52 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <cstring>
-#include <sstream>
-#include <stdexcept>
-#include <thread>
-#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 namespace qai_forge {
 
-// Shared worker manager instance (singleton pattern)
-static std::shared_ptr<LlamaCppWorkerManager> g_worker_manager = nullptr;
-static std::mutex g_worker_manager_mutex;
+namespace fs = std::filesystem;
 
-LlamaCppBackend::LlamaCppBackend(const std::string& server_binary_path)
-    : server_binary_path_(server_binary_path)
-    , worker_port_(-1)
-    , initialized_(false) {
+// -----------------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------------
 
-    // Initialize shared worker manager if needed
-    std::lock_guard<std::mutex> lock(g_worker_manager_mutex);
-    if (!g_worker_manager) {
-        g_worker_manager = std::make_shared<LlamaCppWorkerManager>();
+LlamaCppBackend::LlamaCppBackend() = default;
+
+// -----------------------------------------------------------------------------
+// worker()  lazy-initialize the LlamaCppWorkerManager
+// -----------------------------------------------------------------------------
+
+LlamaCppWorkerManager& LlamaCppBackend::worker() {
+    if (!worker_) {
+        worker_ = std::make_unique<LlamaCppWorkerManager>();
     }
-    worker_manager_ = g_worker_manager;
+    return *worker_;
 }
 
-LlamaCppBackend::~LlamaCppBackend() {
-    if (initialized_) {
-        unloadModel(false);
-    }
-}
+// -----------------------------------------------------------------------------
+// capabilities()
+// -----------------------------------------------------------------------------
 
 BackendCapabilities LlamaCppBackend::capabilities() const {
-    BackendCapabilities caps;
-    caps.context_strategy = ContextStrategy::FULL_RECOMPUTE;  // llama-server recomputes each turn
-    caps.concurrency_model = ConcurrencyModel::EXCLUSIVE;  // One request at a time per worker
-    caps.backend_filters_think_tokens = false;  // No internal think filtering
-    caps.supports_kv_save_restore = false;  // Not supported
-    return caps;
+    auto& cfg = ModelConfigManager::getInstance();
+    return BackendCapabilities{
+        // MVP: full merged message history is re-rendered and re-decoded
+        // every EXECUTE (KV cache cleared at the start of handleExecute()) 
+        // no incremental KV reuse across turns yet.
+        .context_strategy             = ContextStrategy::FULL_RECOMPUTE,
+        .context_window               = current_model_id_.empty()
+                                            ? 4096
+                                            : cfg.getContextSize(current_model_id_),
+        .compaction_threshold         = 0.70f,
+        // One request at a time per worker (matches today's --parallel 1).
+        .concurrency_model            = ConcurrencyModel::EXCLUSIVE,
+        .max_concurrent               = 1,
+        .backend_filters_think_tokens = false,
+        // SAVE_KV/RESTORE_KV are stubbed (ack with READY, no-op) in the MVP worker.
+        .supports_kv_save_restore     = false,
+    };
 }
 
 void LlamaCppBackend::loadModel(
@@ -68,58 +78,114 @@ void LlamaCppBackend::loadModel(
     loadModel(model_id);
 }
 
+// -----------------------------------------------------------------------------
+// writeWorkerConfigFile()  synthesize the JSON sidecar the worker's
+// loadModel() parses. ModelConfigManager's GGUF auto-discovery sets
+// ModelConfig::config_file to the raw .gguf path directly (there is no
+// processed-bundle step for bare .gguf files), so this backend has to
+// produce the sidecar itself rather than read one written elsewhere.
+// -----------------------------------------------------------------------------
+
+std::string LlamaCppBackend::writeWorkerConfigFile(const std::string& model_id,
+                                                    const std::string& gguf_path,
+                                                    int context_size,
+                                                    const std::string& mmproj_path) {
+    const fs::path dir = "/tmp/configs";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const fs::path sidecar_path = dir / (model_id + ".llamacpp.json");
+
+    json cfg = {
+        {"model_path", gguf_path},
+        {"context_size", context_size},
+        // Matches the old llama-server invocation's "--n-gpu-layers 999"
+        // (offload as many layers as the backend will accept).
+        {"n_gpu_layers", 999},
+    };
+    if (!mmproj_path.empty()) {
+        cfg["mmproj_path"] = mmproj_path;
+    }
+
+    std::ofstream out(sidecar_path);
+    if (!out) {
+        throw std::runtime_error(
+            "[LlamaCppBackend] Failed to write worker config file: " + sidecar_path.string());
+    }
+    out << cfg.dump(2);
+    out.close();
+
+    return sidecar_path.string();
+}
+
+// -----------------------------------------------------------------------------
+// loadModel()
+// -----------------------------------------------------------------------------
+
 void LlamaCppBackend::loadModel(const std::string& model_id) {
-    if (initialized_) {
-        LOG_INFO("[LlamaCppBackend] Model already loaded");
-        return;
+    const auto model_config =
+        ModelConfigManager::getInstance().getModelConfig(model_id);
+    if (!model_config) {
+        throw GenAIException(
+            GenAIErrorCode::MODEL_NOT_FOUND,
+            "Model '" + model_id + "' not found. Check /v1/models for available models.",
+            404);
     }
 
-    model_id_ = model_id;
+    // model_config->config_file is the raw .gguf path for llamacpp models
+    // (see ModelConfigManager's GGUF auto-discovery)  not the sidecar the
+    // worker expects, so build the sidecar here.
+    const std::string sidecar_path =
+        writeWorkerConfigFile(model_id, model_config->config_file,
+                              model_config->context_size, model_config->mmproj_path);
 
-    // Look up the actual .gguf file path from ModelConfigManager
-    model_path_ = ModelConfigManager::getInstance().getConfigFilePath(model_id);
-    if (model_path_.empty()) {
-        throw std::runtime_error("[LlamaCppBackend] No file path found for model: " + model_id);
-    }
+    LOG_INFO("[LlamaCppBackend] loadModel: model=" << model_id
+             << " gguf=" << model_config->config_file
+             << " config=" << sidecar_path
+             << (model_config->mmproj_path.empty()
+                     ? ""
+                     : " mmproj=" + model_config->mmproj_path));
 
-    LOG_INFO("[LlamaCppBackend] Loading model: " + model_id + " from " + model_path_);
-
-    // Start llama-server worker (pass model_id, model_path, and binary_path)
-    int context_size = ModelConfigManager::getInstance().getContextSize(model_id_);
-    LOG_INFO("[LlamaCppBackend] Resolved context size: " + std::to_string(context_size));
-    worker_port_ = worker_manager_->startWorker(model_id_, model_path_, server_binary_path_, context_size);
-    if (worker_port_ < 0) {
-        throw std::runtime_error("Failed to start llama-server worker");
-    }
-
-    initialized_ = true;
-    LOG_INFO("[LlamaCppBackend] Model loaded successfully on port " + std::to_string(worker_port_));
+    ensureWorkerRunning(model_id, sidecar_path, "");
 }
 
-void LlamaCppBackend::unloadModel(bool force) {
-    if (!initialized_) {
-        return;
+// -----------------------------------------------------------------------------
+// unloadModel()
+//
+// Always uses SIGKILL (force=true)  same rationale as GenIEBackend/
+// LiteRTLMBackend: keeping shutdown uniform across all backends is simpler
+// than special-casing llama.cpp's CPU/GPU paths, which could also shut down
+// gracefully.
+// -----------------------------------------------------------------------------
+
+void LlamaCppBackend::unloadModel(bool /*force*/) {
+    LOG_INFO("[LlamaCppBackend] unloadModel: model=" << current_model_id_
+             << " (always SIGKILL for clean resource reclamation)");
+
+    if (worker_) {
+        worker_->terminateWorker(true); // Always SIGKILL
+        worker_.reset();
     }
 
-    LOG_INFO("[LlamaCppBackend] Unloading model");
-    worker_manager_->stopWorker(model_id_);
-    initialized_ = false;
-    worker_port_ = -1;
-    model_id_.clear();
-    model_path_.clear();
+    current_model_id_.clear();
 }
+
+// -----------------------------------------------------------------------------
+// ensureWorkerRunning()
+// -----------------------------------------------------------------------------
 
 void LlamaCppBackend::ensureWorkerRunning(const std::string& model_id,
-                                         const std::string& config_file,
-                                         const std::string& sampler_file) {
-    // llama.cpp backend doesn't use config/sampler files
-    (void)config_file;
-    (void)sampler_file;
-
-    if (!initialized_) {
-        loadModel(model_id);
-    }
+                                          const std::string& config_file,
+                                          const std::string& sampler_file) {
+    current_model_id_ = model_id;
+    LOG_DEBUG("[LlamaCppBackend] ensureWorkerRunning: model=" << model_id
+              << " config=" << config_file);
+    worker().ensureWorkerRunning(model_id, config_file, sampler_file);
 }
+
+// -----------------------------------------------------------------------------
+// generate()  legacy plain-text path, not used by LlamaCppOrchestrator
+// -----------------------------------------------------------------------------
 
 void LlamaCppBackend::generate(
     const std::string& event_id,
@@ -151,293 +217,88 @@ void LlamaCppBackend::generate(
     on_error(error_event);
 }
 
-void LlamaCppBackend::terminateWorker(bool force) {
-    unloadModel(force);
+// -----------------------------------------------------------------------------
+// generateStructured()  structured chat inference
+// -----------------------------------------------------------------------------
+
+void LlamaCppBackend::generateStructured(
+    const std::string& event_id,
+    const std::string& session_id,
+    const json& messages,
+    const json& tools,
+    bool streaming,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    int top_k,
+    float presence_penalty,
+    float frequency_penalty,
+    std::function<void(const IPCTokenEvent&)> on_token,
+    std::function<void(const IPCDoneEvent&)> on_done,
+    std::function<void(const IPCErrorEvent&)> on_error,
+    const std::vector<std::vector<uint8_t>>& images) {
+    worker().executeStructuredRequest(
+        event_id,
+        session_id,
+        messages,
+        tools,
+        streaming,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        presence_penalty,
+        frequency_penalty,
+        std::move(on_token),
+        std::move(on_done),
+        std::move(on_error),
+        images);
 }
+
+// -----------------------------------------------------------------------------
+// KV cache operations  RESET is the only meaningful one (MVP: no save/restore)
+// -----------------------------------------------------------------------------
+
+void LlamaCppBackend::saveKv(const std::string& name, const std::string& /*session_id*/) {
+    LOG_WARN("[LlamaCppBackend] saveKv('" << name << "') not supported (MVP)");
+}
+
+void LlamaCppBackend::restoreKv(const std::string& name, const std::string& /*session_id*/) {
+    LOG_WARN("[LlamaCppBackend] restoreKv('" << name << "') not supported (MVP)");
+}
+
+void LlamaCppBackend::resetKv(const std::string& session_id) {
+    try {
+        worker().sendReset(session_id);
+    } catch (const std::exception& e) {
+        LOG_WARN("[LlamaCppBackend] resetKv failed: " << e.what());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// terminateWorker() / forceKillActiveWorker()
+// -----------------------------------------------------------------------------
+
+void LlamaCppBackend::terminateWorker(bool force) {
+    if (worker_) {
+        worker_->terminateWorker(force);
+    }
+    current_model_id_.clear();
+}
+
+bool LlamaCppBackend::forceKillActiveWorker() {
+    // Delegates to the worker manager's native support, fixing the old
+    // HTTP-based backend's inability to cancel one in-flight request
+    // without killing the whole worker.
+    return worker_ && worker_->forceKillActiveWorker();
+}
+
+// -----------------------------------------------------------------------------
+// isHealthy()
+// -----------------------------------------------------------------------------
 
 bool LlamaCppBackend::isHealthy() const {
-    return initialized_ && worker_manager_->isWorkerHealthy(model_id_);
-}
-
-int LlamaCppBackend::getWorkerPort() const {
-    return worker_port_;
-}
-
-json LlamaCppBackend::httpPostBlocking(const std::string& endpoint, const json& body) {
-    if (!initialized_) {
-        throw std::runtime_error("LlamaCppBackend not initialized");
-    }
-
-    std::string body_str = body.dump();
-    std::string response_str = httpPostBlockingInternal(endpoint, body_str);
-
-    try {
-        return json::parse(response_str);
-    } catch (const json::exception& e) {
-        LOG_ERROR("[LlamaCppBackend] Failed to parse JSON response: " + std::string(e.what()));
-        throw std::runtime_error("Invalid JSON response from llama-server");
-    }
-}
-
-void LlamaCppBackend::httpPostStreaming(const std::string& endpoint, const json& body,
-                                       std::function<void(const std::string&)> on_chunk) {
-    if (!initialized_) {
-        throw std::runtime_error("LlamaCppBackend not initialized");
-    }
-
-    std::string body_str = body.dump();
-    httpPostStreamingInternal(endpoint, body_str, on_chunk);
-}
-
-int LlamaCppBackend::createSocket(const std::string& host, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        throw std::runtime_error("Failed to create socket");
-    }
-
-    // Set socket receive and send timeouts
-    long timeout_sec = 300;
-    const char* timeout_env = std::getenv("LLAMACPP_SOCKET_TIMEOUT_SEC");
-    if (timeout_env && timeout_env[0] != '\0') {
-        try {
-            timeout_sec = std::stol(timeout_env);
-        } catch (...) {
-            LOG_WARN("[LlamaCppBackend] Invalid LLAMACPP_SOCKET_TIMEOUT_SEC value, falling back to 300s");
-        }
-    }
-    struct timeval timeout;
-    timeout.tv_sec = timeout_sec;
-    timeout.tv_usec = 0;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        LOG_WARN("[LlamaCppBackend] Failed to set SO_RCVTIMEO on socket");
-    }
-    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
-        LOG_WARN("[LlamaCppBackend] Failed to set SO_SNDTIMEO on socket");
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        throw std::runtime_error("Failed to connect to " + host + ":" + std::to_string(port));
-    }
-
-    return sock;
-}
-
-void LlamaCppBackend::sendHttpRequest(int sockfd, const std::string& method,
-                                     const std::string& path, const std::string& body) {
-    std::ostringstream request;
-    request << method << " " << path << " HTTP/1.1\r\n"
-            << "Host: localhost\r\n"
-            << "Content-Type: application/json\r\n"
-            << "Content-Length: " << body.size() << "\r\n";
-
-    if (method == "POST" && path.find("/v1/chat/completions") != std::string::npos) {
-        // Check if streaming is requested in the body
-        if (body.find("\"stream\":true") != std::string::npos ||
-            body.find("\"stream\": true") != std::string::npos) {
-            request << "Accept: text/event-stream\r\n";
-        }
-    }
-
-    request << "\r\n" << body;
-
-    std::string req_str = request.str();
-    if (send(sockfd, req_str.c_str(), req_str.size(), 0) < 0) {
-        throw std::runtime_error("Failed to send HTTP request");
-    }
-}
-
-std::string LlamaCppBackend::receiveHttpResponse(int sockfd) {
-    std::string response;
-    char buffer[4096];
-    ssize_t bytes;
-
-    while ((bytes = recv(sockfd, buffer, sizeof(buffer), 0)) > 0) {
-        response.append(buffer, bytes);
-    }
-
-    // Extract body from HTTP response
-    size_t body_start = response.find("\r\n\r\n");
-    if (body_start == std::string::npos) {
-        throw std::runtime_error("Invalid HTTP response - no body separator");
-    }
-
-    return response.substr(body_start + 4);
-}
-
-void LlamaCppBackend::receiveHttpStreamingResponse(int sockfd,
-                                                  std::function<void(const std::string&)> on_chunk) {
-    std::string buffer;
-    char chunk[4096];
-    bool headers_done = false;
-    bool chunked_encoding = false;
-    std::string sse_buffer;
-
-    while (true) {
-        ssize_t bytes = recv(sockfd, chunk, sizeof(chunk), 0);
-        if (bytes <= 0) {
-            break;
-        }
-
-        buffer.append(chunk, bytes);
-
-        // Parse HTTP headers once
-        if (!headers_done) {
-            size_t header_end = buffer.find("\r\n\r\n");
-            if (header_end == std::string::npos) {
-                continue;
-            }
-            std::string headers = buffer.substr(0, header_end);
-            std::string headers_lower = headers;
-            for (auto& c : headers_lower) c = tolower(c);
-            chunked_encoding = headers_lower.find("transfer-encoding: chunked")
-                               != std::string::npos;
-            // Log first 256 bytes after headers for debugging
-            std::string body_preview = buffer.substr(
-                header_end + 4,
-                std::min(buffer.size() - header_end - 4, size_t(256)));
-            LOG_DEBUG("[LlamaCppBackend] streaming headers:\n" + headers
-                      + "\nchunked=" + (chunked_encoding ? "true" : "false")
-                      + "\nbody_preview=" + body_preview);
-            buffer = buffer.substr(header_end + 4);
-            headers_done = true;
-        }
-
-        if (chunked_encoding) {
-            // Log first recv after headers
-            if (!sse_buffer.empty() || buffer.size() > 0) {
-                std::string buf_hex;
-                for (size_t i = 0; i < std::min(buffer.size(), size_t(32)); i++) {
-                    char hex[4];
-                    snprintf(hex, sizeof(hex), "%02x ", (unsigned char)buffer[i]);
-                    buf_hex += hex;
-                }
-                LOG_DEBUG("[LlamaCppBackend] chunked buffer(" +
-                          std::to_string(buffer.size()) + "): " + buf_hex);
-            }
-            while (true) {
-                size_t crlf = buffer.find("\r\n");
-                if (crlf == std::string::npos) break;
-
-                std::string size_str = buffer.substr(0, crlf);
-                // Strip chunk extensions
-                size_t semi = size_str.find(';');
-                if (semi != std::string::npos) size_str = size_str.substr(0, semi);
-                // Trim whitespace/CR
-                while (!size_str.empty() &&
-                       (size_str.front() == ' ' || size_str.front() == '\r'))
-                    size_str.erase(size_str.begin());
-                while (!size_str.empty() &&
-                       (size_str.back() == ' ' || size_str.back() == '\r'))
-                    size_str.pop_back();
-
-                if (size_str.empty()) {
-                    LOG_DEBUG("[LlamaCppBackend] empty size_str, crlf="
-                              + std::to_string(crlf)
-                              + " buf_size=" + std::to_string(buffer.size()));
-                    break;
-                }
-
-                // Validate: must be pure hex digits
-                bool valid_hex = true;
-                for (char c : size_str) {
-                    if (!isxdigit(static_cast<unsigned char>(c))) {
-                        valid_hex = false;
-                        break;
-                    }
-                }
-                if (!valid_hex) {
-                    LOG_DEBUG("[LlamaCppBackend] non-hex chunk size: '"
-                              + size_str + "', skipping");
-                    break;
-                }
-
-                size_t chunk_size = 0;
-                try {
-                    chunk_size = std::stoul(size_str, nullptr, 16);
-                } catch (...) {
-                    LOG_DEBUG("[LlamaCppBackend] failed to parse chunk size: '"
-                              + size_str + "'");
-                    break;
-                }
-
-                LOG_DEBUG("[LlamaCppBackend] chunk: size_str='" + size_str
-                          + "' chunk_size=" + std::to_string(chunk_size)
-                          + " data_start=" + std::to_string(crlf + 2)
-                          + " data_end=" + std::to_string(crlf + 2 + chunk_size)
-                          + " buf_size=" + std::to_string(buffer.size()));
-
-                if (chunk_size > 512 * 1024) break;
-                if (chunk_size == 0) return;
-
-                size_t data_start = crlf + 2;
-                size_t data_end   = data_start + chunk_size;
-                if (data_end + 2 > buffer.size()) break;
-
-                sse_buffer += buffer.substr(data_start, chunk_size);
-                buffer = buffer.substr(data_end + 2);
-
-                size_t pos = 0;
-                while ((pos = sse_buffer.find("\n\n")) != std::string::npos) {
-                    std::string event = sse_buffer.substr(0, pos);
-                    sse_buffer = sse_buffer.substr(pos + 2);
-                    if (!event.empty() && on_chunk) {
-                        on_chunk(event + "\n\n");
-                    }
-                    if (event.find("data: [DONE]") != std::string::npos) {
-                        return;
-                    }
-                }
-            }
-        } else {
-            // Non-chunked: process SSE events directly
-            size_t pos = 0;
-            while ((pos = buffer.find("\n\n")) != std::string::npos) {
-                std::string event = buffer.substr(0, pos);
-                buffer = buffer.substr(pos + 2);
-                if (!event.empty() && on_chunk) {
-                    on_chunk(event + "\n\n");
-                }
-                if (event.find("data: [DONE]") != std::string::npos) {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-bool LlamaCppBackend::waitForServerReady(int timeout_seconds) {
-    for (int i = 0; i < timeout_seconds * 2; ++i) {
-        if (worker_manager_->isWorkerHealthy(model_id_)) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    return false;
-}
-
-std::string LlamaCppBackend::httpPostBlockingInternal(const std::string& endpoint,
-                                                      const std::string& body) {
-    int sock = createSocket("127.0.0.1", worker_port_);
-    sendHttpRequest(sock, "POST", endpoint, body);
-    std::string response = receiveHttpResponse(sock);
-    close(sock);
-    return response;
-}
-
-void LlamaCppBackend::httpPostStreamingInternal(const std::string& endpoint,
-                                               const std::string& body,
-                                               std::function<void(const std::string&)> on_chunk) {
-    int sock = createSocket("127.0.0.1", worker_port_);
-    sendHttpRequest(sock, "POST", endpoint, body);
-    receiveHttpStreamingResponse(sock, on_chunk);
-    close(sock);
+    return worker_ && worker_->isWorkerRunning();
 }
 
 } // namespace qai_forge

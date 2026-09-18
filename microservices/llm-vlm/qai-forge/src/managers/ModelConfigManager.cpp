@@ -472,6 +472,24 @@ void ModelConfigManager::scanModelBundles() {
     //   - Skips files whose model_id was already registered via metadata.json
     //   - context_size and chat_template extracted from GGUF header
 #ifdef QAI_FORGE_BUILD_LLAMACPP
+    // Pre-pass: pair each directory with the sibling .gguf whose filename
+    // contains "mmproj" (case-insensitive) — the naming convention used by
+    // llama.cpp's own --mmproj CLI flag and the community GGUF repos that
+    // ship vision projectors alongside the main model (e.g.
+    // "mmproj-model-f16.gguf"). No new manifest format needed.
+    std::unordered_map<std::string, std::string> mmproj_by_dir;
+    for (const auto& entry : fs::recursive_directory_iterator(models_dir_)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".gguf") continue;
+
+        std::string filename_lower = entry.path().filename().string();
+        std::transform(filename_lower.begin(), filename_lower.end(), filename_lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (filename_lower.find("mmproj") != std::string::npos) {
+            mmproj_by_dir[entry.path().parent_path().string()] = entry.path().string();
+        }
+    }
+
     for (const auto& entry : fs::recursive_directory_iterator(models_dir_)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".gguf") continue;
@@ -485,6 +503,19 @@ void ModelConfigManager::scanModelBundles() {
             LOG_DEBUG("[ModelConfigManager] Skipping .gguf auto-discovery for '"
                       << entry.path().filename().string()
                       << "' — parent directory has a manifest (geniex.json/metadata.json)");
+            continue;
+        }
+
+        // Skip mmproj projector files themselves — they are paired to a
+        // sibling main model (see mmproj_by_dir above), not registered as a
+        // standalone model.
+        std::string filename_lower = entry.path().filename().string();
+        std::transform(filename_lower.begin(), filename_lower.end(), filename_lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (filename_lower.find("mmproj") != std::string::npos) {
+            LOG_DEBUG("[ModelConfigManager] Skipping .gguf auto-discovery for '"
+                      << entry.path().filename().string()
+                      << "' — mmproj vision projector, paired to sibling model(s) instead");
             continue;
         }
 
@@ -522,10 +553,19 @@ void ModelConfigManager::scanModelBundles() {
             }
 
             config.supports_streaming  = true;
-            config.supports_vision     = false;
             config.supports_thinking   = false;
             config.thinking_start_tag  = "<think>";
             config.thinking_end_tag    = "</think>";
+
+            // Pair with a sibling mmproj projector, if one was found in the
+            // pre-pass above, and mark the model vision-capable.
+            auto mmproj_it = mmproj_by_dir.find(entry.path().parent_path().string());
+            if (mmproj_it != mmproj_by_dir.end()) {
+                config.mmproj_path     = mmproj_it->second;
+                config.supports_vision = true;
+            } else {
+                config.supports_vision = false;
+            }
 
             // Store Jinja template from GGUF header
             if (meta.isValid && !meta.chatTemplate.empty()) {
@@ -753,7 +793,7 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         LOG_DEBUG("[ModelConfigManager] LiteRT-LM model: " << config.config_file);
     }
     else if (config.supports_vision) {
-        config.config_file = generateVlmGenieConfig(metadata, genie, pipeline_nodes, processed_config_dir);
+        config.config_file = generateVlmGenieConfig(metadata, genie, pipeline_nodes, bundle_path, processed_config_dir);
     } else {
         std::string text_gen = pipeline_nodes.value("textGenerator", "");
         if (!text_gen.empty()) {
@@ -1089,6 +1129,20 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
         }
     }
 
+    // Resolve the mmproj vision projector, if the manifest declares one, so it
+    // can be attached to whichever ModelConfig(s) get returned below. Must be
+    // resolved before the llama.cpp/litert_lm early returns, since those build
+    // their own ModelConfig copies and would otherwise never see it.
+    std::string mmproj_resolved;
+    if (has_mmproj) {
+        std::string mmproj = manifest["MMProjFile"].value("Name", "");
+        const fs::path mmproj_full = resolveBundleRelativePath(
+            mmproj, bundle_path, "MMProj file");
+        if (fs::exists(mmproj_full)) {
+            mmproj_resolved = mmproj_full.string();
+        }
+    }
+
     // llama_cpp bundles: each downloaded quantization in ModelFile becomes a
     // separate ModelConfig with its own id and config_file path.
     if (config.config_file.empty() && config.runtime == "llamacpp") {
@@ -1114,20 +1168,14 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                     cfg.id = base_model_id + "-" + prec + "-" + config.runtime;
                 }
                 cfg.config_file = gguf_path.string();
+                cfg.mmproj_path = mmproj_resolved;
                 results.push_back(std::move(cfg));
             }
             if (!results.empty()) return results;
         }
     }
 
-    if (has_mmproj) {
-        std::string mmproj = manifest["MMProjFile"].value("Name", "");
-        const fs::path mmproj_full = resolveBundleRelativePath(
-            mmproj, bundle_path, "MMProj file");
-        if (fs::exists(mmproj_full)) {
-            config.sampler_config_file = mmproj_full.string();
-        }
-    }
+    config.mmproj_path = mmproj_resolved;
 
     return {config};
 }
@@ -1135,6 +1183,7 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
 
 std::string ModelConfigManager::generateVlmGenieConfig(const json& metadata, const json& genie,
                                                         const json& pipeline_nodes,
+                                                        const std::string& bundle_path,
                                                         const std::string& processed_config_dir) {
     std::string model_name = metadata.value("model_name", "VLM");
 
@@ -1158,7 +1207,25 @@ std::string ModelConfigManager::generateVlmGenieConfig(const json& metadata, con
 
         std::string file_path = sample.value("file", "");
         if (!file_path.empty() && !fs::path(file_path).is_absolute()) {
-            file_path = processed_config_dir + "/../" + file_path;
+            // sample_inputs[].file is relative to the model bundle directory
+            // (e.g. "sample_inputs/position_ids_cos.raw"), not to
+            // processed_config_dir — that's a scratch dir under /tmp/configs
+            // that scanModelBundles() wipes/recreates on every scan and only
+            // ever populates with the bundle's *.json files (see
+            // processBundle()), so these .raw sample-input files never exist
+            // there. Resolve against the real bundle_path instead.
+            fs::path candidate = fs::path(bundle_path) / file_path;
+            if (!fs::exists(candidate)) {
+                // Some bundles flatten sample_inputs/* into the bundle root
+                // rather than preserving the subdirectory the genie
+                // metadata's "file" field implies — fall back to looking for
+                // just the filename directly under bundle_path.
+                fs::path flattened = fs::path(bundle_path) / fs::path(file_path).filename();
+                if (fs::exists(flattened)) {
+                    candidate = flattened;
+                }
+            }
+            file_path = candidate.string();
         }
         custom_inputs.push_back({
             {"node", sample.value("node", "")},

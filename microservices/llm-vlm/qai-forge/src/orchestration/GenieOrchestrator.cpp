@@ -349,24 +349,6 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
                                                    int thinking_budget,
                                                    int answer_budget,
                                                    bool has_tool_response) const {
-    // OIP raw_prompt bypass: when the caller supplied an already-formatted
-    // prompt (OIP /generate with text_input), feed it through verbatim
-    // without applying the chat template. Safe to return early regardless
-    // of thinking_budget/answer_budget — createJob() may call this once for
-    // preliminary token estimation (with budgets both 0) and again with the
-    // computed budgets; both calls must return the identical fixed string.
-    //
-    // VLM requests must NOT take this shortcut: GenIE needs the full
-    // user_prefix/assistant_prefix turn structure (not just the vision
-    // marker) to recognize the prompt as a chat turn awaiting a response —
-    // without the trailing assistant_prefix cue, generation stops
-    // immediately with zero completion tokens. So when raw_images are
-    // present, fall through to the normal templated path below, which
-    // already injects the vision marker via preprocessVision() at Slot 5.
-    if (request.raw_prompt.has_value() && request.raw_images.empty()) {
-        return request.raw_prompt.value();
-    }
-
     auto& config_mgr = ModelConfigManager::getInstance();
     json chat_template = config_mgr.getChatTemplate(request.model);
     const auto& adapter = ModelAdapterFactory::getAdapter(request.model);

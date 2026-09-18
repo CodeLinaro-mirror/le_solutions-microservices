@@ -52,7 +52,7 @@
 //      memfd-backed region and hands its fd/size to the VLM child via
 //      PROMPT_SHM_FD/PROMPT_SHM_BYTES. Requests use offset zero through
 //      writePromptToShm(). LLM prompts are sent inline.
-//   H. Image shared memory (VLM only): startWorker() creates one fixed-size
+//   H. Image shared memory (VLM and llamacpp): startWorker() creates one fixed-size
 //      region for preprocessed VLM image tensors and exports it via
 //      IMAGE_SHM_FD/IMAGE_SHM_BYTES. VLM is not continuous-batched, so no
 //      shared-memory slot pool is needed.
@@ -170,7 +170,8 @@ public:
                                   float frequency_penalty,
                                   TokenCallback on_token,
                                   DoneCallback on_done,
-                                  ErrorCallback on_error);
+                                  ErrorCallback on_error,
+                                  const std::vector<std::vector<uint8_t>>& images = {});
 
     /**
      * Send a RESET command and wait for the matching READY response.
@@ -510,8 +511,8 @@ protected:
      * to pass as EXECUTE's "image_refs" field.
      *
      * Caller MUST hold a shared lock on mutex_. Only valid when
-     * process_type_ == "vlm" (image_shm_ptr_ is null otherwise), which
-     * always has max_slots_ == 1, so offset 0 is always 0 in practice.
+     * process_type_ == "vlm" or "llamacpp" (image_shm_ptr_ is null otherwise),
+     * which always has max_slots_ == 1, so offset 0 is always 0 in practice.
      * Throws std::runtime_error if the total size exceeds
      * image_shm_bytes_ — callers should catch this and route it to
      * on_error rather than letting it propagate.
