@@ -604,7 +604,14 @@ class InferenceProcessManager(ABC):
         self.current_model = None
         self.current_session_id = None
 
-    async def _ensure_process_running(self, model_id: str, config_path: str, sampler_config: str, session_id: str):
+    async def _ensure_process_running(
+        self,
+        model_id: str,
+        config_path: str,
+        sampler_config: str,
+        session_id: str,
+        preserve_pipeline_state: bool = False,
+    ):
         """
         Ensure subprocess is running with correct model and for correct session.
 
@@ -667,7 +674,12 @@ class InferenceProcessManager(ABC):
             # We must clear the KV cache.
             # We skip sending RESET *only* if we know an eager reset just successfully completed
             # for this idle period. The simplest way is a flag. Let's add it.
-            if not getattr(self, '_just_eager_reset', False):
+            if preserve_pipeline_state:
+                logger.info(
+                    "ADHOC_MODE active: preserving native pipeline state "
+                    "for tool continuation; skipping pre-execution RESET"
+                )
+            elif not getattr(self, '_just_eager_reset', False):
                 logger.info(f"ADHOC_MODE active: sending RESET to clear KV cache before execution")
                 await asyncio.to_thread(self._send_reset_and_wait)
             else:

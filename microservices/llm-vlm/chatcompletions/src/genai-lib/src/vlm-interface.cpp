@@ -12,6 +12,14 @@
 #include <cstdio>
 
 std::string vlm_get_error_message(const std::string& error_str) {
+    // Preserve the CONTEXT_LENGTH_EXCEEDED marker (thrown by
+    // VLMObject::vlm_chat_completion_create() in vlm-service.cpp) verbatim,
+    // so the Python layer's GenieErrorMappings.is_context_length_exceeded_error()
+    // can detect it and map it to an explicit HTTP 400 instead of falling
+    // through to the generic "system resources are busy" message below.
+    if (error_str.find("CONTEXT_LENGTH_EXCEEDED") != std::string::npos) {
+        return error_str;
+    }
     if (error_str.find("1002") != std::string::npos) {
         return "The system is not configured correctly to run AI models.";
     }
@@ -113,6 +121,23 @@ void vlm_chat_completion_create(VLMHandle handle,
                      "error");
             token_cb(&errorToken);
         }
+    }
+}
+
+void vlm_reset_pipeline(VLMHandle handle) {
+    if (!handle) {
+        return;
+    }
+
+    try {
+        auto* obj = static_cast<VLMObject*>(handle);
+        obj->resetPipeline();
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Exception caught in vlm_reset_pipeline: "
+                  << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "ERROR: Unknown exception caught in "
+                  << "vlm_reset_pipeline" << std::endl;
     }
 }
 

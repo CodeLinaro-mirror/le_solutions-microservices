@@ -44,6 +44,16 @@ void vlm_chat_completion_create(VLMHandle handle,
                                 bool streaming,
                                 LLMTokenCallback token_cb);
 
+/**
+ * @brief Reset the VLM pipeline state.
+ *
+ * This is issued after a complete turn. It must not be called between
+ * tool-calling trips that intentionally preserve pipeline state.
+ *
+ * @param handle Opaque handle returned by vlm_create_object.
+ */
+void vlm_reset_pipeline(VLMHandle handle);
+
 #ifdef __cplusplus
 }
 #endif

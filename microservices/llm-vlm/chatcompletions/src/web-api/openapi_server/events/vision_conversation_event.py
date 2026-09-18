@@ -21,6 +21,7 @@ from openapi_server.session.token_counter import TokenCounter
 from openapi_server.managers.model_config_manager import ModelConfigManager
 from openapi_server.models.error import Error
 from openapi_server.logger.logger_config import LoggerConfig
+from openapi_server.session.tool_handler import ToolHandler
 
 LoggerConfig.initialize()
 logger = LoggerConfig.get_logger(__name__)
@@ -96,14 +97,27 @@ class VisionConversationEvent(ConversationEvent):
                     'content': self.session.system_prompt_content,
                 })
 
-            # Count images and text tokens from raw_messages (what the VLM will actually see)
+            # Count image and text costs separately. Do not use
+            # estimate_tokens_for_multimodal_content() here because it already
+            # includes an image cost and would double-count the image below.
             image_count = 0
+            text_tokens = 0
             for msg in raw_messages:
+                if msg.get('role') == 'system':
+                    continue
                 content = msg.get('content', '')
-                if isinstance(content, list):
+                if isinstance(content, str):
+                    text_tokens += TokenCounter.estimate_tokens(content)
+                elif isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and item.get('type') == 'image_url':
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get('type') == 'image_url':
                             image_count += 1
+                        elif item.get('type') == 'text':
+                            text_tokens += TokenCounter.estimate_tokens(
+                                item.get('text', '')
+                            )
 
             from openapi_server.impl.constant import IMAGE_TOKEN_ESTIMATION_RATIO
             tokens_per_image = get_image_token_count(0, 0)  # 864 raw patches (fixed)
@@ -111,13 +125,6 @@ class VisionConversationEvent(ConversationEvent):
             # that reduce actual tokens consumed vs raw patch count.
             # Default 0.7: 864 * 0.7 = 604 estimated tokens per image.
             image_tokens = int(image_count * tokens_per_image * IMAGE_TOKEN_ESTIMATION_RATIO)
-
-            # Estimate text tokens from non-system raw messages
-            text_tokens = sum(
-                TokenCounter.estimate_tokens_for_multimodal_content(msg.get('content', ''))
-                for msg in raw_messages
-                if msg.get('role') != 'system'
-            )
 
             # Use a fixed DEFAULT_MAX_COMPLETION_TOKENS reservation for the
             # pre-flight guard (same logic as _check_user_query_length in LLM).
@@ -187,7 +194,8 @@ class VisionConversationEvent(ConversationEvent):
                 completion_callback=self._completion_callback,
                 event_id=self.event_id,
                 event_state=self.state,
-                event_object=self  # Pass event object for proper completion
+                event_object=self,  # Pass event object for proper completion
+                max_completion_override=effective_max_completion,
             )
 
             # Handle different result types
@@ -220,12 +228,30 @@ class VisionConversationEvent(ConversationEvent):
                     "is_streaming": True
                 }
 
-            # Non-streaming response
-            content = result.choices[0].message.content
-            self.assistant_message = content
-            # Note: complete_turn() will be called by the handler after adding assistant message index
-            # This ensures the event hash includes all messages in the turn
+            # Non-streaming response. The wrapper normalizes native tool output
+            # into the OpenAI-compatible response object.
+            choice = result.choices[0]
+            message = choice.message
+            finish_reason = choice.finish_reason or "stop"
+            tool_calls = getattr(message, "tool_calls", None)
 
+            if finish_reason == "tool_calls" and tool_calls:
+                self._is_tool_calling = True
+                self._pending_tool_calls = tool_calls
+                logger.info(
+                    f"Event {self.event_id}: VLM requested "
+                    f"{len(tool_calls)} tool call(s)"
+                )
+                return {
+                    "response": tool_calls,
+                    "finish_reason": "tool_calls",
+                    "needs_tool_response": True,
+                    "turn_complete": False,
+                    "is_streaming": False,
+                }
+
+            content = message.content or ""
+            self.assistant_message = content
             logger.info(f"Event {self.event_id}: Turn completed, {len(content)} chars")
 
             return {
@@ -262,12 +288,272 @@ class VisionConversationEvent(ConversationEvent):
                 }
             }
 
+    async def _reset_vlm_pipeline(self) -> None:
+        """Reset native VLM state after the complete turn has finished."""
+        from openapi_server.impl.genie_wrapper.vlm_process_manager import (
+            VLMProcessManager,
+        )
+
+        await VLMProcessManager.get_instance().reset_pipeline()
+
+    def _is_tool_call_loop(self, new_tool_calls) -> bool:
+        """Return True when a VLM repeats an answered tool call twice."""
+        call_counts = {}
+        for idx in self.message_indices:
+            if idx >= len(self.session.messages):
+                continue
+            message = self.session.messages[idx]
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                function = getattr(tool_call, "function", None)
+                if function is not None:
+                    name = function.name or ""
+                    arguments = function.arguments or ""
+                else:
+                    function_data = tool_call.get("function", {})
+                    name = function_data.get("name", "")
+                    arguments = function_data.get("arguments", "")
+                key = (name, str(arguments))
+                call_counts[key] = call_counts.get(key, 0) + 1
+
+        for tool_call in new_tool_calls:
+            function = tool_call.function
+            key = (function.name or "", str(function.arguments or ""))
+            if call_counts.get(key, 0) >= 2:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_text_content(content: Any) -> str:
+        """Extract text while excluding image URLs and other multimodal payloads."""
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        text_parts.append(str(text))
+            return "\n".join(text_parts)
+
+        return ""
+
     async def continue_with_tool_response(self, tool_response: str, request_data) -> dict:
-        """
-        VLM doesn't support tool calling yet.
-        Raise NotImplementedError if called.
-        """
-        raise NotImplementedError("VLM does not support tool calling")
+        """Run the VLM's second trip after an external tool result."""
+        if not self._is_tool_calling:
+            raise RuntimeError(f"Event {self.event_id}: Not in tool-calling state")
+
+        self.tool_info = tool_response
+        self.mark_tool_response_received()
+
+        # Recover the original user task. Tool messages are appended to the
+        # event after the first trip, so do not use the last session message.
+        original_task = next(
+            (
+                self._extract_text_content(
+                    self.session.messages[idx].get("content", "")
+                )
+                for idx in self.message_indices
+                if idx < len(self.session.messages)
+                and self.session.messages[idx].get("role") == "user"
+                and self._extract_text_content(
+                    self.session.messages[idx].get("content", "")
+                )
+            ),
+            "",
+        )
+
+        from openapi_server.utils.common_utils import CommonUtils
+        system_content = self.session.system_prompt_content
+        if not system_content:
+            template = CommonUtils.get_chat_template(self.model_id)
+            system_content = template.get(
+                "default_system_prompt",
+                "You are a helpful assistant.",
+            )
+        tool_adapter = ToolHandler._get_format_adapter(self.model_id)
+        continuation_text = (
+            f"Original request: {original_task}\n\n"
+            f"Tool result:\n{tool_adapter.format_tool_response(tool_response)}\n\n"
+            "Use the original image findings and the tool result to provide "
+            "the final answer. Do not call another tool unless absolutely "
+            "necessary."
+        )
+        continuation_messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": continuation_text},
+        ]
+
+        # The native VLM object retains the image and image-encoder state from
+        # trip 1. Do not resend the image buffer on a tool continuation: doing
+        # so charges the image tokens again and can exceed the model context.
+        # Keep the vision marker in the prompt because the model template may
+        # require it to associate the continuation with the retained image.
+        image_bytes = None
+
+        prompt = GenieWrapperCreateVLMChatCompletionIntegrated.build_vlm_prompt_for_turn(
+            messages=continuation_messages,
+            text_prompt=continuation_text,
+            has_image=True,
+            model_id=self.model_id,
+            # Tool definitions were supplied on trip 1. Re-injecting them
+            # here needlessly expands the continuation prompt and context.
+            tools=None,
+        )
+
+        continuation_context = self.context_size
+        requested_continuation_max = getattr(
+            request_data, "max_completion_tokens", None
+        )
+        continuation_max = (
+            requested_continuation_max
+            if requested_continuation_max is not None
+            else self.default_max_completion_tokens
+        )
+        continuation_max = min(
+            max(1, int(continuation_max)),
+            max(1, continuation_context - 1),
+        )
+
+        result = await GenieWrapperCreateVLMChatCompletionIntegrated.create_vlm_chat_completion(
+            request_data,
+            raw_json={
+                "messages": continuation_messages,
+                "model": self.model_id,
+                "session_id": self.session.session_id,
+                "stream": False,
+            },
+            completion_callback=None,
+            event_id=self.event_id,
+            event_state=self.state,
+            # The outer event-based handler owns completion and session-history
+            # updates for tool continuations. Do not let the generic wrapper
+            # complete this event before the final assistant message is added.
+            event_object=None,
+            prompt_override=prompt,
+            image_bytes_override=None,
+            stream_override=False,
+            max_completion_override=continuation_max,
+            preserve_pipeline_state_override=True,
+            reset_after_request_override=False,
+        )
+
+        if isinstance(result, Error):
+            raise RuntimeError(result.message)
+
+        choice = result.choices[0]
+        message = choice.message
+        finish_reason = choice.finish_reason or "stop"
+        tool_calls = getattr(message, "tool_calls", None)
+
+        if finish_reason == "tool_calls" and tool_calls:
+            if self._is_tool_call_loop(tool_calls):
+                # Loop detected — force a final answer via explicit re-prompt
+                # instead of repeating the same tool call indefinitely.
+                loop_tool_name = tool_calls[0].function.name
+                logger.warning(
+                    f"Event {self.event_id}: Tool call loop detected "
+                    f"('{loop_tool_name}' repeated with identical arguments) — "
+                    "forcing final answer"
+                )
+
+                forced_text = (
+                    f"Original request: {original_task}\n\n"
+                    + tool_adapter.format_tool_response(tool_response)
+                    + "You have already retrieved this information. "
+                    "Please provide your final answer now without calling "
+                    "any more tools."
+                )
+                forced_messages = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": forced_text},
+                ]
+                forced_prompt = GenieWrapperCreateVLMChatCompletionIntegrated.build_vlm_prompt_for_turn(
+                    messages=forced_messages,
+                    text_prompt=forced_text,
+                    has_image=True,
+                    model_id=self.model_id,
+                    tools=None,
+                )
+
+                forced_result = await GenieWrapperCreateVLMChatCompletionIntegrated.create_vlm_chat_completion(
+                    request_data,
+                    raw_json={
+                        "messages": forced_messages,
+                        "model": self.model_id,
+                        "session_id": self.session.session_id,
+                        "stream": False,
+                    },
+                    completion_callback=None,
+                    event_id=self.event_id,
+                    event_state=self.state,
+                    event_object=None,
+                    prompt_override=forced_prompt,
+                    image_bytes_override=None,
+                    stream_override=False,
+                    max_completion_override=continuation_max,
+                    preserve_pipeline_state_override=True,
+                    reset_after_request_override=False,
+                )
+
+                if isinstance(forced_result, Error):
+                    content = (
+                        "I have already retrieved the requested information. "
+                        "Please provide the final answer using the available results."
+                    )
+                else:
+                    forced_choice = forced_result.choices[0]
+                    forced_message = forced_choice.message
+                    forced_finish_reason = forced_choice.finish_reason or "stop"
+                    forced_tool_calls = getattr(forced_message, "tool_calls", None)
+                    if forced_finish_reason == "tool_calls" and forced_tool_calls:
+                        # Model is still calling tools despite the explicit
+                        # stop instruction — fall back to a safe canned
+                        # response rather than looping further.
+                        content = (
+                            "I have already retrieved the requested information. "
+                            "Please provide the final answer using the available results."
+                        )
+                    else:
+                        content = forced_message.content or (
+                            "I have already retrieved the requested information. "
+                            "Please provide the final answer using the available results."
+                        )
+
+                self._is_tool_calling = False
+                self._pending_tool_calls = []
+                await self._reset_vlm_pipeline()
+            else:
+                self._is_tool_calling = True
+                self._tool_response_received = False
+                self._pending_tool_calls = tool_calls
+                logger.info(
+                    f"Event {self.event_id}: VLM chained "
+                    f"{len(tool_calls)} tool call(s)"
+                )
+                return {
+                    "response": tool_calls,
+                    "finish_reason": "tool_calls",
+                    "needs_tool_response": True,
+                    "turn_complete": False,
+                }
+        else:
+            content = message.content or ""
+        self.assistant_message = content
+        self._is_tool_calling = False
+        self._pending_tool_calls = []
+        await self._reset_vlm_pipeline()
+
+        logger.info(f"Event {self.event_id}: VLM tool continuation completed")
+        return {
+            "response": content,
+            "finish_reason": "stop",
+            "needs_tool_response": False,
+            "turn_complete": True,
+        }
 
     # No-op handle management methods (VLM uses subprocess, not CFFI handles)
 
@@ -330,7 +616,15 @@ class VisionConversationEvent(ConversationEvent):
         if self.assistant_message:
             tokens += TokenCounter.estimate_tokens(self.assistant_message)
 
-        # VLM doesn't support tool calling yet, so no tool overhead
+        if self._pending_tool_calls:
+            serializable = [
+                tc.model_dump() if hasattr(tc, "model_dump")
+                else tc.dict() if hasattr(tc, "dict")
+                else tc
+                for tc in self._pending_tool_calls
+            ]
+            import json
+            tokens += TokenCounter.estimate_tokens(json.dumps(serializable))
 
         logger.debug(f"Event {self.event_id}: Calculated {tokens} completion tokens")
         return tokens

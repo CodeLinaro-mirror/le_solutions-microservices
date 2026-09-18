@@ -40,7 +40,7 @@ typedef struct {
 typedef struct {
     char role[MAX_STRING_LENGTH];          // "user", "assistant", etc.
 
-    /* Backward‑compatible single‑string content (used by pure LLM) */
+    /* Backward-compatible single-string content (used by pure LLM) */
     char content[MAX_CONTENT_LENGTH];
 
     /* Multimodal content – array of items (text + image files) */
@@ -76,6 +76,10 @@ typedef struct {
     float seed;
     float presence_penalty;
     float frequency_penalty;
+
+    /* VLM turn lifecycle controls. Ignored by LLM callers. */
+    bool preserve_pipeline_state;
+    bool reset_after_request;
 } Query;
 
 typedef struct {
@@ -101,16 +105,16 @@ typedef void* LLMHandle;
 // Callback for individual tokens (streaming)
 typedef void (*LLMTokenCallback)(const TokenResponse* token);
 
-//invokes the Constructor of LLM Object
+// invokes the Constructor of LLM Object
 LLMHandle llm_create_object(
     const char* model,
     char* config_path,
     const char* sampler_config_path,
     bool streaming);
 
-void llm_reset_object(LLMHandle handle); //Reset the Dialog of LLM Object
+void llm_reset_object(LLMHandle handle); // Reset the Dialog of LLM Object
 
-//invokes the Destructor of LLM Object
+// invokes the Destructor of LLM Object
 void llm_destroy_object(LLMHandle handle);
 
 // Chat completion function with token callback only
@@ -126,13 +130,17 @@ typedef void* VLMHandle;
 /**
  * @brief Create a VLMObject.
  *
- * @param model    Model identifier string (e.g., "QWEN2_5_VL_3B").
+ * @param model Model identifier string (e.g., "QWEN2_5_VL_3B").
  * @param config_path Path to the model configuration file.
  * @param sampler_config_path Path to the sampler configuration file.
- * @param streaming Enable streaming mode (true) or non‑streaming (false).
+ * @param streaming Enable streaming mode (true) or non-streaming (false).
  * @return Opaque handle to the created VLMObject.
  */
-VLMHandle vlm_create_object(const char* model, const char* config_path, const char* sampler_config_path, bool streaming);
+VLMHandle vlm_create_object(
+    const char* model,
+    const char* config_path,
+    const char* sampler_config_path,
+    bool streaming);
 
 /**
  * @brief Destroy a VLMObject.
@@ -144,14 +152,21 @@ void vlm_destroy_object(VLMHandle handle);
 /**
  * @brief Perform a VLM completion request with token callback only.
  *
- * @param handle   VLMObject handle.
- * @param query    Pointer to a fully populated Query structure.
- * @param streaming Whether to stream partial results (must match the mode used at creation).
- * @param token_cb Callback for individual tokens during generation. Receives TokenResponse for each token
- *                 with finish_reason set on the final token.
+ * @param handle VLMObject handle.
+ * @param query Pointer to a fully populated Query structure.
+ * @param streaming Whether to stream partial results.
+ * @param token_cb Callback for individual tokens during generation. The final
+ *                 token has finish_reason set.
  */
 void vlm_chat_completion_create(
     VLMHandle handle,
     const Query* query,
     bool streaming,
     LLMTokenCallback token_cb);
+
+/**
+ * @brief Reset the native VLM pipeline state after a complete turn.
+ *
+ * @param handle Opaque handle returned by vlm_create_object.
+ */
+void vlm_reset_pipeline(VLMHandle handle);

@@ -195,6 +195,21 @@ public:
 
     LLMTokenCallback tokenCallback = nullptr;
 
+    /* Set by the Genie SDK log callback when it detects a "Context Size was
+     * exceeded" log line during execution. Checked at the end of
+     * vlm_chat_completion_create() to convert a degenerate/truncated
+     * generation into an explicit error instead of silently returning
+     * partial or empty content to the client. */
+    bool contextExceeded = false;
+
+    /* Tracks how many tokens have been forwarded to the client for the
+     * current request, used to enforce query->max_completion_tokens at the
+     * callback layer since the GenieNode/GeniePipeline API exposes no
+     * equivalent to GenieDialog_setMaxNumTokens()/GenieDialog_signal(ABORT)
+     * for node-pipeline based (VLM) execution. */
+    int emittedTokenCount = 0;
+    bool lengthLimitReached = false;
+
     void vlm_chat_completion_create();   // Execute a VLM request
     void resetPipeline();   // Explicitly reset pipeline state
 

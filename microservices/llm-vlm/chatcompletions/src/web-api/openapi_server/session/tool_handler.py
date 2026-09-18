@@ -44,6 +44,36 @@ class _ToolFormatAdapter:
             response_text, tools=tools, model_id=model_id
         )
 
+    def normalize_tool_call_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        """
+        Normalize a tool-call entry to {"id", "type": "function",
+        "function": {"name", "arguments"}}. Recognizes only strict
+        OpenAI-canonical fields (name/arguments, or nested function.*).
+        Model-specific aliases belong in subclass overrides.
+        """
+        if not isinstance(entry, dict):
+            return None
+
+        function_data = entry.get("function")
+        if isinstance(function_data, dict):
+            name = function_data.get("name")
+            arguments = function_data.get("arguments")
+        else:
+            name = entry.get("name")
+            arguments = entry.get("arguments")
+
+        if not isinstance(name, str) or not name.strip():
+            return None
+
+        return {
+            "id": entry.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+            "type": "function",
+            "function": {
+                "name": name.strip(),
+                "arguments": arguments if arguments is not None else {},
+            },
+        }
+
 
 class _QwenToolFormatAdapter(_ToolFormatAdapter):
     """Native tool format shared by Qwen2.5/Qwen3 families."""
@@ -90,6 +120,44 @@ class _QwenToolFormatAdapter(_ToolFormatAdapter):
             or '"function"' in text
             or ('"name"' in text and '"arguments"' in text)
         )
+
+    def normalize_tool_call_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        """
+        Qwen override: also accepts "action"/"tool" as name aliases and
+        "parameters"/"args" as argument aliases (observed on Qwen3-VL
+        instruct checkpoints), in addition to the strict base conventions.
+        """
+        if not isinstance(entry, dict):
+            return None
+
+        function_data = entry.get("function")
+        if isinstance(function_data, dict):
+            name = function_data.get("name")
+            arguments = function_data.get("arguments")
+        else:
+            name = (
+                entry.get("name")
+                or entry.get("action")
+                or entry.get("tool")
+            )
+            if "arguments" in entry:
+                arguments = entry.get("arguments")
+            elif "parameters" in entry:
+                arguments = entry.get("parameters")
+            else:
+                arguments = entry.get("args")
+
+        if not isinstance(name, str) or not name.strip():
+            return None
+
+        return {
+            "id": entry.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+            "type": "function",
+            "function": {
+                "name": name.strip(),
+                "arguments": arguments if arguments is not None else {},
+            },
+        }
 
 
 class _GemmaToolFormatAdapter(_ToolFormatAdapter):
@@ -169,16 +237,21 @@ class ToolHandler:
 
     @staticmethod
     def _get_format_adapter(model_id: str) -> _ToolFormatAdapter:
-        # FORCE_GENERIC_TOOL_FORMAT lets ops/experimentation force every model
-        # onto the generic OpenAI-JSON tool-calling convention instead of its
-        # family-specific native format (Qwen <tool_call> XML, Gemma <|tool_call>
-        # function syntax, etc.). This is checked first so it overrides the
-        # per-model registry below without needing any other code changes —
-        # every call site already routes through this single method.
+        # FORCE_GENERIC_TOOL_FORMAT overrides native per-model formats with
+        # the generic OpenAI-JSON convention for prompt formatting.
         from openapi_server.impl.constant import FORCE_GENERIC_TOOL_FORMAT
         if FORCE_GENERIC_TOOL_FORMAT:
             return ToolHandler._DEFAULT_FORMAT_ADAPTER
 
+        return ToolHandler._get_native_format_adapter(model_id)
+
+    @staticmethod
+    def _get_native_format_adapter(model_id: str) -> _ToolFormatAdapter:
+        """
+        Resolve the model-family adapter, ignoring FORCE_GENERIC_TOOL_FORMAT.
+        Used as a parsing fallback since a model may emit its native format
+        even when the prompt requested generic JSON.
+        """
         for pattern, adapter in ToolHandler._FORMAT_ADAPTERS:
             if model_id and pattern.search(model_id):
                 return adapter
@@ -482,16 +555,53 @@ class ToolHandler:
         if not response_text:
             return None
 
+        # Try the forced/prompt-selected adapter's normalizer first, then
+        # fall back to the model's native adapter — a model may emit its
+        # native fields even when the prompt requested generic JSON.
+        forced_adapter = ToolHandler._get_format_adapter(model_id)
+        native_adapter = ToolHandler._get_native_format_adapter(model_id)
+        candidate_normalizers = [forced_adapter.normalize_tool_call_entry]
+        if native_adapter is not forced_adapter:
+            candidate_normalizers.append(native_adapter.normalize_tool_call_entry)
+
+        def normalize_entry(entry: Any) -> Optional[Dict[str, Any]]:
+            for normalizer in candidate_normalizers:
+                normalized = normalizer(entry)
+                if normalized:
+                    return normalized
+            return None
+
         try:
             # Strategy 1: Try to parse entire response as JSON
             try:
                 parsed = json.loads(response_text.strip())
+            except json.JSONDecodeError:
+                # Some models (observed with certain Qwen3-VL checkpoints)
+                # drop exactly one trailing closing bracket/brace when
+                # emitting nested tool-call JSON, even though every value is
+                # otherwise complete. Attempt a structural bracket repair
+                # before giving up on this strategy entirely.
+                repaired_text = ToolHandler._attempt_bracket_repair(response_text.strip())
+                parsed = ToolHandler._json_loads_safe(repaired_text) if repaired_text else None
+                if parsed is not None:
+                    logger.info(
+                        "Recovered tool_calls JSON via bracket repair "
+                        f"(added {len(repaired_text) - len(response_text.strip())} "
+                        "closing character(s))"
+                    )
 
+            if parsed is not None:
                 # Check for OpenAI format: {"tool_calls": [...]}
                 if isinstance(parsed, dict) and "tool_calls" in parsed:
                     tool_calls_data = parsed["tool_calls"]
                     if isinstance(tool_calls_data, list) and len(tool_calls_data) > 0:
-                        return ToolHandler._convert_to_tool_calls(tool_calls_data)
+                        normalized_calls = [
+                            normalized
+                            for entry in tool_calls_data
+                            if (normalized := normalize_entry(entry))
+                        ]
+                        if normalized_calls:
+                            return ToolHandler._convert_to_tool_calls(normalized_calls)
                     # Empty tool_calls array — model signalled "no tool needed" in JSON form.
                     # Return None so the caller treats this as a regular text response.
                     if isinstance(tool_calls_data, list) and len(tool_calls_data) == 0:
@@ -499,9 +609,6 @@ class ToolHandler:
                             "Model returned empty tool_calls array — treating as no-tool response"
                         )
                         return None
-
-            except json.JSONDecodeError:
-                pass
 
             # Strategy 2: Look for JSON object containing tool_calls
             # This handles cases where LLM adds extra text around the JSON
@@ -514,7 +621,13 @@ class ToolHandler:
                     if "tool_calls" in parsed:
                         tool_calls_data = parsed["tool_calls"]
                         if isinstance(tool_calls_data, list) and len(tool_calls_data) > 0:
-                            return ToolHandler._convert_to_tool_calls(tool_calls_data)
+                            normalized_calls = [
+                                normalized
+                                for entry in tool_calls_data
+                                if (normalized := normalize_entry(entry))
+                            ]
+                            if normalized_calls:
+                                return ToolHandler._convert_to_tool_calls(normalized_calls)
                 except json.JSONDecodeError:
                     pass
 
@@ -637,14 +750,10 @@ class ToolHandler:
         tools: List[ChatCompletionTool],
     ) -> Optional[List[ChatCompletionMessageToolCall]]:
         """
-        Recover one or more calls from JSON-like output using the supplied tool schemas.
-
-        Collects matches across every balanced JSON candidate found in the response
-        (not just the first), so multiple back-to-back native calls — e.g. two bare
-        call objects with no wrapper, as some models emit when asked to compare
-        multiple things in one turn — are all recovered instead of only the first.
-        Matches are deduplicated by (name, arguments) so the same call found via
-        overlapping candidate spans isn't emitted twice.
+        Recover calls from JSON-like output using the tool schemas, scanning
+        every balanced JSON candidate (not just the first) so multiple
+        back-to-back native calls are all recovered. Deduplicated by
+        (name, arguments).
         """
         tool_specs = {}
         # Map lowercased tool name -> (original name, expected parameter set).
@@ -794,22 +903,10 @@ class ToolHandler:
     @staticmethod
     def _find_all_schema_guided_calls(value: Any, tool_specs: Dict[str, tuple]) -> List[tuple]:
         """
-        Find every known tool name and its schema-compatible argument object
-        within value, recursing through the full structure rather than
-        stopping at the first match.
-
-        This generalizes _find_schema_guided_call() to the multi-call case:
-        some models emit several back-to-back native call objects (e.g. one
-        per location when asked to compare multiple things) without any
-        wrapper array joining them. Since _extract_balanced_json_values()
-        already yields each such object as a separate top-level candidate,
-        this method's job is simply to not stop early within a single
-        candidate's structure, and the caller (_extract_schema_guided_tool_call)
-        aggregates across all candidates.
-
-        Same two conventions as _find_schema_guided_call():
-          1. Value-based: {"name": "get_weather", "arguments": {...}}
-          2. Key-based:   {"get_weather": {...}}
+        Like _find_schema_guided_call but finds every match by recursing
+        through the full structure instead of stopping at the first — some
+        models emit multiple back-to-back native call objects without a
+        wrapper array.
         """
         results = []
 
@@ -974,6 +1071,71 @@ class ToolHandler:
         repaired = repaired.replace('""', '"')
 
         return repaired
+
+    @staticmethod
+    def _attempt_bracket_repair(text: str) -> Optional[str]:
+        """
+        Repair JSON with missing closing brackets/braces by tracking a
+        structural bracket stack (ignoring braces inside quoted strings)
+        and inserting any missing closer exactly where it belongs, not just
+        at the end. Handles mid-string omissions (observed on some Qwen3-VL
+        checkpoints) that a simple trailing-append repair cannot fix.
+        Returns None if nothing needed repair.
+        """
+        if not text:
+            return None
+
+        closing_map = {"{": "}", "[": "]"}
+        output = []
+        stack = []
+        in_string = False
+        escaped = False
+        repaired_any = False
+
+        for char in text:
+            if in_string:
+                output.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                output.append(char)
+                continue
+
+            if char in "{[":
+                stack.append(char)
+                output.append(char)
+                continue
+
+            if char in "}]":
+                # Insert any missing closers until the top of the stack
+                # matches this closer, or the stack runs out entirely
+                # (an unrepairable extra/unexpected closer).
+                while stack and closing_map[stack[-1]] != char:
+                    output.append(closing_map[stack.pop()])
+                    repaired_any = True
+                if stack:
+                    stack.pop()
+                output.append(char)
+                continue
+
+            output.append(char)
+
+        if stack:
+            for opener in reversed(stack):
+                output.append(closing_map[opener])
+            repaired_any = True
+
+        if not repaired_any:
+            return None
+
+        return "".join(output)
 
     @staticmethod
     def is_empty_tool_response(response_text: str) -> bool:
