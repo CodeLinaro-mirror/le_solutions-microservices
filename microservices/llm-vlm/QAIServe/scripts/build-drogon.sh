@@ -17,6 +17,19 @@ DROGON_VERSION="${DROGON_VERSION:-v1.9.6}"
 
 echo "=== Building Drogon ${DROGON_VERSION} ==="
 
+# Native build on arm64; otherwise cross-compile with the aarch64 toolchain
+# (crossbuild-essential-arm64). See build-fastrpc.sh for the same pattern.
+BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    CROSS_CMAKE_ARGS=""
+else
+    # CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR are required so CMake knows
+    # it's cross-compiling — otherwise Drogon's FindFilesystem.cmake try_run()s
+    # the compiled aarch64 test program on this amd64 host, which fails
+    # without qemu-user-static + binfmt_misc set up.
+    CROSS_CMAKE_ARGS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"
+fi
+
 # Clone Drogon
 git clone --depth 1 --branch "${DROGON_VERSION}" \
     https://github.com/drogonframework/drogon.git /tmp/drogon
@@ -26,6 +39,7 @@ git submodule update --init
 
 # Configure with minimal dependencies
 cmake -S . -B build \
+    ${CROSS_CMAKE_ARGS} \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${DEPLOY_DIR}/usr" \
     -DBUILD_SHARED_LIBS=ON \

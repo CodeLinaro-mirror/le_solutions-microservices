@@ -49,6 +49,10 @@ cd /tmp/fastrpc
 autoreconf -is
 
 # Build natively on arm64; cross-compile with the aarch64 toolchain otherwise.
+# PKG_CONFIG_PATH/PKG_CONFIG_LIBDIR must point at the arm64 multiarch
+# pkgconfig dir when cross-compiling — only libyaml-dev:arm64 (not the
+# native amd64 package) is installed in the Dockerfile's builder stage, so
+# pkg-config's default (host-arch) search path can't find yaml-0.1.pc.
 BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 if [ "${BUILD_ARCH}" = "arm64" ]; then
     CROSS_CONFIGURE_ARGS=""

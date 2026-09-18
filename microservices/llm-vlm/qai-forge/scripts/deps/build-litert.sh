@@ -25,6 +25,23 @@
 set -eu
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Detect whether this stage is already running natively on the target
+# architecture (arm64) — e.g. when the Dockerfile's litert_builder stage is
+# built on an arm64 host instead of the usual x86_64 build machine. When
+# true, skip the cross-compile toolchain entirely and build natively (the
+# same way this script worked before cross-compilation support was added).
+# Package installation (crossbuild-essential-arm64 etc. in the Dockerfile)
+# stays unconditional either way — installing it on an arm64 host is harmless,
+# it's just unused.
+# ─────────────────────────────────────────────────────────────────────────────
+BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    echo "Build host is arm64 (native) — building LiteRT natively, no cross-compile toolchain."
+else
+    echo "Build host is ${BUILD_ARCH} — cross-compiling LiteRT for arm64."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Defaults — used only when a variable isn't already set in the environment
 # ─────────────────────────────────────────────────────────────────────────────
 LITERT_VERSION="${LITERT_VERSION:-2.1.6}"
@@ -53,6 +70,12 @@ CLANG_COMPILER_PATH="${CLANG_COMPILER_PATH:-/usr/bin/clang}"
 TF_SET_ANDROID_WORKSPACE="${TF_SET_ANDROID_WORKSPACE:-0}"
 TF_DOWNLOAD_CLANG="${TF_DOWNLOAD_CLANG:-0}"
 TF_ENABLE_XLA="${TF_ENABLE_XLA:-0}"
+# Bazel action concurrency. This build cross-compiles natively on the x86_64
+# build host (see Dockerfile) rather than running an aarch64 Bazel under QEMU,
+# so this can safely be raised to $(nproc) — it no longer needs to be
+# throttled to work around QEMU-user emulation deadlocks.
+BAZEL_JOBS="${BAZEL_JOBS:-4}"
+export BAZEL_JOBS
 export PYTHON_BIN_PATH PYTHON_LIB_PATH \
     TF_NEED_CUDA TF_NEED_ROCM TF_NEED_TENSORRT TF_NEED_OPENCL_SYCL TF_NEED_OPENCL \
     TF_NEED_MPI TF_NEED_COMPUTECPP TF_NEED_CLANG CLANG_COMPILER_PATH \
@@ -62,13 +85,26 @@ echo "=== Building LiteRT v${LITERT_VERSION} with QNN dispatch and compiler plug
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Install Bazelisk
+#
+# x86_64 build — this script now runs natively on the x86_64 build host and
+# cross-compiles to AArch64 (see Dockerfile), so an x86_64 Bazelisk drives the
+# build. If the caller already installed /usr/local/bin/bazel (the Dockerfile
+# does), skip re-downloading so a differently-arched bazel isn't clobbered.
+# On a native arm64 host, download the arm64 Bazelisk instead.
 # ─────────────────────────────────────────────────────────────────────────────
 BAZELISK_VERSION="${BAZELISK_VERSION:-v1.28.1}"
-echo "Installing Bazelisk ${BAZELISK_VERSION}..."
-wget -t 3 -T 120 --no-verbose \
-    -O /usr/local/bin/bazel \
-    "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64"
-chmod +x /usr/local/bin/bazel
+if [ ! -x /usr/local/bin/bazel ]; then
+    echo "Installing Bazelisk ${BAZELISK_VERSION}..."
+    if [ "${BUILD_ARCH}" = "arm64" ]; then
+        BAZELISK_ASSET="bazelisk-linux-arm64"
+    else
+        BAZELISK_ASSET="bazelisk-linux-amd64"
+    fi
+    wget -t 3 -T 120 --no-verbose \
+        -O /usr/local/bin/bazel \
+        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/${BAZELISK_ASSET}"
+    chmod +x /usr/local/bin/bazel
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clone LiteRT v${LITERT_VERSION} with retry logic (POSIX-compatible)
@@ -80,30 +116,35 @@ git config --global http.lowSpeedTime 999999
 git config --global core.compression 0
 
 i=1
-while [ "$i" -le 5 ]; do
-    if git clone --branch "v${LITERT_VERSION}" --depth 1 https://github.com/google-ai-edge/LiteRT.git "${LITERT_SRC_DIR}"; then
+while [ "$i" -le 8 ]; do
+    # timeout guards against a stalled connection that never errors out on its
+    # own (observed on some networks: the clone hangs indefinitely at 0 bytes/s
+    # instead of failing), which would otherwise bypass this retry loop entirely.
+    if timeout 300 git clone --branch "v${LITERT_VERSION}" --depth 1 https://github.com/google-ai-edge/LiteRT.git "${LITERT_SRC_DIR}"; then
         break
     else
-        echo "Clone failed, retrying in 15 seconds..."
+        echo "Clone failed or timed out, retrying in 15 seconds..."
         rm -rf "${LITERT_SRC_DIR}"
         sleep 15
         i=$((i + 1))
     fi
 done
+[ -d "${LITERT_SRC_DIR}/.git" ] || { echo "ERROR: LiteRT clone failed after 8 attempts"; exit 1; }
 
 cd "${LITERT_SRC_DIR}"
 
 # Clone submodules with retry logic
 i=1
-while [ "$i" -le 5 ]; do
-    if git submodule update --init --recursive --depth 1; then
+while [ "$i" -le 8 ]; do
+    if timeout 600 git submodule update --init --recursive --depth 1; then
         break
     else
-        echo "Submodule update failed, retrying in 15 seconds..."
+        echo "Submodule update failed or timed out, retrying in 15 seconds..."
         sleep 15
         i=$((i + 1))
     fi
 done
+[ "$i" -le 8 ] || { echo "ERROR: submodule update failed after 8 attempts"; exit 1; }
 
 # Run configure if present
 if [ -f configure ]; then
@@ -126,6 +167,37 @@ fi
 # versions without the reference and a fix on versions that have it.
 # ─────────────────────────────────────────────────────────────────────────────
 find support -mindepth 2 -maxdepth 2 -name BUILD -exec sed -i -e 's|"@stblib"|"@stb//:stblib"|g' {} +
+
+if [ "${BUILD_ARCH}" != "arm64" ]; then
+    # ─────────────────────────────────────────────────────────────────────────
+    # Register a platform-aware cc_toolchain for cross-compilation
+    #
+    # See litert-cross-compile-toolchains/BUILD (copied in by the Dockerfile) for
+    # why this is needed: LiteRT's legacy local_config_embedded_arm toolchain
+    # isn't registered for Bazel 7's platform-based toolchain resolution, so
+    # --platforms=...:linux_aarch64 fails without it. Only needed on the
+    # cross-compile path — a native arm64 build never resolves toolchains for
+    # a foreign target platform.
+    # ─────────────────────────────────────────────────────────────────────────
+    mkdir -p toolchains
+    cp /tmp/litert-cross-compile-toolchains-BUILD toolchains/BUILD
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Patch Clang-only target attribute syntax for GCC compatibility
+    #
+    # These two files use __attribute__((target("dotprod"))), which is Clang
+    # syntax. The cross-compiler LiteRT pulls in for elinux_aarch64 (Bazel's
+    # hermetic ARM GNU-A download) is plain GCC, which requires the leading '+'
+    # (target("+dotprod")). Both spellings mean the same thing; GCC just insists
+    # on the '+'. //tflite/kernels/internal:optimized_4bit is a required
+    # dependency of the LiteRT targets built below, so this can't be skipped.
+    # Only needed on the cross-compile path — a native arm64 build uses Clang
+    # (TF_NEED_CLANG=1 above), which already accepts the unprefixed syntax.
+    # ─────────────────────────────────────────────────────────────────────────
+    sed -i 's/target("dotprod")/target("+dotprod")/g' \
+        tflite/kernels/internal/optimized/4bit/neon_fully_connected_aarch64_sdot.cc \
+        tflite/kernels/internal/optimized/4bit/neon_fully_connected_arm32_sdot.cc
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download QAIRT SDK
@@ -178,21 +250,62 @@ cd "${LITERT_SRC_DIR}"
 
 mkdir -p /bazel-cache
 
-echo "Building LiteRT with Bazel..."
-bazel build --config=linux -c opt \
-    --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
-    --copt=-DLITERT_ENABLE_NPU \
-    --linkopt=-Wl,--whole-archive \
-    --linkopt=-Wl,--no-whole-archive \
-    //litert/c:litert_runtime_c_api_so \
-    //litert/c:litert_tensor_buffer \
-    //litert/runtime:tensor_buffer \
-    //litert/vendors/qualcomm/dispatch:dispatch_api_so \
-    //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so \
-    //litert/tools:run_model \
-    //litert/tools:run_model_simple \
-    //litert/tools:benchmark_model
+echo "Building LiteRT with Bazel (--jobs=${BAZEL_JOBS})..."
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    # Native build — same invocation this script used before cross-compile
+    # support was added. No --platforms/--extra_toolchains/--cpu overrides
+    # needed since the host's own toolchain already targets arm64.
+    bazel build --config=linux -c opt \
+        --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+        --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+        --copt=-DLITERT_ENABLE_NPU \
+        --linkopt=-Wl,--whole-archive \
+        --linkopt=-Wl,--no-whole-archive \
+        //litert/c:litert_runtime_c_api_so \
+        //litert/c:litert_tensor_buffer \
+        //litert/runtime:tensor_buffer \
+        //litert/vendors/qualcomm/dispatch:dispatch_api_so \
+        //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so \
+        //litert/tools:run_model \
+        //litert/tools:run_model_simple \
+        //litert/tools:benchmark_model
+else
+    # Cross-compile flags (this stage now runs natively on x86_64, see Dockerfile):
+    #   --cpu / --host_cpu / --crosstool_top / --host_crosstool_top
+    #       Legacy toolchain-selection flags — pick the ARM cross-compiler for the
+    #       target and the host's own compiler for host-only tools (codegen
+    #       binaries like flatc, protoc plugins, etc).
+    #   --extra_toolchains / --platforms
+    #       Bazel 7 platform-based resolution — required so LiteRT's
+    #       config_setting()s (which key off constraint_values, not --cpu)
+    #       correctly resolve to aarch64 instead of leaking x86-only flags
+    #       (e.g. -msse4.2) into the cross-compile. See
+    #       litert-cross-compile-toolchains/BUILD for why --extra_toolchains is
+    #       needed alongside --crosstool_top.
+    #   --config=clang_local
+    #       Enables local_config_embedded_arm (LiteRT's elinux toolchain repo).
+    bazel build --config=linux --config=clang_local -c opt \
+        --jobs="${BAZEL_JOBS}" \
+        --cpu=aarch64 \
+        --host_cpu=k8 \
+        --crosstool_top=@local_config_embedded_arm//:toolchain \
+        --host_crosstool_top=@bazel_tools//tools/cpp:toolchain \
+        --extra_toolchains=//toolchains:cc_toolchain_aarch64 \
+        --platforms=@org_tensorflow//tensorflow/tools/toolchains/linux:linux_aarch64 \
+        --copt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+        --cxxopt=-DLITERT_HAS_FASTRPC_SUPPORT_DEFAULT=1 \
+        --copt=-DLITERT_ENABLE_NPU \
+        --linkopt=-Wl,--whole-archive \
+        --linkopt=-Wl,--no-whole-archive \
+        //litert/c:litert_runtime_c_api_so \
+        //litert/c:litert_tensor_buffer \
+        //litert/runtime:tensor_buffer \
+        //litert/vendors/qualcomm/dispatch:dispatch_api_so \
+        //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so \
+        //litert/tools:run_model \
+        //litert/tools:run_model_simple \
+        //litert/tools:benchmark_model
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage LiteRT shared libraries, plugins, binaries, and public headers
@@ -200,12 +313,28 @@ bazel build --config=linux -c opt \
 echo "Staging LiteRT artifacts to ${LITERT_DEPLOY_DIR}..."
 mkdir -p "${LITERT_DEPLOY_DIR}/lib" "${LITERT_DEPLOY_DIR}/bin" "${LITERT_DEPLOY_DIR}/include"
 
-bazel cquery \
-    --config=linux -c opt \
-    --repo_env=HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION}" \
-    --output=files \
-    'set(//litert/c:litert_runtime_c_api_so //litert/c:litert_tensor_buffer //litert/runtime:tensor_buffer //litert/vendors/qualcomm/dispatch:dispatch_api_so //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so //litert/tools:run_model //litert/tools:run_model_simple //litert/tools:benchmark_model)' \
-    > /tmp/litert_bazel_outputs.txt
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    bazel cquery \
+        --config=linux -c opt \
+        --repo_env=HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION}" \
+        --output=files \
+        'set(//litert/c:litert_runtime_c_api_so //litert/c:litert_tensor_buffer //litert/runtime:tensor_buffer //litert/vendors/qualcomm/dispatch:dispatch_api_so //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so //litert/tools:run_model //litert/tools:run_model_simple //litert/tools:benchmark_model)' \
+        > /tmp/litert_bazel_outputs.txt
+else
+    bazel cquery \
+        --config=linux --config=clang_local -c opt \
+        --jobs="${BAZEL_JOBS}" \
+        --cpu=aarch64 \
+        --host_cpu=k8 \
+        --crosstool_top=@local_config_embedded_arm//:toolchain \
+        --host_crosstool_top=@bazel_tools//tools/cpp:toolchain \
+        --extra_toolchains=//toolchains:cc_toolchain_aarch64 \
+        --platforms=@org_tensorflow//tensorflow/tools/toolchains/linux:linux_aarch64 \
+        --repo_env=HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION}" \
+        --output=files \
+        'set(//litert/c:litert_runtime_c_api_so //litert/c:litert_tensor_buffer //litert/runtime:tensor_buffer //litert/vendors/qualcomm/dispatch:dispatch_api_so //litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so //litert/tools:run_model //litert/tools:run_model_simple //litert/tools:benchmark_model)' \
+        > /tmp/litert_bazel_outputs.txt
+fi
 
 echo "Configured LiteRT Bazel outputs:"
 cat /tmp/litert_bazel_outputs.txt

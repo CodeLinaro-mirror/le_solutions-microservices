@@ -12,14 +12,12 @@ find_package(libzip REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# gRPC's own CMake package (gRPCConfig.cmake) unconditionally expects an
-# imported target named c-ares::cares in its link interface. Debian/Ubuntu's
-# libc-ares-dev package ships only a pkg-config file (libcares.pc), not a
-# CMake config (no c-ares-config.cmake), so plain find_package(gRPC REQUIRED)
-# fails with "c-ares::cares ... target was not found". Synthesize that target
-# from pkg-config before gRPC's config is processed.
-# ─────────────────────────────────────────────────────────────────────────────
+# Drogon/Trantor's bundled legacy Findc-ares.cmake sets c-ares_FOUND=TRUE
+# without defining c-ares::cares, which short-circuits gRPCConfig.cmake's
+# own find_package(c-ares) and leaves gRPC::grpc linking against a target
+# that doesn't exist. Synthesize c-ares::cares via pkg-config as a
+# workaround — do not remove as redundant, this reproduces whenever Drogon
+# is find_package()'d before gRPC.
 if(NOT TARGET c-ares::cares)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CARES REQUIRED IMPORTED_TARGET libcares)

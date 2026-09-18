@@ -24,6 +24,10 @@ if [ "${DEBUG:-0}" = "1" ]; then
     set -x
 fi
 
+# Native build on arm64; otherwise cross-compile to aarch64-unknown-linux-gnu.
+# See build-litert.sh for the same detection pattern.
+BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,15 +35,21 @@ LITERT_LM_DEPLOY_DIR="${LITERT_LM_DEPLOY_DIR:-/mnt/work/deploy/usr}"
 
 echo "=== Building Rust cdylib wrappers ==="
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Install Rust
-# ─────────────────────────────────────────────────────────────────────────────
+# This script runs natively on x86_64, so the default x86_64-unknown-linux-gnu
+# Rust target isn't enough — the aarch64 target and a cross-linker are needed.
 echo "Installing Rust toolchain..."
 wget -q -O /tmp/rustup.sh \
     https://raw.githubusercontent.com/rust-lang/rustup/main/rustup-init.sh
 sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal
 # shellcheck disable=SC1091
 . "$HOME/.cargo/env"
+
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    RUST_TARGET=""
+else
+    rustup target add aarch64-unknown-linux-gnu
+    RUST_TARGET=aarch64-unknown-linux-gnu
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Build llguidance cdylib wrapper
@@ -79,11 +89,24 @@ EOF
     mkdir -p src
     echo 'pub use llguidance::*;' > src/lib.rs
 
-    # Build release version
-    cargo build --release
+    if [ "${BUILD_ARCH}" = "arm64" ]; then
+        # Native build — no cross-linker/--target needed.
+        cargo build --release
+        CAPI_SO=$(find target/release -name "libllguidance_cdylib.so" -type f 2>/dev/null | head -1)
+    else
+        # Point cargo's aarch64 target at the cross-linker (crossbuild-essential-arm64)
+        mkdir -p .cargo
+        cat > .cargo/config.toml <<EOF
+[target.${RUST_TARGET}]
+linker = "aarch64-linux-gnu-gcc"
+EOF
+
+        # Build release version, cross-compiled for aarch64
+        cargo build --release --target "${RUST_TARGET}"
+        CAPI_SO=$(find "target/${RUST_TARGET}/release" -name "libllguidance_cdylib.so" -type f 2>/dev/null | head -1)
+    fi
 
     # Copy to deployment directory
-    CAPI_SO=$(find target/release -name "libllguidance_cdylib.so" -type f 2>/dev/null | head -1)
     if [ -n "$CAPI_SO" ]; then
         echo "Copying llguidance cdylib to ${LITERT_LM_DEPLOY_DIR}/lib/libllguidance.so"
         cp -avL "$CAPI_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libllguidance.so"
@@ -133,18 +156,27 @@ CXX_SRC=$(find "$HOME/.cache/bazel" -path "*/crate_index__cxx-*" \
 if [ -n "$CXX_SRC" ]; then
     echo "Found cxx source at: $CXX_SRC"
 
-    # The C++ bridge shims are in cxx.cc — compile them as a shared library
+    # The C++ bridge shims are in cxx.cc — compile them as a shared library.
+    # Cross-compile: use the aarch64 g++ (crossbuild-essential-arm64), not the
+    # host's native g++, since this script now runs on x86_64 (see Rust
+    # target note above) but the output must be aarch64. On a native arm64
+    # host, the native g++ already targets aarch64.
     CXX_CC="${CXX_SRC}/src/cxx.cc"
     CXX_INCLUDE="${CXX_SRC}/include"
+    if [ "${BUILD_ARCH}" = "arm64" ]; then
+        CXX_COMPILER=g++
+    else
+        CXX_COMPILER=aarch64-linux-gnu-g++
+    fi
     if [ -f "$CXX_CC" ]; then
         echo "Compiling cxx C++ runtime shims from $CXX_CC"
-        g++ -O2 -fPIC -shared \
+        "${CXX_COMPILER}" -O2 -fPIC -shared \
             -I"${CXX_INCLUDE}" \
             "$CXX_CC" \
             -o "${LITERT_LM_DEPLOY_DIR}/lib/libcxxbridge_rt.so" \
             -lstdc++ && echo "✓ libcxxbridge_rt.so compiled from C++ source"
     else
-        # Fallback: build Rust cdylib
+        # Fallback: build Rust cdylib, cross-compiled for aarch64
         mkdir -p /tmp/cxx-build && cd /tmp/cxx-build
         cat > Cargo.toml <<EOF
 [package]
@@ -160,8 +192,18 @@ cxx = { path = "${CXX_SRC}" }
 EOF
         mkdir -p src
         echo 'pub use cxx::*;' > src/lib.rs
-        cargo build --release 2>/dev/null || true
-        RT_SO=$(find target/release -name "libcxxbridge_rt.so" -type f 2>/dev/null | head -1)
+        if [ "${BUILD_ARCH}" = "arm64" ]; then
+            cargo build --release 2>/dev/null || true
+            RT_SO=$(find target/release -name "libcxxbridge_rt.so" -type f 2>/dev/null | head -1)
+        else
+            mkdir -p .cargo
+            cat > .cargo/config.toml <<EOF
+[target.${RUST_TARGET}]
+linker = "aarch64-linux-gnu-gcc"
+EOF
+            cargo build --release --target "${RUST_TARGET}" 2>/dev/null || true
+            RT_SO=$(find "target/${RUST_TARGET}/release" -name "libcxxbridge_rt.so" -type f 2>/dev/null | head -1)
+        fi
         if [ -n "$RT_SO" ]; then
             cp -avL "$RT_SO" "${LITERT_LM_DEPLOY_DIR}/lib/libcxxbridge_rt.so"
         fi

@@ -32,9 +32,14 @@ services:
       args:
         - QAIRT_SDK_VERSION=${QAIRT_SDK_VERSION:-2.48.0.260626}
         - BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS:-false}
-        - BUILD_LITERT_LM=true
-        - BUILD_LLAMACPP=true
+        - BUILD_LITERT_LM=ON
+        - BUILD_LLAMACPP=ON
         - BUILD_GENIE=true
+        # Bazel concurrency for the LiteRT / LiteRT-LM stages. Low by default
+        # because the Bazel server JVM deadlocks under QEMU-user emulation when
+        # building for arm64 on an x86 host; set BAZEL_JOBS=$(nproc) on a native
+        # aarch64 builder.
+        - BAZEL_JOBS=${BAZEL_JOBS:-4}
     ports:
       - "${QAISERVE_PORT:-9002}:${QAISERVE_PORT:-9002}"
       - "${GRPC_SERVER_PORT:-50051}:${GRPC_SERVER_PORT:-50051}"

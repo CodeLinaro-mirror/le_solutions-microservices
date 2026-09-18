@@ -80,6 +80,13 @@
 #                       compiled. Pass --build-arg BUILD_LLAMACPP=OFF to skip
 #                       it.
 #
+#   BAZEL_JOBS          Bazel action concurrency for Stage 0 / 0b. Both stages
+#                       now cross-compile natively on the x86_64 build host
+#                       (see below) instead of running an AArch64 Bazel under
+#                       QEMU, so this can be $(nproc) — it no longer needs to
+#                       be throttled to avoid the QEMU-user emulation deadlock
+#                       that motivated the old default of 4.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 ARG QAIRT_SDK_VERSION=2.48.0.260626
 ARG LITERT_VERSION=2.1.6
@@ -88,6 +95,7 @@ ARG BUILD_LITERT_LM=ON
 ARG BUILD_LITERT_LM_CLI_TOOLS=false
 ARG BUILD_LLAMACPP=ON
 ARG BUILD_GENIE=true
+ARG BAZEL_JOBS=4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage -1: qairt_fetcher
@@ -99,8 +107,15 @@ ARG BUILD_GENIE=true
 # multi-hundred-MB zip from softwarecenter.qualcomm.com. They instead
 # COPY --from=qairt_fetcher the already-extracted tree; both scripts detect
 # it's already present at their expected path and skip the network fetch.
+#
+# --platform=$BUILDPLATFORM (not linux/arm64): this stage only runs wget/unzip
+# — no target-architecture code ever executes, so pinning it to arm64 just
+# means paying QEMU overhead for zero benefit (the SDK zip's contents are
+# architecture-agnostic at this stage; individual .so files inside are picked
+# up by other stages that already handle their own architecture). Building
+# natively on $BUILDPLATFORM (x86_64) avoids that overhead entirely.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS qairt_fetcher
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS qairt_fetcher
 
 ARG QAIRT_SDK_VERSION
 
@@ -128,14 +143,24 @@ RUN mkdir -p /opt/qairt-sdk && \
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: litert_builder
 #
-# Builds LiteRT natively on AArch64 using Bazelisk.
-# Uses modular script for maintainability and reusability.
+# Cross-compiles LiteRT for AArch64 from a native BUILDPLATFORM container (not
+# --platform=linux/arm64 — see build-litert.sh for why). --platform=$BUILDPLATFORM
+# is required here, not just omitting --platform: a bare `FROM` with no
+# --platform inherits the overall build's --platform (arm64, from
+# docker-compose.yaml/buildx), which would put us right back under QEMU.
+# $BUILDPLATFORM pins this stage to the builder host's own architecture
+# (x86_64) regardless of the target platform requested for the final image.
+# Uses Bazelisk's x86_64 build to drive an aarch64-targeting Bazel build via
+# LiteRT's elinux_aarch64 config, so no QEMU emulation is involved in the
+# build itself. Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS litert_builder
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS litert_builder
 
 # Re-declare to bring the global ARGs into this stage's scope.
 ARG QAIRT_SDK_VERSION
 ARG LITERT_VERSION
+ARG BAZEL_JOBS
+ENV BAZEL_JOBS=${BAZEL_JOBS}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -145,6 +170,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         lld-15 \
         llvm \
         g++ \
+        crossbuild-essential-arm64 \
         wget \
         git \
         git-lfs \
@@ -163,11 +189,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Use ARM64 Bazelisk for native AArch64 build
+# Use $BUILDPLATFORM-native Bazelisk — on an x86_64 build host this stage
+# cross-compiles to AArch64 via LiteRT's elinux_aarch64 Bazel config (see
+# build-litert.sh); on a native arm64 build host (e.g. building directly on
+# device) build-litert.sh instead builds LiteRT natively. Either way Bazelisk
+# itself must match $BUILDPLATFORM or it can't be exec'd at all.
 ENV BAZELISK_VERSION=v1.28.1
-RUN wget -t 3 -T 120 --no-verbose \
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    wget -t 3 -T 120 --no-verbose \
         -O /usr/local/bin/bazel \
-        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" \
+        "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-${BUILD_ARCH}" \
     && chmod +x /usr/local/bin/bazel
 
 # Build LiteRT using modular script
@@ -205,8 +236,47 @@ ENV TF_ENABLE_XLA=0
 # comment above.
 COPY --from=qairt_fetcher /opt/qairt-sdk ${QAIRT_LITERT_DIR}
 
+# Registers LiteRT's legacy `local_config_embedded_arm` cc_toolchain as a
+# Bazel 7 platform-aware toolchain — required for --platforms=...:linux_aarch64
+# toolchain resolution to succeed when cross-compiling (see build-litert.sh's
+# BUILD_ARCH branch for where this file is consumed). Generated inline via
+# RUN instead of COPY so no extra file needs to be added to the repo.
+RUN { \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
+      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
+      echo '#'; \
+      echo '# Registers LiteRT'"'"'s legacy `local_config_embedded_arm` cc_toolchain (its'; \
+      echo '# elinux_aarch64 config, built on Bazel'"'"'s hermetic ARM GNU-A download) as a'; \
+      echo '# Bazel 7 platform-aware toolchain.'; \
+      echo '#'; \
+      echo '# Without this, --platforms=...:linux_aarch64 fails toolchain resolution'; \
+      echo '# ("No matching toolchains found") because local_config_embedded_arm only'; \
+      echo '# registers under the legacy --crosstool_top mechanism. And without'; \
+      echo '# --platforms=...:linux_aarch64, LiteRT'"'"'s own config_setting()s — which use'; \
+      echo '# constraint_values, not the legacy --cpu flag — misresolve to the host'; \
+      echo '# (x86_64) arch and leak x86-only flags like -msse4.2 into the aarch64'; \
+      echo '# compile. Both the legacy --cpu/--crosstool_top flags (to pick the compiler)'; \
+      echo '# and this toolchain() registration + --platforms (to make config_setting()'; \
+      echo '# resolve correctly) are required together; see build-litert.sh.'; \
+      echo 'package(default_visibility = ["//visibility:public"])'; \
+      echo ''; \
+      echo 'toolchain('; \
+      echo '    name = "cc_toolchain_aarch64",'; \
+      echo '    exec_compatible_with = ['; \
+      echo '        "@platforms//cpu:x86_64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    target_compatible_with = ['; \
+      echo '        "@platforms//cpu:aarch64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    toolchain = "@local_config_embedded_arm//:cc-compiler-aarch64",'; \
+      echo '    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",'; \
+      echo ')'; \
+    } > /tmp/litert-cross-compile-toolchains-BUILD
+
 COPY qai-forge/scripts/deps/build-litert.sh /tmp/
-RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-litert.sh
+RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-litert.sh /tmp/litert-cross-compile-toolchains-BUILD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0b: litert_lm_builder
@@ -216,6 +286,12 @@ RUN chmod +x /tmp/build-litert.sh && /tmp/build-litert.sh && rm /tmp/build-liter
 # LiteRT-LM or invoke Bazel at all — it just stages an empty directory tree so
 # the unconditional `COPY --from=litert_lm_builder` lines below the builder
 # stage still succeed.
+# Cross-compiles LiteRT-LM for AArch64, same approach as litert_builder above
+# (inherits its BUILDPLATFORM/x86_64 environment since this stage is FROM
+# litert_builder). See build-litert-lm-incremental.sh for the LiteRT-LM
+# specific cross-compile flags (elinux_aarch64 config, Rust toolchain triple,
+# -fpermissive) — its WORKSPACE/.bazelrc differ enough from LiteRT's that the
+# same flag set doesn't carry over unchanged.
 # Uses modular script for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM litert_builder AS litert_lm_builder
@@ -226,8 +302,10 @@ FROM litert_builder AS litert_lm_builder
 ARG BUILD_LITERT_LM
 ARG BUILD_LITERT_LM_CLI_TOOLS
 ARG LITERT_LM_VERSION
+ARG BAZEL_JOBS
 ENV BUILD_LITERT_LM_CLI_TOOLS=${BUILD_LITERT_LM_CLI_TOOLS}
 ENV LITERT_LM_VERSION=${LITERT_LM_VERSION}
+ENV BAZEL_JOBS=${BAZEL_JOBS}
 
 # Build LiteRT-LM using modular script
 # LITERT_SRC_DIR is already inherited from litert_builder (this stage is
@@ -240,6 +318,44 @@ ENV LITERT_LM_DEPLOY_DIR=/mnt/work/deploy/usr
 # succeed whether or not LiteRT-LM was actually built below.
 RUN mkdir -p ${LITERT_LM_DEPLOY_DIR}/lib ${LITERT_LM_DEPLOY_DIR}/bin ${LITERT_LM_DEPLOY_DIR}/include
 
+# Same platform-aware cc_toolchain registration as litert_builder above —
+# re-generated here (not persisted from the previous stage) since this is a
+# fresh FROM litert_builder layer and build-litert-lm-incremental.sh's own
+# cross-compile branch also needs it at /tmp/litert-cross-compile-toolchains-BUILD.
+RUN { \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
+      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
+      echo '#'; \
+      echo '# Registers LiteRT'"'"'s legacy `local_config_embedded_arm` cc_toolchain (its'; \
+      echo '# elinux_aarch64 config, built on Bazel'"'"'s hermetic ARM GNU-A download) as a'; \
+      echo '# Bazel 7 platform-aware toolchain.'; \
+      echo '#'; \
+      echo '# Without this, --platforms=...:linux_aarch64 fails toolchain resolution'; \
+      echo '# ("No matching toolchains found") because local_config_embedded_arm only'; \
+      echo '# registers under the legacy --crosstool_top mechanism. And without'; \
+      echo '# --platforms=...:linux_aarch64, LiteRT'"'"'s own config_setting()s — which use'; \
+      echo '# constraint_values, not the legacy --cpu flag — misresolve to the host'; \
+      echo '# (x86_64) arch and leak x86-only flags like -msse4.2 into the aarch64'; \
+      echo '# compile. Both the legacy --cpu/--crosstool_top flags (to pick the compiler)'; \
+      echo '# and this toolchain() registration + --platforms (to make config_setting()'; \
+      echo '# resolve correctly) are required together; see build-litert.sh.'; \
+      echo 'package(default_visibility = ["//visibility:public"])'; \
+      echo ''; \
+      echo 'toolchain('; \
+      echo '    name = "cc_toolchain_aarch64",'; \
+      echo '    exec_compatible_with = ['; \
+      echo '        "@platforms//cpu:x86_64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    target_compatible_with = ['; \
+      echo '        "@platforms//cpu:aarch64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    toolchain = "@local_config_embedded_arm//:cc-compiler-aarch64",'; \
+      echo '    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",'; \
+      echo ')'; \
+    } > /tmp/litert-cross-compile-toolchains-BUILD
+
 COPY qai-forge/scripts/deps/build-litert-lm-incremental.sh /tmp/
 COPY qai-forge/scripts/deps/build-rust-wrappers.sh /tmp/
 RUN chmod +x /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh && \
@@ -248,20 +364,47 @@ RUN chmod +x /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh && 
     else \
         echo "=== Skipping LiteRT-LM build (BUILD_LITERT_LM=OFF) ==="; \
     fi && \
-    rm /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh
+    rm /tmp/build-litert-lm-incremental.sh /tmp/build-rust-wrappers.sh /tmp/litert-cross-compile-toolchains-BUILD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: Builder
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:trixie-slim AS builder
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS builder
 
 # Re-declare to bring the global ARG into this stage's scope.
 ARG QAIRT_SDK_VERSION
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-compile setup: this stage runs natively on the build host's own
+# architecture ($BUILDPLATFORM, x86_64) and cross-compiles fastrpc/Drogon/
+# qai-forge/llama.cpp/QAIServe to aarch64, instead of running them all under
+# QEMU-user emulation. This was motivated by the QAIServe CMake configure
+# step (find_package(gRPC REQUIRED)) recursing through re2's ~228-package
+# abseil dependency graph via pkg-config — each pkg-config exec costs
+# 1-2 minutes under QEMU (measured: ~86s for a single `pkg-config --libs
+# re2`), adding up to ~28 minutes of configure time; the exact same
+# resolution is millisecond-fast when pkg-config itself runs natively,
+# regardless of which architecture's .pc files it's reading.
+#
+# dpkg --add-architecture arm64 + :arm64 suffixed -dev packages below give
+# us aarch64 headers/libs under the Debian multiarch path
+# (/usr/lib/aarch64-linux-gnu), which the aarch64-linux-gnu-gcc/g++ cross
+# compiler (from crossbuild-essential-arm64) links against; codegen tools
+# that must run at build time (protobuf-compiler, protobuf-compiler-grpc)
+# stay native amd64.
+# ─────────────────────────────────────────────────────────────────────────────
+RUN dpkg --add-architecture arm64
 
 # Install build dependencies:
 #   - Drogon hard deps (no DB client libs)
 #   - fastrpc build deps: autoconf/automake/libtool/libbsd-dev/libmd-dev/libyaml-dev
 #   - binutils for strip
+#   - libatomic1:arm64: runtime dep of the Hexagon SDK's hexagon-clang (an
+#     aarch64 binary run under qemu-user during build-llamacpp-hexagon.sh's
+#     HTP DSP skel compilation) — without it hexagon-clang fails to even
+#     start ("error while loading shared libraries: libatomic.so.1"), since
+#     crossbuild-essential-arm64 only provides the static .a for linking, not
+#     this runtime .so.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -272,26 +415,37 @@ RUN apt-get update && \
         wget \
         unzip \
         ca-certificates \
-        libssl-dev \
-        libjsoncpp-dev \
-        uuid-dev \
-        zlib1g-dev \
-        nlohmann-json3-dev \
+        crossbuild-essential-arm64 \
+        libssl-dev:arm64 \
+        libjsoncpp-dev:arm64 \
+        uuid-dev:arm64 \
+        zlib1g-dev:arm64 \
+        nlohmann-json3-dev:arm64 \
+        libatomic1:arm64 \
         autoconf \
         automake \
         libtool \
         m4 \
-        libbsd-dev \
-        libmd-dev \
-        libyaml-dev \
+        libbsd-dev:arm64 \
+        libmd-dev:arm64 \
+        libyaml-dev:arm64 \
         binutils \
+        binutils-aarch64-linux-gnu \
         protobuf-compiler \
-        libprotobuf-dev \
-        libgrpc++-dev \
+        libprotobuf-dev:arm64 \
+        libgrpc++-dev:arm64 \
         protobuf-compiler-grpc \
-        libc-ares-dev \
+        libc-ares-dev:arm64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# pkg-config's default search path is the host's own (amd64) multiarch dir;
+# point it at the arm64 one instead so it resolves the :arm64 -dev packages'
+# .pc files above (re2.pc, libcares.pc, etc) — runs natively here, not under
+# QEMU, so the abseil dependency graph inside re2.pc resolves in milliseconds
+# instead of minutes.
+ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
 
 # ── Deploy directory (all runtime artifacts staged here) ─────────────────────
 # Defined early so all subsequent build steps can install directly into it.
@@ -400,7 +554,32 @@ COPY qai-forge /build/qai-forge
 ARG BUILD_LITERT_LM
 ARG BUILD_GENIE
 
-RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
+# CMAKE_C_COMPILER/CMAKE_CXX_COMPILER pin this build to the aarch64 cross
+# compiler (crossbuild-essential-arm64, installed above) — no
+# CMAKE_SYSTEM_NAME/CMAKE_FIND_ROOT_PATH toolchain-file ceremony needed;
+# Debian's multiarch cross-gcc already resolves aarch64 headers/libs on its
+# own (verified with a minimal find_package(gRPC REQUIRED) repro, see
+# x86.html). All the -D*_INCLUDE_PATH/-D*_LIB_PATH flags below already point
+# at aarch64 content (vendor QAIRT/GenieX .so + headers, or output staged by
+# the cross-compiled litert_builder/litert_lm_builder Bazel stages /
+# build-llamacpp.sh above), so only the compiler selection needs to change.
+#
+# BUILD_ARCH-gated: unlike the deps/*.sh scripts, this compiler selection was
+# originally hardcoded unconditionally here, which breaks a native arm64
+# build host (this stage runs on $BUILDPLATFORM, which equals arm64 on such a
+# host) — aarch64-linux-gnu-gcc/g++ are cross-compiler binary names that
+# don't exist on a native arm64 system (which only has plain gcc/g++),
+# causing "Could NOT find CMAKE_C_COMPILER". Gated the same way as
+# build-drogon.sh/build-llamacpp.sh so a native arm64 build host falls back
+# to the system default compiler untouched.
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" = "arm64" ]; then \
+        CROSS_CMAKE_ARGS=""; \
+    else \
+        CROSS_CMAKE_ARGS="-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"; \
+    fi && \
+    cmake -S /build/qai-forge -B /build/qai-forge/build \
+        ${CROSS_CMAKE_ARGS} \
         -DCMAKE_BUILD_TYPE=Release \
         -DGENIE_INCLUDE_PATH=/usr/include \
         -DGENIE_LIB_PATH=/usr/lib \
@@ -454,8 +633,8 @@ RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
 # invalidate the expensive LiteRT / LiteRT-LM / qai-forge build cache above.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libcurl4-openssl-dev \
-        libzip-dev \
+        libcurl4-openssl-dev:arm64 \
+        libzip-dev:arm64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && touch /usr/bin/zipcmp /usr/bin/zipmerge /usr/bin/ziptool \
@@ -464,7 +643,25 @@ RUN apt-get update && \
 # ── Build QAIServe server (Layer 1: Drogon HTTP server) ──────────────────────
 COPY QAIServe /build/QAIServe
 
-RUN cmake -S /build/QAIServe -B /build/QAIServe/build \
+# Cross-compiles to aarch64 via the same aarch64-linux-gnu-gcc/g++ pinning as
+# qai-forge above — running find_package(gRPC REQUIRED)'s pkg-config
+# resolution natively here avoids the multi-minute QEMU pkg-config overhead
+# (see qai-forge cmake call above for the measured numbers).
+#
+# BUILD_ARCH-gated the same way: native arm64 hosts fall back to the system
+# compiler. CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR are required alongside
+# the compiler vars so CMake knows this is a cross-compile — otherwise
+# Drogon's FindFilesystem.cmake (via find_package(Drogon) below) try_run()s
+# a compiled aarch64 test program on this amd64 host, which fails without
+# qemu-user-static + binfmt_misc set up.
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" = "arm64" ]; then \
+        CROSS_CMAKE_ARGS=""; \
+    else \
+        CROSS_CMAKE_ARGS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"; \
+    fi && \
+    cmake -S /build/QAIServe -B /build/QAIServe/build \
+        ${CROSS_CMAKE_ARGS} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
         -DCMAKE_PREFIX_PATH=${DEPLOY_DIR}/usr && \
@@ -479,12 +676,16 @@ RUN cmake -S /build/QAIServe -B /build/QAIServe/build \
 # Deliberately skips ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ — those are Hexagon DSP
 # blobs compiled for the DSP core, not ARM64; stripping them would corrupt them.
 # Vendor QAIRT .so files are already stripped release binaries; strip is a no-op.
+# Uses the aarch64 cross-strip (from crossbuild-essential-arm64/
+# binutils-aarch64-linux-gnu, installed above) — this stage's native `strip`
+# is an amd64 binary and can't operate on the aarch64 ELF files produced by
+# cross-compilation.
 RUN find ${DEPLOY_DIR}/usr/bin -type f \
-        -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
+        -exec aarch64-linux-gnu-strip --strip-unneeded {} \; 2>/dev/null || true && \
     find ${DEPLOY_DIR}/usr/lib -maxdepth 1 -type f -name "*.so*" \
-        -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
+        -exec aarch64-linux-gnu-strip --strip-unneeded {} \; 2>/dev/null || true && \
     find ${DEPLOY_DIR}/usr/lib/postproc_plugins -maxdepth 1 -type f -name "*.so" \
-        -exec strip --strip-unneeded {} \; 2>/dev/null || true
+        -exec aarch64-linux-gnu-strip --strip-unneeded {} \; 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: Stager
@@ -492,13 +693,27 @@ RUN find ${DEPLOY_DIR}/usr/bin -type f \
 # Installs runtime apt packages solely to obtain their .so files, then
 # cherry-picks only the required libraries into /export. Nothing else from
 # this stage's OS lands in the final image.
+#
+# --platform=$BUILDPLATFORM + :arm64 multiarch packages (same pattern as the
+# builder stage — see x86.html problem 3b): apt's own dependency resolution
+# and package post-install scripts are the only things that execute here: no
+# target-architecture compiled code ever runs (we only cherry-pick .so files
+# by copying them, never load/exec them). Running this natively on the build
+# host avoids QEMU overhead for what is otherwise a pure download+extract
+# step, identical in spirit to why qairt_fetcher was converted. Verified all
+# these packages resolve cleanly as :arm64 on Debian trixie (apt correctly
+# maps to the "t64" 64-bit-time_t renamed packages, e.g. libssl3 ->
+# libssl3t64:arm64, libcurl4 -> libcurl4t64:arm64); ca-certificates is
+# "Architecture: all" and needs no :arm64 suffix.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 debian:trixie-slim AS stager
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS stager
 
 # Same value as the builder stage's DEPLOY_DIR — re-declared here since ENV
 # does not cross stage boundaries and this stage is FROM debian:trixie-slim,
 # not FROM builder.
 ENV DEPLOY_DIR=/build/deploy
+
+RUN dpkg --add-architecture arm64
 
 # Install runtime deps to make their .so files available for cherry-picking.
 # libgrpc++1.51/libgrpc29/libprotobuf32 pull in abseil + re2 + c-ares
@@ -516,35 +731,35 @@ ENV DEPLOY_DIR=/build/deploy
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
-        libyaml-0-2 \
-        libbsd0 \
-        libmd0 \
-        libjsoncpp26 \
-        libssl3 \
-        zlib1g \
-        libuuid1 \
-        libatomic1 \
-        libcurl4 \
-        libzip5 \
-        libnghttp2-14 \
-        libnghttp3-9 \
-        librtmp1 \
-        libidn2-0 \
-        libssh2-1 \
-        libpsl5 \
-        libgssapi-krb5-2 \
-        libldap2 \
-        libbrotli1 \
-        libzstd1 \
-        liblzma5 \
-        libbz2-1.0 \
-        libsasl2-2 \
-        libunistring5 \
-        libgnutls30 \
-        libgrpc++1.51t64 \
-        libgrpc29t64 \
-        libprotobuf32t64 \
-        libgomp1 \
+        libyaml-0-2:arm64 \
+        libbsd0:arm64 \
+        libmd0:arm64 \
+        libjsoncpp26:arm64 \
+        libssl3:arm64 \
+        zlib1g:arm64 \
+        libuuid1:arm64 \
+        libatomic1:arm64 \
+        libcurl4:arm64 \
+        libzip5:arm64 \
+        libnghttp2-14:arm64 \
+        libnghttp3-9:arm64 \
+        librtmp1:arm64 \
+        libidn2-0:arm64 \
+        libssh2-1:arm64 \
+        libpsl5:arm64 \
+        libgssapi-krb5-2:arm64 \
+        libldap2:arm64 \
+        libbrotli1:arm64 \
+        libzstd1:arm64 \
+        liblzma5:arm64 \
+        libbz2-1.0:arm64 \
+        libsasl2-2:arm64 \
+        libunistring5:arm64 \
+        libgnutls30:arm64 \
+        libgrpc++1.51t64:arm64 \
+        libgrpc29t64:arm64 \
+        libprotobuf32t64:arm64 \
+        libgomp1:arm64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

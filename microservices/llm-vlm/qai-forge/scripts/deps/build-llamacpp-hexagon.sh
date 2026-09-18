@@ -50,6 +50,23 @@ LLAMACPP_BUILD_SERVER="${LLAMACPP_BUILD_SERVER:-ON}"
 
 echo "=== Building llama.cpp with Hexagon NPU support ==="
 
+# Same BUILD_ARCH cross-compile detection as build-fastrpc.sh/build-drogon.sh.
+BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    FASTRPC_CC=gcc
+    FASTRPC_CONFIGURE_ARGS=""
+    LLAMACPP_CROSS_CMAKE_ARGS=""
+    STRIP_BIN=strip
+else
+    FASTRPC_CC=aarch64-linux-gnu-gcc
+    FASTRPC_CONFIGURE_ARGS="--host=aarch64-linux-gnu"
+    # CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR required: ggml probes
+    # CMAKE_SYSTEM_PROCESSOR for codegen flags, defaulting to x86_64 and
+    # adding -mavx2 etc. that aarch64-linux-gnu-gcc rejects otherwise.
+    LLAMACPP_CROSS_CMAKE_ARGS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"
+    STRIP_BIN=aarch64-linux-gnu-strip
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Build fastrpc (required for Hexagon DSP communication)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,8 +74,8 @@ echo "Building fastrpc..."
 git clone --depth 1 https://github.com/quic/fastrpc.git /tmp/fastrpc
 cd /tmp/fastrpc
 autoreconf -is
-CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
-    ./configure --prefix=/usr --libdir=/usr/lib
+CC="${FASTRPC_CC}" CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
+    ./configure --prefix=/usr --libdir=/usr/lib ${FASTRPC_CONFIGURE_ARGS}
 make -j"$(nproc)"
 make install
 find /tmp/fastrpc -name 'remote.h' -exec cp {} /usr/include/ \;
@@ -66,47 +83,57 @@ rm -rf /tmp/fastrpc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup multi-arch for x86_64 libraries (needed for qaic compiler)
+#
+# qaic (the Hexagon IDL compiler invoked below) ships as an x86_64 binary.
+# On a native arm64 build host it needs amd64 emulation (qemu-user-static) to
+# run at all. On an x86_64 build host (BUILD_ARCH=amd64, cross-compiling
+# everything else to aarch64) qaic is already running on its native
+# architecture — skip the multi-arch/qemu dance entirely.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Setting up multi-arch support for x86_64..."
-dpkg --add-architecture amd64
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    echo "Setting up multi-arch support for x86_64..."
+    dpkg --add-architecture amd64
 
-# Ubuntu and Debian codenames are not interchangeable (e.g. Debian's
-# "trixie" is not an Ubuntu suite) — archive.ubuntu.com only has a matching
-# suite when the base image actually IS Ubuntu. Detect that instead of
-# blindly reusing this host's own codename for the Ubuntu archive URL.
-DISTRO_ID="$(. /etc/os-release && echo "${ID}")"
-if [ "${DISTRO_ID}" = "ubuntu" ]; then
-    UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
-    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
-    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
-    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+    # Ubuntu and Debian codenames are not interchangeable (e.g. Debian's
+    # "trixie" is not an Ubuntu suite) — archive.ubuntu.com only has a matching
+    # suite when the base image actually IS Ubuntu. Detect that instead of
+    # blindly reusing this host's own codename for the Ubuntu archive URL.
+    DISTRO_ID="$(. /etc/os-release && echo "${ID}")"
+    if [ "${DISTRO_ID}" = "ubuntu" ]; then
+        UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+        echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
+        echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+        echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
 
-    # Restrict the native repo to arm64 only, so `apt-get update` doesn't also
-    # try to fetch amd64 indices from it (ports.ubuntu.com never hosts amd64).
-    # Ubuntu 24.04+ ("noble") ships its default sources in the new DEB822 format
-    # at /etc/apt/sources.list.d/ubuntu.sources instead of the classic one-line
-    # /etc/apt/sources.list, so patch whichever file is actually populated.
-    if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then
-        sed -i '/^Types:/i Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
+        # Restrict the native repo to arm64 only, so `apt-get update` doesn't also
+        # try to fetch amd64 indices from it (ports.ubuntu.com never hosts amd64).
+        # Ubuntu 24.04+ ("noble") ships its default sources in the new DEB822 format
+        # at /etc/apt/sources.list.d/ubuntu.sources instead of the classic one-line
+        # /etc/apt/sources.list, so patch whichever file is actually populated.
+        if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sed -i '/^Types:/i Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
+        fi
+        if [ -s /etc/apt/sources.list ]; then
+            sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
+        fi
+    else
+        # Debian (and derivatives): deb.debian.org already mirrors amd64 packages
+        # under the same suite name, no extra Ubuntu source needed — just letting
+        # apt see the newly-added amd64 architecture against the existing sources
+        # is sufficient.
+        echo "Non-Ubuntu base (${DISTRO_ID}) detected — using existing Debian sources for amd64, skipping archive.ubuntu.com"
     fi
-    if [ -s /etc/apt/sources.list ]; then
-        sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
-    fi
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        libc6:amd64 \
+        libstdc++6:amd64 \
+        libgmp10:amd64 \
+        qemu-user-static
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 else
-    # Debian (and derivatives): deb.debian.org already mirrors amd64 packages
-    # under the same suite name, no extra Ubuntu source needed — just letting
-    # apt see the newly-added amd64 architecture against the existing sources
-    # is sufficient.
-    echo "Non-Ubuntu base (${DISTRO_ID}) detected — using existing Debian sources for amd64, skipping archive.ubuntu.com"
+    echo "Build host is ${BUILD_ARCH} — qaic (x86_64 binary) runs natively, skipping amd64 multiarch/qemu setup."
 fi
-
-apt-get update
-apt-get install -y --no-install-recommends \
-    libc6:amd64 \
-    libstdc++6:amd64 \
-    libgmp10:amd64 \
-    qemu-user-static
-apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download Hexagon SDK
@@ -120,11 +147,19 @@ rm /tmp/hexagon_sdk.zip
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download Hexagon Tools
+#
+# The ARM64 tarball ships hexagon-clang as an aarch64 ELF binary — on an
+# x86_64 build host it fails with "Exec format error" (it's not run under
+# QEMU here). Use the Linux-Any tarball instead, which ships an x86_64
+# hexagon-clang.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Downloading Hexagon Tools ${HEXAGON_TOOLS_VERSION}..."
-wget --no-check-certificate \
-    "https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/ARM64/Debian/${HEXAGON_TOOLS_VERSION}/Hexagon_open_access.Core.${HEXAGON_TOOLS_VERSION}.Linux-ARM64.tar.gz" \
-    -O /tmp/hexagon_tools.tar.gz
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    HEXAGON_TOOLS_URL="https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/ARM64/Debian/${HEXAGON_TOOLS_VERSION}/Hexagon_open_access.Core.${HEXAGON_TOOLS_VERSION}.Linux-ARM64.tar.gz"
+else
+    HEXAGON_TOOLS_URL="https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/${HEXAGON_TOOLS_VERSION}/Hexagon_open_access.Core.${HEXAGON_TOOLS_VERSION}.Linux-Any.tar.gz"
+fi
+wget --no-check-certificate "${HEXAGON_TOOLS_URL}" -O /tmp/hexagon_tools.tar.gz
 mkdir -p /opt/hexagon
 tar -xzf /tmp/hexagon_tools.tar.gz -C /opt/hexagon/
 rm /tmp/hexagon_tools.tar.gz
@@ -146,14 +181,25 @@ sed -i 's/string(FIND \${PREBUILT_LIB_DIR} /string(FIND "${PREBUILT_LIB_DIR}" /g
     "${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Setup qemu wrapper for qaic (x86_64 binary)
+# Setup qaic wrapper (x86_64 binary)
+#
+# On a native arm64 build host, qaic must run under qemu-user-static
+# emulation (see the multi-arch setup above). On an x86_64 build host it
+# already IS the build host's native architecture — invoke it directly.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Setting up qemu wrapper for qaic..."
+echo "Setting up qaic wrapper..."
 mkdir -p "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin"
-cat > "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic" <<'EOF'
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    cat > "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic" <<'EOF'
 #!/bin/sh
 exec qemu-x86_64-static /opt/Hexagon_SDK/6.6.0.0/ipc/fastrpc/qaic/Ubuntu/qaic "$@"
 EOF
+else
+    cat > "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic" <<'EOF'
+#!/bin/sh
+exec /opt/Hexagon_SDK/6.6.0.0/ipc/fastrpc/qaic/Ubuntu/qaic "$@"
+EOF
+fi
 chmod +x "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +228,7 @@ sed -i 's/GGML_SCHED_MAX_SPLIT_INPUTS [0-9]*/GGML_SCHED_MAX_SPLIT_INPUTS 256/' g
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Building llama.cpp with Hexagon backend..."
 cmake -S . -B build \
+    ${LLAMACPP_CROSS_CMAKE_ARGS} \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_HEXAGON=ON \
     -DGGML_NATIVE=OFF \
@@ -289,9 +336,11 @@ cp -v /build/llama.cpp/vendor/nlohmann/json.hpp /build/llama.cpp/vendor/nlohmann
 # Strip binaries and non-DSP shared libraries (stripping the Hexagon HTP
 # blobs would corrupt them — they're compiled for the DSP core, not ARM64,
 # same rationale the QAIServe Dockerfile's own strip step already documents).
-find "${LLAMACPP_INSTALL_DIR}/bin" -type f -exec strip --strip-unneeded {} \; 2>/dev/null || true
+# Uses the aarch64 cross-strip when cross-compiling (see BUILD_ARCH detection
+# above) — a native amd64 `strip` can't operate on aarch64 ELF files.
+find "${LLAMACPP_INSTALL_DIR}/bin" -type f -exec "${STRIP_BIN}" --strip-unneeded {} \; 2>/dev/null || true
 find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -type f -name '*.so*' ! -name 'libggml-htp-v*.so' \
-    -exec strip --strip-unneeded {} \; 2>/dev/null || true
+    -exec "${STRIP_BIN}" --strip-unneeded {} \; 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage runtime artifacts into the final image's deploy tree
