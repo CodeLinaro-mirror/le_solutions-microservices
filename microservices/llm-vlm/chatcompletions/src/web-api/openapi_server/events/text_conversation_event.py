@@ -28,6 +28,7 @@ from openapi_server.managers.metrics_manager import MetricsManager
 from openapi_server.impl.constant import (
     LLMServiceQueryConstant as QUERY_CONST,
     TOOL_RESPONSE_TIMEOUT_SECONDS,
+    TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS,
 )
 from openapi_server.utils.common_utils import CommonUtils
 from openapi_server.logger.logger_config import LoggerConfig
@@ -610,8 +611,14 @@ class TextConversationEvent(ConversationEvent):
             except Exception as metrics_err:
                 logger.error(f"Event {self.event_id}: Failed to record non-streaming metrics: {metrics_err}")
 
-            # 4. Handle Response (Tool calls vs Regular)
-            tool_calls = ToolHandler.parse_tool_response(response_content)
+            # 4. Handle Response (tool calls vs regular text).
+            # Parse according to the model family's native convention while
+            # normalizing the result to the OpenAI-compatible internal object.
+            tool_calls = ToolHandler.parse_tool_response(
+                response_content,
+                tools=getattr(request_data, "tools", None),
+                model_id=self.model_id,
+            )
 
             if tool_calls:
                 self._is_tool_calling = True
@@ -624,7 +631,33 @@ class TextConversationEvent(ConversationEvent):
                     "needs_tool_response": True,
                     "turn_complete": False,
                 }
+            elif (
+                not ToolHandler.is_empty_tool_response(response_content)
+                and ToolHandler._get_format_adapter(self.model_id)
+                .looks_like_attempted_tool_call(response_content)
+            ):
+                logger.error(
+                    f"Event {self.event_id}: TOOL_CALL_PARSE_FAILED "
+                    f"raw_response={response_content!r}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": (
+                            "The model attempted a tool call but produced "
+                            "output that could not be parsed."
+                        ),
+                        "type": "server_error",
+                        "code": "tool_call_parse_failed",
+                    },
+                )
             else:
+                # An explicit empty tool_calls array means the model selected
+                # no tool. Suppress the raw control JSON so clients never see
+                # a literal '{"tool_calls":[]}' string as the answer.
+                if ToolHandler.is_empty_tool_response(response_content):
+                    response_content = ""
+
                 self.assistant_message = response_content
                 logger.info(f"Event {self.event_id}: Turn completed successfully")
 
@@ -702,6 +735,21 @@ class TextConversationEvent(ConversationEvent):
             stream_failure: Optional[Exception] = None
 
             has_tools = hasattr(request_data, 'tools') and request_data.tools
+            # Known tool names from the caller's schema. Used as a secondary
+            # detection signal alongside the adapter's native-format prefix
+            # check: some models emit stray preamble text (e.g. a hallucinated
+            # word) before the actual native tool-call payload, which defeats
+            # a strict startswith() check. If a known tool name appears
+            # anywhere in the buffered text, treat it as a potential tool
+            # call so the full response reaches the parser (including its
+            # schema-guided recovery) instead of being flushed as content.
+            # Lowercased for case-insensitive substring matching, since some
+            # models alter tool-name casing in their output.
+            tool_names = {
+                getattr(getattr(tool, 'function', None), 'name', '').lower()
+                for tool in (request_data.tools or [])
+                if getattr(getattr(tool, 'function', None), 'name', '')
+            }
             is_potential_tool_call = False
             tool_check_buffer = []
             tool_check_completed = not has_tools
@@ -754,18 +802,33 @@ class TextConversationEvent(ConversationEvent):
                     completion_tokens += 1
                     full_response_content.append(token)
 
-                    # Tool call detection buffering.
-                    # Detect both generic JSON format (starts with '{') and
-                    # Qwen native format (starts with '<tool_call>').
+                    # Tool-call detection buffering is adapter-specific. Keep
+                    # the initial buffer small, but recognize native prefixes
+                    # before releasing text to the client.
                     if not tool_check_completed:
                         tool_check_buffer.append(token)
                         current_text = "".join(tool_check_buffer).lstrip()
                         if current_text:
-                            if current_text.startswith('{') or current_text.startswith('<tool_call'):
+                            adapter = ToolHandler._get_format_adapter(self.model_id)
+                            if adapter.looks_like_attempted_tool_call(current_text):
                                 is_potential_tool_call = True
                                 tool_check_completed = True
-                                logger.info(f"Event {self.event_id}: Potential tool call detected in stream")
-                            elif len(current_text) > 20:
+                                logger.info(
+                                    f"Event {self.event_id}: Potential native tool call "
+                                    "detected in stream"
+                                )
+                            elif any(name in current_text.lower() for name in tool_names):
+                                # Schema-driven detection catches a valid tool
+                                # name appearing after arbitrary model-generated
+                                # preamble noise, before the strict prefix check
+                                # would otherwise give up and flush the buffer.
+                                is_potential_tool_call = True
+                                tool_check_completed = True
+                                logger.info(
+                                    f"Event {self.event_id}: Known tool name detected "
+                                    "in stream"
+                                )
+                            elif len(current_text) > TOOL_CALL_STREAM_DETECTION_BUFFER_CHARS:
                                 is_potential_tool_call = False
                                 tool_check_completed = True
                                 for buf_token in tool_check_buffer:
@@ -797,7 +860,15 @@ class TextConversationEvent(ConversationEvent):
                 self._cap_started_from_clean_kv = started_from_clean_kv
                 self._cap_prompt_tokens_total += prompt_tokens
                 self._cap_completion_tokens_total += TokenCounter.estimate_tokens(final_response or "")
-                parsed_tool_calls = None if not is_potential_tool_call else ToolHandler.parse_tool_response(final_response)
+                parsed_tool_calls = (
+                    None
+                    if not is_potential_tool_call
+                    else ToolHandler.parse_tool_response(
+                        final_response,
+                        tools=getattr(request_data, "tools", None),
+                        model_id=self.model_id,
+                    )
+                )
 
                 if parsed_tool_calls:
                     self._is_tool_calling = True
@@ -844,7 +915,22 @@ class TextConversationEvent(ConversationEvent):
                     self.start_tool_response_timeout(TOOL_RESPONSE_TIMEOUT_SECONDS)
 
                 else:
-                    if is_potential_tool_call:
+                    if (
+                        is_potential_tool_call
+                        and not ToolHandler.is_empty_tool_response(final_response)
+                        and ToolHandler._get_format_adapter(self.model_id)
+                        .looks_like_attempted_tool_call(final_response)
+                    ):
+                        logger.error(
+                            f"Event {self.event_id}: TOOL_CALL_PARSE_FAILED "
+                            f"raw_response={final_response!r}"
+                        )
+                        raise ValueError(
+                            "The model attempted a tool call but produced "
+                            "output that could not be parsed "
+                            "(tool_call_parse_failed)"
+                        )
+                    elif is_potential_tool_call:
                         chunk_size = 100
                         for i in range(0, len(final_response), chunk_size):
                             chunk = {
@@ -875,6 +961,9 @@ class TextConversationEvent(ConversationEvent):
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}]
                     }
                     await token_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
+
+                    if ToolHandler.is_empty_tool_response(final_response):
+                        final_response = ""
 
                     self.assistant_message = final_response
                     assistant_idx = self.session.add_message({'role': 'assistant', 'content': final_response})
@@ -1160,6 +1249,13 @@ class TextConversationEvent(ConversationEvent):
                 getattr(self.session, 'system_prompt_content', None)
                 or "You are a helpful coding assistant."
             )
+            language_guardrail = (
+                "\n\nResponse language rule: Always respond in the same language "
+                "as the user's message unless the user explicitly asks for a "
+                "different language. Do not switch languages on your own."
+            )
+            if language_guardrail not in system_content:
+                system_content += language_guardrail
 
             original_task_full = next(
                 (
@@ -1193,8 +1289,10 @@ class TextConversationEvent(ConversationEvent):
                     "role": "user",
                     "content": (
                         f"Task: {original_task}\n\n"
-                        f"Tool result:\n{tool_response}\n\n"
-                        "Please provide your response now."
+                        + ToolHandler._get_format_adapter(
+                            self.model_id
+                        ).format_tool_response(tool_response)
+                        + "Please provide your response now."
                     ),
                 },
             ]
@@ -1244,7 +1342,11 @@ class TextConversationEvent(ConversationEvent):
             # final answer.  Detect this here so the service can keep the event
             # in tool-calling state and return finish_reason="tool_calls" to the
             # client, rather than leaking the raw JSON as finish_reason="stop".
-            chained_tool_calls = ToolHandler.parse_tool_response(final_response)
+            chained_tool_calls = ToolHandler.parse_tool_response(
+                final_response,
+                tools=getattr(request_data, "tools", None),
+                model_id=self.model_id,
+            )
             if chained_tool_calls:
                 if not self._is_tool_call_loop(chained_tool_calls):
                     # Normal chained call — different arguments, allow it
@@ -1276,8 +1378,10 @@ class TextConversationEvent(ConversationEvent):
                         prompt_messages[-1] = {
                             "role": "user",
                             "content": (
-                                f"{tool_response}\n\n"
-                                "You have already retrieved this information. "
+                                ToolHandler._get_format_adapter(
+                                    self.model_id
+                                ).format_tool_response(tool_response)
+                                + "You have already retrieved this information. "
                                 "Please provide your final answer now without calling any more tools."
                             ),
                         }
@@ -1311,12 +1415,19 @@ class TextConversationEvent(ConversationEvent):
                         forced_tokens.append(token)
                     forced_response = "".join(forced_tokens).strip()
                     # If the LLM is still calling tools, use a safe fallback
-                    if not forced_response or ToolHandler.parse_tool_response(forced_response):
+                    if not forced_response or ToolHandler.parse_tool_response(
+                        forced_response,
+                        tools=getattr(request_data, "tools", None),
+                        model_id=self.model_id,
+                    ):
                         forced_response = (
                             "I have gathered the necessary information from the codebase."
                         )
                     final_response = forced_response
                     # Fall through to the normal turn-complete path below
+
+            if ToolHandler.is_empty_tool_response(final_response):
+                final_response = ""
 
             self.assistant_message = final_response
             self._is_tool_calling = False
