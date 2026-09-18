@@ -73,6 +73,15 @@ struct CurlHandle {
     CurlHandle& operator=(const CurlHandle&) = delete;
 };
 
+// RAII wrapper for a curl_slist header list
+struct CurlHeaderList {
+    curl_slist* list = nullptr;
+    ~CurlHeaderList() { if (list) curl_slist_free_all(list); }
+    void append(const std::string& header) {
+        list = curl_slist_append(list, header.c_str());
+    }
+};
+
 // Perform a curl request and return the HTTP status code.
 // Throws AiHubDownloadError on curl error.
 long curlPerform(CURL* h) {
@@ -217,10 +226,16 @@ std::string AiHubClient::resolveUrl(const std::string& model_id,
 void AiHubClient::download(const std::string& url,
                             const std::string& dest_path,
                             std::function<void(int64_t, int64_t)> progress_cb,
-                            int num_retries) {
+                            int num_retries,
+                            const std::string& bearer_token) {
     fs::path dest(dest_path);
     if (dest.has_parent_path()) {
         fs::create_directories(dest.parent_path());
+    }
+
+    CurlHeaderList headers;
+    if (!bearer_token.empty()) {
+        headers.append("Authorization: Bearer " + bearer_token);
     }
 
     for (int attempt = 0; attempt <= num_retries; ++attempt) {
@@ -249,6 +264,10 @@ void AiHubClient::download(const std::string& url,
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 30L);
         curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeToFile);
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &file);
+
+        if (headers.list) {
+            curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers.list);
+        }
 
         // Resume from where we left off
         if (bytes_so_far > 0) {

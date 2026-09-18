@@ -112,12 +112,16 @@ public:
      * @param dest_path    Destination file path (must not exist)
      * @param progress_cb  Optional callback: (bytes_done, total_bytes)
      * @param num_retries  Number of retry attempts (default 4)
+     * @param bearer_token Optional "Authorization: Bearer <token>" credential —
+     *                     needed for gated HuggingFace repos (e.g. Google Gemma).
+     *                     Not used for AI Hub's public S3 bucket; leave empty there.
      * @throws AiHubDownloadError on HTTP error or incomplete download
      */
     static void download(const std::string& url,
                          const std::string& dest_path,
                          std::function<void(int64_t, int64_t)> progress_cb = {},
-                         int num_retries = 4);
+                         int num_retries = 4,
+                         const std::string& bearer_token = "");
 
     // ── ZIP extraction ────────────────────────────────────────────────────────
 
