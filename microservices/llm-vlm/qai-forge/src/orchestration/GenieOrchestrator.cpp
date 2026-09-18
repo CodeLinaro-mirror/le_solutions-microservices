@@ -403,6 +403,10 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
                 prompt << renderToolCallsForPrompt(msg["tool_calls"]);
             }
             prompt << assistant_suffix;
+        } else if (role == "tool") {
+            prompt << user_prefix
+                   << adapter.formatToolResponse(json::array({msg}))
+                   << user_suffix;
         }
     }
 
