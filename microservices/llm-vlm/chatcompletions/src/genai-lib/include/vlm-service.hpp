@@ -231,9 +231,10 @@ private:
     std::string currentPreVisionText;
     std::string currentPostVisionText;
 
-    /* Per-request static custom inputs that must remain valid during async pipeline
-     * execution to avoid dangling pointers. */
+    /* Static custom inputs remain owned for the lifetime of the VLM object so
+     * GenIE can consume them during any pipeline execution. */
     std::vector<std::shared_ptr<void>> currentStaticBuffers;
+    std::vector<size_t> currentStaticBufferSizes;
 
     /* Helper structures */
     struct ModelConfig {
@@ -242,6 +243,7 @@ private:
         std::string textGeneratorConfig;
         std::string visionStartToken = "<|vision_start|>";
         std::string visionEndToken = "<|vision_end|>";
+        bool requiresQwen3VlWildcardConnection = false;
         struct CustomInput {
             std::string node;
             std::string input_type;
@@ -259,7 +261,8 @@ private:
     void loadConfig(const std::string& modelName);
     void createPipelineAndNodes();
     void connectNodes();
-    void loadStaticCustomInputs();
+    void loadStaticCustomInputBuffers();
+    void setStaticCustomInputs();
 
     /* Callback for text output from the text generator node */
     static Genie_Status_t textOutputCallback(const char* responseStr,

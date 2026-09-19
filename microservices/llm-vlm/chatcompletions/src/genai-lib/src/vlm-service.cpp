@@ -13,6 +13,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <cctype>
 #include <json/json.h>
 #include <cstddef> // Explicitly included for size_t
 #include <thread>   // For std::this_thread::sleep_for
@@ -157,6 +158,17 @@ static GenieNode_IOName_t stringToNodeIO(
     }
     throw std::invalid_argument(
         "Invalid Node IO value passed: " + nodeIOString);
+}
+
+static bool isQwen3VlModel(const std::string& modelKey) {
+    std::string normalized;
+    normalized.reserve(modelKey.size());
+    for (const unsigned char ch : modelKey) {
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+
+    return normalized.rfind("qwen3-vl-", 0) == 0 ||
+           normalized.rfind("qwen3_vl_", 0) == 0;
 }
 
 static GenieLog_Level_t parseGenieLogLevel(const char* levelStr) {
@@ -444,8 +456,9 @@ VLMObject::VLMObject(
     // Connect nodes
     connectNodes();
 
-    // Load static custom inputs (position ids, masks, etc.)
-    loadStaticCustomInputs();
+    // Keep static custom inputs resident, but do not submit them until a
+    // request establishes the required text-image-text ordering.
+    loadStaticCustomInputBuffers();
 
     sc_configPath = sampler_config_path.empty() ?
         "sampler.json" : sampler_config_path;
@@ -492,6 +505,14 @@ void VLMObject::loadConfig(
         // Get the first model key
         std::string modelKey = root.getMemberNames()[0];
         const Json::Value& modelConfig_json = root[modelKey];
+
+        // Qwen3-VL image encoders produce DeepStack outputs in addition to
+        // the regular image embedding. The bundle reference pipeline routes
+        // them through a wildcard image-encoder-to-generator connection,
+        // which also forwards the visual-position mask. Qwen2.5-VL only
+        // uses the regular embedding path.
+        modelConfig.requiresQwen3VlWildcardConnection =
+            isQwen3VlModel(modelKey);
 
         // Validate required fields
         if (!modelConfig_json.isMember("pipeline") ||
@@ -653,6 +674,15 @@ void VLMObject::connectNodes() {
                       textGeneratorNode,
                       GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT);
 
+    if (modelConfig.requiresQwen3VlWildcardConnection) {
+        pipeline->connect(imageEncoderNode,
+                          GENIE_NODE_WILDCARD,
+                          textGeneratorNode,
+                          GENIE_NODE_WILDCARD);
+        std::cout << "Enabled Qwen3-VL wildcard vision connection"
+                  << std::endl;
+    }
+
     // Register text output callback on the text generator node
     textGeneratorNode->setTextCallback(
         GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT,
@@ -660,13 +690,16 @@ void VLMObject::connectNodes() {
 }
 
 /*--------------------------------------------------------------------
- * Load static custom inputs (position ids, masks, etc.)
+ * Load static custom input buffers (position ids, masks, etc.)
  *--------------------------------------------------------------------*/
-void VLMObject::loadStaticCustomInputs() {
-    std::cout << "[VLMObject::loadStaticCustomInputs] "
-              << "Loading custom inputs..." << std::endl;
+void VLMObject::loadStaticCustomInputBuffers() {
+    std::cout << "[VLMObject::loadStaticCustomInputBuffers] "
+              << "Loading custom input buffers..." << std::endl;
 
-    bool needs_allocation = currentStaticBuffers.empty();
+    currentStaticBuffers.clear();
+    currentStaticBufferSizes.clear();
+    currentStaticBuffers.reserve(modelConfig.custom_inputs.size());
+    currentStaticBufferSizes.reserve(modelConfig.custom_inputs.size());
 
     for (size_t i = 0; i < modelConfig.custom_inputs.size(); ++i) {
         const auto& ci = modelConfig.custom_inputs[i];
@@ -677,39 +710,52 @@ void VLMObject::loadStaticCustomInputs() {
             throw std::runtime_error(
                 "Failed to open custom input file: " + ci.file);
         }
-        uint32_t fileSize = file.tellg();
+        const std::streamsize streamSize = file.tellg();
+        if (streamSize <= 0) {
+            throw std::runtime_error(
+                "Invalid custom input file size: " + ci.file);
+        }
+        const size_t fileSize = static_cast<size_t>(streamSize);
 
-        void* buffer_ptr = nullptr;
-
-        if (needs_allocation) {
-            // Allocate aligned memory for DSP (4096 bytes alignment)
-            void* raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, 4096, fileSize) != 0) {
-                // Fallback to regular malloc
-                raw_ptr = malloc(fileSize);
-            }
-            std::shared_ptr<void> imageBuffer(raw_ptr, free);
-
-            // Store the buffer so it stays alive during execution
-            currentStaticBuffers.push_back(imageBuffer);
-
-            std::ifstream embeddingStream(
-                ci.file, std::ifstream::binary);
-            embeddingStream.read(
-                static_cast<char*>(imageBuffer.get()), fileSize);
-
-            buffer_ptr = imageBuffer.get();
-        } else {
-            // Reuse existing memory buffer to avoid invalidating DSP mappings
-            buffer_ptr = currentStaticBuffers[i].get();
+        void* raw_ptr = nullptr;
+        if (posix_memalign(&raw_ptr, 4096, fileSize) != 0) {
+            raw_ptr = malloc(fileSize);
+        }
+        if (!raw_ptr) {
+            throw std::runtime_error(
+                "Failed to allocate custom input buffer: " + ci.file);
         }
 
-        std::cout << "[VLMObject::loadStaticCustomInputs] "
-                  << (needs_allocation ? "Loaded " : "Reused ")
-                  << fileSize << " bytes for " << ci.input_type
-                  << " to buffer ptr: " << buffer_ptr << std::endl;
+        std::shared_ptr<void> buffer(raw_ptr, free);
+        file.seekg(0, std::ios::beg);
+        if (!file.read(static_cast<char*>(buffer.get()), streamSize)) {
+            throw std::runtime_error(
+                "Failed to read custom input file: " + ci.file);
+        }
 
-        // Determine target node
+        currentStaticBuffers.push_back(buffer);
+        currentStaticBufferSizes.push_back(fileSize);
+
+        std::cout << "[VLMObject::loadStaticCustomInputBuffers] Loaded "
+                  << fileSize << " bytes for " << ci.input_type
+                  << " at buffer ptr: " << buffer.get() << std::endl;
+    }
+    std::cout << "[VLMObject::loadStaticCustomInputBuffers] "
+              << "Finished loading custom input buffers." << std::endl;
+}
+
+/*--------------------------------------------------------------------
+ * Submit static custom inputs for the current pipeline execution
+ *--------------------------------------------------------------------*/
+void VLMObject::setStaticCustomInputs() {
+    if (currentStaticBuffers.size() != modelConfig.custom_inputs.size() ||
+        currentStaticBufferSizes.size() != modelConfig.custom_inputs.size()) {
+        throw std::runtime_error(
+            "Static custom input buffers are not initialized");
+    }
+
+    for (size_t i = 0; i < modelConfig.custom_inputs.size(); ++i) {
+        const auto& ci = modelConfig.custom_inputs[i];
         std::shared_ptr<Node> targetNode;
         if (ci.node == "imageEncoder") {
             targetNode = imageEncoderNode;
@@ -722,14 +768,11 @@ void VLMObject::loadStaticCustomInputs() {
                 "Unknown node in custom_inputs: " + ci.node);
         }
 
-        // Convert input_type string to enum
-        GenieNode_IOName_t ioEnum = stringToNodeIO(ci.input_type);
-
-        // Set data on the node
-        targetNode->setData(ioEnum, buffer_ptr, fileSize);
+        targetNode->setData(
+            stringToNodeIO(ci.input_type),
+            currentStaticBuffers[i].get(),
+            currentStaticBufferSizes[i]);
     }
-    std::cout << "[VLMObject::loadStaticCustomInputs] "
-              << "Finished loading custom inputs." << std::endl;
 }
 
 /*--------------------------------------------------------------------
@@ -848,14 +891,6 @@ void VLMObject::vlm_chat_completion_create() {
                         << (void*)currentImageData.data()
                         << std::endl;
 
-                    imageEncoderNode->setData(
-                        GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
-                        currentImageData.data(),
-                        currentImageData.size());
-                    std::cout
-                        << "[VLMObject::vlm_chat_completion_create] "
-                        << "Set image data on imageEncoderNode."
-                        << std::endl;
                 }
             }
         }
@@ -889,8 +924,9 @@ void VLMObject::vlm_chat_completion_create() {
                 currentImageData.size());
         }
 
-        // Load static custom inputs (position ids, masks, etc.)
-        loadStaticCustomInputs();
+        // The final required image inputs are submitted only after the prompt
+        // prefix and image, preventing a premature image-encoder execution.
+        setStaticCustomInputs();
 
         // (c) Post-vision text → LUT encoder
         lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPostVisionText);
@@ -899,8 +935,14 @@ void VLMObject::vlm_chat_completion_create() {
         currentPromptData = userPrompt;
         lutEncoderNode->setData(GENIE_NODE_TEXT_ENCODER_TEXT_INPUT, currentPromptData);
 
-        // Reload static inputs (Pos IDs, Masks) for every request.
-        loadStaticCustomInputs();
+        if (!currentImageData.empty()) {
+            imageEncoderNode->setData(
+                GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT,
+                currentImageData.data(),
+                currentImageData.size());
+        }
+
+        setStaticCustomInputs();
     }
 
     // ---------------------------------------------------------------
