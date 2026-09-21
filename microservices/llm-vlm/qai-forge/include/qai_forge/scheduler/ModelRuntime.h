@@ -12,12 +12,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+#include <unordered_set>
 
 class IGenerativeBackend;
 
@@ -30,7 +31,6 @@ enum class ModelRuntimeState {
     Loading,
     Idle,
     Running,
-    PostTurn,
     Draining,
     Evicting,
     Failed,
@@ -112,13 +112,14 @@ private:
     };
 
     void executorLoop();
+    void runJobEntry(GenerativeJobPtr job);
     bool runJob(GenerativeJob& job);
     bool beginPostTurn(GenerativeJob& job,
                        const StandardResponse& response);
-    void finishPostTurn();
+    void finishPostTurn(const std::string& session_id);
     void unloadBackend(bool force);
     void armCancelWatchdog(const std::string& job_id);
-    void invalidateCancelWatchdog();
+    void invalidateCancelWatchdog(const std::string& job_id);
     void stopCancelWatchdog();
     void cancelWatchdogLoop(std::string job_id, std::uint64_t generation);
     void handleCancelWatchdogTimeout(const std::string& job_id);
@@ -157,12 +158,19 @@ private:
 
     ModelRuntimeState state_ = ModelRuntimeState::NotResident;
     bool backend_healthy_ = false;
-    GenerativeJobPtr running_job_;
+    std::unordered_map<std::string, GenerativeJobPtr> running_jobs_;
+    std::unordered_set<std::string> active_sessions_;
+    std::unordered_set<std::string> post_turn_sessions_;
+    std::size_t max_concurrent_ = 1;
+    bool recovery_in_progress_ = false;
 
+    struct CancelWatchdogEntry {
+        std::thread thread;
+        std::uint64_t generation = 0;
+    };
     std::mutex cancel_watchdog_mutex_;
     std::condition_variable cancel_watchdog_cv_;
-    std::thread cancel_watchdog_thread_;
-    std::uint64_t cancel_watchdog_generation_ = 0;
+    std::unordered_map<std::string, CancelWatchdogEntry> cancel_watchdogs_;
     bool cancel_watchdog_shutdown_ = false;
 };
 

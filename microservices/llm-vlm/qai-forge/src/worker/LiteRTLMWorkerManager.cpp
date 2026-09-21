@@ -191,6 +191,7 @@ void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
     // Send a metadata probe request
     executeRequest(
         "__GET_METADATA__",  // event_id — worker recognizes this
+        "",                  // empty session
         "",                  // empty prompt
         false,               // not streaming
         1,                   // max_tokens = 1 (minimal)

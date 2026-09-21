@@ -46,6 +46,12 @@ public:
     void save_kv(const std::string& name);
     void restore_kv(const std::string& name);
 
+    // Signals GENIE_DIALOG_ACTION_ABORT on this engine's dialog handle,
+    // unblocking a generate() call in progress on another thread. Safe to
+    // call concurrently with generate() — GenieDialog_signal is designed for
+    // exactly this cross-thread cancellation use.
+    void abort();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

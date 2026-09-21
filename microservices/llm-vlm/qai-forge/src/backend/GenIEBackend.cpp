@@ -49,8 +49,20 @@ VlmInferenceWorkerManager& GenIEBackend::vlmWorker() {
 // capabilities()
 // ─────────────────────────────────────────────────────────────────────────────
 
+int GenIEBackend::effectiveMaxConcurrent(const std::string& model_id) const {
+    auto& cfg = ModelConfigManager::getInstance();
+    const int max_slots = cfg.getMaxSlots(model_id);
+    const bool is_vlm = cfg.supportsVision(model_id);
+    const bool shared_engine = cfg.hasSharedEngine(model_id);
+    return (!is_vlm && max_slots > 1 && shared_engine) ? max_slots : 1;
+}
+
 BackendCapabilities GenIEBackend::capabilities() const {
     auto& cfg = ModelConfigManager::getInstance();
+    const int max_concurrent = current_model_id_.empty()
+        ? 1
+        : effectiveMaxConcurrent(current_model_id_);
+    const bool bounded = max_concurrent > 1;
     return BackendCapabilities{
         // GenIE has a stateful KV cache — reset it after context compaction
         .context_strategy             = ContextStrategy::RESET_KV,
@@ -59,10 +71,13 @@ BackendCapabilities GenIEBackend::capabilities() const {
                                             ? 4096
                                             : cfg.getContextSize(current_model_id_),
         .compaction_threshold         = 0.70f,
-        // Per backend instance / loaded GenIE handle: one request at a time.
-        // Cross-model concurrency comes from separate scheduler-owned backends.
-        .concurrency_model            = ConcurrencyModel::EXCLUSIVE,
-        .max_concurrent               = 1,
+        // BOUNDED when the loaded model's genie_config.json declares
+        // dialog.engine.batching.max-slots > 1 (continuous batching enabled);
+        // otherwise EXCLUSIVE/1, matching every model's behavior before
+        // continuous batching existed.
+        .concurrency_model            = bounded ? ConcurrencyModel::BOUNDED
+                                                 : ConcurrencyModel::EXCLUSIVE,
+        .max_concurrent               = max_concurrent,
         // GenIE SDK can filter <think> tokens internally via bypass_think_filter
         .backend_filters_think_tokens = true,
         // LLM supports KV save/restore (GenieDialog_save/restore); VLM does not
@@ -125,6 +140,7 @@ void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
                                        const std::string& config_file,
                                        const std::string& sampler_file) {
     const bool is_vlm = ModelConfigManager::getInstance().supportsVision(model_id);
+    const int max_concurrent = effectiveMaxConcurrent(model_id);
     if (!current_model_id_.empty() && current_is_vlm_.load() != is_vlm) {
         unloadModel(false);
     }
@@ -134,9 +150,11 @@ void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
 
     if (is_vlm) {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: VLM model=" << model_id);
+        vlmWorker().setMaxSlots(max_concurrent);
         vlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
     } else {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: LLM model=" << model_id);
+        llmWorker().setMaxSlots(max_concurrent);
         llmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
     }
 }
@@ -147,6 +165,7 @@ void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
 
 void GenIEBackend::generate(
     const std::string& event_id,
+    const std::string& session_id,
     const std::string& prompt,
     bool               streaming,
     int                max_tokens,
@@ -167,6 +186,7 @@ void GenIEBackend::generate(
 
     llmWorker().executeRequest(
         event_id,
+        session_id,
         prompt,
         streaming,
         max_tokens,
@@ -187,6 +207,7 @@ void GenIEBackend::generate(
 
 void GenIEBackend::generateVlm(
     const std::string&              event_id,
+    const std::string&              session_id,
     const std::string&              prompt,
     const std::vector<std::vector<uint8_t>>& images,
     bool                            streaming,
@@ -202,6 +223,7 @@ void GenIEBackend::generateVlm(
 {
     vlmWorker().executeVlmRequest(
         event_id,
+        session_id,
         prompt,
         images,
         streaming,
@@ -219,10 +241,7 @@ void GenIEBackend::generateVlm(
 // ─────────────────────────────────────────────────────────────────────────────
 // onContextCompacted()
 //
-// No-op: KV cache reset is now handled by resetKvAsync() which is called by
-// GenieOrchestrator immediately after every generate() / generateVlm() call.
-// The eager background reset runs concurrently with returning the response to
-// the HTTP layer, eliminating the pre-inference reset latency.
+// No-op: KV reset is initiated by resetKvAsync() for both LLM and VLM.
 // Kept for interface compatibility with IGenerativeBackend.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -235,25 +254,24 @@ void GenIEBackend::onContextCompacted() {
 // resetKvAsync() — Eager background KV cache reset
 //
 // Called by GenieOrchestrator immediately after generate() / generateVlm()
-// returns. Initiates a background reset on the active worker so the reset
-// runs concurrently with returning the response to the HTTP layer.
-// The next generate() call waits for the reset to complete via
-// InferenceWorkerManager::waitForPendingReset() (called inside executeRequest).
+// returns. The parent starts the reset asynchronously; the worker lane remains
+// reserved until the matching RESET command completes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-void GenIEBackend::resetKvAsync() {
+void GenIEBackend::resetKvAsync(const std::string& session_id) {
     const bool is_vlm = current_is_vlm_.load();
     LOG_INFO("[GenIEBackend] Initiating background KV reset for model: "
              << current_model_id_
-             << (is_vlm ? " (VLM)" : " (LLM)"));
+             << (is_vlm ? " (VLM)" : " (LLM)")
+             << " session=" << session_id);
     try {
         if (is_vlm) {
             if (vlm_worker_) {
-                vlm_worker_->initiateBackgroundReset();
+                vlm_worker_->initiateBackgroundReset(session_id);
             }
         } else {
             if (llm_worker_) {
-                llm_worker_->initiateBackgroundReset();
+                llm_worker_->initiateBackgroundReset(session_id);
             }
         }
     } catch (const std::exception& e) {
@@ -262,32 +280,40 @@ void GenIEBackend::resetKvAsync() {
     }
 }
 
+void GenIEBackend::waitForSessionReady(const std::string& session_id) {
+    if (current_is_vlm_.load()) {
+        if (vlm_worker_) vlm_worker_->waitForPendingReset(session_id);
+    } else if (llm_worker_) {
+        llm_worker_->waitForSessionReady(session_id);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // KV cache operations (LLM only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-void GenIEBackend::saveKv(const std::string& name) {
+void GenIEBackend::saveKv(const std::string& name, const std::string& session_id) {
     if (!llm_worker_) {
         LOG_WARN("[GenIEBackend] saveKv skipped; no LLM worker loaded");
         return;
     }
-    llm_worker_->saveKvCache(name);
+    llm_worker_->saveKvCache(name, session_id);
 }
 
-void GenIEBackend::restoreKv(const std::string& name) {
+void GenIEBackend::restoreKv(const std::string& name, const std::string& session_id) {
     if (!llm_worker_) {
         LOG_WARN("[GenIEBackend] restoreKv skipped; no LLM worker loaded");
         return;
     }
-    llm_worker_->restoreKvCache(name);
+    llm_worker_->restoreKvCache(name, session_id);
 }
 
-void GenIEBackend::resetKv() {
+void GenIEBackend::resetKv(const std::string& session_id) {
     if (!llm_worker_) {
         LOG_WARN("[GenIEBackend] resetKv skipped; no LLM worker loaded");
         return;
     }
-    llm_worker_->sendReset();
+    llm_worker_->sendReset(session_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +339,13 @@ bool GenIEBackend::forceKillActiveWorker() {
         return vlm_worker_ && vlm_worker_->forceKillActiveWorker();
     }
     return llm_worker_ && llm_worker_->forceKillActiveWorker();
+}
+
+bool GenIEBackend::sendAbort(const std::string& session_id) {
+    if (current_is_vlm_.load()) {
+        return vlm_worker_ && vlm_worker_->sendAbort(session_id);
+    }
+    return llm_worker_ && llm_worker_->sendAbort(session_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

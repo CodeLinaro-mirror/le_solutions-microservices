@@ -85,6 +85,7 @@ public:
      */
     void generate(
         const std::string& event_id,
+        const std::string& session_id,
         const std::string& prompt,
         bool               streaming,
         int                max_tokens,
@@ -123,12 +124,14 @@ public:
         std::function<void(const IPCErrorEvent&)>  on_error,
         bool               kv_invalidated = false) override;
 
+
     /**
      * VLM inference — not supported by LiteRT-LM (LLM-only backend).
      * Calls on_error immediately.
      */
     void generateVlm(
         const std::string&              event_id,
+        const std::string&              session_id,
         const std::string&              prompt,
         const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
@@ -152,16 +155,17 @@ public:
      * Initiate an eager background KV cache reset after inference completes.
      * Delegates to LiteRTLMWorkerManager::initiateBackgroundReset().
      */
-    void resetKvAsync() override;
+    void resetKvAsync(const std::string& session_id = "") override;
 
     /**
      * KV cache operations — not yet supported for LiteRT-LM.
      * saveKv/restoreKv are no-ops; resetKv calls sendReset().
      */
-    void saveKv(const std::string& name)    override;
-    void restoreKv(const std::string& name) override;
-    void resetKv()                          override;
+    void saveKv(const std::string& name, const std::string& session_id = "")    override;
+    void restoreKv(const std::string& name, const std::string& session_id = "") override;
+    void resetKv(const std::string& session_id = "")                           override;
     void clearSession(const std::string& session_id) override;
+
 
     /**
      * Terminate the worker subprocess.

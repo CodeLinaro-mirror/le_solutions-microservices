@@ -35,6 +35,9 @@ public:
      * Execute a VLM inference request with optional image data.
      *
      * @param event_id          Unique ID for this inference event
+     * @param session_id        Continuous-batching slot/routing key. VLM
+     *                          workers are always single-slot, so this is
+     *                          currently only used for error attribution.
      * @param prompt            The compacted context prompt (text portion)
      * @param images             Preprocessed image tensors (already encoded
      *                          by the model adapter's preprocessVision()),
@@ -51,6 +54,7 @@ public:
      * @param on_error          Called on ERROR event or socket failure
      */
     void executeVlmRequest(const std::string& event_id,
+                           const std::string& session_id,
                            const std::string& prompt,
                            const std::vector<std::vector<uint8_t>>& images,
                            bool streaming,

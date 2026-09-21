@@ -29,7 +29,7 @@ public:
         IGenerativeBackend& backend,
         std::shared_ptr<IGenerativeOrchestrator> orchestrator,
         std::shared_ptr<ConversationMemoryCoordinator> coordinator,
-        std::function<void()> finish_post_turn,
+        std::function<void(const std::string& session_id)> finish_post_turn,
         size_t max_queue_depth = 1);
     ~PostTurnWorker();
 
@@ -38,6 +38,7 @@ public:
 
     void start();
     bool enqueue(PostTurnTask task);
+    void setMaxQueueDepth(size_t max_queue_depth);
     void stop(bool force);
 
 private:
@@ -49,8 +50,8 @@ private:
     IGenerativeBackend& backend_;
     std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
     std::shared_ptr<ConversationMemoryCoordinator> coordinator_;
-    std::function<void()> finish_post_turn_;
-    const size_t max_queue_depth_;
+    std::function<void(const std::string& session_id)> finish_post_turn_;
+    size_t max_queue_depth_;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;

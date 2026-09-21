@@ -33,6 +33,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
+constexpr int kMaxConfiguredGenieSlots = 16;
+
 std::string runtimeAliasKey(std::string runtime) {
     std::transform(runtime.begin(), runtime.end(), runtime.begin(),
                    [](unsigned char c) {
@@ -581,6 +583,46 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
             if (fs::exists(fallback)) {
                 config.config_file = fallback;
             }
+        }
+    }
+
+    // Continuous batching capacity: dialog.engine.batching.max-slots in the
+    // processed genie_config.json, if present. Absent/unparseable → 1 (today's
+    // single-slot behavior, unchanged).
+    if (config.runtime == "genie" && !config.config_file.empty() && fs::exists(config.config_file)) {
+        try {
+            std::ifstream cfg_stream(config.config_file);
+            json cfg_json = json::parse(cfg_stream);
+            config.max_slots = cfg_json.value("dialog", json::object())
+                                       .value("engine", json::object())
+                                       .value("batching", json::object())
+                                       .value("max-slots", 1);
+            if (config.max_slots < 1) config.max_slots = 1;
+            config.max_slots = std::min(config.max_slots,
+                                        kMaxConfiguredGenieSlots);
+
+            const auto engine = cfg_json.value("dialog", json::object()).value("engine", json::object());
+            auto hasSharedEngine = [](const json& engine_config) {
+                if (!engine_config.is_object()) return false;
+                for (const char* backend : {"QnnHtp", "QnnGenAiTransformer", "QnnGpu"}) {
+                    if (engine_config.contains("backend") && engine_config["backend"].is_object() &&
+                        engine_config["backend"].contains(backend) &&
+                        engine_config["backend"][backend].is_object() &&
+                        engine_config["backend"][backend].value("shared-engine", false)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (engine.is_array()) {
+                for (const auto& engine_config : engine)
+                    config.shared_engine = config.shared_engine || hasSharedEngine(engine_config);
+            } else {
+                config.shared_engine = hasSharedEngine(engine);
+            }
+        } catch (...) {
+            config.max_slots = 1;
+            config.shared_engine = false;
         }
     }
 
@@ -1138,10 +1180,21 @@ int ModelConfigManager::getContextSize(const std::string& model_id) const {
     return size;
 }
 
-int ModelConfigManager::getMemoryRequirementMb(const std::string& model_id) const {
+int ModelConfigManager::getMaxSlots(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) ? it->second.memory_requirement_mb : 4096;
+    return (it != models_.end()) ? it->second.max_slots : 1;
+}
+
+bool ModelConfigManager::hasSharedEngine(const std::string& model_id) const {
+    std::shared_lock lock(mutex_);
+    auto it = models_.find(model_id);
+    return (it != models_.end()) && it->second.shared_engine;
+}
+
+int ModelConfigManager::getMemoryRequirementMb(const std::string& model_id) const {
+    std::shared_lock lock(mutex_);
+    auto it = models_.find(model_id);    return (it != models_.end()) ? it->second.memory_requirement_mb : 4096;
 }
 
 bool ModelConfigManager::supportsVision(const std::string& model_id) const {

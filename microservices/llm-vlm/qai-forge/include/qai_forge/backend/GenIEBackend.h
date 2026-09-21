@@ -83,6 +83,7 @@ public:
      */
     void generate(
         const std::string& event_id,
+        const std::string& session_id,
         const std::string& prompt,
         bool               streaming,
         int                max_tokens,
@@ -105,6 +106,7 @@ public:
      */
     void generateVlm(
         const std::string&              event_id,
+        const std::string&              session_id,
         const std::string&              prompt,
         const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
@@ -129,22 +131,23 @@ public:
      * Initiate an eager background KV cache reset after inference completes.
      *
      * Called by GenieOrchestrator immediately after generate() / generateVlm()
-     * returns. Delegates to InferenceWorkerManager::initiateBackgroundReset()
-     * (LLM) or VlmInferenceWorkerManager::initiateBackgroundReset() (VLM).
+     * returns. The parent starts the reset asynchronously; the worker keeps
+     * the completed session's handle reserved until RESET completes.
      *
      * The reset runs in a background thread so it overlaps with returning the
-     * response to the HTTP layer. The next generate() call waits for the reset
-     * to complete via waitForPendingReset() inside executeRequest().
+     * response to the HTTP layer. The scheduler waits for the reset before
+     * releasing the session and concurrency reservation.
      */
-    void resetKvAsync() override;
+    void resetKvAsync(const std::string& session_id = "") override;
+    void waitForSessionReady(const std::string& session_id = "") override;
 
     /**
      * KV cache checkpoint operations (LLM only; VLM does not support these).
      * Delegates to InferenceWorkerManager::saveKvCache() / restoreKvCache().
      */
-    void saveKv(const std::string& name)    override;
-    void restoreKv(const std::string& name) override;
-    void resetKv()                          override;
+    void saveKv(const std::string& name, const std::string& session_id = "")    override;
+    void restoreKv(const std::string& name, const std::string& session_id = "") override;
+    void resetKv(const std::string& session_id = "")                           override;
 
     /**
      * Terminate the active worker subprocess.
@@ -153,6 +156,14 @@ public:
      */
     void terminateWorker(bool force = false) override;
     bool forceKillActiveWorker() override;
+
+    /**
+     * Cancel a single session's in-flight generation. Delegates to
+     * InferenceWorkerManager::sendAbort() (LLM) or
+     * VlmInferenceWorkerManager::sendAbort() (VLM) — routes to whichever
+     * worker is active per current_is_vlm_.
+     */
+    bool sendAbort(const std::string& session_id) override;
 
     /**
      * Returns true if the active worker subprocess is alive.
@@ -165,6 +176,7 @@ private:
 
     InferenceWorkerManager& llmWorker();
     VlmInferenceWorkerManager& vlmWorker();
+    int effectiveMaxConcurrent(const std::string& model_id) const;
 
     // Track which worker is currently active.
     // Updated by ensureWorkerRunning() on each request.

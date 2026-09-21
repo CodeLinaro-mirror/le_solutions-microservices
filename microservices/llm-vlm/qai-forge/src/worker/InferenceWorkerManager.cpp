@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// InferenceWorkerManager — Layer 3 Implementation
+// InferenceWorkerManager — Layer 3/4 Implementation
 //
 // Manages the genai-inference-worker subprocess lifecycle and communicates
-// via JSON Lines over a Unix Domain Socket (socketpair).
-//
-// Architecture compliance (architecture_refactoring_design.md Section 4):
-//   A. No threading + queue: socket reads are synchronous within executeRequest().
-//      The Drogon thread pool handles concurrency at Layer 1.
-//   B. Typed IPC events: all responses are parsed into IPCTokenEvent etc.
-//   C. bypass_think_filter: passed through to the worker via EXECUTE command.
-//   D. No ADHOC_MODE: sendReset() is called explicitly by Layer 2.
-//   E. UUID socket paths: prevents clashes between concurrent workers.
+// via JSON Lines over a Unix Domain Socket (socketpair). A dedicated reader
+// thread demuxes responses by event_id/command_id so that up to max_slots_
+// EXECUTE requests can be in flight concurrently under continuous batching;
+// non-CB models (max_slots_ == 1) see identical externally-observable
+// behavior to the original single-slot implementation.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/worker/InferenceWorkerManager.h"
@@ -36,8 +32,24 @@
 #include <sys/mman.h>
 
 namespace {
-constexpr size_t kDefaultPromptShmBytes = 4u * 1024 * 1024;   // 4MB
-constexpr size_t kDefaultImageShmBytes  = 32u * 1024 * 1024;  // 32MB
+constexpr size_t kDefaultPromptShmBytes = 4u * 1024 * 1024;
+constexpr size_t kDefaultImageShmBytes  = 32u * 1024 * 1024;  // 32MB per slot
+
+struct ActiveRequestGuard {
+    explicit ActiveRequestGuard(std::atomic<int>& count) : count_(count) {
+        count_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ~ActiveRequestGuard() {
+        count_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    ActiveRequestGuard(const ActiveRequestGuard&) = delete;
+    ActiveRequestGuard& operator=(const ActiveRequestGuard&) = delete;
+
+private:
+    std::atomic<int>& count_;
+};
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +57,6 @@ constexpr size_t kDefaultImageShmBytes  = 32u * 1024 * 1024;  // 32MB
 // ─────────────────────────────────────────────────────────────────────────────
 InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
     : process_type_(process_type) {
-    // Read the active-inference silence threshold once at startup.
     auto read_env_int = [](const char* name, int default_val) -> int {
         const char* val = std::getenv(name);
         if (!val) return default_val;
@@ -56,18 +67,19 @@ InferenceWorkerManager::InferenceWorkerManager(const std::string& process_type)
         active_timeout_seconds_ = 600;
     }
 
-    prompt_shm_bytes_ = kDefaultPromptShmBytes;
-    if (const char* env = std::getenv("GENAI_PROMPT_SHM_BYTES")) {
-        size_t bytes = std::strtoull(env, nullptr, 10);
-        if (bytes > 0) prompt_shm_bytes_ = bytes;
-    }
+    if (process_type_ == "vlm") {
+        prompt_shm_bytes_ = kDefaultPromptShmBytes;
+        if (const char* env = std::getenv("GENAI_PROMPT_SHM_BYTES")) {
+            size_t bytes = std::strtoull(env, nullptr, 10);
+            if (bytes > 0) prompt_shm_bytes_ = bytes;
+        }
 
-    image_shm_bytes_ = kDefaultImageShmBytes;
-    if (const char* env = std::getenv("GENAI_IMAGE_SHM_BYTES")) {
-        size_t bytes = std::strtoull(env, nullptr, 10);
-        if (bytes > 0) image_shm_bytes_ = bytes;
+        image_shm_bytes_ = kDefaultImageShmBytes;
+        if (const char* env = std::getenv("GENAI_IMAGE_SHM_BYTES")) {
+            size_t bytes = std::strtoull(env, nullptr, 10);
+            if (bytes > 0) image_shm_bytes_ = bytes;
+        }
     }
-
 }
 
 InferenceWorkerManager::~InferenceWorkerManager() {
@@ -87,12 +99,26 @@ std::string InferenceWorkerManager::generateSocketPath(const std::string& model_
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// generateCommandId — thread_local rng avoids racing on shared state now that
+// multiple request threads can generate command ids concurrently under a
+// shared lock.
+// ─────────────────────────────────────────────────────────────────────────────
+std::string InferenceWorkerManager::generateCommandId(const std::string& prefix) {
+    static thread_local std::mt19937_64 rng(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::ostringstream oss;
+    oss << std::hex << rng();
+    return prefix + "-" + oss.str().substr(0, 8);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ensureWorkerRunning
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::ensureWorkerRunning(const std::string& model_id,
                                                   const std::string& config_file,
                                                   const std::string& sampler_config) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     // Model switch: terminate old worker and start fresh
     if (!current_model_id_.empty() && current_model_id_ != model_id) {
@@ -107,55 +133,63 @@ void InferenceWorkerManager::ensureWorkerRunning(const std::string& model_id,
     }
 }
 
+void InferenceWorkerManager::setMaxSlots(int max_slots) {
+    max_slots_ = std::clamp(max_slots, 1, 16);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // startWorker — Fork/exec the genai-inference-worker binary
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::startWorker(const std::string& model_id,
                                           const std::string& config_file,
                                           const std::string& sampler_config) {
+    // max_slots_ is supplied by the backend; default remains one slot.
+    const bool is_vlm_worker = (process_type_ == "vlm");
+
+    // Prompt shared memory is retained only for the VLM worker, whose
+    // protocol still carries prompt_ref alongside image_refs. LLM prompts
+    // travel inline in the EXECUTE JSON command.
+    int prompt_shm_fd = -1;
+    void* prompt_shm_ptr = nullptr;
+    if (is_vlm_worker) {
+        prompt_shm_fd = memfd_create("qai-forge-prompt-shm", 0);
+        if (prompt_shm_fd < 0) throw std::runtime_error(std::string("memfd_create failed: ") + strerror(errno));
+        if (ftruncate(prompt_shm_fd, static_cast<off_t>(prompt_shm_bytes_)) < 0) {
+            ::close(prompt_shm_fd); throw std::runtime_error(std::string("ftruncate failed: ") + strerror(errno));
+        }
+        prompt_shm_ptr = mmap(nullptr, prompt_shm_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, prompt_shm_fd, 0);
+        if (prompt_shm_ptr == MAP_FAILED) {
+            ::close(prompt_shm_fd); throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
+        }
+    }
+
     // Create a socketpair for bidirectional IPC
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
+        if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
         throw std::runtime_error(std::string("socketpair() failed: ") + strerror(errno));
     }
 
     int parent_fd = sv[0];
     int child_fd  = sv[1];
 
-    // Create the prompt shared-memory region before fork() so both sides
-    // inherit the same fd number across fork/exec (mirrors sv[] above).
-    // No MFD_CLOEXEC — the fd must survive execl() in the child.
-    int prompt_shm_fd = memfd_create("qai-forge-prompt-shm", 0);
-    if (prompt_shm_fd < 0) {
-        ::close(sv[0]); ::close(sv[1]);
-        throw std::runtime_error(std::string("memfd_create failed: ") + strerror(errno));
-    }
-    if (ftruncate(prompt_shm_fd, static_cast<off_t>(prompt_shm_bytes_)) < 0) {
-        ::close(prompt_shm_fd); ::close(sv[0]); ::close(sv[1]);
-        throw std::runtime_error(std::string("ftruncate failed: ") + strerror(errno));
-    }
-    void* prompt_shm_ptr = mmap(nullptr, prompt_shm_bytes_, PROT_READ | PROT_WRITE,
-                                MAP_SHARED, prompt_shm_fd, 0);
-    if (prompt_shm_ptr == MAP_FAILED) {
-        ::close(prompt_shm_fd); ::close(sv[0]); ::close(sv[1]);
-        throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
-    }
+    // Create the image shared-memory region (VLM only).
 
-    // Create the image shared-memory region (VLM only) — mirrors the prompt
-    // region above. LLM/litert-lm workers never see this fd/env var.
     int   image_shm_fd  = -1;
     void* image_shm_ptr = nullptr;
-    const bool is_vlm_worker = (process_type_ == "vlm");
     if (is_vlm_worker) {
         image_shm_fd = memfd_create("qai-forge-image-shm", 0);
         if (image_shm_fd < 0) {
-            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
+            if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
             ::close(sv[0]); ::close(sv[1]);
             throw std::runtime_error(std::string("memfd_create (image) failed: ") + strerror(errno));
         }
         if (ftruncate(image_shm_fd, static_cast<off_t>(image_shm_bytes_)) < 0) {
             ::close(image_shm_fd);
-            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
+            if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
             ::close(sv[0]); ::close(sv[1]);
             throw std::runtime_error(std::string("ftruncate (image) failed: ") + strerror(errno));
         }
@@ -163,7 +197,8 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
                              MAP_SHARED, image_shm_fd, 0);
         if (image_shm_ptr == MAP_FAILED) {
             ::close(image_shm_fd);
-            munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+            if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
+            if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
             ::close(sv[0]); ::close(sv[1]);
             throw std::runtime_error(std::string("mmap (image) failed: ") + strerror(errno));
         }
@@ -192,9 +227,8 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     const char* worker_bin = worker_bin_env ? worker_bin_env : default_bin;
 
     // Set the child socket FD in the environment for the worker
-    std::string child_fd_str = std::to_string(child_fd);
     std::string env_var = socket_fd_var;
-    std::string prompt_shm_fd_var    = "PROMPT_SHM_FD=" + std::to_string(prompt_shm_fd);
+    std::string prompt_shm_fd_var = "PROMPT_SHM_FD=" + std::to_string(prompt_shm_fd);
     std::string prompt_shm_bytes_var = "PROMPT_SHM_BYTES=" + std::to_string(prompt_shm_bytes_);
     std::string image_shm_fd_var     = "IMAGE_SHM_FD=" + std::to_string(image_shm_fd);
     std::string image_shm_bytes_var  = "IMAGE_SHM_BYTES=" + std::to_string(image_shm_bytes_);
@@ -202,7 +236,8 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     pid_t pid = ::fork();
     if (pid < 0) {
         if (is_vlm_worker) { munmap(image_shm_ptr, image_shm_bytes_); ::close(image_shm_fd); }
-        munmap(prompt_shm_ptr, prompt_shm_bytes_); ::close(prompt_shm_fd);
+        if (prompt_shm_ptr) munmap(prompt_shm_ptr, prompt_shm_bytes_);
+        if (prompt_shm_fd >= 0) ::close(prompt_shm_fd);
         ::close(sv[0]);
         ::close(sv[1]);
         throw std::runtime_error(std::string("fork() failed: ") + strerror(errno));
@@ -212,11 +247,11 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
         // ── Child process ──────────────────────────────────────────────────
         ::close(parent_fd);
 
-        // Set socket FD and prompt shm FD/size environment variables
+        // Set the socket FD environment variable.
         ::putenv(const_cast<char*>(env_var.c_str()));
-        ::putenv(const_cast<char*>(prompt_shm_fd_var.c_str()));
-        ::putenv(const_cast<char*>(prompt_shm_bytes_var.c_str()));
         if (is_vlm_worker) {
+            ::putenv(const_cast<char*>(prompt_shm_fd_var.c_str()));
+            ::putenv(const_cast<char*>(prompt_shm_bytes_var.c_str()));
             ::putenv(const_cast<char*>(image_shm_fd_var.c_str()));
             ::putenv(const_cast<char*>(image_shm_bytes_var.c_str()));
         }
@@ -234,18 +269,19 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     ::close(child_fd);
     worker_pid_ = pid;
     sock_fd_ = parent_fd;
-    prompt_shm_ptr_ = prompt_shm_ptr;
-    prompt_shm_fd_  = prompt_shm_fd;
     if (is_vlm_worker) {
+        prompt_shm_ptr_ = prompt_shm_ptr;
+        prompt_shm_fd_ = prompt_shm_fd;
         image_shm_ptr_ = image_shm_ptr;
         image_shm_fd_  = image_shm_fd;
     }
     socket_path_ = generateSocketPath(model_id);
 
     LOG_INFO("[" << process_type_ << "Worker] Started PID " << worker_pid_
-             << " for model " << model_id);
+             << " for model " << model_id << " max_slots=" << max_slots_);
 
-    // Wait for READY from worker
+    // Wait for READY from worker (reader thread not started yet — safe to
+    // read directly on this thread while holding the exclusive lock).
     json ready = readMessage(30);
     if (ready.value("type", "") != ResponseType::READY) {
         cleanupWorker(true);
@@ -253,7 +289,7 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     }
 
     // Send INIT command
-    json init_cmd = InferenceProtocol::createInitCommand(model_id, config_file, sampler_config);
+    json init_cmd = InferenceProtocol::createInitCommand(model_id, config_file, sampler_config, max_slots_);
     sendMessage(init_cmd);
 
     // Wait for READY after INIT
@@ -267,10 +303,14 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
     current_model_id_ = model_id;
 
     // Arm the watchdog: record the PID to monitor, reset the activity clock,
-    // and start the background thread.
+    // and start the background threads (watchdog + reader).
     watchdog_target_pid_.store(worker_pid_);
     last_activity_time_.store(std::chrono::steady_clock::now());
+    active_request_count_.store(0);
     startWatchdog();
+
+    reader_stop_.store(false, std::memory_order_relaxed);
+    reader_thread_ = std::thread(&InferenceWorkerManager::readerThreadFunc, this);
 
     LOG_INFO("[" << process_type_ << "Worker] Ready for model: " << model_id);
 }
@@ -279,10 +319,24 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
 // cleanupWorker
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::cleanupWorker(bool force) {
-    // Disarm the watchdog first.  The watchdog thread never acquires mutex_,
+    // Disarm the watchdog first. The watchdog thread never acquires mutex_,
     // so joining it here (while mutex_ is held by our caller) is safe.
     stopWatchdog();
     watchdog_target_pid_.store(-1);
+
+    // Stop the reader thread: signal intent, then shutdown() (not close()) the
+    // socket to unblock its blocking read()/select() cleanly without
+    // invalidating the fd number while the reader thread may still reference
+    // it, then join.
+    reader_stop_.store(true, std::memory_order_relaxed);
+    if (sock_fd_ >= 0) {
+        ::shutdown(sock_fd_, SHUT_RDWR);
+    }
+    if (reader_thread_.joinable()) {
+        reader_thread_.join();
+    }
+    failAllPending("worker terminated");
+    joinAllResetThreads();
 
     if (sock_fd_ >= 0) {
         ::close(sock_fd_);
@@ -328,27 +382,41 @@ void InferenceWorkerManager::cleanupWorker(bool force) {
         image_shm_fd_ = -1;
     }
 
+    max_slots_ = 1;
+    prompt_shm_bytes_ = 0;
+    image_shm_bytes_ = 0;
+
     read_buf_.clear();
     current_model_id_.clear();
-    is_active_ = false;
+    active_request_count_.store(0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendMessage — Write a JSON Line to the socket
+// sendMessage — Write a JSON Line to the socket (thread-safe)
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::sendMessage(const json& msg) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     if (sock_fd_ < 0) throw std::runtime_error("Worker socket not connected");
     std::string line = InferenceProtocol::serialize(msg);
-    ssize_t written = ::write(sock_fd_, line.c_str(), line.size());
-    if (written < 0) {
-        throw std::runtime_error(std::string("Socket write failed: ") + strerror(errno));
+    size_t offset = 0;
+    while (offset < line.size()) {
+        ssize_t written = ::write(sock_fd_, line.data() + offset, line.size() - offset);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error(std::string("Socket write failed: ") + strerror(errno));
+        }
+        if (written == 0) throw std::runtime_error("Socket write returned zero bytes");
+        offset += static_cast<size_t>(written);
     }
     // Any outbound IPC traffic counts as activity — reset the watchdog timer.
     last_activity_time_.store(std::chrono::steady_clock::now());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// readMessage — Read a JSON Line from the socket with timeout
+// readMessage — Read a JSON Line from the socket with timeout.
+// Only called from the reader thread once startWorker() has launched it (or
+// directly from startWorker()'s own thread during the initial handshake,
+// before the reader thread exists).
 // ─────────────────────────────────────────────────────────────────────────────
 json InferenceWorkerManager::readMessage(int timeout_seconds) {
     if (sock_fd_ < 0) throw std::runtime_error("Worker socket not connected");
@@ -386,9 +454,7 @@ json InferenceWorkerManager::readMessage(int timeout_seconds) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// writePromptToShm — copy a prompt into the shared-memory region, return a
-// {"offset","len"} reference for EXECUTE's "prompt_ref" field. Caller must
-// hold mutex_. See header Section G for the region's lifecycle.
+// writePromptToShm / writeImagesToShm — VLM-only fixed shared-memory transport
 // ─────────────────────────────────────────────────────────────────────────────
 json InferenceWorkerManager::writePromptToShm(const std::string& prompt) {
     if (prompt.size() > prompt_shm_bytes_) {
@@ -396,18 +462,13 @@ json InferenceWorkerManager::writePromptToShm(const std::string& prompt) {
             "Prompt exceeds shared-memory capacity (" +
             std::to_string(prompt_shm_bytes_) + " bytes)");
     }
+    size_t offset = 0;
     if (!prompt.empty()) {
-        std::memcpy(prompt_shm_ptr_, prompt.data(), prompt.size());
+        std::memcpy(static_cast<uint8_t*>(prompt_shm_ptr_) + offset, prompt.data(), prompt.size());
     }
-    return {{"offset", 0}, {"len", prompt.size()}};
+    return {{"offset", offset}, {"len", prompt.size()}};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// writeImagesToShm — copy each image's bytes sequentially into the image
-// shared-memory region, return a JSON array of {"offset","len"} references
-// for EXECUTE's "image_refs" field. Caller must hold mutex_. See header
-// Section H for the region's lifecycle.
-// ─────────────────────────────────────────────────────────────────────────────
 json InferenceWorkerManager::writeImagesToShm(const std::vector<std::vector<uint8_t>>& images) {
     size_t total = 0;
     for (const auto& img : images) total += img.size();
@@ -431,111 +492,228 @@ json InferenceWorkerManager::writeImagesToShm(const std::vector<std::vector<uint
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendCommandAndWaitReady — Send command and drain until matching READY
+// Reader thread — the sole reader of sock_fd_ once started. Demuxes every
+// incoming message to whichever caller thread is waiting on its event_id
+// (EXECUTE stream) or command_id (RESET/SAVE_KV/RESTORE_KV/ABORT).
 // ─────────────────────────────────────────────────────────────────────────────
-bool InferenceWorkerManager::sendCommandAndWaitReady(const json& cmd, int timeout_seconds) {
-    std::string command_id = cmd.value("command_id", "");
-    sendMessage(cmd);
+void InferenceWorkerManager::readerThreadFunc() {
+    LOG_INFO("[" << process_type_ << "Worker] Reader thread started");
 
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
-    while (std::chrono::steady_clock::now() < deadline) {
-        json response = readMessage(timeout_seconds);
-        std::string type = response.value("type", "");
+    while (!reader_stop_.load(std::memory_order_relaxed)) {
+        json msg;
+        try {
+            // Poll on the watchdog cadence so reader_stop_ is noticed promptly
+            // without busy-looping.
+            msg = readMessage(watchdog_interval_seconds_);
+        } catch (const std::exception& e) {
+            std::string what = e.what();
+            if (what.find("Timeout") != std::string::npos) {
+                continue;
+            }
+            if (reader_stop_.load(std::memory_order_relaxed)) {
+                break; // expected: shutdown() during cleanupWorker()
+            }
+            LOG_WARN("[" << process_type_ << "Worker] Reader thread: fatal I/O error: " << what);
+            failAllPending(what);
+            break;
+        }
 
-        if (type == ResponseType::READY) {
-            std::string resp_cmd_id = response.value("command_id", "");
-            if (command_id.empty() || resp_cmd_id == command_id) return true;
-            // Stale READY — keep draining
-            continue;
+        std::string type       = msg.value("type", "");
+        std::string event_id   = msg.value("event_id", "");
+        std::string command_id = msg.value("command_id", "");
+
+        if (!event_id.empty() &&
+            (type == ResponseType::TOKEN || type == ResponseType::DONE)) {
+            dispatchExecuteEvent(type, event_id, msg);
+        } else if (type == ResponseType::ERROR && !event_id.empty()) {
+            dispatchExecuteEvent(type, event_id, msg);
+        } else if (!command_id.empty() &&
+                   (type == ResponseType::READY || type == ResponseType::ERROR)) {
+            dispatchCommandEvent(type, command_id, msg);
+        } else {
+            LOG_DEBUG("[" << process_type_ << "Worker] Reader thread: unmatched message type="
+                      << type << " event_id=" << event_id << " command_id=" << command_id);
         }
-        if (type == ResponseType::ERROR) {
-            LOG_ERROR("[" << process_type_ << "Worker] Command failed: "
-                      << response.value("message", "Unknown"));
-            return false;
-        }
-        // TOKEN/DONE are stale stream output — drain silently
     }
-    return false;
+
+    LOG_INFO("[" << process_type_ << "Worker] Reader thread stopped");
+}
+
+void InferenceWorkerManager::dispatchExecuteEvent(const std::string& type,
+                                                    const std::string& event_id,
+                                                    const json& msg) {
+    std::shared_ptr<PendingExecute> pending;
+    {
+        std::lock_guard<std::mutex> lock(pending_execute_mutex_);
+        auto it = pending_execute_.find(event_id);
+        if (it == pending_execute_.end()) return; // stale/unknown — drop
+        pending = it->second;
+        if (type != ResponseType::TOKEN) {
+            pending_execute_.erase(it); // DONE/ERROR terminate the request
+        }
+    }
+
+    if (type == ResponseType::TOKEN) {
+        pending->on_token(InferenceProtocol::parseToken(msg));
+    } else if (type == ResponseType::DONE) {
+        const auto done = InferenceProtocol::parseDone(msg);
+        LOG_INFO("[" << process_type_ << "Worker] INFERENCE_SUCCESS event="
+                 << done.event_id << " session=" << done.session_id
+                 << " finish_reason=" << done.finish_reason);
+        pending->on_done(done);
+        pending->done_promise.set_value();
+    } else { // ERROR
+        const auto error = InferenceProtocol::parseError(msg);
+        LOG_ERROR("[" << process_type_ << "Worker] INFERENCE_ERROR event="
+                  << error.event_id << " session=" << error.session_id
+                  << " message=\"" << error.message << "\"");
+        pending->on_error(error);
+        pending->done_promise.set_value();
+    }
+}
+
+void InferenceWorkerManager::dispatchCommandEvent(const std::string& type,
+                                                    const std::string& command_id,
+                                                    const json& msg) {
+    std::shared_ptr<PendingCommand> pending;
+    {
+        std::lock_guard<std::mutex> lock(pending_command_mutex_);
+        auto it = pending_command_.find(command_id);
+        if (it == pending_command_.end()) return; // stale/unknown — drop
+        pending = it->second;
+        pending_command_.erase(it);
+    }
+
+    if (type == ResponseType::READY) {
+        pending->promise.set_value(true);
+    } else { // ERROR
+        pending->error_message = msg.value("message", "Unknown error");
+        pending->promise.set_value(false);
+    }
+}
+
+void InferenceWorkerManager::failAllPending(const std::string& reason) {
+    std::vector<std::shared_ptr<PendingExecute>> executes;
+    {
+        std::lock_guard<std::mutex> lock(pending_execute_mutex_);
+        for (auto& entry : pending_execute_) executes.push_back(entry.second);
+        pending_execute_.clear();
+    }
+    for (auto& p : executes) {
+        try {
+            p->on_error({"", "", "", std::string("Worker connection lost: ") + reason});
+        } catch (...) {}
+        p->done_promise.set_value();
+    }
+
+    std::vector<std::shared_ptr<PendingCommand>> commands;
+    {
+        std::lock_guard<std::mutex> lock(pending_command_mutex_);
+        for (auto& entry : pending_command_) commands.push_back(entry.second);
+        pending_command_.clear();
+    }
+    for (auto& p : commands) {
+        p->error_message = reason;
+        p->promise.set_value(false);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendExecuteAndStream — protected helper (Fix 4)
+// sendCommandAndWait — register in pending_command_, send, block on future
+// ─────────────────────────────────────────────────────────────────────────────
+bool InferenceWorkerManager::sendCommandAndWait(const json& cmd, const std::string& command_id,
+                                                 int timeout_seconds) {
+    auto pending = std::make_shared<PendingCommand>();
+    auto future = pending->promise.get_future();
+    {
+        std::lock_guard<std::mutex> lock(pending_command_mutex_);
+        pending_command_[command_id] = pending;
+    }
+
+    try {
+        sendMessage(cmd);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(pending_command_mutex_);
+        pending_command_.erase(command_id);
+        LOG_ERROR("[" << process_type_ << "Worker] Failed to send command " << command_id
+                  << ": " << e.what());
+        return false;
+    }
+
+    if (future.wait_for(std::chrono::seconds(timeout_seconds)) == std::future_status::timeout) {
+        std::lock_guard<std::mutex> lock(pending_command_mutex_);
+        pending_command_.erase(command_id);
+        LOG_ERROR("[" << process_type_ << "Worker] Command " << command_id << " timed out");
+        return false;
+    }
+
+    bool ok = future.get();
+    if (!ok) {
+        LOG_ERROR("[" << process_type_ << "Worker] Command " << command_id
+                  << " failed: " << pending->error_message);
+    }
+    return ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sendExecuteAndStream — protected helper
 //
-// Sends a pre-built EXECUTE command and reads TOKEN/DONE/READY/ERROR responses
-// until the final READY arrives. Caller MUST hold mutex_.
-//
-// Extracted from executeRequest() so that VlmInferenceWorkerManager can build
-// an augmented command (with image_refs) and call this method directly,
-// without duplicating the streaming loop.
+// Registers the EXECUTE request in pending_execute_, sends it, and blocks
+// this caller thread until the reader thread signals DONE/ERROR (invoking
+// on_token/on_done/on_error along the way). Caller MUST hold a shared lock
+// on mutex_.
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::sendExecuteAndStream(const json& execute_cmd,
                                                    const std::string& event_id,
                                                    TokenCallback on_token,
                                                    DoneCallback on_done,
                                                    ErrorCallback on_error) {
-    struct ActiveStateGuard {
-        explicit ActiveStateGuard(std::atomic<bool>& active)
-            : active_(active) {
-        }
+    const std::string session_id = execute_cmd.value("session_id", "");
 
-        ~ActiveStateGuard() {
-            active_.store(false, std::memory_order_release);
-        }
+    LOG_INFO("[" << process_type_ << "Worker] INFERENCE_START event=" << event_id
+             << " session=" << session_id
+             << " physical_genie_batch=unknown");
 
-        std::atomic<bool>& active_;
-    };
+    auto pending = std::make_shared<PendingExecute>();
+    pending->on_token = std::move(on_token);
+    pending->on_done   = std::move(on_done);
+    pending->on_error  = std::move(on_error);
+    auto future = pending->done_promise.get_future();
 
-    last_activity_time_.store(
-        std::chrono::steady_clock::now(),
-        std::memory_order_relaxed);
-    is_active_.store(true, std::memory_order_release);
-    const ActiveStateGuard active_state_guard(is_active_);
-
-    sendMessage(execute_cmd);
-
-    bool pending_error = false;
-    std::string pending_error_msg;
-
-    while (true) {
-        json response;
-        try {
-            const int socket_fallback_seconds =
-                active_timeout_seconds_ + (2 * watchdog_interval_seconds_);
-            response = readMessage(socket_fallback_seconds);
-        } catch (const std::exception& e) {
-            on_error({event_id, "", std::string("Socket error: ") + e.what()});
-            return;
-        }
-
-        std::string type = response.value("type", "");
-        std::string resp_event_id = response.value("event_id", "");
-
-        // Ignore stale messages from previous events
-        if (!resp_event_id.empty() && resp_event_id != event_id) continue;
-
-        if (type == ResponseType::TOKEN) {
-            on_token(InferenceProtocol::parseToken(response));
-        } else if (type == ResponseType::DONE) {
-            on_done(InferenceProtocol::parseDone(response));
-            // Wait for the final READY that follows DONE
-        } else if (type == ResponseType::READY) {
-            // Stream complete
-            if (pending_error) {
-                on_error({event_id, "", pending_error_msg});
-            }
-            break;
-        } else if (type == ResponseType::ERROR) {
-            // Defer error until READY arrives (to drain state cleanly)
-            pending_error = true;
-            pending_error_msg = response.value("message", "Unknown error");
-        }
+    {
+        std::lock_guard<std::mutex> lock(pending_execute_mutex_);
+        pending_execute_[event_id] = pending;
     }
+
+    try {
+        sendMessage(execute_cmd);
+    } catch (const std::exception& e) {
+        {
+            std::lock_guard<std::mutex> lock(pending_execute_mutex_);
+            pending_execute_.erase(event_id);
+        }
+        pending->on_error({event_id, session_id, "", std::string("Socket error: ") + e.what()});
+        return;
+    }
+
+    const auto timeout = std::chrono::seconds(
+        active_timeout_seconds_ + 2 * watchdog_interval_seconds_);
+    if (future.wait_for(timeout) == std::future_status::timeout) {
+        {
+            std::lock_guard<std::mutex> lock(pending_execute_mutex_);
+            pending_execute_.erase(event_id);
+        }
+        pending->on_error({event_id, session_id, "", "Timeout waiting for worker response"});
+        return;
+    }
+    // on_done/on_error were already invoked by the reader thread.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// executeRequest — builds EXECUTE command and delegates to sendExecuteAndStream
+// executeRequest
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::executeRequest(const std::string& event_id,
+                                             const std::string& session_id,
                                              const std::string& prompt,
                                              bool streaming,
                                              int max_tokens,
@@ -548,35 +726,27 @@ void InferenceWorkerManager::executeRequest(const std::string& event_id,
                                              TokenCallback on_token,
                                              DoneCallback on_done,
                                              ErrorCallback on_error,
-                                             const std::string& session_id,
                                              bool kv_invalidated) {
-    waitForPendingReset();
+    waitForPendingReset(session_id);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
 
     LOG_DEBUG("[" << process_type_ << "Worker] executeRequest event_id=" << event_id
-              << " model=" << current_model_id_ << " streaming=" << streaming
-              << " max_tokens=" << max_tokens);
+              << " session=" << session_id << " model=" << current_model_id_
+              << " streaming=" << streaming << " max_tokens=" << max_tokens);
 
-    json prompt_ref;
-    try {
-        prompt_ref = writePromptToShm(prompt);
-    } catch (const std::exception& e) {
-        is_active_ = false;
-        on_error({event_id, "", e.what()});
-        return;
-    }
+    ActiveRequestGuard active_guard{active_request_count_};
 
-    json execute_cmd = InferenceProtocol::createExecuteCommand(
-        event_id, prompt_ref, streaming, max_tokens, temperature,
+    json execute_cmd = InferenceProtocol::createLlmExecuteCommand(
+        event_id, prompt, streaming, max_tokens, temperature,
         top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter,
-        session_id, kv_invalidated
-    );
+        session_id, kv_invalidated);
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
 }
 
 void InferenceWorkerManager::executeStructuredRequest(
     const std::string& event_id,
+    const std::string& session_id,
     const json& messages,
     const json& tools,
     bool streaming,
@@ -589,9 +759,11 @@ void InferenceWorkerManager::executeStructuredRequest(
     TokenCallback on_token,
     DoneCallback on_done,
     ErrorCallback on_error) {
-    waitForPendingReset();
+    waitForPendingReset(session_id);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+
+    ActiveRequestGuard active_guard{active_request_count_};
 
     json execute_cmd = InferenceProtocol::createStructuredExecuteCommand(
         event_id,
@@ -603,124 +775,257 @@ void InferenceWorkerManager::executeStructuredRequest(
         top_p,
         top_k,
         presence_penalty,
-        frequency_penalty);
+        frequency_penalty,
+        session_id);
     sendExecuteAndStream(execute_cmd, event_id, on_token, on_done, on_error);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sendReset — Called by Layer 2's ConcurrencyMiddleware (not by Layer 3 itself)
 // ─────────────────────────────────────────────────────────────────────────────
-void InferenceWorkerManager::sendReset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << std::hex << rng();
-    std::string command_id = "reset-" + oss.str().substr(0, 8);
+void InferenceWorkerManager::sendReset(const std::string& session_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::string command_id = generateCommandId("reset");
 
-    json reset_cmd = InferenceProtocol::createResetCommand(command_id);
-    if (!sendCommandAndWaitReady(reset_cmd, 10)) {
+    json reset_cmd = InferenceProtocol::createResetCommand(command_id, session_id);
+    if (!sendCommandAndWait(reset_cmd, command_id, 10)) {
         throw std::runtime_error("RESET command failed or timed out");
     }
-    LOG_INFO("[" << process_type_ << "Worker] KV cache reset successfully");
+    LOG_INFO("[" << process_type_ << "Worker] KV cache reset successfully"
+              << (session_id.empty() ? "" : (" (session=" + session_id + ")")));
+}
+
+void InferenceWorkerManager::sendReinitialize(const std::string& session_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const std::string command_id = generateCommandId("reinitialize");
+    const json command =
+        InferenceProtocol::createReinitializeCommand(command_id, session_id);
+    if (!sendCommandAndWait(command, command_id, 30)) {
+        throw std::runtime_error("REINITIALIZE command failed or timed out");
+    }
+    LOG_INFO("[" << process_type_ << "Worker] Lane reinitialized (session="
+             << session_id << ")");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// initiateBackgroundReset — Eager post-inference KV cache reset
+// initiateBackgroundReset — Eager post-inference KV cache reset (per session)
 //
-// Spawns a background thread that calls sendReset() (RESET + wait for READY).
-// Returns immediately so the caller can return the response to the HTTP layer
-// while the reset runs concurrently.
+// Spawns a background thread that calls sendReset(session_id). Returns
+// immediately so the caller can return the response to the HTTP layer while
+// the reset runs concurrently.
 //
-// The next executeRequest() call joins this thread via waitForPendingReset()
-// before acquiring mutex_, ensuring clean KV state with minimal latency.
+// The next executeRequest() call for this session_id waits on the shared
+// completion via waitForPendingReset(session_id) before claiming a shm slot,
+// ensuring clean KV state with minimal latency.
 // ─────────────────────────────────────────────────────────────────────────────
-void InferenceWorkerManager::initiateBackgroundReset() {
-    // Join any previous reset thread before spawning a new one.
-    // In normal operation the previous reset is already done by the time
-    // the next request arrives, so this join is a no-op.
-    if (reset_thread_.joinable()) {
-        reset_thread_.join();
+void InferenceWorkerManager::initiateBackgroundReset(const std::string& session_id) {
+    std::shared_ptr<PendingReset> previous;
+    {
+        std::lock_guard<std::mutex> lock(reset_threads_mutex_);
+        auto it = reset_threads_.find(session_id);
+        if (it != reset_threads_.end()) {
+            previous = it->second;
+            reset_threads_.erase(it);
+        }
+    }
+    // Join outside the global map lock so unrelated sessions are not blocked.
+    // Same-session ordering is handled by ModelRuntime.
+    if (previous) {
+        previous->completion.wait();
+        std::lock_guard<std::mutex> worker_lock(previous->worker_mutex);
+        if (previous->worker.joinable()) {
+            previous->worker.join();
+        }
     }
 
-    reset_thread_ = std::thread([this]() {
+    auto pending = std::make_shared<PendingReset>();
+    {
+        std::lock_guard<std::mutex> lock(reset_threads_mutex_);
+        reset_threads_[session_id] = pending;
         try {
-            sendReset();
-        } catch (const std::exception& e) {
-            LOG_WARN("[" << process_type_ << "Worker] Background KV reset failed: "
-                     << e.what() << " (non-fatal — next request will rebuild from scratch)");
+            pending->worker = std::thread([this, session_id, pending]() {
+                try {
+                    sendReset(session_id);
+                } catch (...) {
+                    try {
+                        LOG_WARN("[" << process_type_
+                                 << "Worker] KV reset failed for session="
+                                 << session_id
+                                 << "; attempting lane reinitialization");
+                        sendReinitialize(session_id);
+                    } catch (...) {
+                        LOG_ERROR("[" << process_type_
+                                  << "Worker] Lane reinitialization failed for session="
+                                  << session_id
+                                  << "; worker recovery is required");
+                        pending->completion_promise.set_exception(
+                            std::current_exception());
+                        return;
+                    }
+                }
+                pending->completion_promise.set_value();
+            });
         } catch (...) {
-            LOG_WARN("[" << process_type_ << "Worker] Background KV reset failed "
-                     "with unknown exception (non-fatal)");
+            reset_threads_.erase(session_id);
+            pending->completion_promise.set_exception(std::current_exception());
+            throw;
         }
-    });
+    }
 }
 
+// waitForPendingReset — Block until the session's background reset completes
 // ─────────────────────────────────────────────────────────────────────────────
-// waitForPendingReset — Block until the background reset thread completes
-//
-// Called at the start of executeRequest() to ensure the KV cache is clean
-// before sending the EXECUTE command. If no reset is in progress (thread not
-// joinable), returns immediately.
+void InferenceWorkerManager::waitForPendingReset(const std::string& session_id) {
+    std::shared_ptr<PendingReset> pending;
+    {
+        std::lock_guard<std::mutex> lock(reset_threads_mutex_);
+        auto it = reset_threads_.find(session_id);
+        if (it == reset_threads_.end()) return;
+        pending = it->second;
+    }
+    std::exception_ptr error;
+    if (pending) {
+        LOG_INFO("[" << process_type_ << "Worker] Waiting for background KV reset (session="
+                 << session_id << ") to complete");
+        try {
+            pending->completion.get();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        LOG_INFO("[" << process_type_ << "Worker] Background KV reset (session=" << session_id
+                 << ") complete - ready for inference");
+    }
+    std::thread completed_worker;
+    {
+        std::lock_guard<std::mutex> lock(reset_threads_mutex_);
+        auto pending_it = reset_threads_.find(session_id);
+        if (pending_it != reset_threads_.end() && pending_it->second == pending &&
+            pending->completion.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+            std::lock_guard<std::mutex> worker_lock(pending->worker_mutex);
+            completed_worker = std::move(pending->worker);
+            reset_threads_.erase(pending_it);
+        }
+    }
+    if (completed_worker.joinable()) completed_worker.join();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+void InferenceWorkerManager::waitForSessionReady(
+    const std::string& session_id) {
+    waitForPendingReset(session_id);
+}
+
+// joinAllResetThreads — used during worker teardown, where every session's
+// reset must be drained (not just one).
 // ─────────────────────────────────────────────────────────────────────────────
-void InferenceWorkerManager::waitForPendingReset() {
-    if (reset_thread_.joinable()) {
-        LOG_INFO("[" << process_type_ << "Worker] Waiting for background KV reset to complete");
-        reset_thread_.join();
-        LOG_INFO("[" << process_type_ << "Worker] Background KV reset complete — ready for inference");
+void InferenceWorkerManager::joinAllResetThreads() {
+    std::vector<std::shared_ptr<PendingReset>> pending_resets;
+    {
+        std::lock_guard<std::mutex> lock(reset_threads_mutex_);
+        for (auto& entry : reset_threads_) {
+            pending_resets.push_back(entry.second);
+        }
+        reset_threads_.clear();
+    }
+    for (const auto& pending : pending_resets) {
+        try {
+            pending->completion.wait();
+        } catch (...) {
+            // Teardown still must join the worker even when reset failed.
+        }
+        std::lock_guard<std::mutex> worker_lock(pending->worker_mutex);
+        if (pending->worker.joinable()) {
+            pending->worker.join();
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // saveKvCache / restoreKvCache — Section 6 (KV Cache Management)
 // ─────────────────────────────────────────────────────────────────────────────
-bool InferenceWorkerManager::saveKvCache(const std::string& checkpoint_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << std::hex << rng();
-    std::string command_id = "savekv-" + oss.str().substr(0, 8);
+bool InferenceWorkerManager::saveKvCache(const std::string& checkpoint_name,
+                                          const std::string& session_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::string command_id = generateCommandId("savekv");
 
-    json cmd = InferenceProtocol::createSaveKvCommand(checkpoint_name, command_id);
-    bool ok = sendCommandAndWaitReady(cmd, 30);
+    json cmd = InferenceProtocol::createSaveKvCommand(checkpoint_name, command_id, session_id);
+    bool ok = sendCommandAndWait(cmd, command_id, 30);
     if (ok) LOG_INFO("[" << process_type_ << "Worker] KV saved: " << checkpoint_name);
     return ok;
 }
 
-bool InferenceWorkerManager::restoreKvCache(const std::string& checkpoint_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    static std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream oss;
-    oss << std::hex << rng();
-    std::string command_id = "restorekv-" + oss.str().substr(0, 8);
+bool InferenceWorkerManager::restoreKvCache(const std::string& checkpoint_name,
+                                             const std::string& session_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::string command_id = generateCommandId("restorekv");
 
-    json cmd = InferenceProtocol::createRestoreKvCommand(checkpoint_name, command_id);
-    bool ok = sendCommandAndWaitReady(cmd, 30);
+    json cmd = InferenceProtocol::createRestoreKvCommand(checkpoint_name, command_id, session_id);
+    bool ok = sendCommandAndWait(cmd, command_id, 30);
     if (ok) LOG_INFO("[" << process_type_ << "Worker] KV restored: " << checkpoint_name);
     return ok;
 }
 
 void InferenceWorkerManager::sendClearSession(const std::string& session_id) {
     if (session_id.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!isWorkerRunningLocked()) return;
-    json cmd = InferenceProtocol::createClearSessionCommand(session_id);
-    sendCommandAndWaitReady(cmd, 10);
+    const std::string command_id = generateCommandId("clear");
+    json cmd = InferenceProtocol::createClearSessionCommand(session_id, command_id);
+    if (!sendCommandAndWait(cmd, command_id, 10)) {
+        LOG_WARN("[" << process_type_ << "Worker] clearSession failed: "
+                 << session_id);
+        return;
+    }
     LOG_INFO("[" << process_type_ << "Worker] clearSession sent: " << session_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// terminateWorker — SIGKILL for cancellation (Section 7)
+// sendAbort — session-scoped cancellation, primary path under continuous
+// batching (whole-worker SIGKILL affects every concurrent session's engine).
+// ─────────────────────────────────────────────────────────────────────────────
+bool InferenceWorkerManager::sendAbort(const std::string& session_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (sock_fd_ < 0) return false;
+    std::string command_id = generateCommandId("abort");
+
+    json cmd = InferenceProtocol::createAbortCommand(session_id, command_id);
+    bool ok = sendCommandAndWait(cmd, command_id, 10);
+    if (ok) {
+        LOG_INFO("[" << process_type_ << "Worker] ABORT sent for session=" << session_id);
+    } else {
+        LOG_WARN("[" << process_type_ << "Worker] ABORT failed or timed out for session="
+                 << session_id);
+    }
+    return ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// terminateWorker — SIGKILL for whole-worker cancellation (Section 7)
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::terminateWorker(bool force) {
-    // Join any pending background KV reset BEFORE acquiring mutex_.
-    // The reset thread calls sendReset() which acquires mutex_, so holding
-    // mutex_ while joining would deadlock. In the common case the reset
-    // already completed, so this is a no-op join.
-    // Failure to join here causes std::terminate() when the std::thread
+    // Join any pending background KV resets BEFORE acquiring the exclusive
+    // lock. Reset threads call sendReset() which takes a shared lock, so
+    // holding the exclusive lock while joining would deadlock.
+    // Failure to join here causes std::terminate() when a std::thread
     // destructor fires on a still-joinable thread during model eviction.
-    waitForPendingReset();
+    joinAllResetThreads();
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Under continuous batching, other sessions may be holding a shared
+    // lock inside a blocking EXECUTE wait (up to active_timeout_seconds_).
+    // A forced teardown must not queue behind them for the exclusive lock —
+    // kill the worker PID directly first (same no-lock pattern as
+    // forceKillActiveWorker()); the resulting socket EOF makes the reader
+    // thread fail every pending request via failAllPending(), which
+    // releases their shared locks so the exclusive lock below is granted
+    // promptly instead of after minutes of waiting.
+    if (force) {
+        forceKillActiveWorker();
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     cleanupWorker(force);
 }
 
@@ -756,14 +1061,14 @@ bool InferenceWorkerManager::forceKillActiveWorker() {
 // shutdown — Graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::shutdown() {
-    // Join any pending background KV reset BEFORE acquiring mutex_.
-    // Same reasoning as terminateWorker(): the reset thread holds mutex_
-    // internally, so we must not hold it while joining.
+    // Join any pending background KV resets BEFORE acquiring the exclusive
+    // lock. Same reasoning as terminateWorker(): reset threads take a shared
+    // lock internally, so we must not hold the exclusive lock while joining.
     // This also covers the destructor path (~InferenceWorkerManager calls
-    // shutdown()), ensuring reset_thread_ is never joinable at destruction.
-    waitForPendingReset();
+    // shutdown()), ensuring no reset thread is ever joinable at destruction.
+    joinAllResetThreads();
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (worker_pid_ > 0 && sock_fd_ >= 0) {
         try {
             sendMessage(InferenceProtocol::createShutdownCommand());
@@ -776,7 +1081,7 @@ void InferenceWorkerManager::shutdown() {
 // Accessors
 // ─────────────────────────────────────────────────────────────────────────────
 bool InferenceWorkerManager::isWorkerRunning() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return isWorkerRunningLocked();
 }
 
@@ -793,7 +1098,7 @@ bool InferenceWorkerManager::isWorkerRunningLocked() const {
 }
 
 std::string InferenceWorkerManager::getCurrentModelId() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return current_model_id_;
 }
 
@@ -838,7 +1143,7 @@ void InferenceWorkerManager::watchdogThreadFunc() {
             continue;
         }
 
-        const bool active = is_active_.load(std::memory_order_acquire);
+        const bool active = active_request_count_.load(std::memory_order_acquire) > 0;
         if (!active) continue;
 
         // Check whether the last IPC activity is within the allowed window.
@@ -864,8 +1169,8 @@ void InferenceWorkerManager::watchdogThreadFunc() {
         watchdog_target_pid_.store(-1, std::memory_order_relaxed);
 
         // Send SIGKILL directly — no mutex, no Layer-3 helpers.
-        // The main thread's readMessage() will receive an EOF/error on the
-        // socket and propagate it to the caller via on_error callback.
+        // The reader thread will receive an EOF/error on the socket and
+        // propagate it to every pending request via failAllPending().
         // The next ensureWorkerRunning() call will spawn a fresh worker.
         if (::kill(target_pid, SIGKILL) == 0) {
             LOG_WARN("[" << process_type_ << "Watchdog] SIGKILL sent to PID "
@@ -880,7 +1185,7 @@ void InferenceWorkerManager::watchdogThreadFunc() {
 }
 
 // startWatchdog — launch the watchdog background thread.
-// Called from startWorker() while mutex_ is held.
+// Called from startWorker() while the exclusive lock is held.
 void InferenceWorkerManager::startWatchdog() {
     // Stop any previously running watchdog first (e.g. after a model switch).
     stopWatchdog();
@@ -890,7 +1195,7 @@ void InferenceWorkerManager::startWatchdog() {
 }
 
 // stopWatchdog — signal the watchdog to exit and join its thread.
-// Called from cleanupWorker() while mutex_ is held.
+// Called from cleanupWorker() while the exclusive lock is held.
 // Safe because the watchdog thread never acquires mutex_.
 void InferenceWorkerManager::stopWatchdog() {
     watchdog_stop_.store(true, std::memory_order_relaxed);

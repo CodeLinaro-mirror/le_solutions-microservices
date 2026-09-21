@@ -49,8 +49,6 @@ const char* stateToString(ModelRuntimeState state) {
             return "idle";
         case ModelRuntimeState::Running:
             return "running";
-        case ModelRuntimeState::PostTurn:
-            return "post_turn";
         case ModelRuntimeState::Draining:
             return "draining";
         case ModelRuntimeState::Evicting:
@@ -669,10 +667,6 @@ void WarmModelPool::handleRuntimeStateChanged(const std::string& model_id,
                 record.idle_since.reset();
                 record.last_used_at = now;
                 break;
-            case ModelRuntimeState::PostTurn:
-                record.idle_since.reset();
-                record.last_used_at = now;
-                break;
             case ModelRuntimeState::Idle:
                 record.idle_since = now;
                 record.last_used_at = now;
@@ -841,7 +835,6 @@ bool WarmModelPool::isActiveReservedState(ModelRuntimeState state) {
     return state == ModelRuntimeState::Loading ||
            state == ModelRuntimeState::Idle ||
            state == ModelRuntimeState::Running ||
-           state == ModelRuntimeState::PostTurn ||
            state == ModelRuntimeState::Draining ||
            state == ModelRuntimeState::Evicting;
 }

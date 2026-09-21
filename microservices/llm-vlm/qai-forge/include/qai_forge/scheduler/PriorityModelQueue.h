@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <functional>
 
 namespace scheduler {
 
@@ -37,6 +38,7 @@ class PriorityModelQueue {
 public:
     void push(GenerativeJobPtr job);
     GenerativeJobPtr pop();
+    GenerativeJobPtr popIf(const std::function<bool(const GenerativeJobPtr&)>& predicate);
     GenerativeJobPtr cancel(const std::string& job_id);
 
     bool empty() const;
