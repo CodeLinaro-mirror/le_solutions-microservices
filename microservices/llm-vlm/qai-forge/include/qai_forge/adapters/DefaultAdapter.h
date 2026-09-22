@@ -15,8 +15,10 @@
 class DefaultAdapter : public ModelAdapter {
 public:
     json preprocessVision(const json& messages,
-                          const json& chat_template = json::object()) const override {
+                          const json& chat_template = json::object(),
+                          int extra_images = 0) const override {
         (void)chat_template;
+        (void)extra_images;
         return messages;
     }
     std::string formatToolInstructions(const json& tools) const override { return ""; }

@@ -196,6 +196,11 @@ CreateChatCompletionRequest buildChatRequest(
         req.raw_prompt = oip_req.text_input.value();
     }
 
+    // Raw compressed image bytes (already in memory from images_shm/images/
+    // multipart) pass straight through to the vision preprocessor — no
+    // base64 re-encoding, preserving the shm extension's zero-copy benefit.
+    req.raw_images = std::move(oip_req.images);
+
     return req;
 }
 

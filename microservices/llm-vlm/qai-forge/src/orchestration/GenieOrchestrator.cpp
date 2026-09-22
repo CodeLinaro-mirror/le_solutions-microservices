@@ -194,6 +194,7 @@ std::string renderToolCallsForPrompt(const json& tool_calls) {
 
 std::vector<std::vector<uint8_t>> preprocessImagesToBuffers(
     const json& messages,
+    const std::vector<std::vector<uint8_t>>& raw_images,
     const std::string& model_id) {
     VisionPreprocessConfig vision_cfg = VisionPreprocessConfig::defaults();
     auto opt_preprocess =
@@ -266,6 +267,41 @@ std::vector<std::vector<uint8_t>> preprocessImagesToBuffers(
         }
     }
 
+    // Raw compressed bytes already resolved to memory by the caller (OIP
+    // /generate's images/images_shm — see InferController::buildChatRequest).
+    // Feed these directly into ImageUtils::preprocessImage(), bypassing the
+    // URL/base64-string parsing that preprocessImageToBuffer() does — this is
+    // what makes the images_shm extension zero-copy on the server side.
+    for (size_t i = 0; i < raw_images.size(); ++i) {
+        try {
+            buffers.push_back(
+                ImageUtils::preprocessImage(raw_images[i], vision_cfg, model_id)
+                    .toBytes());
+            LOG_INFO("[GenieOrchestrator] Preprocessed raw VLM image "
+                     << (i + 1) << "/" << raw_images.size()
+                     << ": model=" << model_id
+                     << " bytes=" << buffers.back().size());
+        } catch (const GenAIException&) {
+            throw;
+        } catch (const std::exception& e) {
+            throw GenAIException(
+                GenAIErrorCode::INVALID_REQUEST,
+                std::string("Failed to preprocess raw image ") +
+                    std::to_string(i + 1) + ": " + e.what(),
+                400);
+        }
+    }
+
+    if (buffers.size() == 1) {
+        LOG_INFO("[GenieOrchestrator] Only one image supplied for VLM; "
+                 "duplicating image to satisfy backend minimum");
+        // NOTE: buffers.push_back(buffers[0]) would be undefined behavior —
+        // push_back may reallocate before reading the reference argument,
+        // so the source could be freed before the copy happens. Copy first.
+        std::vector<uint8_t> duplicate = buffers[0];
+        buffers.push_back(std::move(duplicate));
+    }
+
     return buffers;
 }
 
@@ -319,7 +355,15 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     // of thinking_budget/answer_budget — createJob() may call this once for
     // preliminary token estimation (with budgets both 0) and again with the
     // computed budgets; both calls must return the identical fixed string.
-    if (request.raw_prompt.has_value()) {
+    //
+    // VLM requests must NOT take this shortcut: GenIE needs the full
+    // user_prefix/assistant_prefix turn structure (not just the vision
+    // marker) to recognize the prompt as a chat turn awaiting a response —
+    // without the trailing assistant_prefix cue, generation stops
+    // immediately with zero completion tokens. So when raw_images are
+    // present, fall through to the normal templated path below, which
+    // already injects the vision marker via preprocessVision() at Slot 5.
+    if (request.raw_prompt.has_value() && request.raw_images.empty()) {
         return request.raw_prompt.value();
     }
 
@@ -411,7 +455,10 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     }
 
     // ── Slot 5: Current turn ──────────────────────────────────────────────────
-    json processed_messages = adapter.preprocessVision(request.messages, chat_template);
+    // request.raw_images (OIP images/images_shm) carry image bytes outside of
+    // `messages`.
+    json processed_messages = adapter.preprocessVision(
+        request.messages, chat_template, static_cast<int>(request.raw_images.size()));
     for (const auto& msg : processed_messages) {
         std::string role = getStringOrDefault(msg, "role", "");
         std::string content = messageText(msg);
@@ -554,7 +601,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     prepared.uses_private_memory = uses_private_memory;
     if (is_vlm) {
         prepared.vision.buffers =
-            preprocessImagesToBuffers(request.messages, context.model_id);
+            preprocessImagesToBuffers(request.messages, request.raw_images, context.model_id);
     }
     prepared.conversation_messages = std::move(post_turn_messages);
 

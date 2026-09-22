@@ -17,7 +17,8 @@ class Qwen25Adapter : public ModelAdapter {
 public:
     // ── Vision Preprocessing ───────────────────────────────────────────────────
     json preprocessVision(const json& messages,
-                          const json& chat_template = json::object()) const override;
+                          const json& chat_template = json::object(),
+                          int extra_images = 0) const override;
 
     // ── Tool Calling ───────────────────────────────────────────────────────────
     std::string formatToolInstructions(const json& tools) const override;

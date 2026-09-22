@@ -9,12 +9,15 @@
 # This variant includes Hexagon SDK, DSP toolchain, and cross-compilation setup.
 #
 # Environment Variables:
-#   LLAMACPP_VERSION=master                    llama.cpp version/branch to build
-#   HEXAGON_SDK_VERSION=6.6.0.0                Hexagon SDK version
-#   HEXAGON_TOOLS_VERSION=19.0.02              Hexagon tools version
-#   HEXAGON_ARCH=v73                           Hexagon architecture (v68, v73, v75)
-#   LLAMACPP_DEPLOY_DIR=/mnt/work/deploy/usr   Deployment directory
-#   DEBUG=1                                    Enable debug output (set -x)
+#   LLAMACPP_VERSION=master                       llama.cpp version/branch to build
+#   HEXAGON_SDK_VERSION=6.6.0.0                   Hexagon SDK version
+#   HEXAGON_TOOLS_VERSION=19.0.02                 Hexagon tools version
+#   HEXAGON_ARCH=v73                              Hexagon architecture (v68, v73, v75)
+#   LLAMACPP_INSTALL_DIR=/build/llamacpp-install  cmake install prefix (headers/libs
+#                                                  qai-forge's own build looks for)
+#   DEPLOY_DIR=/build/deploy                      Runtime staging dir copied into the
+#                                                  final image (matches build-llamacpp.sh)
+#   DEBUG=1                                       Enable debug output (set -x)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -eu
@@ -31,7 +34,9 @@ LLAMACPP_VERSION="${LLAMACPP_VERSION:-master}"
 HEXAGON_SDK_VERSION="${HEXAGON_SDK_VERSION:-6.6.0.0}"
 HEXAGON_TOOLS_VERSION="${HEXAGON_TOOLS_VERSION:-19.0.02}"
 HEXAGON_ARCH="${HEXAGON_ARCH:-v73}"
-LLAMACPP_DEPLOY_DIR="${LLAMACPP_DEPLOY_DIR:-/mnt/work/deploy/usr}"
+LLAMACPP_INSTALL_DIR="${LLAMACPP_INSTALL_DIR:-/build/llamacpp-install}"
+DEPLOY_DIR="${DEPLOY_DIR:-/build/deploy}"
+LLAMACPP_BUILD_SERVER="${LLAMACPP_BUILD_SERVER:-ON}"
 
 echo "=== Building llama.cpp with Hexagon NPU support ==="
 
@@ -48,6 +53,50 @@ make -j"$(nproc)"
 make install
 find /tmp/fastrpc -name 'remote.h' -exec cp {} /usr/include/ \;
 rm -rf /tmp/fastrpc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup multi-arch for x86_64 libraries (needed for qaic compiler)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Setting up multi-arch support for x86_64..."
+dpkg --add-architecture amd64
+
+# Ubuntu and Debian codenames are not interchangeable (e.g. Debian's
+# "trixie" is not an Ubuntu suite) — archive.ubuntu.com only has a matching
+# suite when the base image actually IS Ubuntu. Detect that instead of
+# blindly reusing this host's own codename for the Ubuntu archive URL.
+DISTRO_ID="$(. /etc/os-release && echo "${ID}")"
+if [ "${DISTRO_ID}" = "ubuntu" ]; then
+    UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
+    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+    echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
+
+    # Restrict the native repo to arm64 only, so `apt-get update` doesn't also
+    # try to fetch amd64 indices from it (ports.ubuntu.com never hosts amd64).
+    # Ubuntu 24.04+ ("noble") ships its default sources in the new DEB822 format
+    # at /etc/apt/sources.list.d/ubuntu.sources instead of the classic one-line
+    # /etc/apt/sources.list, so patch whichever file is actually populated.
+    if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then
+        sed -i '/^Types:/i Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
+    fi
+    if [ -s /etc/apt/sources.list ]; then
+        sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
+    fi
+else
+    # Debian (and derivatives): deb.debian.org already mirrors amd64 packages
+    # under the same suite name, no extra Ubuntu source needed — just letting
+    # apt see the newly-added amd64 architecture against the existing sources
+    # is sufficient.
+    echo "Non-Ubuntu base (${DISTRO_ID}) detected — using existing Debian sources for amd64, skipping archive.ubuntu.com"
+fi
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    libc6:amd64 \
+    libstdc++6:amd64 \
+    libgmp10:amd64 \
+    qemu-user-static
+apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Download Hexagon SDK
@@ -87,36 +136,6 @@ sed -i 's/string(FIND \${PREBUILT_LIB_DIR} /string(FIND "${PREBUILT_LIB_DIR}" /g
     "${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Setup multi-arch for x86_64 libraries (needed for qaic compiler)
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Setting up multi-arch support for x86_64..."
-dpkg --add-architecture amd64
-# Read the codename off this host instead of hardcoding one.
-UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse" > /etc/apt/sources.list.d/amd64.list
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
-echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" >> /etc/apt/sources.list.d/amd64.list
-
-# Restrict the native repo to arm64 only, so `apt-get update` doesn't also
-# try to fetch amd64 indices from it (ports.ubuntu.com never hosts amd64).
-# Ubuntu 24.04+ ("noble") ships its default sources in the new DEB822 format
-# at /etc/apt/sources.list.d/ubuntu.sources instead of the classic one-line
-# /etc/apt/sources.list, so patch whichever file is actually populated.
-if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then
-    sed -i '/^Types:/i Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
-fi
-if [ -s /etc/apt/sources.list ]; then
-    sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
-fi
-
-apt-get update
-apt-get install -y --no-install-recommends \
-    libc6:amd64 \
-    libstdc++6:amd64 \
-    libgmp10:amd64
-apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Setup qemu wrapper for qaic (x86_64 binary)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Setting up qemu wrapper for qaic..."
@@ -130,7 +149,7 @@ chmod +x "${HEXAGON_SDK_ROOT}/ipc/fastrpc/qaic/bin/qaic"
 # ─────────────────────────────────────────────────────────────────────────────
 # Clone and build llama.cpp
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Cloning llama.cpp..."
+echo "Cloning llama.cpp @ ${LLAMACPP_VERSION}..."
 mkdir -p /build
 cd /build
 git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
@@ -152,13 +171,13 @@ cmake -S . -B build \
     -DBUILD_SHARED_LIBS=ON \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_SERVER=ON \
+    -DLLAMA_BUILD_SERVER="${LLAMACPP_BUILD_SERVER}" \
     -DHEXAGON_SDK_ROOT="${HEXAGON_SDK_ROOT}" \
     -DHEXAGON_TOOLS_ROOT="${HEXAGON_TOOLS_ROOT}" \
     -DHEXAGON_CMAKE_ROOT="${HEXAGON_CMAKE_ROOT}" \
     -DHEXAGON_ARCH="${HEXAGON_ARCH}" \
     -DPREBUILT_LIB_DIR=linux_aarch64 \
-    -DCMAKE_INSTALL_PREFIX="${LLAMACPP_DEPLOY_DIR}" \
+    -DCMAKE_INSTALL_PREFIX="${LLAMACPP_INSTALL_DIR}" \
     -GNinja
 
 cmake --build build -j4
@@ -168,48 +187,74 @@ cmake --build build -j4
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== Verifying build artifacts ==="
 find build -name "*.so" -type f
-find build -name "llama-server" -type f
+if [ "${LLAMACPP_BUILD_SERVER}" = "ON" ]; then
+    find build -name "llama-server" -type f
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Install artifacts directly to the deployment directory
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Installing llama.cpp artifacts to ${LLAMACPP_DEPLOY_DIR}..."
-mkdir -p "${LLAMACPP_DEPLOY_DIR}/lib/rfsa/adsp" \
-         "${LLAMACPP_DEPLOY_DIR}/include/ggml/include"
+echo "Installing llama.cpp artifacts to ${LLAMACPP_INSTALL_DIR}..."
+mkdir -p "${LLAMACPP_INSTALL_DIR}/lib/rfsa/adsp" \
+         "${LLAMACPP_INSTALL_DIR}/include/ggml/include"
 
 cmake --install build
 
 echo "=== Verifying installation ==="
-ls -la "${LLAMACPP_DEPLOY_DIR}/lib/"
-ls -la "${LLAMACPP_DEPLOY_DIR}/bin/"
+ls -la "${LLAMACPP_INSTALL_DIR}/lib/"
+ls -la "${LLAMACPP_INSTALL_DIR}/bin/"
 
 # Manual copy if cmake install didn't work
-if [ -z "$(ls -A "${LLAMACPP_DEPLOY_DIR}/lib"/*.so 2>/dev/null)" ]; then
+if [ -z "$(ls -A "${LLAMACPP_INSTALL_DIR}/lib"/*.so 2>/dev/null)" ]; then
     echo "WARNING: Libraries not installed, copying manually..."
-    find build -name "*.so" -type f -exec cp -v {} "${LLAMACPP_DEPLOY_DIR}/lib/" \;
+    find build -name "*.so" -type f -exec cp -v {} "${LLAMACPP_INSTALL_DIR}/lib/" \;
 fi
 
-if [ ! -f "${LLAMACPP_DEPLOY_DIR}/bin/llama-server" ]; then
+if [ "${LLAMACPP_BUILD_SERVER}" = "ON" ] && [ ! -f "${LLAMACPP_INSTALL_DIR}/bin/llama-server" ]; then
     echo "WARNING: llama-server not installed, copying manually..."
-    find build -name "llama-server" -type f -exec cp -v {} "${LLAMACPP_DEPLOY_DIR}/bin/" \;
+    find build -name "llama-server" -type f -exec cp -v {} "${LLAMACPP_INSTALL_DIR}/bin/" \;
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reorganize Hexagon DSP blobs and copy headers
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Staging DSP blobs and headers to ${LLAMACPP_DEPLOY_DIR}..."
+echo "Staging DSP blobs and headers to ${LLAMACPP_INSTALL_DIR}..."
 
 # Copy Hexagon DSP blobs (also needed under rfsa/adsp for the DSP loader,
 # in addition to their install location in usr/lib)
-find "${LLAMACPP_DEPLOY_DIR}/lib" -maxdepth 1 -name 'libggml-htp-v*.so' \
-    -exec cp {} "${LLAMACPP_DEPLOY_DIR}/lib/rfsa/adsp/" \; 2>/dev/null || true
+find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -name 'libggml-htp-v*.so' \
+    -exec cp {} "${LLAMACPP_INSTALL_DIR}/lib/rfsa/adsp/" \; 2>/dev/null || true
 
 # Copy headers
-cp -r /build/llama.cpp/ggml/include/* "${LLAMACPP_DEPLOY_DIR}/include/ggml/include/" 2>/dev/null || true
-cp -r /build/llama.cpp/include/* "${LLAMACPP_DEPLOY_DIR}/include/" 2>/dev/null || true
+cp -r /build/llama.cpp/ggml/include/* "${LLAMACPP_INSTALL_DIR}/include/ggml/include/" 2>/dev/null || true
+cp -r /build/llama.cpp/include/* "${LLAMACPP_INSTALL_DIR}/include/" 2>/dev/null || true
 
-# Strip binaries
-find "${LLAMACPP_DEPLOY_DIR}/bin" -type f -exec strip --strip-unneeded {} \; 2>/dev/null || true
+# Strip binaries and non-DSP shared libraries (stripping the Hexagon HTP
+# blobs would corrupt them — they're compiled for the DSP core, not ARM64,
+# same rationale the QAIServe Dockerfile's own strip step already documents).
+find "${LLAMACPP_INSTALL_DIR}/bin" -type f -exec strip --strip-unneeded {} \; 2>/dev/null || true
+find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -type f -name '*.so*' ! -name 'libggml-htp-v*.so' \
+    -exec strip --strip-unneeded {} \; 2>/dev/null || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage runtime artifacts into the final image's deploy tree
+# ─────────────────────────────────────────────────────────────────────────────
+# ${LLAMACPP_INSTALL_DIR} is only a build-time cmake prefix (headers +
+# libs for qai-forge to link against) — it is not copied into the runtime
+# image by itself. Mirror build-llamacpp.sh's convention and stage the
+# actual .so/binaries the runtime needs into ${DEPLOY_DIR}, same as every
+# other backend already does. The HTP DSP blobs go to rfsa/adsp only (never
+# the flat lib dir) so the Dockerfile's later blanket `strip` over
+# ${DEPLOY_DIR}/usr/lib (maxdepth 1) can't reach and corrupt them.
+echo "Staging runtime artifacts to ${DEPLOY_DIR}..."
+mkdir -p "${DEPLOY_DIR}/usr/bin" "${DEPLOY_DIR}/usr/lib/rfsa/adsp"
+find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -name '*.so*' ! -name 'libggml-htp-v*.so' \
+    -exec cp -Pv {} "${DEPLOY_DIR}/usr/lib/" \;
+find "${LLAMACPP_INSTALL_DIR}/lib" -maxdepth 1 -name 'libggml-htp-v*.so' \
+    -exec cp -v {} "${DEPLOY_DIR}/usr/lib/rfsa/adsp/" \;
+if [ "${LLAMACPP_BUILD_SERVER}" = "ON" ] && [ -f "${LLAMACPP_INSTALL_DIR}/bin/llama-server" ]; then
+    cp -v "${LLAMACPP_INSTALL_DIR}/bin/llama-server" "${DEPLOY_DIR}/usr/bin/"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cleanup
@@ -217,8 +262,29 @@ find "${LLAMACPP_DEPLOY_DIR}/bin" -type f -exec strip --strip-unneeded {} \; 2>/
 echo "Cleaning up build artifacts..."
 rm -rf /build/llama.cpp
 
+# The Hexagon SDK and Tools (~1GB+ combined between the SDK zip contents and
+# the Tools tarball) are only needed to cross-compile the HTP DSP backend
+# above — nothing later in the Dockerfile references /opt/Hexagon_SDK or
+# /opt/hexagon, so leaving them in place only inflates this RUN layer with
+# dead weight.
+echo "Removing Hexagon SDK/Tools (no longer needed post-build)..."
+rm -rf /opt/Hexagon_SDK /opt/hexagon
+
+# The amd64 multiarch libs + qemu-user-static were only needed to run the
+# x86_64 qaic IDL compiler under emulation during the build above; drop them
+# now rather than leaving them installed in the layer. apt-get clean/rm
+# lists alone (already done earlier) only clear the download cache, not the
+# packages themselves.
+echo "Removing amd64 multiarch/qemu build-only packages..."
+apt-get purge -y --auto-remove \
+    qemu-user-static \
+    'libc6:amd64' \
+    'libstdc++6:amd64' \
+    'libgmp10:amd64' 2>/dev/null || true
+dpkg --remove-architecture amd64 2>/dev/null || true
+
 echo "✓ llama.cpp with Hexagon NPU build complete"
-echo "  Binaries: ${LLAMACPP_DEPLOY_DIR}/bin"
-echo "  Libraries: ${LLAMACPP_DEPLOY_DIR}/lib"
-echo "  DSP blobs: ${LLAMACPP_DEPLOY_DIR}/lib/rfsa/adsp"
-echo "  Headers: ${LLAMACPP_DEPLOY_DIR}/include"
+echo "  Build-time headers/libs: ${LLAMACPP_INSTALL_DIR}"
+echo "  Runtime binaries: ${DEPLOY_DIR}/usr/bin"
+echo "  Runtime libraries: ${DEPLOY_DIR}/usr/lib"
+echo "  DSP blobs: ${DEPLOY_DIR}/usr/lib/rfsa/adsp"
