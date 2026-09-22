@@ -358,7 +358,7 @@ class VehicleAnalytics():
         '''
         Create the loitering alerts.
 
-        Expected behavior:
+        Modified behavior:
         - Send alert when loitering starts (first vehicles exceed threshold)
         - Send alert when loitering clears (no more vehicles)
         - Send alert when composition changes (vehicles added or removed from loitering set)
@@ -500,6 +500,8 @@ class VehicleAnalytics():
             logger.info(f'\r\n---Checking Alerts---')
             all_alerts = []
             for trigger in triggers:
+                loitering_alert = None
+                occupancy_alerts = False
                 current_occupancy = 0
                 monitor_id = trigger['monitor_id']
                 region_id = trigger.get('region_id', 'missing')

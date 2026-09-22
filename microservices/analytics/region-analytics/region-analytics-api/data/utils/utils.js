@@ -66,10 +66,15 @@ function convertToms(time) {
 
 async function checkTriggerConditionParams(data) {
     let tc = data.trigger_condition;
-    // Check if params match people counting
-    if (config.peopleCountTriggerConditions.includes(tc)) {
-        if (tc === "occupancy_changed") return;
-        else if (!data.params.some((obj => obj.name === "threshold"))) {
+    if (!config.validTriggers.includes(tc)) {
+        throw new Error(`Error trigger condition invalid. Please enter one of the following: [${config.validTriggers}]`);
+    }
+    // Check if params match
+    if (tc == "occupancy_over" || tc == "occupancy_under" || tc == "loitering_over") {
+        if (data.params == null || data.params == undefined) {
+            throw new Error ('Error Params must be provided for the trigger condition in an Array of name value objects')
+        }
+        if (!data.params.some((obj => obj.name === "threshold"))) {
             throw new Error("Mismatch between Params and Trigger Condition. Threshold was not provided")
         }
     }

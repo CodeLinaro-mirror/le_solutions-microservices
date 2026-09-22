@@ -24,7 +24,8 @@ const config = {
     redisRAAnalyticsChannel: process.env.redisRAAnalyticsChannel,
     redisRARegionKey: process.env.RA_REGION_KEY,
     redisRATriggerKey: process.env.RA_TRIGGER_KEY,
-    redisCameraUpdates: process.env.redisCameraUpdates
+    redisCameraUpdates: process.env.redisCameraUpdates,
+    validTriggers: ["occupancy_changed", "occupancy_over", "occupancy_under", "loitering_over"]
 };
 
 module.exports = config;
