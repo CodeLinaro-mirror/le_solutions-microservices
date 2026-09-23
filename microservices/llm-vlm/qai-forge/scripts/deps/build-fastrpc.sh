@@ -48,8 +48,20 @@ cd /tmp/fastrpc
 # ─────────────────────────────────────────────────────────────────────────────
 autoreconf -is
 
+# Build natively on arm64; cross-compile with the aarch64 toolchain otherwise.
+BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+if [ "${BUILD_ARCH}" = "arm64" ]; then
+    CROSS_CONFIGURE_ARGS=""
+else
+    export CC=aarch64-linux-gnu-gcc
+    export CXX=aarch64-linux-gnu-g++
+    export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+    export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
+    CROSS_CONFIGURE_ARGS="--host=aarch64-linux-gnu"
+fi
+
 CFLAGS='-UMACHINE_NAME_PATH -DMACHINE_NAME_PATH=\"/run/device-model\"' \
-    ./configure --prefix=/usr --libdir=/usr/lib
+    ./configure --prefix=/usr --libdir=/usr/lib ${CROSS_CONFIGURE_ARGS}
 
 make -j$(nproc)
 make install

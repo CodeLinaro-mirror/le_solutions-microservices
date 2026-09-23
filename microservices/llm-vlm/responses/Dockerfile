@@ -63,10 +63,15 @@ ARG BUILD_GENIE=true
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 0: LiteRT-LM Builder (conditional via shell if)
 #
-# Builds LiteRT-LM v0.14.0 natively on AArch64 using Bazelisk when BUILD_LITERT_LM=true.
+# Cross-compiles LiteRT-LM for AArch64 from a native BUILDPLATFORM container
+# when BUILD_LITERT_LM=true — see QAIServe/Dockerfile's litert_lm_builder
+# stage and build-litert-lm-standalone.sh for the same rationale (avoids
+# QEMU-user emulation entirely; --platform=$BUILDPLATFORM, not
+# linux/arm64, pins this stage to the build host's own architecture
+# regardless of the final image's target platform).
 # Uses modular scripts for maintainability and reusability.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS litert_lm_builder
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS litert_lm_builder
 
 # Re-declare ARG after FROM (required for ARG to be available in this stage)
 ARG BUILD_LITERT_LM=false
@@ -87,6 +92,7 @@ RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
             lld-15 \
             llvm \
             g++ \
+            crossbuild-essential-arm64 \
             wget \
             git \
             git-lfs \
@@ -115,6 +121,49 @@ ENV QAIRT_VERSION=${QAIRT_SDK_VERSION}
 ENV LITERT_LM_SRC_DIR=/mnt/work/src/litert-lm
 ENV QAIRT_DIR=/tmp/qairt
 ENV BAZELISK_VERSION=v1.28.1
+
+# Registers LiteRT's legacy `local_config_embedded_arm` cc_toolchain as a
+# Bazel 7 platform-aware toolchain — required for --platforms=...:linux_aarch64
+# toolchain resolution to succeed when cross-compiling (consumed by
+# build-litert-lm-standalone.sh's BUILD_ARCH branch; see
+# QAIServe/Dockerfile's litert_builder stage for the fuller rationale).
+# Generated inline via RUN instead of COPY so no extra file needs to be
+# added to the repo. Only meaningful on the cross-compile path — harmless
+# but unused on a native arm64 build host.
+RUN { \
+      echo '# SPDX-License-Identifier: BSD-3-Clause-Clear'; \
+      echo '# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.'; \
+      echo '#'; \
+      echo '# Registers LiteRT'"'"'s legacy `local_config_embedded_arm` cc_toolchain (its'; \
+      echo '# elinux_aarch64 config, built on Bazel'"'"'s hermetic ARM GNU-A download) as a'; \
+      echo '# Bazel 7 platform-aware toolchain.'; \
+      echo '#'; \
+      echo '# Without this, --platforms=...:linux_aarch64 fails toolchain resolution'; \
+      echo '# ("No matching toolchains found") because local_config_embedded_arm only'; \
+      echo '# registers under the legacy --crosstool_top mechanism. And without'; \
+      echo '# --platforms=...:linux_aarch64, LiteRT'"'"'s own config_setting()s — which use'; \
+      echo '# constraint_values, not the legacy --cpu flag — misresolve to the host'; \
+      echo '# (x86_64) arch and leak x86-only flags like -msse4.2 into the aarch64'; \
+      echo '# compile. Both the legacy --cpu/--crosstool_top flags (to pick the compiler)'; \
+      echo '# and this toolchain() registration + --platforms (to make config_setting()'; \
+      echo '# resolve correctly) are required together; see build-litert.sh.'; \
+      echo 'package(default_visibility = ["//visibility:public"])'; \
+      echo ''; \
+      echo 'toolchain('; \
+      echo '    name = "cc_toolchain_aarch64",'; \
+      echo '    exec_compatible_with = ['; \
+      echo '        "@platforms//cpu:x86_64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    target_compatible_with = ['; \
+      echo '        "@platforms//cpu:aarch64",'; \
+      echo '        "@platforms//os:linux",'; \
+      echo '    ],'; \
+      echo '    toolchain = "@local_config_embedded_arm//:cc-compiler-aarch64",'; \
+      echo '    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",'; \
+      echo ')'; \
+    } > /tmp/litert-cross-compile-toolchains-BUILD
+
 COPY qai-forge/scripts/deps/build-litert-lm-standalone.sh /tmp/
 COPY qai-forge/scripts/deps/build-rust-wrappers.sh /tmp/
 RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
@@ -124,15 +173,20 @@ RUN if [ "$BUILD_LITERT_LM" = "true" ]; then \
         chmod +x /tmp/build-rust-wrappers.sh && \
         /tmp/build-rust-wrappers.sh && \
         rm /tmp/build-rust-wrappers.sh; \
+        rm -f /tmp/litert-cross-compile-toolchains-BUILD; \
     fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: llama.cpp Builder (conditional via shell if)
 #
-# Builds llama.cpp with Hexagon NPU backend when BUILD_LLAMACPP=true.
+# Cross-compiles llama.cpp with Hexagon NPU backend for AArch64 when
+# BUILD_LLAMACPP=true — see QAIServe/Dockerfile's builder stage and
+# build-llamacpp-hexagon.sh for the same BUILD_ARCH-gated cross-compile
+# pattern (no QEMU: qaic and hexagon-clang both run natively on this stage's
+# own x86_64/aarch64 architecture as appropriate, never under emulation).
 # When BUILD_LLAMACPP=false, only creates minimal directory structure (zero build cost).
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS llamacpp_builder
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS llamacpp_builder
 
 # Re-declare ARG after FROM
 ARG BUILD_LLAMACPP=false
@@ -141,8 +195,41 @@ ENV LLAMACPP_DEPLOY_DIR=/mnt/work/deploy/usr
 RUN mkdir -p ${LLAMACPP_DEPLOY_DIR}/bin ${LLAMACPP_DEPLOY_DIR}/lib ${LLAMACPP_DEPLOY_DIR}/lib/rfsa/adsp ${LLAMACPP_DEPLOY_DIR}/include
 
 # Conditional build using modular script
+#
+# dpkg --add-architecture arm64 + :arm64 suffixed -dev packages: this stage
+# cross-compiles to aarch64 (crossbuild-essential-arm64's aarch64-linux-gnu-gcc)
+# rather than building under QEMU, so fastrpc's link step (inside
+# build-llamacpp-hexagon.sh) needs aarch64 versions of libbsd/libmd/libyaml —
+# same pattern as QAIServe/Dockerfile's builder stage. libatomic1:arm64 and
+# zlib1g:arm64 are runtime deps of the Hexagon SDK's hexagon-clang (an
+# aarch64 binary run directly — no QEMU) during the HTP DSP skel
+# compilation; without them hexagon-clang fails to even start ("error while
+# loading shared libraries: libatomic.so.1" / "libz.so.1"), since
+# crossbuild-essential-arm64 only provides libatomic's static .a for
+# linking, not its runtime .so, and doesn't provide zlib at all.
+# qemu-user-static is no longer needed: qaic (an x86_64 binary) now runs
+# natively on this x86_64 build host instead of under emulation on a native
+# arm64 host.
+#
+# Ubuntu (unlike Debian) does not mirror arm64 packages on archive.ubuntu.com
+# — they live on ports.ubuntu.com under a separate suite layout — so
+# dpkg --add-architecture arm64 alone leaves apt-get unable to find any
+# :arm64 package ("Unable to locate package"). Restrict the existing sources
+# to amd64 and add a ports.ubuntu.com arm64 source alongside it.
 RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
         echo "=== Building llama.cpp (BUILD_LLAMACPP=true) ===" && \
+        dpkg --add-architecture arm64 && \
+        UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" && \
+        if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then \
+            sed -i '/^Types:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources; \
+        fi && \
+        if [ -s /etc/apt/sources.list ]; then \
+            sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list; \
+        fi && \
+        { echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME} main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-updates main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-security main restricted universe multiverse"; \
+        } > /etc/apt/sources.list.d/arm64.list && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
             build-essential \
@@ -153,21 +240,23 @@ RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
             wget \
             unzip \
             ca-certificates \
+            crossbuild-essential-arm64 \
             autoconf \
             automake \
             libtool \
             m4 \
-            libbsd-dev \
-            libmd-dev \
-            libyaml-dev \
+            libbsd-dev:arm64 \
+            libmd-dev:arm64 \
+            libyaml-dev:arm64 \
+            libatomic1:arm64 \
+            zlib1g:arm64 \
             binutils \
             python3 \
             python3-pip \
             python-is-python3 \
-            qemu-user-static \
         && apt-get clean \
         && rm -rf /var/lib/apt/lists/* \
-        && pip3 install cmake --upgrade; \
+        && pip3 install 'cmake<4'; \
     else \
         echo "=== Skipping llama.cpp build (BUILD_LLAMACPP=false) ==="; \
     fi
@@ -186,8 +275,13 @@ RUN if [ "$BUILD_LLAMACPP" = "true" ]; then \
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: Builder
+#
+# Cross-compiles fastrpc/Drogon/qai-forge/responses-server to aarch64 from a
+# native BUILDPLATFORM (x86_64) container instead of running them all under
+# QEMU-user emulation — same rationale as QAIServe/Dockerfile's builder
+# stage.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS builder
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS builder
 
 ARG QAIRT_SDK_VERSION
 
@@ -196,9 +290,49 @@ ARG QAIRT_SDK_VERSION
 # 3.23 minimum required by qai-forge/CMakeLists.txt (needed for jinja2cpp's
 # own cmake_minimum_required). Upgrade via pip3 after the apt install,
 # mirroring the same workaround already used in the llamacpp_builder stage
-# above.
+# above. Pinned to <4 — CMake 4.0 removed support entirely for projects
+# whose cmake_minimum_required() is below 3.5 (previously just a warning);
+# qai-forge's FetchContent-pulled jinja2cpp bundles a vendored rapidjson
+# with exactly that, so an unpinned `pip3 install cmake --upgrade` grabs
+# whatever is newest on PyPI and eventually breaks that dependency's
+# configure step outright ("Compatibility with CMake < 3.5 has been
+# removed"). 3.31.x (the latest 3.x line) still satisfies the >=3.23
+# requirement above.
+#
+# dpkg --add-architecture arm64 + :arm64 suffixed -dev packages give us
+# aarch64 headers/libs under the Debian/Ubuntu multiarch path
+# (/usr/lib/aarch64-linux-gnu), which the aarch64-linux-gnu-gcc/g++ cross
+# compiler (from crossbuild-essential-arm64) links against — same pattern as
+# QAIServe/Dockerfile's builder stage.
+#
+# Ubuntu (unlike Debian) does not mirror arm64 packages on archive.ubuntu.com
+# — they live on ports.ubuntu.com under a separate suite layout — so
+# dpkg --add-architecture arm64 alone leaves apt-get unable to find any
+# :arm64 package. Restrict the existing sources to amd64 and add a
+# ports.ubuntu.com arm64 source alongside it.
+#
+# Same BUILD_ARCH gate as the cmake/strip steps below: on a native arm64
+# build host, ubuntu:22.04's default sources.list is already the
+# ports.ubuntu.com arm64 mirror, so this rewrite is unneeded — and actively
+# wrong, since it would mistag those already-arm64 sources as arch=amd64 and
+# apt-get would then 404 on nonexistent binary-amd64 index files.
 # Install build dependencies
-RUN apt-get update && \
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" != "arm64" ]; then \
+        dpkg --add-architecture arm64 && \
+        UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" && \
+        if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then \
+            sed -i '/^Types:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources; \
+        fi && \
+        if [ -s /etc/apt/sources.list ]; then \
+            sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list; \
+        fi && \
+        { echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME} main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-updates main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-security main restricted universe multiverse"; \
+        } > /etc/apt/sources.list.d/arm64.list; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
@@ -208,25 +342,27 @@ RUN apt-get update && \
         wget \
         unzip \
         ca-certificates \
-        libssl-dev \
-        libjsoncpp-dev \
-        uuid-dev \
-        zlib1g-dev \
-        nlohmann-json3-dev \
+        crossbuild-essential-arm64 \
+        libssl-dev:arm64 \
+        libjsoncpp-dev:arm64 \
+        uuid-dev:arm64 \
+        zlib1g-dev:arm64 \
+        nlohmann-json3-dev:arm64 \
         autoconf \
         automake \
         libtool \
         m4 \
-        libbsd-dev \
-        libmd-dev \
-        libyaml-dev \
+        libbsd-dev:arm64 \
+        libmd-dev:arm64 \
+        libyaml-dev:arm64 \
         binutils \
+        binutils-aarch64-linux-gnu \
         python3 \
         python3-pip \
         python-is-python3 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install cmake --upgrade
+    && pip3 install 'cmake<4'
 
 ENV DEPLOY_DIR=/build/deploy
 
@@ -332,7 +468,21 @@ COPY qai-forge /build/qai-forge
 
 ARG BUILD_LLAMACPP
 ARG BUILD_GENIE
-RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
+
+# CMAKE_C_COMPILER/CMAKE_CXX_COMPILER pin this build to the aarch64 cross
+# compiler (crossbuild-essential-arm64, installed above) — same
+# BUILD_ARCH-gated pattern as QAIServe/Dockerfile's qai-forge cmake call: a
+# native arm64 build host (where this stage's own BUILD_ARCH is arm64) has
+# no aarch64-linux-gnu-gcc/g++ (only plain gcc/g++), so it falls back to the
+# system default compiler there.
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" = "arm64" ]; then \
+        CROSS_CMAKE_ARGS=""; \
+    else \
+        CROSS_CMAKE_ARGS="-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"; \
+    fi && \
+    cmake -S /build/qai-forge -B /build/qai-forge/build \
+        ${CROSS_CMAKE_ARGS} \
         -DCMAKE_BUILD_TYPE=Release \
         -DGENIE_INCLUDE_PATH=/usr/include \
         -DGENIE_LIB_PATH=/usr/lib \
@@ -351,7 +501,16 @@ RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
 # Build responses server
 COPY responses /build/responses
 
-RUN cmake -S /build/responses -B /build/responses/build \
+# Same BUILD_ARCH-gated cross-compiler pinning as the qai-forge cmake call
+# above.
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" = "arm64" ]; then \
+        CROSS_CMAKE_ARGS=""; \
+    else \
+        CROSS_CMAKE_ARGS="-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"; \
+    fi && \
+    cmake -S /build/responses -B /build/responses/build \
+        ${CROSS_CMAKE_ARGS} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=${DEPLOY_DIR}/usr \
         -DCMAKE_PREFIX_PATH=${DEPLOY_DIR}/usr && \
@@ -359,10 +518,17 @@ RUN cmake -S /build/responses -B /build/responses/build \
     cmake --install /build/responses/build
 
 # Verify LiteRT-LM dependencies
+#
+# Uses readelf -d (static ELF inspection), not ldd — ldd works by executing
+# the target file with LD_TRACE_LOADED_OBJECTS=1, which fails outright for a
+# cross-compiled aarch64 .so on this x86_64 build host ("Exec format error")
+# since this Dockerfile cross-compiles without QEMU. readelf reads the
+# NEEDED entries from the ELF dynamic section directly, no execution
+# required, and works identically whether this stage is cross-compiling or
+# building natively on arm64.
 RUN echo "Verifying LiteRT-LM library dependencies:" \
-    && export LD_LIBRARY_PATH=${DEPLOY_DIR}/usr/lib:/usr/lib:$LD_LIBRARY_PATH \
     && if [ -f "${DEPLOY_DIR}/usr/lib/liblitert_lm_c_api.so" ]; then \
-           ldd ${DEPLOY_DIR}/usr/lib/liblitert_lm_c_api.so || { \
+           readelf -d ${DEPLOY_DIR}/usr/lib/liblitert_lm_c_api.so || { \
                echo "ERROR: liblitert_lm_c_api.so has unresolved dependencies"; \
                exit 1; \
            }; \
@@ -370,30 +536,67 @@ RUN echo "Verifying LiteRT-LM library dependencies:" \
     && echo "✓ LiteRT-LM dependencies verified"
 
 # Strip binaries
-RUN find ${DEPLOY_DIR}/usr/bin -type f \
-        -exec strip --strip-unneeded {} \; 2>/dev/null || true && \
+#
+# Uses the aarch64 cross-strip when cross-compiling — this stage's native
+# `strip` is an amd64 binary and can't operate on the aarch64 ELF files
+# produced by cross-compilation (same pattern as QAIServe/Dockerfile).
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" = "arm64" ]; then \
+        STRIP_BIN=strip; \
+    else \
+        STRIP_BIN=aarch64-linux-gnu-strip; \
+    fi && \
+    find ${DEPLOY_DIR}/usr/bin -type f \
+        -exec "${STRIP_BIN}" --strip-unneeded {} \; 2>/dev/null || true && \
     find ${DEPLOY_DIR}/usr/lib -maxdepth 1 -type f -name "*.so*" \
-        -exec strip --strip-unneeded {} \; 2>/dev/null || true
+        -exec "${STRIP_BIN}" --strip-unneeded {} \; 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 3: Stager
+#
+# --platform=$BUILDPLATFORM + :arm64 multiarch packages: apt's own dependency
+# resolution is the only thing that executes here — we only cherry-pick .so
+# files by copying them, never load/exec them — so running this natively on
+# the build host avoids QEMU overhead for what is otherwise a pure
+# download+extract step. Same pattern as QAIServe/Dockerfile's stager stage.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/arm64 ubuntu:22.04 AS stager
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS stager
 
 ENV DEPLOY_DIR=/build/deploy
+
+# Same BUILD_ARCH gate as the builder stage: on a native arm64 build host,
+# ubuntu:22.04's default sources.list is already the ports.ubuntu.com arm64
+# mirror, so this rewrite is unneeded — and actively wrong, since it would
+# mistag those already-arm64 sources as arch=amd64 and apt-get would then
+# 404 on nonexistent binary-amd64 index files.
+RUN BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)" && \
+    if [ "${BUILD_ARCH}" != "arm64" ]; then \
+        dpkg --add-architecture arm64 && \
+        UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" && \
+        if [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then \
+            sed -i '/^Types:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources; \
+        fi && \
+        if [ -s /etc/apt/sources.list ]; then \
+            sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list; \
+        fi && \
+        { echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME} main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-updates main restricted universe multiverse"; \
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${UBUNTU_CODENAME}-security main restricted universe multiverse"; \
+        } > /etc/apt/sources.list.d/arm64.list; \
+    fi
 
 # Install runtime deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libyaml-0-2 \
-        libbsd0 \
-        libmd0 \
-        libjsoncpp25 \
-        libssl3 \
-        zlib1g \
-        libuuid1 \
-        libatomic1 \
-        libgomp1 \
+        libyaml-0-2:arm64 \
+        libbsd0:arm64 \
+        libmd0:arm64 \
+        libjsoncpp25:arm64 \
+        libssl3:arm64 \
+        zlib1g:arm64 \
+        libuuid1:arm64 \
+        libatomic1:arm64 \
+        libgomp1:arm64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

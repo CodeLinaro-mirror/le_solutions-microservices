@@ -334,6 +334,7 @@ if(QAI_FORGE_BUILD_GENIE)
 
         # GenIE config materialization (Layer 2 — device-placement config tree)
         src/execution/GenieConfigMaterializer.cpp
+        src/execution/RuntimeArtifacts.cpp
 
         # GenIE VLM worker management (Layer 3) — genie-specific subclass of
         # the always-on InferenceWorkerManager base class above.
