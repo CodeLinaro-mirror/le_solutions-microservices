@@ -47,6 +47,7 @@ public:
 
     void generate(
         const std::string& event_id,
+        const std::string& session_id,
         const std::string& prompt,
         bool               streaming,
         int                max_tokens,

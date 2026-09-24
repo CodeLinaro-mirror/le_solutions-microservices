@@ -190,7 +190,6 @@ bool EvictionPolicy::isActiveReservedState(ModelRuntimeState state) {
     return state == ModelRuntimeState::Loading ||
            state == ModelRuntimeState::Idle ||
            state == ModelRuntimeState::Running ||
-           state == ModelRuntimeState::PostTurn ||
            state == ModelRuntimeState::Draining ||
            state == ModelRuntimeState::Evicting;
 }

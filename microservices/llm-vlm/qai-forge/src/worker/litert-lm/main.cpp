@@ -49,7 +49,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-#include <sys/mman.h>
 
 // LiteRT-LM C API — conditionally included when SDK is available
 #ifdef LITERT_LM_AVAILABLE
@@ -77,24 +76,6 @@ static std::string getStringOrDefault(const json& obj,
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int g_sock_fd = -1;
-
-// Prompt shared-memory region inherited from the parent (see
-// InferenceWorkerManager::startWorker() / writePromptToShm()). EXECUTE's
-// "prompt_ref" {"offset","len"} points into this instead of an inline
-// "prompt" string.
-static uint8_t* g_prompt_shm_ptr   = nullptr;
-static size_t   g_prompt_shm_bytes = 0;
-
-// Resolve an EXECUTE command's "prompt_ref" {"offset","len"} into the actual
-// prompt text from the shared-memory region.
-static std::string resolvePrompt(const json& cmd) {
-    const auto& ref = cmd.at("prompt_ref");
-    size_t offset = ref.value("offset", (size_t)0);
-    size_t len    = ref.value("len", (size_t)0);
-    if (offset + len > g_prompt_shm_bytes)
-        throw std::runtime_error("prompt_ref out of bounds");
-    return std::string(reinterpret_cast<const char*>(g_prompt_shm_ptr + offset), len);
-}
 
 static void sendMessage(const json& msg) {
     std::string line = msg.dump() + "\n";
@@ -531,14 +512,7 @@ static void handleExecute(LiteRTLMSession& sess, const json& cmd) {
     std::string session_id   = cmd.value("session_id", "");
     bool        kv_invalidated = cmd.value("kv_invalidated", false);
 
-    std::string prompt;
-    try {
-        prompt = resolvePrompt(cmd);
-    } catch (const std::exception& e) {
-        sendError(event_id, e.what());
-        sendReady();
-        return;
-    }
+    std::string prompt = getStringOrDefault(cmd, "prompt");
 
     int max_tokens       = cmd.value("max_tokens", 512);
     float temperature    = cmd.value("temperature", 0.7f);
@@ -801,22 +775,6 @@ int main() {
         LOG_ERROR("[LiteRTLMWorker] Invalid socket FD: " << sock_fd_env);
         return 1;
     }
-
-    // Attach the prompt shared-memory region inherited from the parent.
-    const char* shm_fd_env    = std::getenv("PROMPT_SHM_FD");
-    const char* shm_bytes_env = std::getenv("PROMPT_SHM_BYTES");
-    if (!shm_fd_env || !shm_bytes_env) {
-        LOG_ERROR("[LiteRTLMWorker] PROMPT_SHM_FD/PROMPT_SHM_BYTES not set");
-        return 1;
-    }
-    int prompt_shm_fd = std::atoi(shm_fd_env);
-    g_prompt_shm_bytes = std::strtoull(shm_bytes_env, nullptr, 10);
-    void* mapped = mmap(nullptr, g_prompt_shm_bytes, PROT_READ, MAP_SHARED, prompt_shm_fd, 0);
-    if (mapped == MAP_FAILED) {
-        LOG_ERROR("[LiteRTLMWorker] mmap of prompt shm region failed");
-        return 1;
-    }
-    g_prompt_shm_ptr = static_cast<uint8_t*>(mapped);
 
     LOG_INFO("[LiteRTLMWorker] Started, socket FD=" << g_sock_fd);
 

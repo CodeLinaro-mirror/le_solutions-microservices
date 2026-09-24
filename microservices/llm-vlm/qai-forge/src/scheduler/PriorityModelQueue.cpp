@@ -60,6 +60,29 @@ GenerativeJobPtr PriorityModelQueue::pop() {
     return job;
 }
 
+GenerativeJobPtr PriorityModelQueue::popIf(
+    const std::function<bool(const GenerativeJobPtr&)>& predicate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto pop_matching = [&predicate](Lane& lane) -> GenerativeJobPtr {
+        for (auto it = lane.begin(); it != lane.end();) {
+            if (!*it || (*it)->isCancelled()) {
+                it = lane.erase(it);
+                continue;
+            }
+            if (predicate(*it)) {
+                auto job = std::move(*it);
+                lane.erase(it);
+                return job;
+            }
+            ++it;
+        }
+        return nullptr;
+    };
+    if (auto job = pop_matching(control_)) return job;
+    if (auto job = pop_matching(tool_continuation_)) return job;
+    return pop_matching(any_request_);
+}
+
 GenerativeJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 

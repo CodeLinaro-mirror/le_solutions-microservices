@@ -66,6 +66,14 @@ struct ModelConfig {
     // Tensor specs for Predictive AI models (from metadata.json)
     std::vector<ModelTensorSpec> input_specs;
     std::vector<ModelTensorSpec> output_specs;
+
+    // GenIE continuous-batching capacity
+    int max_slots = 1;
+
+    // True when the GenIE engine configuration explicitly enables shared-engine
+    // operation. Continuous batching requires this so multiple dialogs can
+    // share one underlying qualla/QNN engine.
+    bool shared_engine = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +118,12 @@ public:
     std::string getConfigFilePath(const std::string& model_id) const;
     std::optional<json> getVisionPreprocessing(const std::string& model_id) const;
     json getChatTemplate(const std::string& model_id) const;
+
+    // Returns the GenIE continuous-batching slot capacity for a model
+    int getMaxSlots(const std::string& model_id) const;
+
+    // Returns whether the processed GenIE config enables shared-engine mode.
+    bool hasSharedEngine(const std::string& model_id) const;
 
     // Returns the runtime identifier for a model ("genie", "litert_lm", "onnxrt").
     // Returns "genie" if the model is not found (safe default — existing behaviour).

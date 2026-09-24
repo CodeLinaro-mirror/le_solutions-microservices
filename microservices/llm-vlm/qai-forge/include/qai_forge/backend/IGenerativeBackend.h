@@ -110,6 +110,7 @@ public:
      */
     virtual void generate(
         const std::string& event_id,
+        const std::string& session_id,
         const std::string& prompt,
         bool               streaming,
         int                max_tokens,
@@ -179,6 +180,7 @@ public:
      */
     virtual void generateVlm(
         const std::string&              event_id,
+        const std::string&              session_id,
         const std::string&              prompt,
         const std::vector<std::vector<uint8_t>>& images,
         bool                            streaming,
@@ -192,7 +194,7 @@ public:
         std::function<void(const IPCDoneEvent&)>   on_done,
         std::function<void(const IPCErrorEvent&)>  on_error) {
         // Default: no-op. Backends without VLM support do not override this.
-        (void)event_id; (void)prompt; (void)images; (void)streaming;
+        (void)event_id; (void)session_id; (void)prompt; (void)images; (void)streaming;
         (void)max_tokens; (void)temperature; (void)top_p; (void)top_k;
         (void)presence_penalty; (void)frequency_penalty;
         (void)on_token; (void)on_done; (void)on_error;
@@ -218,14 +220,25 @@ public:
      * The next generate() call waits for the reset to complete before sending
      * the EXECUTE command, ensuring clean KV state with minimal added latency.
      *
-     * GenIEBackend:    calls InferenceWorkerManager::initiateBackgroundReset()
-     *                  on the active worker.
+     * GenIEBackend:    starts a worker-side RESET asynchronously for the
+     *                  completed LLM/VLM session. The scheduler keeps the
+     *                  session and capacity reserved until it completes.
      * LiteRTLMBackend: calls LlmInference::ResetContext() asynchronously (future).
      * OnnxRTBackend:   no-op — OnnxRT recomputes full context each turn anyway.
      *
      * Default implementation is a no-op.
      */
-    virtual void resetKvAsync() {}
+    virtual void resetKvAsync(const std::string& session_id = "") { (void)session_id; }
+
+    /**
+     * Wait until the session's post-inference KV reset is complete.
+     * The response may already have been delivered to the client; this
+     * barrier controls when scheduler capacity and the session reservation
+     * can be released.
+     */
+    virtual void waitForSessionReady(const std::string& session_id = "") {
+        (void)session_id;
+    }
 
     /**
      * KV cache checkpoint operations.
@@ -234,9 +247,9 @@ public:
      * <think> blocks for precise budget enforcement.
      * Default implementations are no-ops.
      */
-    virtual void saveKv(const std::string& name)    { (void)name; }
-    virtual void restoreKv(const std::string& name) { (void)name; }
-    virtual void resetKv()                          {}
+    virtual void saveKv(const std::string& name, const std::string& session_id = "")    { (void)name; (void)session_id; }
+    virtual void restoreKv(const std::string& name, const std::string& session_id = "") { (void)name; (void)session_id; }
+    virtual void resetKv(const std::string& session_id = "")                            { (void)session_id; }
 
     /**
      * Release per-session KV state in the worker.
@@ -290,6 +303,22 @@ public:
      * abort APIs. Backends without a killable worker may return false.
      */
     virtual bool forceKillActiveWorker() { return false; }
+
+    /**
+     * Cancel a single session's in-flight generation without affecting other
+     * concurrent sessions on the same worker.
+     *
+     * Primary cancellation path for backends where multiple sessions can run
+     * concurrently against a shared worker (continuous batching). Callers
+     * should fall back to forceKillActiveWorker() if this returns false.
+     * Default implementation is a no-op — single-session backends have
+     * nothing else running to protect, so forceKillActiveWorker() alone is
+     * sufficient for them.
+     */
+    virtual bool sendAbort(const std::string& session_id) {
+        (void)session_id;
+        return false;
+    }
 
     /**
      * Returns true if the worker subprocess is alive and responsive.

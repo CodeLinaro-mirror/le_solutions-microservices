@@ -348,3 +348,9 @@ void LlmEngine::restore_kv(const std::string& name) {
     if (status != GENIE_STATUS_SUCCESS)
         throw std::runtime_error("[LlmEngine] Failed to restore KV cache: " + name);
 }
+
+void LlmEngine::abort() {
+    int32_t status = GenieDialog_signal(m_impl->dialog_handle, GENIE_DIALOG_ACTION_ABORT);
+    if (status != GENIE_STATUS_SUCCESS)
+        throw std::runtime_error("[LlmEngine] Failed to signal abort");
+}

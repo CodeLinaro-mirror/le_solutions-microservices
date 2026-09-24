@@ -39,14 +39,9 @@ inline std::string ipcGetStringOrDefault(const json& obj,
 //   Server → Worker: INIT, EXECUTE, RESET, SAVE_KV, RESTORE_KV, SHUTDOWN
 //   Worker → Server: READY, TOKEN, DONE, ERROR
 //
-// EXECUTE's prompt text does not travel inline in this JSON. The server
-// memcpy's it into a memfd-backed shared-memory region (inherited by the
-// worker across fork()/exec() via the PROMPT_SHM_FD/PROMPT_SHM_BYTES env
-// vars — see InferenceWorkerManager::startWorker()) and EXECUTE carries only
-// a "prompt_ref": {"offset":..,"len":..} pointing into it. This avoids the
-// JSON-escape/unescape scan a large inline prompt string would otherwise
-// cost on every request. Streamed TOKEN output is unaffected — token chunks
-// are small and stay inline.
+// EXECUTE carries the generative prompt inline as a JSON string. Generative
+// prompts are normally small enough that an additional shared-memory region
+// is unnecessary. VLM image tensors retain their separate shared-memory path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Command types (Server → Worker) ──────────────────────────────────────────
@@ -54,8 +49,10 @@ namespace CommandType {
     constexpr const char* INIT          = "INIT";
     constexpr const char* EXECUTE       = "EXECUTE";
     constexpr const char* RESET         = "RESET";
+    constexpr const char* REINITIALIZE  = "REINITIALIZE";
     constexpr const char* SAVE_KV       = "SAVE_KV";
     constexpr const char* RESTORE_KV    = "RESTORE_KV";
+    constexpr const char* ABORT         = "ABORT";
     constexpr const char* SHUTDOWN      = "SHUTDOWN";
     constexpr const char* CLEAR_SESSION = "CLEAR_SESSION";
 }
@@ -81,16 +78,19 @@ struct IPCReadyEvent {
 
 struct IPCTokenEvent {
     std::string event_id;
+    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
     std::string content;
 };
 
 struct IPCDoneEvent {
     std::string event_id;
+    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
     std::string finish_reason;  // "stop", "length", "error"
 };
 
 struct IPCErrorEvent {
     std::string event_id;
+    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
     std::string command_id;
     std::string message;
 };
@@ -115,22 +115,24 @@ public:
     static json createInitCommand(const std::string& model_id,
                                    const std::string& config_file,
                                    const std::string& sampler_config,
+                                   int max_slots,
                                    bool streaming = true) {
         return {
             {"type", CommandType::INIT},
             {"model", model_id},
             {"config_file", config_file},
             {"sampler_config", sampler_config},
-            {"streaming", streaming}
+            {"streaming", streaming},
+            {"max_slots", max_slots}
         };
     }
 
-    // prompt_ref: {"offset":.., "len":..} into the prompt shared-memory
-    // region (see InferenceWorkerManager::writePromptToShm) — the prompt
-    // text itself never travels inline in this JSON message.
-    static json createExecuteCommand(const std::string& event_id,
-                                      const json& prompt_ref,
-                                      bool streaming,
+    // session_id: continuous-batching slot key. Empty ("") means single-slot
+    // mode — the worker's legacy singular engine. Non-empty routes to (or
+    // lazily creates) that session's own LlmEngine/dialog slot.
+    static json createLlmExecuteCommand(const std::string& event_id,
+                                         const std::string& prompt,
+                                         bool streaming,
                                       int max_tokens = 1024,
                                       float temperature = 1.0f,
                                       float top_p = 1.0f,
@@ -143,7 +145,8 @@ public:
         json cmd = {
             {"type", CommandType::EXECUTE},
             {"event_id", event_id},
-            {"prompt_ref", prompt_ref},
+            {"session_id", session_id},
+            {"prompt", prompt},
             {"streaming", streaming},
             {"max_tokens", max_tokens},
             {"temperature", temperature},
@@ -162,6 +165,23 @@ public:
         return cmd;
     }
 
+    static json createExecuteCommand(const std::string& event_id,
+                                      const json& prompt_ref,
+                                      bool streaming,
+                                      int max_tokens = 1024,
+                                      float temperature = 1.0f,
+                                      float top_p = 1.0f,
+                                      int top_k = 40,
+                                      float presence_penalty = 0.0f,
+                                      float frequency_penalty = 0.0f,
+                                      bool bypass_think_filter = false,
+                                      const std::string& session_id = "") {
+        auto cmd = createLlmExecuteCommand(event_id, prompt_ref.dump(), streaming, max_tokens, temperature, top_p, top_k, presence_penalty, frequency_penalty, bypass_think_filter, session_id);
+        cmd.erase("prompt");
+        cmd["prompt_ref"] = prompt_ref;
+        return cmd;
+    }
+
     static json createStructuredExecuteCommand(
         const std::string& event_id,
         const json& messages,
@@ -172,10 +192,12 @@ public:
         float top_p = 1.0f,
         int top_k = 40,
         float presence_penalty = 0.0f,
-        float frequency_penalty = 0.0f) {
+        float frequency_penalty = 0.0f,
+        const std::string& session_id = "") {
         return {
             {"type", CommandType::EXECUTE},
             {"event_id", event_id},
+            {"session_id", session_id},
             {"messages", messages},
             {"tools", tools},
             {"streaming", streaming},
@@ -188,28 +210,51 @@ public:
         };
     }
 
-    static json createResetCommand(const std::string& command_id = "") {
-        json cmd = {{"type", CommandType::RESET}};
+    static json createResetCommand(const std::string& command_id = "",
+                                    const std::string& session_id = "") {
+        json cmd = {{"type", CommandType::RESET}, {"session_id", session_id}};
         if (!command_id.empty()) cmd["command_id"] = command_id;
         return cmd;
     }
 
+    static json createReinitializeCommand(const std::string& command_id,
+                                           const std::string& session_id) {
+        return {{"type", CommandType::REINITIALIZE},
+                {"command_id", command_id},
+                {"session_id", session_id}};
+    }
+
     static json createSaveKvCommand(const std::string& checkpoint_name,
-                                     const std::string& command_id = "") {
+                                     const std::string& command_id = "",
+                                     const std::string& session_id = "") {
         json cmd = {
             {"type", CommandType::SAVE_KV},
-            {"checkpoint_name", checkpoint_name}
+            {"checkpoint_name", checkpoint_name},
+            {"session_id", session_id}
         };
         if (!command_id.empty()) cmd["command_id"] = command_id;
         return cmd;
     }
 
     static json createRestoreKvCommand(const std::string& checkpoint_name,
-                                        const std::string& command_id = "") {
+                                        const std::string& command_id = "",
+                                        const std::string& session_id = "") {
         json cmd = {
             {"type", CommandType::RESTORE_KV},
-            {"checkpoint_name", checkpoint_name}
+            {"checkpoint_name", checkpoint_name},
+            {"session_id", session_id}
         };
+        if (!command_id.empty()) cmd["command_id"] = command_id;
+        return cmd;
+    }
+
+    // Session-scoped cancellation. The worker signals GENIE_DIALOG_ACTION_ABORT
+    // on that session's dialog handle only — other concurrent sessions'
+    // generations are unaffected. Used in place of killing the whole worker
+    // process when a single request is cancelled under continuous batching.
+    static json createAbortCommand(const std::string& session_id,
+                                    const std::string& command_id = "") {
+        json cmd = {{"type", CommandType::ABORT}, {"session_id", session_id}};
         if (!command_id.empty()) cmd["command_id"] = command_id;
         return cmd;
     }
@@ -240,6 +285,7 @@ public:
     static IPCTokenEvent parseToken(const json& msg) {
         return {
             ipcGetStringOrDefault(msg, "event_id", ""),
+            ipcGetStringOrDefault(msg, "session_id", ""),
             ipcGetStringOrDefault(msg, "content", "")
         };
     }
@@ -247,6 +293,7 @@ public:
     static IPCDoneEvent parseDone(const json& msg) {
         return {
             msg.value("event_id", ""),
+            msg.value("session_id", ""),
             msg.value("finish_reason", "stop")
         };
     }
@@ -254,6 +301,7 @@ public:
     static IPCErrorEvent parseError(const json& msg) {
         return {
             msg.value("event_id", ""),
+            msg.value("session_id", ""),
             msg.value("command_id", ""),
             msg.value("message", "Unknown error")
         };

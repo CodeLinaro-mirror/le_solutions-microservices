@@ -536,6 +536,14 @@ void InferController::generate(
     std::function<void(const HttpResponsePtr&)>&& callback,
     const std::string& model_name)
 {
+    const auto http_enter_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto http_thread_id = std::hash<std::thread::id>{}(
+        std::this_thread::get_id());
+    LOG_INFO << "[ConcurrencyTrace] HTTP_ENTER model=" << model_name
+             << " thread=" << http_thread_id
+             << " time_ns=" << http_enter_ns;
+
     auto& cfg = ModelConfigManager::getInstance();
     if (!cfg.validateModel(model_name)) {
         callback(makeError(404, "Model '" + model_name + "' not found."));
@@ -588,28 +596,50 @@ void InferController::generate(
     // Build inference request
     CreateChatCompletionRequest chat_req = buildChatRequest(oip_req, model_name);
 
-    try {
-        qai_forge::GenerateOptions opts =
-            makeOipGenerateOptions(oip_req, chat_req);
+    qai_forge::GenerateOptions opts =
+        makeOipGenerateOptions(oip_req, chat_req);
 
-        StandardResponse resp =
-            qai_forge::QaiForge::getInstance().generate(chat_req, opts);
+    // Route to QaiForge::generate (generative AI) on a background thread.
+    // generate() runs synchronously and blocks for the full duration of
+    // inference — running it directly on this Drogon IO thread would pin
+    // that thread for the whole call, capping real request concurrency at
+    // the number of Drogon IO threads instead of the model's own batch
+    // capacity (see /infer above for the same reasoning).
+    auto* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    std::thread([chat_req = std::move(chat_req), opts = std::move(opts),
+                 model_name, loop, callback]() mutable {
+        const auto before_qai_forge_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto before_qai_forge_thread_id = std::hash<std::thread::id>{}(
+            std::this_thread::get_id());
+        LOG_INFO << "[ConcurrencyTrace] BEFORE_QAIFORGE_GENERATE model=" << model_name
+                 << " session=" << opts.session_id
+                 << " thread=" << before_qai_forge_thread_id
+                 << " time_ns=" << before_qai_forge_ns;
 
-        OipGenerateResponse oip_resp;
-        oip_resp.model_name        = model_name;
-        oip_resp.text_output       = resp.content.value_or("");
-        oip_resp.reasoning_output  = resp.reasoning_content.value_or("");
-        oip_resp.finish_reason     = resp.finish_reason;
-        oip_resp.prompt_tokens     = resp.prompt_tokens;
-        oip_resp.completion_tokens = resp.completion_tokens;
+        HttpResponsePtr response;
+        try {
+            StandardResponse resp =
+                qai_forge::QaiForge::getInstance().generate(chat_req, opts);
 
-        callback(makeJson(oip_resp.toJson()));
+            OipGenerateResponse oip_resp;
+            oip_resp.model_name        = model_name;
+            oip_resp.text_output       = resp.content.value_or("");
+            oip_resp.reasoning_output  = resp.reasoning_content.value_or("");
+            oip_resp.finish_reason     = resp.finish_reason;
+            oip_resp.prompt_tokens     = resp.prompt_tokens;
+            oip_resp.completion_tokens = resp.completion_tokens;
 
-    } catch (const GenAIException& e) {
-        callback(makeError(e.http_status, e.message));
-    } catch (const std::exception& e) {
-        callback(makeError(500, std::string("Internal error: ") + e.what()));
-    }
+            response = makeJson(oip_resp.toJson());
+
+        } catch (const GenAIException& e) {
+            response = makeError(e.http_status, e.message);
+        } catch (const std::exception& e) {
+            response = makeError(500, std::string("Internal error: ") + e.what());
+        }
+
+        loop->queueInLoop([callback, response]() { callback(response); });
+    }).detach();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

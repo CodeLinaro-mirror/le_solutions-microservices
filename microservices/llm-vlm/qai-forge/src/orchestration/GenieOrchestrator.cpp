@@ -445,7 +445,7 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
             prompt << assistant_prefix << content;
             if (msg.contains("tool_calls")) {
                 prompt << renderToolCallsForPrompt(msg["tool_calls"]);
-            }
+	    }
             prompt << assistant_suffix;
         } else if (role == "tool") {
             prompt << user_prefix
@@ -656,6 +656,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
                  << " images=" << prepared.vision.buffers.size());
         backend.generateVlm(
             event_id,
+            job.session_id,
             prepared.final_prompt,
             prepared.vision.buffers,
             false,
@@ -678,6 +679,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     } else {
         backend.generate(
             event_id,
+            job.session_id,
             prepared.final_prompt,
             false,
             generation.max_tokens,
@@ -700,7 +702,7 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     }
 
     // ── Eager background KV reset ─────────────────────────────────────────────
-    backend.resetKvAsync();
+    backend.resetKvAsync(job.session_id);
 
     if (had_error) {
         LOG_ERROR("[GenieOrchestrator] Blocking inference failed: model="
@@ -819,6 +821,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
                  << " images=" << prepared.vision.buffers.size());
         backend.generateVlm(
             event_id,
+            job.session_id,
             prepared.final_prompt,
             prepared.vision.buffers,
             true,
@@ -847,6 +850,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     } else {
         backend.generate(
             event_id,
+            job.session_id,
             prepared.final_prompt,
             true,
             generation.max_tokens,
@@ -888,7 +892,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     }
 
     // ── Eager background KV reset ─────────────────────────────────────────────
-    backend.resetKvAsync();
+    backend.resetKvAsync(job.session_id);
 
     if (had_error) {
         LOG_ERROR("[GenieOrchestrator] Streaming inference failed: model="
@@ -1129,6 +1133,7 @@ GenieOrchestrator::generateSummary(
 
     backend.generate(
         generateEventId() + "-summary",
+        session.session_id,
         prompt,
         false,
         max_summary_tokens,
@@ -1209,6 +1214,7 @@ void GenieOrchestrator::extractFacts(
 
     backend.generate(
         generateEventId() + "-facts",
+        session.session_id,
         prompt,
         false,
         150,    // max 150 tokens for facts JSON
@@ -1277,8 +1283,7 @@ void GenieOrchestrator::extractFacts(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// postTurnProcessing
+
 // ─────────────────────────────────────────────────────────────────────────────
 void GenieOrchestrator::postTurnProcessing(
     ConversationSession& session,
@@ -1391,12 +1396,12 @@ void GenieOrchestrator::postTurnProcessing(
     } catch (const std::exception& e) {
         LOG_WARN("[GenieOrchestrator] postTurnProcessing: summarization failed: "
                  << e.what());
-        backend.resetKvAsync();
+        backend.resetKvAsync(session.session_id);
         throw;
     }
 
     // Reset KV cache after summarization inference.
-    backend.resetKvAsync();
+    backend.resetKvAsync(session.session_id);
 
     // ── Step 2: Extract facts from eviction batch ─────────────────────────────
     // extractFacts() calls backend.generate() which calls waitForPendingReset()
@@ -1406,12 +1411,12 @@ void GenieOrchestrator::postTurnProcessing(
     } catch (const std::exception& e) {
         LOG_WARN("[GenieOrchestrator] postTurnProcessing: fact extraction failed: "
                  << e.what());
-        backend.resetKvAsync();
+        backend.resetKvAsync(session.session_id);
         throw;
     }
 
     // Reset KV cache after fact extraction inference.
-    backend.resetKvAsync();
+    backend.resetKvAsync(session.session_id);
 
     // ── Step 3: Advance eviction pointer ─────────────────────────────────────
     // Messages [evicted_message_count, evicted_message_count + evict_count)

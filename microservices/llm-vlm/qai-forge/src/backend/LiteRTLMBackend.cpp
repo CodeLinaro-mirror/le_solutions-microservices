@@ -131,6 +131,7 @@ void LiteRTLMBackend::ensureWorkerRunning(const std::string& model_id,
 
 void LiteRTLMBackend::generate(
     const std::string& event_id,
+    const std::string& session_id,
     const std::string& prompt,
     bool               streaming,
     int                max_tokens,
@@ -145,7 +146,7 @@ void LiteRTLMBackend::generate(
     std::function<void(const IPCErrorEvent&)>  on_error)
 {
     worker().executeRequest(
-        event_id, prompt, streaming,
+        event_id, session_id, prompt, streaming,
         max_tokens, temperature, top_p, top_k,
         presence_penalty, frequency_penalty,
         false,
@@ -170,12 +171,12 @@ void LiteRTLMBackend::generateWithSession(
     bool               kv_invalidated)
 {
     worker().executeRequest(
-        event_id, prompt, streaming,
+        event_id, session_id, prompt, streaming,
         max_tokens, temperature, top_p, top_k,
         presence_penalty, frequency_penalty,
         false,
         on_token, on_done, on_error,
-        session_id, kv_invalidated);
+        kv_invalidated);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +185,7 @@ void LiteRTLMBackend::generateWithSession(
 
 void LiteRTLMBackend::generateVlm(
     const std::string&              event_id,
+    const std::string&              /*session_id*/,
     const std::string&              /*prompt*/,
     const std::vector<std::vector<uint8_t>>& /*images*/,
     bool                            /*streaming*/,
@@ -197,7 +199,7 @@ void LiteRTLMBackend::generateVlm(
     std::function<void(const IPCDoneEvent&)>   /*on_done*/,
     std::function<void(const IPCErrorEvent&)>  on_error)
 {
-    on_error({event_id, "", "LiteRTLMBackend does not support VLM inference"});
+    on_error({event_id, "", "", "LiteRTLMBackend does not support VLM inference"});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,12 +221,12 @@ void LiteRTLMBackend::onContextCompacted() {
 // resetKvAsync() — Eager background KV cache reset
 // ─────────────────────────────────────────────────────────────────────────────
 
-void LiteRTLMBackend::resetKvAsync() {
+void LiteRTLMBackend::resetKvAsync(const std::string& session_id) {
     LOG_INFO("[LiteRTLMBackend] Initiating background KV reset for model: "
              << current_model_id_);
     try {
         if (worker_) {
-            worker_->initiateBackgroundReset();
+            worker_->initiateBackgroundReset(session_id);
         }
     } catch (const std::exception& e) {
         LOG_WARN("[LiteRTLMBackend] Failed to initiate background KV reset: " << e.what()
@@ -236,7 +238,7 @@ void LiteRTLMBackend::resetKvAsync() {
 // KV cache operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-void LiteRTLMBackend::saveKv(const std::string& name) {
+void LiteRTLMBackend::saveKv(const std::string& name, const std::string& /*session_id*/) {
     // saveKv/restoreKv are not implemented for LiteRT-LM.
     // The LiteRT-LM C API (engine.h) does not expose SessionAdvanced::SaveCheckpoint /
     // RewindToCheckpoint. Cross-request KV cache is instead provided by keeping
@@ -246,13 +248,13 @@ void LiteRTLMBackend::saveKv(const std::string& name) {
     (void)name;
 }
 
-void LiteRTLMBackend::restoreKv(const std::string& name) {
+void LiteRTLMBackend::restoreKv(const std::string& name, const std::string& /*session_id*/) {
     (void)name;
 }
 
-void LiteRTLMBackend::resetKv() {
+void LiteRTLMBackend::resetKv(const std::string& session_id) {
     try {
-        worker().sendReset();
+        worker().sendReset(session_id);
     } catch (const std::exception& e) {
         LOG_WARN("[LiteRTLMBackend] resetKv failed: " << e.what());
     }

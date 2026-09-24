@@ -17,6 +17,7 @@
 #include "qai_forge/worker/InferenceProtocol.h"
 #include "qai_forge/utils/Logger.h"
 #include <mutex>
+#include <shared_mutex>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
@@ -36,6 +37,7 @@ VlmInferenceWorkerManager& VlmInferenceWorkerManager::getInstance() {
 // ─────────────────────────────────────────────────────────────────────────────
 void VlmInferenceWorkerManager::executeVlmRequest(
     const std::string& event_id,
+    const std::string& session_id,
     const std::string& prompt,
     const std::vector<std::vector<uint8_t>>& images,
     bool streaming,
@@ -49,14 +51,13 @@ void VlmInferenceWorkerManager::executeVlmRequest(
     DoneCallback on_done,
     ErrorCallback on_error) {
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     json prompt_ref;
     try {
         prompt_ref = writePromptToShm(prompt);
     } catch (const std::exception& e) {
-        is_active_ = false;
-        on_error({event_id, "", e.what()});
+        on_error({event_id, session_id, "", e.what()});
         return;
     }
 
@@ -64,8 +65,7 @@ void VlmInferenceWorkerManager::executeVlmRequest(
     try {
         image_refs = writeImagesToShm(images);
     } catch (const std::exception& e) {
-        is_active_ = false;
-        on_error({event_id, "", e.what()});
+        on_error({event_id, session_id, "", e.what()});
         return;
     }
 
@@ -73,7 +73,8 @@ void VlmInferenceWorkerManager::executeVlmRequest(
     json execute_cmd = InferenceProtocol::createExecuteCommand(
         event_id, prompt_ref, streaming, max_tokens, temperature,
         top_p, top_k, presence_penalty, frequency_penalty,
-        false  // bypass_think_filter — VLM models don't use thinking
+        false,  // bypass_think_filter — VLM models don't use thinking
+        session_id
     );
 
     // Attach the image shared-memory references so the VLM worker can

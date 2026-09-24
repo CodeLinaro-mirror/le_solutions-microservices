@@ -30,7 +30,7 @@ PostTurnWorker::PostTurnWorker(
     IGenerativeBackend& backend,
     std::shared_ptr<IGenerativeOrchestrator> orchestrator,
     std::shared_ptr<ConversationMemoryCoordinator> coordinator,
-    std::function<void()> finish_post_turn,
+    std::function<void(const std::string& session_id)> finish_post_turn,
     size_t max_queue_depth)
     : model_id_(std::move(model_id)),
       backend_(backend),
@@ -65,6 +65,11 @@ bool PostTurnWorker::enqueue(PostTurnTask task) {
     }
     cv_.notify_one();
     return true;
+}
+
+void PostTurnWorker::setMaxQueueDepth(size_t max_queue_depth) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    max_queue_depth_ = max_queue_depth;
 }
 
 void PostTurnWorker::stop(bool force) {
@@ -157,7 +162,7 @@ void PostTurnWorker::workerLoop() {
         }
 
         if (finish_post_turn_) {
-            finish_post_turn_();
+            finish_post_turn_(task.input.session_id);
         }
     }
 }
@@ -166,7 +171,7 @@ void PostTurnWorker::cancelTask(PostTurnTask& task) {
     coordinator_->abortTurn(
         task.input.memory_turn, MemoryTurnState::Cancelled);
     if (finish_post_turn_) {
-        finish_post_turn_();
+        finish_post_turn_(task.input.session_id);
     }
 }
 
