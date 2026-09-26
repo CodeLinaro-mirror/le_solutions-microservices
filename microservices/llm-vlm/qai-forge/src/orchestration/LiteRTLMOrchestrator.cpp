@@ -3,15 +3,15 @@
 
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 
+#include "qai_forge/adapters/ModelAdapterFactory.h"
 #include "qai_forge/backend/LiteRTLMBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/reasoning/ReasoningRouter.h"
 #include "qai_forge/utils/Logger.h"
 
-#include <jinja2cpp/template.h>
-#include <jinja2cpp/value.h>
+#include "minja/minja.hpp"
+#include "minja/chat-template.hpp"
 
-#include <cctype>
 #include <iomanip>
 #include <optional>
 #include <random>
@@ -41,47 +41,6 @@ std::string generateEventId() {
     oss << "litert-lm-" << std::hex << std::setw(16) << std::setfill('0')
         << rng();
     return oss.str();
-}
-
-// Recursively converts an nlohmann::json value into a jinja2::Value so it
-// can be passed as template render context to jinja2cpp. Handles the shapes
-// produced by CreateChatCompletionRequest: arrays of message objects,
-// nested tool-call objects, primitive scalars, etc.
-jinja2::Value jsonToJinjaValue(const json& value) {
-    if (value.is_null()) {
-        return jinja2::Value();
-    }
-    if (value.is_boolean()) {
-        return jinja2::Value(value.get<bool>());
-    }
-    if (value.is_number_integer()) {
-        return jinja2::Value(static_cast<int64_t>(value.get<long long>()));
-    }
-    if (value.is_number_unsigned()) {
-        return jinja2::Value(static_cast<int64_t>(value.get<unsigned long long>()));
-    }
-    if (value.is_number_float()) {
-        return jinja2::Value(value.get<double>());
-    }
-    if (value.is_string()) {
-        return jinja2::Value(value.get<std::string>());
-    }
-    if (value.is_array()) {
-        jinja2::ValuesList list;
-        list.reserve(value.size());
-        for (const auto& item : value) {
-            list.push_back(jsonToJinjaValue(item));
-        }
-        return jinja2::Value(std::move(list));
-    }
-    if (value.is_object()) {
-        jinja2::ValuesMap map;
-        for (auto it = value.begin(); it != value.end(); ++it) {
-            map[it.key()] = jsonToJinjaValue(it.value());
-        }
-        return jinja2::Value(std::move(map));
-    }
-    return jinja2::Value();
 }
 
 } // namespace
@@ -118,8 +77,6 @@ bool LiteRTLMOrchestrator::initMetadataIfNeeded(IGenerativeBackend& backend) con
     model_type_              = meta.model_type;
     max_context_length_      = (meta.max_context_length > 0)
                                ? meta.max_context_length : defaultContextLength();
-    tool_call_delimiter_     = meta.tool_call_delimiter;
-    tool_response_delimiter_ = meta.tool_response_delimiter;
     think_start_             = meta.think_start;
     think_end_               = meta.think_end;
 
@@ -129,6 +86,23 @@ bool LiteRTLMOrchestrator::initMetadataIfNeeded(IGenerativeBackend& backend) con
         if (jinja_template_.find("<think>") != std::string::npos) {
             think_start_ = "<think>";
             think_end_   = "</think>";
+        }
+    }
+
+    // Compile the chat template once via minja. bos_token/eos_token are not
+    // currently surfaced by LiteRTLMMetadata — most HF chat templates only
+    // reference {{ bos_token }}/{{ eos_token }} informationally (if at all),
+    // and the worker's own tokenizer independently prepends/appends the
+    // real BOS/EOS tokens around the rendered prompt text, so passing empty
+    // strings here does not affect correctness of the generated prompt.
+    if (!jinja_template_.empty()) {
+        try {
+            chat_template_ = std::make_unique<minja::chat_template>(
+                jinja_template_, /*bos_token=*/"", /*eos_token=*/"");
+        } catch (const std::exception& e) {
+            LOG_WARN("[LiteRTLMOrchestrator] Failed to compile minja chat "
+                     "template: " << e.what());
+            chat_template_.reset();
         }
     }
 
@@ -145,31 +119,20 @@ bool LiteRTLMOrchestrator::initMetadataIfNeeded(IGenerativeBackend& backend) con
 std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
                                                 const json& tools,
                                                 bool add_generation_prompt) const {
-    if (!jinja_template_.empty()) {
+    if (chat_template_) {
         try {
-            jinja2::Template tmpl;
-            auto load_result = tmpl.Load(jinja_template_);
-            if (!load_result) {
-                LOG_WARN("[LiteRTLMOrchestrator] Failed to load Jinja2 template: "
-                         << load_result.error().ToString());
-            } else {
-                jinja2::ValuesMap params;
-                params["messages"] = jsonToJinjaValue(messages);
-                params["add_generation_prompt"] = add_generation_prompt;
-                params["enable_thinking"] = false;
-                if (!tools.is_null() && tools.is_array() && !tools.empty()) {
-                    params["tools"] = jsonToJinjaValue(tools);
-                }
+            json extra_context = json::object();
+            extra_context["enable_thinking"] = false;
 
-                auto render_result = tmpl.RenderAsString(params);
-                if (render_result) {
-                    return render_result.value();
-                }
-                LOG_WARN("[LiteRTLMOrchestrator] Failed to render Jinja2 template: "
-                         << render_result.error().ToString());
-            }
+            json empty_tools = json::array();
+            const json& tools_arg =
+                (!tools.is_null() && tools.is_array() && !tools.empty())
+                    ? tools : empty_tools;
+
+            return chat_template_->apply(
+                messages, tools_arg, add_generation_prompt, extra_context);
         } catch (const std::exception& e) {
-            LOG_WARN("[LiteRTLMOrchestrator] Jinja2 rendering threw exception: "
+            LOG_WARN("[LiteRTLMOrchestrator] minja rendering threw exception: "
                      << e.what());
         }
         // Fall through to the flat fallback formatter below on any failure —
@@ -267,8 +230,9 @@ StandardResponse LiteRTLMOrchestrator::execute(
             "LiteRTLMOrchestrator received a non-LiteRT-LM prepared request");
     }
 
-    // Lazy metadata init — populates jinja_template_, tool_call_delimiter_,
-    // think_start_, think_end_, max_context_length_ from the backend.
+    // Lazy metadata init — populates jinja_template_ (compiled into
+    // chat_template_), think_start_, think_end_, max_context_length_ from
+    // the backend.
     initMetadataIfNeeded(backend);
 
     const std::string event_id = generateEventId();
@@ -324,6 +288,15 @@ StandardResponse LiteRTLMOrchestrator::execute(
         stream_chunk.role.reset();
     }
 
+    // Resolved once per execute() call (not per-token) — the marker that,
+    // once observed in the accumulated response text, indicates a tool-call
+    // payload has started and per-token streaming must be suppressed until
+    // the full response can be parsed via ModelAdapterFactory::parseToolCalls().
+    // Empty for adapters that don't support tool calling or whose syntax
+    // doesn't require buffering — in that case no suppression ever occurs.
+    const std::string tool_call_start_marker =
+        ModelAdapterFactory::getAdapter(job.model_id).toolCallStartMarker();
+
     backend.generateWithSession(
         event_id, job.session_id, prompt, streaming,
         prepared->generation.max_tokens,
@@ -353,31 +326,46 @@ StandardResponse LiteRTLMOrchestrator::execute(
             }
 
             if (!streaming || !job.callbacks.on_token) return;
-            if (!tool_call_delimiter_.empty() &&
-                    accumulated_text.find(tool_call_delimiter_) != std::string::npos)
+            // Suppress raw per-token streaming ONLY once the adapter's
+            // tool-call start marker has actually appeared in the
+            // accumulated response text — NOT merely because the adapter is
+            // tool-calling-capable in general. Gating on capability alone
+            // would suppress 100% of streamed content for every response
+            // from a tool-calling-capable model, even plain answers that
+            // never contain a tool call. Once the marker is seen, tokens
+            // are buffered until the full response can be parsed via
+            // ModelAdapterFactory::parseToolCalls() below.
+            if (!tool_call_start_marker.empty() &&
+                    accumulated_text.find(tool_call_start_marker) != std::string::npos)
                 return;
 
             if (has_thinking) {
-                // Only forward answer-channel chunks that arrive AFTER the
-                // model has emitted at least one reasoning chunk — matches
-                // the old manual buffering behavior exactly: it withheld
-                // *everything* (including any pre-<think> preamble) until
-                // </think> was found in the growing buffer, and reasoning
-                // content itself was never forwarded to the client.
+                // Forward answer-channel content to the client as it
+                // arrives; reasoning_content chunks are never forwarded
+                // (they remain internal-only, accumulated into
+                // reasoning_text for the final non-streaming response's
+                // reasoning_content field).
+                //
+                // IMPORTANT: streaming must not be gated on having already
+                // seen a reasoning chunk. Many models only optionally emit
+                // a thinking block — for a plain answer with no thinking
+                // block at all, gating on "saw_reasoning" would suppress
+                // 100% of legitimate answer content for the entire
+                // response. Only the leading "\n\r" that immediately
+                // follows a real </think> boundary is trimmed (once).
                 for (auto& chunk : chunks) {
                     if (chunk.reasoning_content.has_value()) {
                         saw_reasoning = true;
                         continue;  // reasoning content never reaches the client
                     }
                     if (!chunk.content_delta.has_value()) continue;
-                    if (!saw_reasoning) continue;  // suppress pre-think preamble
-                    if (!answer_started) {
+                    if (saw_reasoning && !answer_started) {
                         std::string& delta = chunk.content_delta.value();
                         size_t start = delta.find_first_not_of("\n\r");
                         delta = (start != std::string::npos)
                             ? delta.substr(start) : std::string();
-                        if (delta.empty()) continue;  // still trimming
                         answer_started = true;
+                        if (delta.empty()) continue;  // fully-whitespace chunk trimmed away
                     }
                     chunk.id = job.response_id;
                     chunk.model = job.model_id;
@@ -430,17 +418,18 @@ StandardResponse LiteRTLMOrchestrator::execute(
     response.total_tokens = response.prompt_tokens + completion_tokens;
     if (!reasoning_text.empty()) response.reasoning_content = reasoning_text;
 
-    if (!tool_call_delimiter_.empty() &&
-            content_text.find(tool_call_delimiter_) != std::string::npos) {
-        json tool_calls = parseToolCalls(content_text, tool_call_delimiter_);
-        if (tool_calls.is_array() && !tool_calls.empty()) {
-            response.tool_calls = std::move(tool_calls);
-            response.finish_reason = "tool_calls";
-            const std::string pre = extractPreToolContent(content_text, tool_call_delimiter_);
-            if (!pre.empty()) response.content = pre;
-        } else {
-            response.content = content_text;
-        }
+    // Delegate tool-call parsing to the model-family adapter — mirrors
+    // GenieOrchestrator's pattern exactly. Each model's own chat template
+    // determines its tool-call syntax independent of backend, so
+    // resolution is by model_id substring match via ModelAdapterFactory.
+    const auto& adapter = ModelAdapterFactory::getAdapter(job.model_id);
+    json tool_calls = adapter.parseToolCalls(content_text);
+    if (tool_calls.is_array() && !tool_calls.empty()) {
+        response.tool_calls = std::move(tool_calls);
+        response.finish_reason = "tool_calls";
+        // content left unset, matching GenieOrchestrator — avoids leaking
+        // raw tool-call syntax into message.content when tool_calls already
+        // carries the structured, parsed call(s).
     } else {
         response.content = content_text;
     }
@@ -483,84 +472,4 @@ int LiteRTLMOrchestrator::applyContextEviction(
         ++evicted;
     }
     return evicted;
-}
-
-json LiteRTLMOrchestrator::parseToolCalls(
-    const std::string& text,
-    const std::string& delimiter) const {
-    const std::size_t delimiter_position = text.find(delimiter);
-    if (delimiter_position == std::string::npos) {
-        return nullptr;
-    }
-
-    std::string payload = text.substr(
-        delimiter_position + delimiter.size());
-    while (!payload.empty() &&
-           std::isspace(static_cast<unsigned char>(payload.front()))) {
-        payload.erase(payload.begin());
-    }
-
-    try {
-        std::size_t start = payload.find('[');
-        if (start == std::string::npos) {
-            start = payload.find('{');
-        }
-        if (start == std::string::npos) {
-            return nullptr;
-        }
-
-        std::string candidate = payload.substr(start);
-        const char opening = candidate.front();
-        const char closing = opening == '[' ? ']' : '}';
-        int depth = 0;
-        std::size_t end = std::string::npos;
-        for (std::size_t index = 0; index < candidate.size(); ++index) {
-            if (candidate[index] == opening) {
-                ++depth;
-            } else if (candidate[index] == closing && --depth == 0) {
-                end = index + 1;
-                break;
-            }
-        }
-        if (end == std::string::npos) {
-            return nullptr;
-        }
-
-        json parsed = json::parse(candidate.substr(0, end));
-        if (parsed.is_object()) {
-            parsed = json::array({parsed});
-        }
-        if (!parsed.is_array()) {
-            return nullptr;
-        }
-
-        for (auto& tool_call : parsed) {
-            if (!tool_call.contains("id")) {
-                tool_call["id"] = generateEventId();
-            }
-            if (!tool_call.contains("type")) {
-                tool_call["type"] = "function";
-            }
-        }
-        return parsed;
-    } catch (const std::exception& error) {
-        LOG_WARN("[LiteRTLMOrchestrator] Tool call parsing failed: "
-                 << error.what());
-        return nullptr;
-    }
-}
-
-std::string LiteRTLMOrchestrator::extractPreToolContent(
-    const std::string& text,
-    const std::string& delimiter) const {
-    const std::size_t delimiter_position = text.find(delimiter);
-    if (delimiter_position == std::string::npos) {
-        return text;
-    }
-    std::string content = text.substr(0, delimiter_position);
-    while (!content.empty() &&
-           std::isspace(static_cast<unsigned char>(content.back()))) {
-        content.pop_back();
-    }
-    return content;
 }

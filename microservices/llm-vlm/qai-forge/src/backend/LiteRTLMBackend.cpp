@@ -2,23 +2,25 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMBackend — Phase 3: IGenerativeBackend implementation for LiteRT-LM
+// LiteRTLMBackend — IGenerativeBackend implementation for LiteRT-LM
 //
 // Wraps LiteRTLMWorkerManager (which extends InferenceWorkerManager) to manage
 // the litert-lm-inference-worker subprocess. The worker uses the LiteRT-LM
 // Session API for raw inference; all chat intelligence lives in
-// LiteRTLMOrchestrator (Phase 4).
+// LiteRTLMOrchestrator.
 //
-// Key differences from the old singleton-based implementation:
-//   - Uses LiteRTLMWorkerManager instead of plain InferenceWorkerManager
+// Notes:
 //   - Exposes getMetadata() for LiteRTLMOrchestrator initialization
 //   - unloadModel() always uses SIGKILL for clean DSP resource reclamation
 //   - Supports scheduler-owned instances (one per ModelRuntime)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/LiteRTLMBackend.h"
+#include "qai_forge/execution/LiteRtLmLaunchOptions.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
+
+#include <utility>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
@@ -77,8 +79,30 @@ BackendCapabilities LiteRTLMBackend::capabilities() const {
 // loadModel()
 // ─────────────────────────────────────────────────────────────────────────────
 
+void LiteRTLMBackend::loadModel(
+    const qai_forge::execution::RuntimeLaunchRequest& request) {
+    loadModel(request.model_id, request.execution_plan);
+}
+
 void LiteRTLMBackend::loadModel(const std::string& model_id) {
-    const auto* model_config =
+    qai_forge::execution::ExecutionPlan automatic_plan;
+    automatic_plan.provider = "litert_lm";
+    qai_forge::execution::ComponentPlacement component;
+    component.target.provider = "litert_lm";
+    component.target.semantics =
+        qai_forge::execution::TargetSemantics::BackendAutomatic;
+    component.target.discovery_mode =
+        qai_forge::execution::DiscoveryMode::BackendManaged;
+    component.target.binding_strength =
+        qai_forge::execution::BindingStrength::Automatic;
+    automatic_plan.components.push_back(std::move(component));
+    loadModel(model_id, automatic_plan);
+}
+
+void LiteRTLMBackend::loadModel(
+    const std::string& model_id,
+    const qai_forge::execution::ExecutionPlan& plan) {
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(
@@ -90,7 +114,36 @@ void LiteRTLMBackend::loadModel(const std::string& model_id) {
     LOG_INFO("[LiteRTLMBackend] loadModel: model=" << model_id
              << " config=" << model_config->config_file);
 
-    ensureWorkerRunning(model_id, model_config->config_file, "");
+    // toInitOptions() yields the optional {"litert_lm":{"backend":"cpu"|
+    // "gpu"|"npu"}} override (present only when the plan specifies a
+    // backend-class selector); setInitOptions() merges it into the next
+    // INIT the worker manager sends. The worker (src/worker/litert-lm/
+    // main.cpp) applies it by setenv()ing LITERT_LM_BACKEND before
+    // loadModel(), falling back to the existing env/default otherwise.
+    const auto launch_options =
+        qai_forge::execution::LiteRtLmLaunchOptions::toInitOptions(plan);
+    worker().setInitOptions(launch_options);
+    // ready_validator runs on the worker's post-INIT READY and confirms
+    // provider=="litert_lm" and binding_strength=="automatic" — LiteRT-LM
+    // cannot confirm a physical target, so binding is always automatic.
+    worker().ensureWorkerRunning(
+        model_id, model_config->config_file, "",
+        [](const json& ready) {
+            if (ready.value("provider", "") != "litert_lm") {
+                throw std::runtime_error(
+                    "LiteRTLMBackend: worker READY reported an unexpected "
+                    "provider");
+            }
+            if (ready.value("binding_strength", "") != "automatic") {
+                throw std::runtime_error(
+                    "LiteRTLMBackend: LiteRT-LM worker must report automatic "
+                    "binding");
+            }
+        });
+
+    current_model_id_ = model_id;
+    current_plan_ = plan;
+    has_current_plan_ = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +163,8 @@ void LiteRTLMBackend::unloadModel(bool /*force*/) {
     }
 
     current_model_id_.clear();
+    current_plan_ = {};
+    has_current_plan_ = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,6 +334,8 @@ void LiteRTLMBackend::terminateWorker(bool force) {
         worker_->terminateWorker(force);
     }
     current_model_id_.clear();
+    current_plan_ = {};
+    has_current_plan_ = false;
 }
 
 bool LiteRTLMBackend::forceKillActiveWorker() {

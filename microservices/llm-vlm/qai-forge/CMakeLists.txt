@@ -45,52 +45,76 @@ option(QAI_FORGE_BUILD_LITERT    "Build LiteRT Predictive AI engine + worker" OF
 option(QAI_FORGE_BUILD_LITERT_LM "Build LiteRT-LM generative worker" OFF)
 option(QAI_FORGE_BUILD_LLAMACPP  "Build llama.cpp backend support" OFF)
 option(QAI_FORGE_INSTALL         "Install targets and CMake package config" ON)
+option(QAI_FORGE_BUILD_TOPOLOGY_PROBE "Build the standalone topology-probe CLI" ON)
 
 # ── Required dependencies ─────────────────────────────────────────────────────
 find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
 
 # ── stb_image (header-only image decoder — JPEG, PNG, WEBP, BMP, GIF) ────────
-# Downloaded at configure time; compiled into libqai_forge (no runtime .so).
-# stb_image.h is defined in exactly one .cpp file (ImageUtils.cpp).
+# Compiled into libqai_forge (no runtime .so). stb_image.h is defined in
+# exactly one .cpp file (ImageUtils.cpp).
+#
+# NOT fetched during CMake configure. The source must be pre-fetched
+# (pinned commit 2c980bb59875b0d32144a71867fbdebb2f77cd20) by whichever build
+# path is in use (Dockerfile RUN step or scripts/build.sh) and its location
+# passed in via -DSTB_SOURCE_DIR=<path>. This avoids any network/git activity
+# at configure time.
 include(FetchContent)
-FetchContent_Declare(
-    stb
-    GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(stb)
+set(STB_SOURCE_DIR "" CACHE PATH "Path to pre-fetched stb source (must contain stb_image.h)")
+if(NOT STB_SOURCE_DIR)
+    message(FATAL_ERROR
+        "[qai-forge] STB_SOURCE_DIR is not set.\n"
+        "  stb must be pre-fetched (pinned commit 2c980bb59875b0d32144a71867fbdebb2f77cd20)\n"
+        "  before configuring qai-forge. Pass:\n"
+        "  -DSTB_SOURCE_DIR=<path-containing-stb_image.h>")
+endif()
+set(stb_SOURCE_DIR "${STB_SOURCE_DIR}")
 
-# ── jinja2cpp (Apache 2.0 — full Jinja2-compatible template engine) ──────────
+# ── minja (MIT — purpose-built Jinja2 subset for HuggingFace chat templates) ──
 # Used by LiteRTLMOrchestrator::renderPrompt() to render each model's chat
 # template (Jinja2 syntax, as provided by the LiteRT-LM worker's METADATA
 # message) into a flat prompt string. Only needed when LiteRT-LM support is
 # enabled — LiteRTLMOrchestrator.cpp (the only consumer) is compiled behind
-# QAI_FORGE_BUILD_LITERT_LM, so this dependency is fetched/built only then.
-# Built and linked as a shared library (libjinja2cpp.so) — installed
-# alongside libqai_forge.so (see the QAI_FORGE_INSTALL block below) and
-# located at runtime via the $ORIGIN RPATH set on the qai_forge target.
+# QAI_FORGE_BUILD_LITERT_LM.
+# Header-only INTERFACE target — no shared library to build/install/RPATH.
+#
+# NOT fetched during CMake configure. The source must be pre-fetched
+# (pinned commit 021c2293c187789ef13d56c6cfd89c9b134fd80f) by whichever build
+# path is in use (Dockerfile RUN step or scripts/build.sh) and its location
+# passed in via -DMINJA_SOURCE_DIR=<path>. This avoids any network/git
+# activity at configure time.
 if(QAI_FORGE_BUILD_LITERT_LM)
-    set(JINJA2CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(JINJA2CPP_STRICT_WARNINGS OFF CACHE BOOL "" FORCE)
-    set(JINJA2CPP_BUILD_SHARED ON CACHE BOOL "" FORCE)
-    set(JINJA2CPP_DEPS_MODE "internal" CACHE STRING "" FORCE)
-    FetchContent_Declare(
-        jinja2cpp
-        GIT_REPOSITORY https://github.com/jinja2cpp/Jinja2Cpp.git
-        GIT_TAG        1.3.2
-        GIT_SHALLOW    TRUE
-    )
-    # EXCLUDE_FROM_ALL keeps jinja2cpp's own install() rules (which reference
-    # broken thirdparty header paths under its bundled nonstd/RapidJSON deps)
-    # out of qai_forge's `cmake --install` — we only need the built .so file,
-    # installed separately below via install(TARGETS jinja2cpp ...).
-    FetchContent_GetProperties(jinja2cpp)
-    if(NOT jinja2cpp_POPULATED)
-        FetchContent_Populate(jinja2cpp)
-        add_subdirectory(${jinja2cpp_SOURCE_DIR} ${jinja2cpp_BINARY_DIR} EXCLUDE_FROM_ALL)
+    set(MINJA_SOURCE_DIR "" CACHE PATH "Path to pre-fetched minja source (must contain CMakeLists.txt)")
+    if(NOT MINJA_SOURCE_DIR)
+        message(FATAL_ERROR
+            "[qai-forge] QAI_FORGE_BUILD_LITERT_LM=ON but MINJA_SOURCE_DIR is not set.\n"
+            "  minja must be pre-fetched (pinned commit 021c2293c187789ef13d56c6cfd89c9b134fd80f)\n"
+            "  before configuring qai-forge. Pass:\n"
+            "  -DMINJA_SOURCE_DIR=<path-containing-minja/CMakeLists.txt>")
     endif()
+
+    # minja's own CMakeLists.txt unconditionally does its own
+    # FetchContent_Declare(json ...) + FetchContent_MakeAvailable(json),
+    # which would re-create the nlohmann_json target our own
+    # find_package(nlohmann_json REQUIRED) call above already created,
+    # causing a duplicate-target CMake error. Pre-declaring the same
+    # FetchContent name ("json") pointed at an empty stub directory makes
+    # FetchContent treat it as already populated, so minja's identical call
+    # becomes a no-op and it links against our imported target instead.
+    set(_qai_forge_minja_json_stub "${CMAKE_CURRENT_BINARY_DIR}/_minja_json_stub")
+    file(MAKE_DIRECTORY "${_qai_forge_minja_json_stub}")
+    file(WRITE "${_qai_forge_minja_json_stub}/CMakeLists.txt" "")
+    FetchContent_Declare(json SOURCE_DIR "${_qai_forge_minja_json_stub}")
+    FetchContent_MakeAvailable(json)
+
+    set(MINJA_TEST_ENABLED OFF CACHE BOOL "" FORCE)
+    set(MINJA_EXAMPLE_ENABLED OFF CACHE BOOL "" FORCE)
+    # SOURCE_DIR points FetchContent at the pre-fetched local checkout —
+    # FetchContent_MakeAvailable() then only runs add_subdirectory(), with no
+    # git clone/fetch of any kind.
+    FetchContent_Declare(minja SOURCE_DIR "${MINJA_SOURCE_DIR}")
+    FetchContent_MakeAvailable(minja)
 endif()
 
 # ── GenIE SDK paths ───────────────────────────────────────────────────────────
@@ -215,6 +239,7 @@ set(QAI_FORGE_SOURCES
     src/adapters/ModelAdapterFactory.cpp
     src/adapters/Qwen25Adapter.cpp
     src/adapters/Qwen3Adapter.cpp
+    src/adapters/GemmaAdapter.cpp
     src/adapters/ToolCallJsonUtils.cpp
 
     # Vision Preprocessing Adapters (Layer 2 — VLM Patch Ordering)
@@ -237,10 +262,30 @@ set(QAI_FORGE_SOURCES
     src/scheduler/PostTurnWorker.cpp
     src/scheduler/WarmModelPool.cpp
     src/scheduler/InferenceScheduler.cpp
+    src/scheduler/PlacementContext.cpp
 
     # Predictive AI scheduler (Phase 4 — pool + runtime for tensor inference)
     src/scheduler/PredictiveModelRuntime.cpp
     src/scheduler/PredictiveModelPool.cpp
+
+    # Resource/topology layer (device placement)
+    src/resources/ResourceTypes.cpp
+    src/resources/TopologyRegistry.cpp
+    src/resources/StandardTopologies.cpp
+    src/resources/ResourceManager.cpp
+    $<IF:$<BOOL:${QAI_FORGE_BUILD_QNN}>,${CMAKE_CURRENT_SOURCE_DIR}/src/resources/QnnTopologyProbe.cpp,${CMAKE_CURRENT_SOURCE_DIR}/src/resources/QnnTopologyProbeStub.cpp>
+
+    # Execution/placement layer (device placement)
+    src/execution/ExecutionPlan.cpp
+    src/execution/ProviderRegistry.cpp
+    src/execution/ExecutionPlanResolver.cpp
+    src/execution/RuntimeArtifacts.cpp
+    src/execution/GenieConfigMaterializer.cpp
+    src/execution/QnnLaunchOptions.cpp
+    src/execution/SnpeLaunchOptions.cpp
+    src/execution/LiteRtLaunchOptions.cpp
+    src/execution/LiteRtLmLaunchOptions.cpp
+    src/execution/LlamaCppLaunchOptions.cpp
 
     # Orchestration (Layer 2)
     src/orchestration/GenieOrchestrator.cpp
@@ -272,10 +317,9 @@ set(QAI_FORGE_SOURCES
 )
 
 # ── Conditionally add LiteRT-LM generative backend sources ───────────────────
-# LiteRTLMOrchestrator.cpp depends on jinja2cpp (see the jinja2cpp
-# FetchContent block above, itself gated on this same flag) — gating these
-# together ensures a non-LiteRT-LM build never pulls in the jinja2cpp
-# dependency or its stricter CMake version requirement.
+# LiteRTLMOrchestrator.cpp depends on minja (see the minja FetchContent
+# block above, itself gated on this same flag) — gating these together
+# ensures a non-LiteRT-LM build never pulls in the minja dependency.
 if(QAI_FORGE_BUILD_LITERT_LM)
     list(APPEND QAI_FORGE_SOURCES
         # LiteRT-LM backend (Layer 3 — IGenerativeBackend implementation)
@@ -330,6 +374,12 @@ target_include_directories(qai_forge
         # stb_image.h — header-only image decoder used by ImageUtils.cpp
         ${stb_SOURCE_DIR}
 )
+
+# ── Add QNN include path if enabled (QnnTopologyProbe.cpp needs QnnInterface.h) ─
+if(QAI_FORGE_BUILD_QNN)
+    target_include_directories(qai_forge PRIVATE ${QNN_INCLUDE_PATH})
+    message(STATUS "[qai-forge] Added QNN include path to qai_forge: ${QNN_INCLUDE_PATH}")
+endif()
 
 # ── Add llama.cpp include path if enabled ────────────────────────────────────
 if(QAI_FORGE_BUILD_LLAMACPP)
@@ -421,26 +471,14 @@ if(QAI_FORGE_BUILD_LLAMACPP)
     endif()
 endif()
 
-# jinja2cpp is linked by resolved .so path ($<TARGET_FILE:>) rather than by
-# target name to avoid install(EXPORT) requiring jinja2cpp's own file sets
-# to be exported — so its include dirs (and its nonstd::*-lite deps' dirs,
-# used by jinja2cpp's public headers) must be added explicitly. Only needed
-# when LiteRTLMOrchestrator.cpp (the sole consumer) is actually compiled.
+# minja is a header-only INTERFACE target — target_link_libraries() alone
+# propagates its include directories automatically. Only needed when
+# LiteRTLMOrchestrator.cpp (the sole consumer) is actually compiled.
 if(QAI_FORGE_BUILD_LITERT_LM)
-    target_include_directories(qai_forge PRIVATE
-        ${jinja2cpp_SOURCE_DIR}/include
-        $<TARGET_PROPERTY:nonstd::expected-lite,INTERFACE_INCLUDE_DIRECTORIES>
-        $<TARGET_PROPERTY:nonstd::variant-lite,INTERFACE_INCLUDE_DIRECTORIES>
-        $<TARGET_PROPERTY:nonstd::optional-lite,INTERFACE_INCLUDE_DIRECTORIES>
-        $<TARGET_PROPERTY:nonstd::string-view-lite,INTERFACE_INCLUDE_DIRECTORIES>
-    )
-
     target_link_libraries(qai_forge PRIVATE
-        # Jinja2 template engine — used by LiteRTLMOrchestrator::renderPrompt()
-        $<TARGET_FILE:jinja2cpp>
+        # minja template engine — used by LiteRTLMOrchestrator::renderPrompt()
+        minja
     )
-    # Ensure build order since $<TARGET_FILE:> doesn't imply one under Makefiles
-    add_dependencies(qai_forge jinja2cpp)
 endif()
 
 target_link_libraries(qai_forge
@@ -475,7 +513,8 @@ set_target_properties(qai_forge PROPERTIES
     # Ensure the library exports its symbols
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
-    # $ORIGIN so libjinja2cpp.so (installed alongside) resolves at runtime
+    # $ORIGIN kept for any future co-installed runtime .so dependencies
+    # (no longer needed for jinja2cpp — minja is header-only).
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
 )
@@ -570,6 +609,29 @@ if(QAI_FORGE_BUILD_QNN AND QAI_FORGE_BUILD_WORKERS)
     endif()
 
 endif() # QAI_FORGE_BUILD_QNN
+
+# ─────────────────────────────────────────────────────────────────────────────
+# topology-probe CLI — standalone hardware topology discovery tool.
+# Links against libqai_forge to reuse TopologyRegistry/StandardTopologies/
+# QnnTopologyProbe. Does not participate in any inference path.
+# ─────────────────────────────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_TOPOLOGY_PROBE)
+    add_executable(topology-probe
+        src/tools/topology-probe.cpp
+    )
+    target_include_directories(topology-probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(topology-probe PRIVATE
+        qai_forge
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS topology-probe
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
+endif() # QAI_FORGE_BUILD_TOPOLOGY_PROBE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SNPE engine + worker (Predictive AI — SNPE DLC container)
@@ -786,14 +848,6 @@ if(QAI_FORGE_INSTALL)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-
-    # ── Install jinja2cpp shared library (for $ORIGIN RPATH resolution) ───────
-    if(TARGET jinja2cpp)
-        install(TARGETS jinja2cpp
-            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        )
-    endif()
 
     # ── Install public headers ─────────────────────────────────────────────────
     install(DIRECTORY include/

@@ -6,6 +6,7 @@
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/worker/LlamaCppWorkerManager.h"
 #include <nlohmann/json.hpp>
 #include <memory>
@@ -39,6 +40,19 @@ public:
     BackendCapabilities capabilities() const override;
 
     void loadModel(const std::string& model_id) override;
+    void loadModel(
+        const qai_forge::execution::RuntimeLaunchRequest& request) override;
+
+    /**
+     * Placement-aware overload. llama.cpp Hexagon endpoint selection
+     * (GGML_HEXAGON_DEVICES / HTPN:0 expressions) is resolved via
+     * LlamaCppLaunchOptions; wiring it into the worker's startWorker()
+     * signature is a Phase E worker-protocol change.
+     */
+    void loadModel(
+        const std::string& model_id,
+        const qai_forge::execution::ExecutionPlan& plan);
+
     void unloadModel(bool force = false) override;
 
     void ensureWorkerRunning(const std::string& model_id,

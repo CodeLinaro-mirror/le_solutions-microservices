@@ -588,7 +588,7 @@ scheduler::GenerativeJobPtr GenieOrchestrator::createJob(
     prepared.generation.streaming = static_cast<bool>(callbacks.on_token);
     prepared.generation.use_reasoning = use_reasoning;
     prepared.generation.thinking_budget = thinking_budget;
-    const ModelConfig* model_config =
+    const auto model_config =
         config_manager.getModelConfig(context.model_id);
     if (model_config) {
         prepared.generation.thinking_start_tag =

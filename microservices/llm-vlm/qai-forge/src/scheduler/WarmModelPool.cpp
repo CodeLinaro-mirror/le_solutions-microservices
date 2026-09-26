@@ -81,13 +81,15 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
                              std::shared_ptr<ConversationMemoryCoordinator>
                                  memory_coordinator,
                              std::shared_ptr<ModelLoadCoordinator>
-                                 load_coordinator)
+                                 load_coordinator,
+                             std::shared_ptr<PlacementContext> placement)
     : config_(config),
       runtime_factory_(runtime_factory ? std::move(runtime_factory)
                                        : defaultRuntimeFactory()),
       runtime_events_(std::move(runtime_events)),
       memory_coordinator_(std::move(memory_coordinator)),
       load_coordinator_(std::move(load_coordinator)),
+      placement_(std::move(placement)),
       eviction_policy_(std::make_unique<EvictionPolicy>()) {
     if (!runtime_factory_) {
         throw std::invalid_argument("WarmModelPool requires a runtime factory");
@@ -101,6 +103,9 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
         load_coordinator_ =
             std::make_shared<ModelLoadCoordinator>(config_.memory_headroom_mb);
         load_coordinator_->start();
+    }
+    if (!placement_) {
+        placement_ = PlacementContext::createDefault();
     }
     if (config_.cold_model_fairness_wait.count() <= 0) {
         config_.cold_model_fairness_wait = std::chrono::seconds(120);
@@ -726,6 +731,7 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
         memory_coordinator_,
         load_coordinator_,
         modelMemoryMb(model_id),
+        placement_,
         std::move(events));
     runtime->start();
 

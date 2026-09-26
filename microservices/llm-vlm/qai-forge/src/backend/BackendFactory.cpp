@@ -51,14 +51,12 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
 
 #ifdef QAI_FORGE_BUILD_LITERT_LM
     if (runtime == "litert_lm") {
-        // Phase 3: Scheduler-owned LiteRTLMBackend instance
         return std::make_unique<LiteRTLMBackend>();
     }
 #endif
 
 #ifdef QAI_FORGE_BUILD_LLAMACPP
     if (runtime == "llamacpp") {
-        // Phase 4: Scheduler-owned LlamaCppBackend instance
         return std::make_unique<qai_forge::LlamaCppBackend>("/usr/bin/llama-server");
     }
 #endif
@@ -71,7 +69,7 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
 
 std::unique_ptr<IGenerativeBackend>
 BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
-    const auto* model_config =
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(
@@ -110,7 +108,7 @@ BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
 std::shared_ptr<IGenerativeOrchestrator>
 BackendFactory::createGenerativeOrchestratorForModel(
     const std::string& model_id) {
-    const auto* model_config =
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(
@@ -124,7 +122,7 @@ BackendFactory::createGenerativeOrchestratorForModel(
 }
 
 RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
-    const auto* model_config =
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(
@@ -170,7 +168,7 @@ BackendFactory::createPredictiveBackend(const std::string& runtime) {
 
 std::unique_ptr<IInferenceBackend>
 BackendFactory::createPredictiveBackendForModel(const std::string& model_id) {
-    const auto* model_config =
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(

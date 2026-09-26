@@ -55,7 +55,7 @@ bool isPathAtOrUnder(const fs::path& candidate, const fs::path& root) {
 }
 
 fs::path targetPathForModel(const std::string& model_id) {
-    const ModelConfig* config = ModelConfigManager::getInstance().getModelConfig(model_id);
+    const auto config = ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!config || config->config_file.empty()) return {};
 
     fs::path config_path = fs::path(config->config_file).lexically_normal();

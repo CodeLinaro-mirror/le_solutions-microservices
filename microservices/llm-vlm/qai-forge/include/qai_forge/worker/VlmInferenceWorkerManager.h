@@ -9,7 +9,7 @@
 #include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VlmInferenceWorkerManager — Layer 3 VLM Subprocess Manager (P5)
+// VlmInferenceWorkerManager — Layer 3 VLM Subprocess Manager
 //
 // Extends InferenceWorkerManager for VLM (Vision-Language Model) inference.
 // The key difference from the LLM manager is that VLM requests may include
@@ -23,7 +23,7 @@
 // The VLM worker subprocess links against libvlmservice.so (vlm-interface.h)
 // instead of libllmservice.so (llm-interface.h).
 //
-// Architecture compliance (Section 4.E):
+// Notes:
 //   - Uses a separate UUID socket path: /tmp/genai-vlm-worker-{model_id}-{uuid}.sock
 //   - Inherits all fault isolation and cancellation semantics from the base class.
 // ─────────────────────────────────────────────────────────────────────────────

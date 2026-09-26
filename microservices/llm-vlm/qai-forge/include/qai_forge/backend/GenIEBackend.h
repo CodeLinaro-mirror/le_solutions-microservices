@@ -4,6 +4,8 @@
 #pragma once
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/execution/ExecutionPlan.h"
+#include "qai_forge/execution/GenieConfigMaterializer.h"
 #include <string>
 #include <atomic>
 #include <memory>
@@ -28,6 +30,11 @@ class VlmInferenceWorkerManager;
 // The static worker singletons (getLlmWorker, getVlmWorker) that previously
 // lived in ChatOrchestratorImpl.cpp have been moved here — worker lifecycle
 // is a backend concern, not an orchestrator concern.
+//
+// Placement: loadModel(RuntimeLaunchRequest) materializes a runtime-specific
+// GenIE config tree via GenieConfigMaterializer and patches devices[0].device_id
+// per the resolved ExecutionPlan. runtime_artifacts_ keeps that tree alive
+// until the worker is torn down.
 //
 // See docs/genai-backend-decoupling.md for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +66,16 @@ public:
      */
     void loadModel(const std::string& model_id) override;
 
+    void loadModel(
+        const qai_forge::execution::RuntimeLaunchRequest& request) override;
+
+    /**
+     * Placement-aware overload for a default (replica_id=0) runtime identity.
+     */
+    void loadModel(
+        const std::string& model_id,
+        const qai_forge::execution::ExecutionPlan& plan);
+
     /**
      * Unload this backend instance's active worker.
      */
@@ -72,6 +89,11 @@ public:
     void ensureWorkerRunning(const std::string& model_id,
                              const std::string& config_file,
                              const std::string& sampler_file) override;
+
+    void ensureWorkerRunning(const std::string& model_id,
+                             const std::string& config_file,
+                             const std::string& sampler_file,
+                             bool validate_ready);
 
     /**
      * Text-only LLM inference.
@@ -178,6 +200,11 @@ private:
     VlmInferenceWorkerManager& vlmWorker();
     int effectiveMaxConcurrent(const std::string& model_id) const;
 
+    void loadModel(
+        const std::string& model_id,
+        const qai_forge::execution::RuntimeId& runtime_id,
+        const qai_forge::execution::ExecutionPlan& plan);
+
     // Track which worker is currently active.
     // Updated by ensureWorkerRunning() on each request.
     std::string current_model_id_;
@@ -185,4 +212,9 @@ private:
 
     std::unique_ptr<InferenceWorkerManager>    llm_worker_;
     std::unique_ptr<VlmInferenceWorkerManager> vlm_worker_;
+
+    // Retained until the corresponding worker has been terminated and
+    // reaped. Keeps the runtime-specific materialized GenIE config tree
+    // alive across inference and same-runtime worker restarts.
+    std::shared_ptr<qai_forge::execution::RuntimeArtifacts> runtime_artifacts_;
 };

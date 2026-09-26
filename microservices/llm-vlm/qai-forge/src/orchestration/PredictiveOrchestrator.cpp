@@ -118,7 +118,7 @@ const InputTensor* findInput(const TensorInferenceRequest& request,
 }
 
 void validateRequest(const scheduler::PredictiveJobContext& context) {
-    const ModelConfig* stored_config =
+    const auto stored_config =
         ModelConfigManager::getInstance().getModelConfig(context.model_id);
     if (!stored_config) {
         throw GenAIException(
@@ -219,7 +219,7 @@ void validateRequest(const scheduler::PredictiveJobContext& context) {
 }
 
 void normalizeRequest(scheduler::PredictiveJobContext& context) {
-    const ModelConfig* config = ModelConfigManager::getInstance().getModelConfig(context.model_id);
+    const auto config = ModelConfigManager::getInstance().getModelConfig(context.model_id);
     if (!config) return;
     std::vector<InputTensor> ordered;
     ordered.reserve(config->input_specs.size());
@@ -337,7 +337,7 @@ TensorInferenceResponse PredictiveOrchestrator::executeBatch(
             input.segments.push_back({source.data.data(), source.data.size()});
         }
 
-        const ModelConfig* config =
+        const auto config =
             ModelConfigManager::getInstance().getModelConfig(batch.model_id);
         if (config && input_index < config->input_specs.size()) {
             input.padding_value = paddingValue(

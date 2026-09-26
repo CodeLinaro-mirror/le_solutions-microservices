@@ -24,7 +24,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
 #include <iostream>
+#include <limits>
 #include <numeric>
 
 // QNN SDK headers — resolved via GENIE_INCLUDE_PATH at build time
@@ -136,6 +139,20 @@ struct QNNEngine::Impl {
     // Binary buffer (kept alive for the lifetime of the context)
     std::vector<char>              binary_buf;
 
+    // Optional exact-device configuration. The platform metadata returned by
+    // QNN is retained until deviceFree because copied hardware/core entries
+    // may contain backend-owned extension pointers.
+    std::optional<uint32_t>        selected_device_id;
+    const QnnDevice_PlatformInfo_t* source_platform_info = nullptr;
+    QnnDevice_PlatformInfo_t        selected_platform_info =
+        QNN_DEVICE_PLATFORM_INFO_INIT;
+    QnnDevice_HardwareDeviceInfo_t selected_hardware_info =
+        QNN_DEVICE_HARDWARE_DEVICE_INFO_INIT;
+    std::vector<QnnDevice_CoreInfo_t> selected_core_info;
+    QnnDevice_Config_t              selected_device_config =
+        QNN_DEVICE_CONFIG_INIT;
+    const QnnDevice_Config_t*       selected_device_config_ptr = nullptr;
+
     ~Impl() { cleanup(); }
 
     void cleanup() {
@@ -154,6 +171,10 @@ struct QNNEngine::Impl {
             interface.contextFree(context, nullptr);
         if (interface.deviceFree && device)
             interface.deviceFree(device);
+        if (source_platform_info && interface.deviceFreePlatformInfo) {
+            interface.deviceFreePlatformInfo(logger, source_platform_info);
+            source_platform_info = nullptr;
+        }
         if (interface.profileFree && profiler)
             interface.profileFree(profiler);
         if (interface.backendFree && backend)
@@ -254,10 +275,12 @@ static std::string qnnDtypeToString(Qnn_DataType_t dt) {
 
 QNNEngine::QNNEngine(const std::string& model_file,
                      const std::string& backend_lib,
-                     const std::string& sys_lib)
+                     const std::string& sys_lib,
+                     std::optional<uint32_t> selected_device_id)
     : impl_(std::make_unique<Impl>())
 {
     auto& m = *impl_;
+    m.selected_device_id = selected_device_id;
 
     // ── 1. Load backend library ───────────────────────────────────────────────
     m.libhandle = dlopen(backend_lib.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -302,11 +325,79 @@ QNNEngine::QNNEngine(const std::string& model_file,
     if (m.interface.profileCreate(m.backend, QNN_PROFILE_LEVEL_BASIC, &m.profiler) != QNN_SUCCESS)
         throw std::runtime_error("QNNEngine: profileCreate failed");
 
-    // Device creation is optional (some backends don't support it)
+    // Device creation is optional (some backends don't support it). For an
+    // explicit placement request, enumerate the platform and pass a
+    // one-device platform descriptor through QNN's standard device config.
+    const QnnDevice_Config_t** device_config = nullptr;
+    if (m.selected_device_id.has_value()) {
+        if (!m.interface.deviceGetPlatformInfo) {
+            throw std::runtime_error(
+                "QNNEngine: exact device selection is unsupported by this backend");
+        }
+
+        const QnnDevice_PlatformInfo_t* platform_info = nullptr;
+        const Qnn_ErrorHandle_t platform_err =
+            m.interface.deviceGetPlatformInfo(m.logger, &platform_info);
+        if (platform_err != QNN_SUCCESS || !platform_info) {
+            throw std::runtime_error(
+                "QNNEngine: deviceGetPlatformInfo failed for exact device selection");
+        }
+        m.source_platform_info = platform_info;
+
+        if (platform_info->version != QNN_DEVICE_PLATFORM_INFO_VERSION_1 ||
+            platform_info->v1.hwDevices == nullptr) {
+            throw std::runtime_error(
+                "QNNEngine: unsupported platform-info version for exact device selection");
+        }
+
+        const QnnDevice_HardwareDeviceInfo_t* selected_hardware = nullptr;
+        for (uint32_t i = 0; i < platform_info->v1.numHwDevices; ++i) {
+            const auto& candidate = platform_info->v1.hwDevices[i];
+            if (candidate.version == QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1 &&
+                candidate.v1.deviceId == *m.selected_device_id) {
+                selected_hardware = &candidate;
+                break;
+            }
+        }
+        if (!selected_hardware) {
+            throw std::runtime_error(
+                "QNNEngine: requested device_id=" +
+                std::to_string(*m.selected_device_id) +
+                " was not enumerated by the backend");
+        }
+
+        m.selected_platform_info.version = platform_info->version;
+        m.selected_hardware_info = *selected_hardware;
+        if (selected_hardware->v1.numCores > 0 &&
+            selected_hardware->v1.cores != nullptr) {
+            m.selected_core_info.assign(
+                selected_hardware->v1.cores,
+                selected_hardware->v1.cores +
+                    selected_hardware->v1.numCores);
+            m.selected_hardware_info.v1.cores = m.selected_core_info.data();
+        } else {
+            m.selected_hardware_info.v1.cores = nullptr;
+            m.selected_hardware_info.v1.numCores = 0;
+        }
+        m.selected_platform_info.v1.numHwDevices = 1;
+        m.selected_platform_info.v1.hwDevices = &m.selected_hardware_info;
+
+        m.selected_device_config.option =
+            QNN_DEVICE_CONFIG_OPTION_PLATFORM_INFO;
+        m.selected_device_config.hardwareInfo = &m.selected_platform_info;
+        m.selected_device_config_ptr = &m.selected_device_config;
+        device_config = &m.selected_device_config_ptr;
+    }
+
     Qnn_ErrorHandle_t dev_err = m.interface.deviceCreate(
-        m.logger, nullptr, &m.device);
+        m.logger, device_config, &m.device);
     if (dev_err != QNN_SUCCESS && dev_err != QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE)
         throw std::runtime_error("QNNEngine: deviceCreate failed");
+    if (m.selected_device_id.has_value() &&
+        dev_err == QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE) {
+        throw std::runtime_error(
+            "QNNEngine: backend does not support exact device selection");
+    }
 
     // ── 4. Read context binary ────────────────────────────────────────────────
     std::ifstream f(model_file, std::ios::binary | std::ios::ate);
@@ -437,6 +528,34 @@ const std::vector<QNNTensorSpec>& QNNEngine::inputSpecs() const {
 
 const std::vector<QNNTensorSpec>& QNNEngine::outputSpecs() const {
     return impl_->output_specs;
+}
+
+std::optional<uint32_t> QNNEngine::effectiveDeviceId() const {
+    if (!impl_->selected_device_id.has_value()) {
+        return std::nullopt;
+    }
+    if (!impl_->interface.deviceGetInfo || !impl_->device) {
+        return std::nullopt;
+    }
+
+    const QnnDevice_PlatformInfo_t* info = nullptr;
+    if (impl_->interface.deviceGetInfo(impl_->device, &info) != QNN_SUCCESS ||
+        !info) {
+        return std::nullopt;
+    }
+
+    std::optional<uint32_t> effective;
+    if (info->version == QNN_DEVICE_PLATFORM_INFO_VERSION_1 &&
+        info->v1.numHwDevices > 0 && info->v1.hwDevices != nullptr &&
+        info->v1.hwDevices[0].version ==
+            QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1) {
+        effective = info->v1.hwDevices[0].v1.deviceId;
+    }
+
+    if (impl_->interface.deviceFreePlatformInfo) {
+        impl_->interface.deviceFreePlatformInfo(impl_->logger, info);
+    }
+    return effective;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

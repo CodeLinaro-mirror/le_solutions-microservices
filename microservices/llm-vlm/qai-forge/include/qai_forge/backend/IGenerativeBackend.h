@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/backend/BackendCapabilities.h"
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/worker/InferenceProtocol.h"
 #include <string>
 #include <vector>
@@ -63,6 +64,22 @@ public:
     virtual void loadModel(const std::string& model_id) {
         (void)model_id;
         throw std::runtime_error("Backend does not implement loadModel()");
+    }
+
+    /**
+     * Load this runtime through the provider-neutral placement boundary.
+     * Concrete adapters translate the execution plan into provider-specific
+     * launch configuration. Default falls back to the model-only overload
+     * when no placement plan is present.
+     */
+    virtual void loadModel(
+        const qai_forge::execution::RuntimeLaunchRequest& request) {
+        if (!request.execution_plan.components.empty() ||
+            !request.execution_plan.native_options.empty()) {
+            throw std::runtime_error(
+                "Backend does not support placement-aware loadModel()");
+        }
+        loadModel(request.model_id);
     }
 
     /**

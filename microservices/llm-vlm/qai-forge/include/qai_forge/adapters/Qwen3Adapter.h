@@ -36,4 +36,5 @@ public:
     std::string adapterName() const override { return "Qwen3Adapter"; }
     bool supportsVision() const override { return true; }
     bool supportsToolCalling() const override { return true; }
+    std::string toolCallStartMarker() const override { return "<tool_call>"; }
 };

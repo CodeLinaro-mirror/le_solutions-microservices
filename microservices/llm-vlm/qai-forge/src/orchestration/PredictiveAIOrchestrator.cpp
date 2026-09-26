@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // DEPRECATED — PredictiveAIOrchestrator.cpp
 //
-// This file is no longer compiled (removed from CMakeLists.txt in Phase 4).
+// This file is no longer compiled (removed from CMakeLists.txt).
 // PredictiveAIOrchestrator has been superseded by PredictiveModelPool.
 //
 // QaiForge::infer() now routes through PredictiveModelPool, which provides:
@@ -13,6 +13,4 @@
 //   - Idle-timeout eviction for unused models
 //   - Per-model serialization + cross-model concurrency
 //   - Owned backend instances (not singletons) via BackendFactory::createPredictiveBackend()
-//
-// See qai-forge/docs/phase4-predictive-scheduler.md for the full design.
 // ─────────────────────────────────────────────────────────────────────────────

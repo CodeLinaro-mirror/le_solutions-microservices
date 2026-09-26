@@ -17,11 +17,13 @@ PredictiveModelPool::PredictiveModelPool(
     WarmModelPoolConfig config,
     PredictiveBackendFactory factory,
     ModelRuntimeEvents runtime_events,
-    std::shared_ptr<ModelLoadCoordinator> load_coordinator)
+    std::shared_ptr<ModelLoadCoordinator> load_coordinator,
+    std::shared_ptr<PlacementContext> placement)
     : config_(std::move(config))
     , factory_(std::move(factory))
     , runtime_events_(std::move(runtime_events))
     , load_coordinator_(std::move(load_coordinator))
+    , placement_(std::move(placement))
 {
     // Use default factory if none provided
     if (!factory_) {
@@ -34,6 +36,9 @@ PredictiveModelPool::PredictiveModelPool(
         load_coordinator_ =
             std::make_shared<ModelLoadCoordinator>(config_.memory_headroom_mb);
         load_coordinator_->start();
+    }
+    if (!placement_) {
+        placement_ = PlacementContext::createDefault();
     }
 
     LOG_INFO("[PredictiveModelPool] Initialized with max_active_models="
@@ -355,6 +360,7 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
         BackendFactory::createPredictiveOrchestrator(),
         load_coordinator_,
         modelMemoryMb(model_id),
+        placement_,
         runtime_events_);
 
     runtime->start();
@@ -396,7 +402,7 @@ long PredictiveModelPool::availableMemoryMb() const {
 }
 
 long PredictiveModelPool::modelMemoryMb(const std::string& model_id) const {
-    const auto* config =
+    const auto config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!config) {
         LOG_WARN("[PredictiveModelPool] Model '" << model_id

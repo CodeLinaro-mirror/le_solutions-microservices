@@ -16,6 +16,14 @@
 //   - Images are resolved directly from shared memory and passed as
 //     ImageBuffer to VlmEngine — no disk I/O
 //   - RESET is a no-op (VLM context management uses SAVE_KV / RESTORE_KV)
+//
+// READY messages: the pre-INIT startup READY and every per-EXECUTE/RESET/
+// SAVE_KV/RESTORE_KV READY are the bare {"type":"READY",...} form. The one
+// post-INIT-success READY (sent once VlmEngine construction succeeds)
+// additionally reports {"provider":"genie","binding_strength":"preferred"}
+// — GenIE's device selection is applied earlier, before INIT is even sent,
+// by GenieConfigMaterializer patching htp_backend_ext_config.json, so this
+// READY only confirms the worker started successfully with that config.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "vlm-engine.hpp"
@@ -163,7 +171,10 @@ int main() {
                     cmd.value("config_file", ""),
                     cmd.value("sampler_config", "sampler.json"));
                 LOG_INFO("[vlm-worker] Model loaded: " << model_id);
-                send_message({{"type", "READY"}});
+                send_message({
+                    {"type", "READY"},
+                    {"provider", "genie"},
+                    {"binding_strength", "preferred"}});
             } catch (const std::exception& e) {
                 send_message({{"type", "ERROR"},
                                {"message", "Failed to load model '" + model_id + "': " +

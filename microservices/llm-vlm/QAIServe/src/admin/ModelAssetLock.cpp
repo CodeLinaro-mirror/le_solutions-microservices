@@ -140,8 +140,13 @@ std::string expectedInstallPath(const std::string& models_dir,
         if (!chipset.empty()) dest_name += "-" + chipset;
         return (fs::path(models_dir) / dest_name).string();
     }
-    // GenieX SDK writes to GENIEX_DATADIR/models/<org>/<repo>, where GENIEX_DATADIR = models_dir.
-    return (fs::path(models_dir) / "models" / model).string();
+    // GenieX SDK writes to <data_dir>/models/<org>/<repo> where <data_dir> is
+    // GENIEX_DATADIR (see AdminController::genieXDataDir(), which defaults it
+    // to the parent of models_dir rather than models_dir itself, to avoid
+    // double "models" nesting). With that data_dir choice, the SDK's own
+    // nested "models/" subfolder resolves back to exactly models_dir, so the
+    // install path here is simply models_dir/<org>/<repo> — no extra segment.
+    return (fs::path(models_dir) / model).string();
 }
 
 // ── cleanupOnStartup ─────────────────────────────────────────────────────────

@@ -93,12 +93,15 @@ ModelRuntime::ModelRuntime(std::string model_id,
                      std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                      std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                      long model_memory_mb,
+                     std::shared_ptr<PlacementContext> placement,
                      ModelRuntimeEvents events)
-    : model_id_(std::move(model_id)),
+    : model_id_(model_id),
+      runtime_id_{model_id, 0},
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
       memory_coordinator_(std::move(coordinator)),
       load_coordinator_(std::move(load_coordinator)),
+      placement_(std::move(placement)),
       events_(std::move(events)),
       model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 4096) {
     if (model_id_.empty()) {
@@ -117,6 +120,10 @@ ModelRuntime::ModelRuntime(std::string model_id,
     if (!load_coordinator_) {
         throw std::invalid_argument(
             "ModelRuntime requires a model load coordinator");
+    }
+    if (!placement_) {
+        throw std::invalid_argument(
+            "ModelRuntime requires a placement context");
     }
     post_turn_worker_ = std::make_unique<PostTurnWorker>(
         model_id_,
@@ -660,7 +667,22 @@ void ModelRuntime::executorLoop() {
                     LOG_INFO("[ModelRuntime] Loading backend: model="
                              << model_id_ << " attempt=" << attempt
                              << "/" << kMaxLoadAttempts);
-                    backend_->loadModel(model_id_);
+                    auto placement_admission =
+                        placement_->tryAcquireAutomatic(runtime_id_, model_id_);
+                    if (!placement_admission.granted) {
+                        throw GenAIException(
+                            GenAIErrorCode::HARDWARE_UNAVAILABLE,
+                            "Placement admission denied for model '" +
+                                model_id_ + "': " +
+                                placement_admission.denial_reason,
+                            503);
+                    }
+                    qai_forge::execution::RuntimeLaunchRequest launch_request{
+                        runtime_id_, model_id_,
+                        placement_admission.reservation.plan()};
+                    backend_->loadModel(launch_request);
+                    placement_reservation_ =
+                        std::move(placement_admission.reservation);
                     reservation.release();
                     LOG_INFO("[ModelRuntime] Backend loaded: model=" << model_id_);
                     qai_forge::writeUseLock(model_id_);
@@ -1336,6 +1358,9 @@ void ModelRuntime::unloadBackend(bool force) {
         LOG_WARN("[ModelRuntime] Backend unload threw and was suppressed; retaining use lock: model="
                  << model_id_);
     }
+    // Release the resource lease unconditionally — the backend no longer
+    // holds the device, whether or not unloadModel() threw.
+    placement_reservation_.release();
 }
 
 void ModelRuntime::setStateLocked(

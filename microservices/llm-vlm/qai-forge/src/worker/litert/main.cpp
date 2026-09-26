@@ -14,6 +14,14 @@
 // shapes). INIT command parameters differ:
 //   {"type":"INIT","model_id":"...","model_file":"...","dispatch_lib_dir":"...",
 //    "compiler_plugin_dir":"...","hw_accelerators":<int>}
+//   (hw_accelerators is a flat INIT field, not a nested placement object —
+//    it defaults to 5 = NPU|CPU when absent. There is currently no
+//    per-plan LiteRT accelerator override in INIT; accelerator class
+//    selection is driven by the LITERT_HW_ACCELERATORS env var only.)
+//
+// Post-INIT READY always confirms the accelerator mask that was used:
+//   {"type":"READY","provider":"litert","binding_strength":"automatic",
+//    "litert":{"hw_accelerators":<int>}}
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "litert-engine.hpp"
@@ -183,7 +191,12 @@ int main() {
             try {
                 engine = std::make_unique<LiteRTEngine>(
                     model_file, dispatch_lib_dir, compiler_plugin_dir, hw_accelerators);
-                sendMsg({{"type", "READY"}});
+                sendMsg({
+                    {"type", "READY"},
+                    {"provider", "litert"},
+                    {"binding_strength", "automatic"},
+                    {"litert", {{"hw_accelerators", hw_accelerators}}}
+                });
             } catch (const std::exception& e) {
                 sendMsg({{"type", "ERROR"}, {"message", e.what()}});
             }

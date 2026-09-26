@@ -4,30 +4,28 @@
 #pragma once
 
 #include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
+#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
 //
-// Wraps PredictiveWorkerManager to manage the litert-inference-worker
-// subprocess. Supports .tflite models with NPU acceleration (Qualcomm QNN
-// dispatch) and CPU fallback via the LiteRT CompiledModel API.
+// Manages the litert-inference-worker subprocess via PredictiveWorkerManager.
+// The worker binary path is resolved from the LITERT_WORKER_BINARY environment
+// variable (default: /usr/local/bin/litert-inference-worker).
 //
-// metadata.json fields used:
-//   "runtime":              "litert"
-//   "model_file":           "model.tflite"
-//   "dispatch_lib_dir":     "/usr/lib"   (optional, default /usr/lib)
-//   "compiler_plugin_dir":  "/usr/lib"   (optional, default /usr/lib)
+// Placement: initialize(RuntimeLaunchRequest) translates the resolved
+// ExecutionPlan into a LiteRT hw_accelerators bitmask via LiteRtLaunchOptions.
 //
-// Environment variable overrides:
-//   LITERT_WORKER_BINARY       — path to litert-inference-worker binary
-//   LITERT_DISPATCH_DIR        — dispatch library directory
-//   LITERT_COMPILER_PLUGIN_DIR — compiler plugin directory
+// INIT params sent to the worker:
+//   model_file          — absolute path to the .tflite model
+//   dispatch_lib_dir    — directory containing LiteRT dispatch .so
+//   compiler_plugin_dir — directory containing LiteRT compiler plugin .so
+//   hw_accelerators     — bitmask (NPU=4, CPU=1; default 5 = NPU|CPU)
 // ─────────────────────────────────────────────────────────────────────────────
-
-class PredictiveWorkerManager;
 
 class LiteRTBackend : public IInferenceBackend {
 public:
@@ -45,6 +43,17 @@ public:
     void initialize(const std::string& model_id,
                     const std::string& model_file) override;
 
+    void initialize(
+        const qai_forge::execution::RuntimeLaunchRequest& request) override;
+
+    /**
+     * Placement-aware initialization. LiteRT accepts accelerator classes,
+     * not physical HTP IDs; binding remains Automatic.
+     */
+    void initialize(const std::string& model_id,
+                    const std::string& model_file,
+                    const qai_forge::execution::ExecutionPlan& plan);
+
     TensorInferenceResponse infer(
         const SegmentedTensorInferenceRequest& request) override;
     PredictiveExecuteRequest prepareWorkerRequest(
@@ -54,10 +63,12 @@ public:
     void shutdown() override;
 
 private:
-    LiteRTBackend(const LiteRTBackend&)            = delete;
+    LiteRTBackend(const LiteRTBackend&) = delete;
     LiteRTBackend& operator=(const LiteRTBackend&) = delete;
 
     std::unique_ptr<PredictiveSharedMemory> shared_memory_;
     std::unique_ptr<PredictiveWorkerManager> worker_;
+    qai_forge::execution::ExecutionPlan current_plan_;
+    bool has_current_plan_ = false;
     std::string current_model_id_;
 };

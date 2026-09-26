@@ -8,7 +8,7 @@
 #include <atomic>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMWorkerManager — Phase 2: Extended worker manager for LiteRT-LM
+// LiteRTLMWorkerManager — Extended worker manager for LiteRT-LM
 //
 // Extends InferenceWorkerManager with LiteRT-LM-specific startup handling:
 //
@@ -78,6 +78,11 @@ public:
     void ensureWorkerRunning(const std::string& model_id,
                              const std::string& config_file,
                              const std::string& sampler_config) override;
+
+    void ensureWorkerRunning(const std::string& model_id,
+                             const std::string& config_file,
+                             const std::string& sampler_config,
+                             ReadyValidator ready_validator);
 
     /**
      * Return the metadata received from the worker after model load.

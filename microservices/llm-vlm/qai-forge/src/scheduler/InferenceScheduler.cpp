@@ -268,18 +268,22 @@ InferenceScheduler::InferenceScheduler(
       model_load_coordinator_(std::make_shared<ModelLoadCoordinator>(
           std::max(config_.generative_pool_config.memory_headroom_mb,
                    config_.predictive_pool_config.memory_headroom_mb))),
+      placement_context_(PlacementContext::createDefault()),
       generative_pool_(
           config_.generative_pool_config,
           std::move(generative_factory),
           {},
           memory_coordinator_,
-          model_load_coordinator_),
+          model_load_coordinator_,
+          placement_context_),
       predictive_pool_(
           config_.predictive_pool_config,
           std::move(predictive_factory),
           {},
-          model_load_coordinator_) {
-    LOG_INFO("[InferenceScheduler] Configured shared model load coordinator");
+          model_load_coordinator_,
+          placement_context_) {
+    LOG_INFO("[InferenceScheduler] Configured shared model load coordinator "
+             "and placement context");
 }
 
 InferenceScheduler::~InferenceScheduler() {

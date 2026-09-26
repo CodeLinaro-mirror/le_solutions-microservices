@@ -16,6 +16,15 @@
 //
 // The worker supports multiple in-flight EXECUTE requests when the loaded
 // model enables bounded continuous batching.
+//
+// READY messages: the pre-INIT startup READY (sent immediately on socket
+// connect) and every RESET/ABORT/REINITIALIZE/SAVE_KV/RESTORE_KV READY are
+// the bare {"type":"READY",...} form. The one post-INIT-success READY (sent
+// once the first lane is created) additionally reports
+// {"provider":"genie","binding_strength":"preferred"} — GenIE's device
+// selection is applied earlier, before INIT is even sent, by
+// GenieConfigMaterializer patching htp_backend_ext_config.json, so this
+// READY only confirms the worker started successfully with that config.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "llm-engine.hpp"
@@ -487,7 +496,10 @@ int main() {
                          << " reason=initial lane_count=" << g_lanes.size());
                 startSweepThread();
 
-                send_message({{"type","READY"}});
+                send_message({
+                    {"type", "READY"},
+                    {"provider", "genie"},
+                    {"binding_strength", "preferred"}});
             } catch (const std::exception& e) {
                 send_message({{"type","ERROR"},{"message",e.what()}});
             }

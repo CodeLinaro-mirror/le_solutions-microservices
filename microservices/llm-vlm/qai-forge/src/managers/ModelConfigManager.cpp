@@ -5,13 +5,24 @@
 // ModelConfigManager — Layer 2 Implementation
 //
 // Scans model bundles from the models directory, copies and patches JSON
-// config files to /tmp/configs (to avoid corrupting original bundles), and
-// exposes a clean read-only API to the orchestration pipeline.
+// config files into a generation-scoped discovery directory (to avoid
+// corrupting original bundles and to avoid invalidating files still in use
+// by resident runtimes on rescan), and exposes a clean read-only API to the
+// orchestration pipeline.
 //
-// Adheres to architecture_refactoring_design.md:
+// Design:
 //   - Pure data manager: no process spawning, no inference handles.
 //   - Thread-safe via shared_mutex (multiple readers, single writer on reload).
 //   - Supports both metadata.json (new format) and model_config.json (legacy).
+//
+// Discovery-safety design:
+//   Each scanModelBundles() call builds an entirely new generation directory
+//   (tmp_config_dir_/generation-<stamp>/) without touching the previously
+//   published generation. Only on full success is models_/current_generation_
+//   atomically swapped under the write lock. ModelConfigHandle keeps a
+//   shared_ptr<const void> reference to the generation it was resolved from,
+//   so as long as any caller retains a handle, that generation's on-disk
+//   files remain alive even after a subsequent scan publishes a new one.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/managers/ModelConfigManager.h"
@@ -21,13 +32,16 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <cmath>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -66,6 +80,60 @@ std::string normalizeRuntime(const std::string& runtime) {
     return it != aliases.end() ? it->second : runtime;
 }
 
+bool isSafeRelativePath(const fs::path& path) {
+    const fs::path normalized = path.lexically_normal();
+    if (normalized.empty() || normalized.is_absolute() || normalized.has_root_name()) {
+        return false;
+    }
+
+    const auto first = normalized.begin();
+    return first == normalized.end() || *first != "..";
+}
+
+fs::path resolveBundleRelativePath(
+    const std::string& relative_path,
+    const std::string& bundle_path,
+    const std::string& description) {
+    const fs::path relative = fs::path(relative_path).lexically_normal();
+    if (!isSafeRelativePath(relative)) {
+        throw std::runtime_error(
+            "Unsafe " + description + " path: " + relative_path);
+    }
+    return fs::path(bundle_path) / relative;
+}
+
+std::string remapBundleJsonPath(
+    const std::string& source_path,
+    const std::string& bundle_path,
+    const std::string& processed_config_dir) {
+    const fs::path source = fs::path(source_path).lexically_normal();
+    const fs::path bundle = fs::path(bundle_path).lexically_normal();
+
+    std::error_code ec;
+    const fs::path relative = fs::relative(source, bundle, ec).lexically_normal();
+    if (ec || !isSafeRelativePath(relative) ||
+        source.extension() != ".json") {
+        return source_path;
+    }
+
+    return (fs::path(processed_config_dir) / relative).string();
+}
+
+// Retains ownership of a discovery generation's on-disk directory. Erased
+// (via shared_ptr refcounting inside ModelConfigHandle/current_generation_)
+// only once no caller and no published models_ map reference it anymore.
+struct DiscoveryGeneration {
+    explicit DiscoveryGeneration(fs::path root_path)
+        : root(std::move(root_path)) {}
+
+    ~DiscoveryGeneration() {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+
+    fs::path root;
+};
+
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,18 +154,24 @@ void ModelConfigManager::scanModelBundles() {
 
     std::unordered_map<std::string, ModelConfig> new_models;
     std::string new_default;
+    bool discovery_failed = false;
 
-    // Clean up and recreate /tmp/configs
-    if (fs::exists(tmp_config_dir_)) {
-        fs::remove_all(tmp_config_dir_);
-    }
-    fs::create_directories(tmp_config_dir_);
+    // Build this scan's output entirely under a fresh generation directory.
+    // The previously published generation (models_/current_generation_) is
+    // never touched until the very end of this function, after
+    // discovery_failed has been checked — any resident runtime still
+    // referencing the old generation via a ModelConfigHandle keeps that
+    // generation's files alive regardless of what happens here.
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path published_dir =
+        fs::path(tmp_config_dir_) / ("generation-" + std::to_string(stamp));
+    fs::create_directories(published_dir);
 
     if (!fs::exists(models_dir_)) {
         LOG_ERROR("[ModelConfigManager] Models directory not found: " << models_dir_);
-        std::unique_lock lock(mutex_);
-        models_ = std::move(new_models);
-        default_model_id_ = new_default;
+        std::error_code ec;
+        fs::remove_all(published_dir, ec);
+        LOG_ERROR("[ModelConfigManager] Discovery aborted; previous generation remains active.");
         return;
     }
 
@@ -111,7 +185,14 @@ void ModelConfigManager::scanModelBundles() {
         // ── New format: metadata.json ──────────────────────────────────────
         if (fs::exists(bundle_path + "/metadata.json")) {
             try {
-                std::string processed_dir = processBundle(bundle_path, bundle_name);
+                const fs::path relative_bundle =
+                    fs::relative(entry.path(), fs::path(models_dir_)).lexically_normal();
+                if (!isSafeRelativePath(relative_bundle)) {
+                    throw std::runtime_error(
+                        "Unsafe bundle-relative path: " + relative_bundle.string());
+                }
+                std::string processed_dir = processBundle(
+                    bundle_path, relative_bundle.string(), published_dir.string());
 
                 std::ifstream f(processed_dir + "/metadata.json");
                 json metadata = json::parse(f);
@@ -143,6 +224,7 @@ void ModelConfigManager::scanModelBundles() {
                          << " from " << bundle_name);
 
             } catch (const std::exception& e) {
+                discovery_failed = true;
                 LOG_ERROR("[ModelConfigManager] Error processing bundle "
                           << bundle_name << ": " << e.what());
             }
@@ -150,7 +232,14 @@ void ModelConfigManager::scanModelBundles() {
         // ── Legacy format: model_config.json ──────────────────────────────
         else if (fs::exists(bundle_path + "/model_config.json")) {
             try {
-                std::string processed_dir = processBundle(bundle_path, bundle_name);
+                const fs::path relative_bundle =
+                    fs::relative(entry.path(), fs::path(models_dir_)).lexically_normal();
+                if (!isSafeRelativePath(relative_bundle)) {
+                    throw std::runtime_error(
+                        "Unsafe bundle-relative path: " + relative_bundle.string());
+                }
+                std::string processed_dir = processBundle(
+                    bundle_path, relative_bundle.string(), published_dir.string());
 
                 std::ifstream f(processed_dir + "/model_config.json");
                 json model_config_data = json::parse(f);
@@ -167,7 +256,14 @@ void ModelConfigManager::scanModelBundles() {
                     // Resolve config_file to the processed copy
                     std::string orig_config = model_info.value("config_file", "");
                     if (!orig_config.empty()) {
-                        config.config_file = processed_dir + "/" + fs::path(orig_config).filename().string();
+                        const fs::path relative =
+                            fs::path(orig_config).lexically_normal();
+                        if (!isSafeRelativePath(relative)) {
+                            throw std::runtime_error(
+                                "Unsafe legacy config path: " + orig_config);
+                        }
+                        config.config_file =
+                            (fs::path(processed_dir) / relative).string();
                     }
 
                     if (new_models.count(model_id)) {
@@ -183,6 +279,7 @@ void ModelConfigManager::scanModelBundles() {
                 }
 
             } catch (const std::exception& e) {
+                discovery_failed = true;
                 LOG_ERROR("[ModelConfigManager] Error processing legacy bundle "
                           << bundle_name << ": " << e.what());
             }
@@ -196,7 +293,22 @@ void ModelConfigManager::scanModelBundles() {
                 std::ifstream f(bundle_path + "/geniex.json");
                 json manifest = json::parse(f);
 
+                const fs::path relative_bundle =
+                    fs::relative(entry.path(), fs::path(models_dir_)).lexically_normal();
+                if (!isSafeRelativePath(relative_bundle)) {
+                    throw std::runtime_error(
+                        "Unsafe bundle-relative path: " + relative_bundle.string());
+                }
+                const std::string processed_dir = processBundle(
+                    bundle_path, relative_bundle.string(), published_dir.string());
+
                 auto configs = parseGenieXJson(manifest, bundle_path);
+                for (auto& parsed : configs) {
+                    if (!parsed.config_file.empty()) {
+                        parsed.config_file = remapBundleJsonPath(
+                            parsed.config_file, bundle_path, processed_dir);
+                    }
+                }
                 for (auto& config : configs) {
                     if (config.id.empty()) {
                         LOG_WARN("[ModelConfigManager] Could not derive id from geniex.json: "
@@ -218,6 +330,7 @@ void ModelConfigManager::scanModelBundles() {
                 }
 
             } catch (const std::exception& e) {
+                discovery_failed = true;
                 LOG_ERROR("[ModelConfigManager] Error processing GenieX bundle "
                           << bundle_name << ": " << e.what());
             }
@@ -231,7 +344,22 @@ void ModelConfigManager::scanModelBundles() {
                 std::ifstream f(bundle_path + "/hf_manifest.json");
                 json manifest = json::parse(f);
 
+                const fs::path relative_bundle =
+                    fs::relative(entry.path(), fs::path(models_dir_)).lexically_normal();
+                if (!isSafeRelativePath(relative_bundle)) {
+                    throw std::runtime_error(
+                        "Unsafe bundle-relative path: " + relative_bundle.string());
+                }
+                const std::string processed_dir = processBundle(
+                    bundle_path, relative_bundle.string(), published_dir.string());
+
                 auto configs = parseGenieXJson(manifest, bundle_path);
+                for (auto& parsed : configs) {
+                    if (!parsed.config_file.empty()) {
+                        parsed.config_file = remapBundleJsonPath(
+                            parsed.config_file, bundle_path, processed_dir);
+                    }
+                }
                 for (auto& config : configs) {
                     if (config.id.empty()) {
                         LOG_WARN("[ModelConfigManager] Could not derive id from hf_manifest.json: "
@@ -253,6 +381,7 @@ void ModelConfigManager::scanModelBundles() {
                 }
 
             } catch (const std::exception& e) {
+                discovery_failed = true;
                 LOG_ERROR("[ModelConfigManager] Error processing HF bundle "
                           << bundle_name << ": " << e.what());
             }
@@ -327,6 +456,7 @@ void ModelConfigManager::scanModelBundles() {
                      << model_id << " -> " << file_path);
 
         } catch (const std::exception& e) {
+            discovery_failed = true;
             LOG_ERROR("[ModelConfigManager] Error auto-discovering .litertlm file "
                       << file_path << ": " << e.what());
         }
@@ -418,24 +548,57 @@ void ModelConfigManager::scanModelBundles() {
                      << " (ctx=" << config.context_size << ")");
 
         } catch (const std::exception& e) {
+            discovery_failed = true;
             LOG_ERROR("[ModelConfigManager] Error auto-discovering .gguf file "
                       << file_path << ": " << e.what());
         }
     }
 #endif // QAI_FORGE_BUILD_LLAMACPP
 
-    std::unique_lock lock(mutex_);
-    models_ = std::move(new_models);
-    default_model_id_ = new_default;
-    LOG_INFO("[ModelConfigManager] Scan complete. " << models_.size() << " model(s) loaded.");
+    if (discovery_failed) {
+        std::error_code ec;
+        fs::remove_all(published_dir, ec);
+        LOG_ERROR("[ModelConfigManager] Discovery failed; previous generation remains active.");
+        return;
+    }
+
+    // No rename/path-rewrite step needed: every ModelConfig was already
+    // built against published_dir (the final path) from the start, so every
+    // baked-in path is already correct.
+    auto generation = std::make_shared<DiscoveryGeneration>(published_dir);
+    std::unordered_map<std::string, std::shared_ptr<const ModelConfig>> published_models;
+    published_models.reserve(new_models.size());
+    for (auto& [id, config] : new_models) {
+        published_models.emplace(
+            id, std::make_shared<const ModelConfig>(std::move(config)));
+    }
+
+    {
+        std::unique_lock lock(mutex_);
+        models_ = std::move(published_models);
+        default_model_id_ = new_default;
+        current_generation_ = generation;
+    }
+    LOG_INFO("[ModelConfigManager] Scan complete. " << models_.size()
+             << " model(s) loaded in " << published_dir);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// processBundle — Copy and patch JSON configs to /tmp/configs
+// processBundle — Copy and patch JSON configs into the generation dir
 // ─────────────────────────────────────────────────────────────────────────────
-std::string ModelConfigManager::processBundle(const std::string& bundle_path, const std::string& bundle_name) {
-    std::string output_dir = tmp_config_dir_ + "/" + bundle_name;
+std::string ModelConfigManager::processBundle(const std::string& bundle_path,
+                                              const std::string& bundle_relative_path,
+                                              const std::string& generation_dir) {
+    const fs::path relative_bundle =
+        fs::path(bundle_relative_path).lexically_normal();
+    if (!isSafeRelativePath(relative_bundle)) {
+        throw std::runtime_error(
+            "Unsafe bundle-relative path: " + bundle_relative_path);
+    }
+
+    fs::path output_dir = fs::path(generation_dir) / relative_bundle;
     fs::create_directories(output_dir);
+    const std::string bundle_name = fs::path(bundle_path).filename().string();
 
     // Determine LLM config filename from metadata.json (for key normalization)
     std::string llm_config_filename;
@@ -451,49 +614,66 @@ std::string ModelConfigManager::processBundle(const std::string& bundle_path, co
         } catch (...) {}
     }
 
-    // Process each JSON file in the bundle
-    for (const auto& entry : fs::directory_iterator(bundle_path)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().extension() != ".json") continue;
+    // Process every JSON file while preserving its bundle-relative path.
+    // This prevents files such as subdir-a/config.json and
+    // subdir-b/config.json from colliding in the generated tree.
+    for (const auto& entry :
+         fs::recursive_directory_iterator(bundle_path)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+            continue;
+        }
 
-        std::string filename = entry.path().filename().string();
+        const fs::path relative_file =
+            fs::relative(entry.path(), fs::path(bundle_path)).lexically_normal();
+        if (!isSafeRelativePath(relative_file)) {
+            throw std::runtime_error(
+                "Unsafe bundle JSON relative path: " + entry.path().string());
+        }
+        const std::string filename = relative_file.filename().string();
 
-        // Never copy tokenizer assets — always reference the originals
-        if (filename == "tokenizer.json" || filename == "vocab.json") continue;
+        // Never copy tokenizer assets — always reference the originals.
+        if (filename == "tokenizer.json" || filename == "vocab.json") {
+            continue;
+        }
 
         json data;
         try {
             std::ifstream f(entry.path());
             data = json::parse(f);
         } catch (...) {
-            LOG_WARN("[ModelConfigManager] Failed to parse: " << entry.path().string());
-            continue;
+            throw std::runtime_error(
+                "Failed to parse bundle JSON: " + entry.path().string());
         }
 
-        // Normalize LLM dialog config: replace non-"dialog" root key with "dialog"
-        if (!llm_config_filename.empty() && filename == llm_config_filename &&
+        // Normalize only the configured root-level LLM dialog file.
+        if (!llm_config_filename.empty() &&
+            relative_file == fs::path(llm_config_filename) &&
             !data.contains("dialog") && data.size() == 1) {
             std::string old_key = data.begin().key();
             data["dialog"] = data[old_key];
             data.erase(old_key);
             LOG_DEBUG("[ModelConfigManager] Normalized root key '" << old_key
-                      << "' -> 'dialog' in " << bundle_name << "/" << filename);
+                      << "' -> 'dialog' in " << bundle_name << "/"
+                      << relative_file.string());
         }
 
-        // Apply patches to the copy (never to the original)
-        patchDialogSamplerConfig(data, bundle_name, filename);
-        applyContextCapping(data, bundle_name, filename);
-        patchHtpPollingConfig(data, bundle_name, filename);
+        patchDialogSamplerConfig(data, bundle_name, relative_file.string());
+        applyContextCapping(data, bundle_name, relative_file.string());
+        patchHtpPollingConfig(data, bundle_name, relative_file.string());
 
-        // Rewrite relative paths to absolute paths
-        data = rewritePaths(data, bundle_path, output_dir);
+        data = rewritePaths(data, bundle_path, output_dir.string());
 
-        // Write processed copy
-        std::ofstream out(output_dir + "/" + filename);
+        const fs::path destination = output_dir / relative_file;
+        fs::create_directories(destination.parent_path());
+        std::ofstream out(destination);
+        if (!out) {
+            throw std::runtime_error(
+                "Failed to write processed config: " + destination.string());
+        }
         out << data.dump(4);
     }
 
-    return output_dir;
+    return output_dir.string();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -548,18 +728,19 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
         std::string model_file;
         if (!model_files.empty()) {
             model_file = model_files.begin().key();
-            config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
+            config.config_file = resolveBundleRelativePath(
+                model_file, bundle_path, "model file").string();
         }
     }
     else if (config.runtime == "litert_lm") {
-        // Phase 5: LiteRT-LM model discovery
         // The config_file points to the .litertlm model bundle file.
         // Look for a .litertlm file in the bundle directory.
         auto model_files = metadata.value("model_files", json::object());
         if (!model_files.empty()) {
             // Use the first model file listed in metadata.json
             std::string model_file = model_files.begin().key();
-            config.config_file = bundle_path + "/" + fs::path(model_file).filename().string();
+            config.config_file = resolveBundleRelativePath(
+                model_file, bundle_path, "LiteRT-LM model file").string();
         } else {
             // Scan the bundle directory for a .litertlm file
             for (const auto& entry : fs::directory_iterator(bundle_path)) {
@@ -576,7 +757,14 @@ ModelConfig ModelConfigManager::parseMetadataJson(const json& metadata, const st
     } else {
         std::string text_gen = pipeline_nodes.value("textGenerator", "");
         if (!text_gen.empty()) {
-            config.config_file = processed_config_dir + "/" + fs::path(text_gen).filename().string();
+            const fs::path relative =
+                fs::path(text_gen).lexically_normal();
+            if (!isSafeRelativePath(relative)) {
+                throw std::runtime_error(
+                    "Unsafe text generator config path: " + text_gen);
+            }
+            config.config_file =
+                (fs::path(processed_config_dir) / relative).string();
         }
         if (config.config_file.empty()) {
             std::string fallback = processed_config_dir + "/genie_config.json";
@@ -814,7 +1002,10 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                 if (!v.value("Downloaded", false)) continue;
                 std::string fname = v.value("Name", "");
                 if (fname.empty()) continue;
-                if (fs::exists(fs::path(bundle_path) / fname)) {
+                const fs::path candidate =
+                    resolveBundleRelativePath(
+                        fname, bundle_path, "manifest model file");
+                if (fs::exists(candidate)) {
                     precision = k;
                     break;
                 }
@@ -845,9 +1036,13 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
         }
     }
     // MMProjFile.Name non-empty ⇒ multimodal.
+    bool has_mmproj = false;
     if (manifest.contains("MMProjFile") && manifest["MMProjFile"].is_object()) {
         std::string mmproj = manifest["MMProjFile"].value("Name", "");
-        if (!mmproj.empty()) is_vlm = true;
+        if (!mmproj.empty()) {
+            is_vlm = true;
+            has_mmproj = true;
+        }
     }
     config.supports_vision = is_vlm;
     // GenieX models are generative (LLM/VLM), routed to the generative pipeline.
@@ -873,7 +1068,8 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                 if (!quant_val.value("Downloaded", false)) continue;
                 std::string fname = quant_val.value("Name", "");
                 if (fname.empty()) continue;
-                fs::path model_path = fs::path(bundle_path) / fname;
+                const fs::path model_path = resolveBundleRelativePath(
+                    fname, bundle_path, "LiteRT-LM manifest model file");
                 if (!fs::exists(model_path)) continue;
 
                 ModelConfig cfg = config;
@@ -903,7 +1099,8 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                 if (!quant_val.value("Downloaded", false)) continue;
                 std::string fname = quant_val.value("Name", "");
                 if (fname.empty()) continue;
-                fs::path gguf_path = fs::path(bundle_path) / fname;
+                const fs::path gguf_path = resolveBundleRelativePath(
+                    fname, bundle_path, "llama.cpp manifest model file");
                 if (!fs::exists(gguf_path)) continue;
 
                 ModelConfig cfg = config;  // copy base config
@@ -920,6 +1117,15 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                 results.push_back(std::move(cfg));
             }
             if (!results.empty()) return results;
+        }
+    }
+
+    if (has_mmproj) {
+        std::string mmproj = manifest["MMProjFile"].value("Name", "");
+        const fs::path mmproj_full = resolveBundleRelativePath(
+            mmproj, bundle_path, "MMProj file");
+        if (fs::exists(mmproj_full)) {
+            config.sampler_config_file = mmproj_full.string();
         }
     }
 
@@ -989,7 +1195,8 @@ int ModelConfigManager::calculateMemoryFromBinFiles(const std::string& bundle_pa
 
     if (!model_files.empty()) {
         for (const auto& [filename, _] : model_files.items()) {
-            fs::path p = fs::path(bundle_path) / filename;
+            const fs::path p = resolveBundleRelativePath(
+                filename, bundle_path, "memory-estimation model file");
             if (fs::is_regular_file(p)) total_bytes += fs::file_size(p);
         }
     } else {
@@ -1046,7 +1253,15 @@ json ModelConfigManager::rewritePaths(const json& data, const std::string& bundl
             if (filename == "tokenizer.json" || filename == "vocab.json") {
                 return potential.string();
             }
-            if (potential.extension() == ".json") return processed_config_dir + "/" + filename;
+            if (potential.extension() == ".json") {
+                const fs::path relative =
+                    fs::path(val).lexically_normal();
+                if (!isSafeRelativePath(relative)) {
+                    throw std::runtime_error(
+                        "Unsafe JSON reference path: " + val);
+                }
+                return (fs::path(processed_config_dir) / relative).string();
+            }
             return potential.string();
         }
         return data;
@@ -1140,17 +1355,24 @@ void ModelConfigManager::patchHtpPollingConfig(json& data, const std::string& bu
 // ─────────────────────────────────────────────────────────────────────────────
 // Query API
 // ─────────────────────────────────────────────────────────────────────────────
-const ModelConfig* ModelConfigManager::getModelConfig(const std::string& model_id) const {
+ModelConfigHandle ModelConfigManager::getModelConfig(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) ? &it->second : nullptr;
+    if (it == models_.end() || !it->second) {
+        return {};
+    }
+    return ModelConfigHandle(
+        std::shared_ptr<const ModelConfig>(it->second),
+        current_generation_);
 }
 
 std::vector<ModelConfig> ModelConfigManager::getAvailableModels() const {
     std::shared_lock lock(mutex_);
     std::vector<ModelConfig> result;
     result.reserve(models_.size());
-    for (const auto& [id, cfg] : models_) result.push_back(cfg);
+    for (const auto& [id, cfg] : models_) {
+        if (cfg) result.push_back(*cfg);
+    }
     return result;
 }
 
@@ -1167,7 +1389,7 @@ bool ModelConfigManager::validateModel(const std::string& model_id) const {
 int ModelConfigManager::getContextSize(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    int size = (it != models_.end()) ? it->second.context_size : 4096;
+    int size = (it != models_.end() && it->second) ? it->second->context_size : 4096;
     const char* cap_env = std::getenv("GENAI_CONTEXT_CAPPING");
     if (cap_env) {
         try {
@@ -1183,63 +1405,64 @@ int ModelConfigManager::getContextSize(const std::string& model_id) const {
 int ModelConfigManager::getMaxSlots(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) ? it->second.max_slots : 1;
+    return (it != models_.end() && it->second) ? it->second->max_slots : 1;
 }
 
 bool ModelConfigManager::hasSharedEngine(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) && it->second.shared_engine;
+    return (it != models_.end() && it->second) && it->second->shared_engine;
 }
 
 int ModelConfigManager::getMemoryRequirementMb(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
-    auto it = models_.find(model_id);    return (it != models_.end()) ? it->second.memory_requirement_mb : 4096;
+    auto it = models_.find(model_id);
+    return (it != models_.end() && it->second) ? it->second->memory_requirement_mb : 4096;
 }
 
 bool ModelConfigManager::supportsVision(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) && it->second.supports_vision;
+    return (it != models_.end() && it->second) && it->second->supports_vision;
 }
 
 bool ModelConfigManager::supportsThinking(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) && it->second.supports_thinking;
+    return (it != models_.end() && it->second) && it->second->supports_thinking;
 }
 
 std::string ModelConfigManager::getConfigFilePath(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) ? it->second.config_file : "";
+    return (it != models_.end() && it->second) ? it->second->config_file : "";
 }
 
 std::optional<json> ModelConfigManager::getVisionPreprocessing(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    if (it != models_.end()) return it->second.vision_preprocessing;
+    if (it != models_.end() && it->second) return it->second->vision_preprocessing;
     return std::nullopt;
 }
 
 json ModelConfigManager::getChatTemplate(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
-    return (it != models_.end()) ? it->second.chat_template : json::object();
+    return (it != models_.end() && it->second) ? it->second->chat_template : json::object();
 }
 
 std::string ModelConfigManager::getRuntime(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
     // Default to "genie" — safe for all existing bundles
-    return (it != models_.end()) ? it->second.runtime : "genie";
+    return (it != models_.end() && it->second) ? it->second->runtime : "genie";
 }
 
 std::string ModelConfigManager::getModelType(const std::string& model_id) const {
     std::shared_lock lock(mutex_);
     auto it = models_.find(model_id);
     // Default to "generative" — safe for all existing bundles
-    return (it != models_.end()) ? it->second.model_type : "generative";
+    return (it != models_.end() && it->second) ? it->second->model_type : "generative";
 }
 
 void ModelConfigManager::updateLiteRTLMMetadata(const std::string& model_id,
@@ -1249,22 +1472,22 @@ void ModelConfigManager::updateLiteRTLMMetadata(const std::string& model_id,
                                                  const std::string& tool_response_delimiter) {
     std::unique_lock lock(mutex_);
     auto it = models_.find(model_id);
-    if (it == models_.end()) {
+    if (it == models_.end() || !it->second) {
         LOG_WARN("[ModelConfigManager] updateLiteRTLMMetadata: model not found: " << model_id);
         return;
     }
-    it->second.context_size = max_context_length;
+    ModelConfig updated = *it->second;
+    updated.context_size = max_context_length;
     if (!jinja_template.empty()) {
-        it->second.chat_template["jinja_template"] = jinja_template;
+        updated.chat_template["jinja_template"] = jinja_template;
     }
     if (!tool_call_delimiter.empty()) {
-        it->second.chat_template["tool_call_delimiter"] =
-            tool_call_delimiter;
+        updated.chat_template["tool_call_delimiter"] = tool_call_delimiter;
     }
     if (!tool_response_delimiter.empty()) {
-        it->second.chat_template["tool_response_delimiter"] =
-            tool_response_delimiter;
+        updated.chat_template["tool_response_delimiter"] = tool_response_delimiter;
     }
+    it->second = std::make_shared<const ModelConfig>(std::move(updated));
     LOG_INFO("[ModelConfigManager] Updated LiteRT-LM metadata for " << model_id
              << ": ctx=" << max_context_length
              << " jinja=" << (jinja_template.empty() ? "(none)" : "(set)"));

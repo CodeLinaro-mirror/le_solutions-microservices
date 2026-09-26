@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <optional>
 #include <unordered_map>
@@ -77,6 +79,43 @@ struct ModelConfig {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ModelConfigHandle — Immutable ownership handle for a discovered model config
+//
+// The generation token keeps the discovery generation's on-disk artifact
+// tree alive for as long as a caller retains this handle. This prevents a
+// concurrent rescan from deleting files (e.g. processed GenIE config JSON)
+// still in use by a resident backend or worker.
+// ─────────────────────────────────────────────────────────────────────────────
+class ModelConfigHandle {
+public:
+    ModelConfigHandle() = default;
+
+    const ModelConfig* operator->() const noexcept { return config_.get(); }
+    const ModelConfig& operator*() const noexcept { return *config_; }
+    operator const ModelConfig*() const noexcept { return config_.get(); }
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(config_);
+    }
+
+    // Keeps the immutable discovery generation alive while a caller uses
+    // paths derived from this model configuration. Forwarded only to
+    // runtime-artifact owners (e.g. GenieConfigMaterializer).
+    std::shared_ptr<const void> generationToken() const noexcept {
+        return generation_;
+    }
+
+private:
+    friend class ModelConfigManager;
+
+    ModelConfigHandle(std::shared_ptr<const ModelConfig> config,
+                      std::shared_ptr<const void> generation)
+        : config_(std::move(config)), generation_(std::move(generation)) {}
+
+    std::shared_ptr<const ModelConfig> config_;
+    std::shared_ptr<const void> generation_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ModelConfigManager — Layer 2 Singleton
 //
 // Responsibilities:
@@ -86,11 +125,11 @@ struct ModelConfig {
 //   4. Patch copied configs (context capping, sampler top-k, HTP polling).
 //   5. Expose a clean, read-only API for the orchestration pipeline.
 //
-// Design decisions (from architecture_refactoring_design.md):
+// Design decisions:
 //   - This is a pure data manager. It does NOT spawn processes or hold handles.
 //   - It is thread-safe via a shared_mutex (multiple readers, single writer on reload).
-//   - The ModelAdapter pattern (Section 3.E) uses this manager to resolve
-//     model-specific preprocessing and tool formatting adapters.
+//   - The ModelAdapter pattern uses this manager to resolve model-specific
+//     preprocessing and tool formatting adapters.
 // ─────────────────────────────────────────────────────────────────────────────
 class ModelConfigManager {
 public:
@@ -107,7 +146,7 @@ public:
 
     // ── Query API (thread-safe, read-only) ────────────────────────────────────
 
-    const ModelConfig* getModelConfig(const std::string& model_id) const;
+    ModelConfigHandle getModelConfig(const std::string& model_id) const;
     std::vector<ModelConfig> getAvailableModels() const;
     std::string getDefaultModelId() const;
     bool validateModel(const std::string& model_id) const;
@@ -162,12 +201,15 @@ private:
 
     /**
      * Process a single bundle directory:
-     *   1. Copy all JSON files (except tokenizer.json) to /tmp/configs/<bundle_name>/
+     *   1. Copy all JSON files (except tokenizer.json) into the given
+     *      generation directory, preserving relative subdirectory structure
      *   2. Apply patches to the copies (context capping, sampler, HTP polling)
      *   3. Rewrite relative file paths to absolute paths
      * Returns the path to the processed config directory.
      */
-    std::string processBundle(const std::string& bundle_path, const std::string& bundle_name);
+    std::string processBundle(const std::string& bundle_path,
+                              const std::string& bundle_relative_path,
+                              const std::string& generation_dir);
 
     /**
      * Parse a metadata.json file into a ModelConfig.
@@ -233,8 +275,10 @@ private:
 
     // ── State ──────────────────────────────────────────────────────────────────
     mutable std::shared_mutex mutex_;
-    std::unordered_map<std::string, ModelConfig> models_;
+    std::unordered_map<std::string, std::shared_ptr<const ModelConfig>> models_;
+    std::shared_ptr<const void> current_generation_;
+    uint64_t next_generation_id_ = 1;
     std::string default_model_id_;
     std::string models_dir_ = "/mnt/work/models";
-    std::string tmp_config_dir_ = "/tmp/configs";
+    std::string tmp_config_dir_ = "/tmp/qai-forge/discovery";
 };

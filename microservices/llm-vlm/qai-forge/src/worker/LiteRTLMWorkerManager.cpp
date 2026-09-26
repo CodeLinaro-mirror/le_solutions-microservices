@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMWorkerManager — Phase 2: Extended worker manager for LiteRT-LM
+// LiteRTLMWorkerManager — Extended worker manager for LiteRT-LM
 //
 // Extends InferenceWorkerManager to intercept the METADATA message that the
 // litert-lm-inference-worker sends after loading the model.
@@ -79,6 +79,14 @@ LiteRTLMWorkerManager::LiteRTLMWorkerManager()
 void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
                                                  const std::string& config_file,
                                                  const std::string& sampler_config) {
+    ensureWorkerRunning(model_id, config_file, sampler_config, ReadyValidator{});
+}
+
+void LiteRTLMWorkerManager::ensureWorkerRunning(
+    const std::string& model_id,
+    const std::string& config_file,
+    const std::string& sampler_config,
+    ReadyValidator ready_validator) {
     // Check if we already have metadata for this model (worker already running)
     if (metadata_.received && getCurrentModelId() == model_id && isWorkerRunning()) {
         LOG_DEBUG("[LiteRTLMWorkerManager] Worker already running for model: " << model_id
@@ -94,7 +102,8 @@ void LiteRTLMWorkerManager::ensureWorkerRunning(const std::string& model_id,
     // Call base class to start the worker and complete the INIT handshake.
     // The worker sends: READY → (base sends INIT) → READY
     // After the base class returns, the worker sends METADATA.
-    InferenceWorkerManager::ensureWorkerRunning(model_id, config_file, sampler_config);
+    InferenceWorkerManager::ensureWorkerRunning(
+        model_id, config_file, sampler_config, std::move(ready_validator));
 
     // If metadata already received (e.g. worker was already running), skip
     if (metadata_.received) {

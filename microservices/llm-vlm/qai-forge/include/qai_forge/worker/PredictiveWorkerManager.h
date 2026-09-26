@@ -41,6 +41,7 @@ using json = nlohmann::ordered_json;
 
 using PredictiveResultCallback = std::function<void(const TensorInferenceResponse&)>;
 using PredictiveErrorCallback  = std::function<void(const std::string& message)>;
+using PredictiveReadyValidator = std::function<void(const json& ready_message)>;
 
 class PredictiveWorkerManager {
 public:
@@ -68,9 +69,15 @@ public:
      *                     For QNN:  {"model_file":..., "backend_lib":..., "sys_lib":...}
      *                     For SNPE: {"model_file":..., "delegate":..., "output_tensors":[...]}
      */
+    /**
+     * @param ready_validator Optional callback used to validate INIT READY
+     *                       metadata before the worker is published as ready.
+     *                       Exceptions terminate the worker and fail startup.
+     */
     void ensureWorkerRunning(const std::string& model_id,
                              const json&        init_params,
-                             const PredictiveSharedMemoryView& shared_memory);
+                             const PredictiveSharedMemoryView& shared_memory,
+                             PredictiveReadyValidator ready_validator = {});
 
     void clearSharedMemory() noexcept;
 
@@ -126,7 +133,9 @@ private:
     int    shm_fd_        = -1;
     size_t shm_dir_bytes_ = 0;
 
-    void startWorker(const std::string& model_id, const json& init_params);
+    void startWorker(const std::string& model_id,
+                     const json& init_params,
+                     const PredictiveReadyValidator& ready_validator);
     void cleanupWorker(bool force = false);
 
     void sendMessage(const json& msg);

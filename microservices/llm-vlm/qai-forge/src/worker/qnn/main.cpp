@@ -18,8 +18,21 @@
 //
 //   INIT (load model):
 //     Server → Worker: {"type":"INIT","model_id":"...","model_file":"...",
-//                        "backend_lib":"...","sys_lib":"..."}
-//     Worker → Server: {"type":"READY"}  or  {"type":"ERROR","message":"..."}
+//                        "backend_lib":"...","sys_lib":"...",
+//                        "runtime_id":{"model_id":"...","replica_id":<uint>},
+//                        "provider":"qnn",
+//                        "qnn":{"device_id":<uint>,"require_exact":true}}
+//                       ("qnn" is present only when the resolved
+//                        ExecutionPlan requests an exact/physical device;
+//                        otherwise the worker binds automatically.)
+//     Worker → Server: {"type":"READY","provider":"qnn",
+//                        "runtime_id":{...},
+//                        "binding_strength":"exact"|"automatic",
+//                        "qnn":{"requested_device_id":<uint>,
+//                               "effective_device_id":<uint>}}
+//                       ("qnn" sub-object present only for the exact case,
+//                        via QNNEngine::effectiveDeviceId().)
+//                   or  {"type":"ERROR","message":"..."}
 //
 //   EXECUTE (run inference):
 //     Server → Worker: {"type":"EXECUTE","event_id":"...","model":"...",
@@ -42,12 +55,14 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/mman.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 
 using json = nlohmann::ordered_json;
@@ -166,8 +181,56 @@ int main() {
             std::string sys_lib    = msg.value("sys_lib",    "/usr/lib/libQnnSystem.so");
 
             try {
-                engine = std::make_unique<QNNEngine>(model_file, backend_lib, sys_lib);
-                sendMsg({{"type", "READY"}});
+                const auto runtime_id = msg.value("runtime_id", json::object());
+                if (!runtime_id.is_object() ||
+                    runtime_id.value("model_id", "") != model_id ||
+                    !runtime_id.contains("replica_id") ||
+                    !runtime_id["replica_id"].is_number_unsigned()) {
+                    throw std::runtime_error(
+                        "INIT runtime_id does not match model_id or is malformed");
+                }
+                if (msg.value("provider", "") != "qnn") {
+                    throw std::runtime_error(
+                        "INIT provider is missing or is not qnn");
+                }
+
+                std::optional<uint32_t> selected_device_id;
+                if (msg.contains("qnn")) {
+                    if (!msg["qnn"].is_object() ||
+                        !msg["qnn"].contains("device_id") ||
+                        !msg["qnn"]["device_id"].is_number_unsigned() ||
+                        !msg["qnn"].value("require_exact", false)) {
+                        throw std::runtime_error(
+                            "invalid exact QNN placement options in INIT");
+                    }
+                    selected_device_id =
+                        msg["qnn"]["device_id"].get<uint32_t>();
+                }
+
+                engine = std::make_unique<QNNEngine>(
+                    model_file, backend_lib, sys_lib, selected_device_id);
+
+                json ready = {
+                    {"type", "READY"},
+                    {"provider", "qnn"},
+                    {"runtime_id", runtime_id}};
+                if (selected_device_id.has_value()) {
+                    const auto effective = engine->effectiveDeviceId();
+                    if (!effective.has_value() ||
+                        *effective != *selected_device_id) {
+                        throw std::runtime_error(
+                            "QNN backend did not confirm requested device_id=" +
+                            std::to_string(*selected_device_id));
+                    }
+                    ready["qnn"] = {
+                        {"requested_device_id", *selected_device_id},
+                        {"effective_device_id", *effective}
+                    };
+                    ready["binding_strength"] = "exact";
+                } else {
+                    ready["binding_strength"] = "automatic";
+                }
+                sendMsg(ready);
             } catch (const std::exception& e) {
                 sendMsg({{"type", "ERROR"}, {"message", e.what()}});
             }

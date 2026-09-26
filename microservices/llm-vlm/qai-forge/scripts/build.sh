@@ -50,6 +50,14 @@ SKIP_QAIRT=false
 SKIP_DEPS=false
 DEBUG=false
 
+# stb / minja — pre-fetched (not via CMake FetchContent) so that the
+# subsequent `cmake -S` configure step below never performs any network/git
+# activity. Pinned commits match qai-forge/CMakeLists.txt's requirements.
+STB_SRC_DIR="${STB_SRC_DIR:-/opt/third_party/stb}"
+STB_GIT_REF="${STB_GIT_REF:-2c980bb59875b0d32144a71867fbdebb2f77cd20}"
+MINJA_SRC_DIR="${MINJA_SRC_DIR:-/opt/third_party/minja}"
+MINJA_GIT_REF="${MINJA_GIT_REF:-021c2293c187789ef13d56c6cfd89c9b134fd80f}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parse command line arguments
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,6 +165,16 @@ if [ "$SKIP_DEPS" = "false" ]; then
         sh "${SCRIPT_DIR}/deps/fetch-qairt-sdk.sh"
     fi
 
+    # Always pre-fetch stb (header-only image decoder) — avoids any network
+    # activity during the `cmake -S` configure step below.
+    if [ -f "${STB_SRC_DIR}/stb_image.h" ]; then
+        echo "stb already present at ${STB_SRC_DIR} (pinned ${STB_GIT_REF}); skipping fetch."
+    else
+        echo "Fetching stb (pinned ${STB_GIT_REF})..."
+        git clone https://github.com/nothings/stb.git "${STB_SRC_DIR}"
+        (cd "${STB_SRC_DIR}" && git checkout "${STB_GIT_REF}")
+    fi
+
     # Build LiteRT if requested
     if [ "$BUILD_LITERT" = "true" ]; then
         echo "Building LiteRT..."
@@ -165,6 +183,17 @@ if [ "$SKIP_DEPS" = "false" ]; then
 
     # Build LiteRT-LM if requested
     if [ "$BUILD_LITERT_LM" = "true" ]; then
+        # Pre-fetch minja (Jinja2 subset used by LiteRTLMOrchestrator) —
+        # avoids any network activity during the `cmake -S` configure step
+        # below, since QAI_FORGE_BUILD_LITERT_LM=ON requires MINJA_SOURCE_DIR.
+        if [ -f "${MINJA_SRC_DIR}/CMakeLists.txt" ]; then
+            echo "minja already present at ${MINJA_SRC_DIR} (pinned ${MINJA_GIT_REF}); skipping fetch."
+        else
+            echo "Fetching minja (pinned ${MINJA_GIT_REF})..."
+            git clone https://github.com/google/minja.git "${MINJA_SRC_DIR}"
+            (cd "${MINJA_SRC_DIR}" && git checkout "${MINJA_GIT_REF}")
+        fi
+
         echo "Building LiteRT-LM..."
         sh "${SCRIPT_DIR}/deps/build-litert-lm-standalone.sh"
 
@@ -208,6 +237,8 @@ cmake -S "${QAI_FORGE_DIR}" -B "${QAI_FORGE_DIR}/build" \
     -DCMAKE_PREFIX_PATH="${DEPLOY_DIR}/usr" \
     -DGENIE_INCLUDE_PATH=/usr/include \
     -DGENIE_LIB_PATH=/usr/lib \
+    -DSTB_SOURCE_DIR="${STB_SRC_DIR}" \
+    -DMINJA_SOURCE_DIR="${MINJA_SRC_DIR}" \
     -DQAI_FORGE_BUILD_LITERT="${BUILD_LITERT}" \
     -DQAI_FORGE_BUILD_LITERT_LM="${BUILD_LITERT_LM}" \
     -DLITERT_LM_INCLUDE_PATH=/usr/include \

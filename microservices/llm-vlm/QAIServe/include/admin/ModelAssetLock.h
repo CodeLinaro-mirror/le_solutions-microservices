@@ -49,7 +49,12 @@ LockJson buildUpdatedDownloadLockJson(const std::filesystem::path& path,
 // ── Install path helpers ───────────────────────────────────────────────────
 // Canonical install path for a model bundle.
 // AI Hub: models_dir/{model}-{runtime}-{precision}[-{chipset}]
-// GenieX: models_dir/models/{org}/{repo}   (SDK uses GENIEX_DATADIR/models/...)
+// GenieX: models_dir/{org}/{repo}
+//   (The GenieX SDK's own fixed convention is to write to
+//   <data_dir>/models/<org>/<repo>. AdminController::genieXDataDir() passes
+//   the *parent* of models_dir as that data_dir — not models_dir itself —
+//   so the SDK's nested "models/" subfolder resolves back to exactly
+//   models_dir, avoiding double "models" nesting on disk.)
 std::string expectedInstallPath(const std::string& models_dir,
                                 const std::string& source,
                                 const std::string& model,

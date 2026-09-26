@@ -13,6 +13,10 @@
 //   - bypass_think_filter is set here (GenIE SDK internal flag), not in Layer 2.
 //   - Worker selection (LLM vs VLM) is based on ModelConfigManager::supportsVision().
 //   - onContextCompacted() calls sendReset() on the correct worker.
+//   - loadModel() derives the placed HTP device_id from the resolved
+//     ExecutionPlan and materializes a runtime-specific GenIE config tree via
+//     GenieConfigMaterializer. Placement is the only path into loadModel() —
+//     model-only callers get a default RuntimeId(model_id, 0).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/GenIEBackend.h"
@@ -22,6 +26,68 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+// Extracts the placed HTP device id from a GenIE ExecutionPlan. Throws for
+// malformed, non-GenIE, or automatic (no physical target) plans.
+int selectedGenieDeviceId(const qai_forge::execution::ExecutionPlan& plan) {
+    if (plan.provider != "genie") {
+        throw std::invalid_argument(
+            "GenIEBackend: expected a GenIE execution plan");
+    }
+    if (plan.components.empty()) {
+        throw std::invalid_argument(
+            "GenIEBackend: placement plan has no GenIE components");
+    }
+
+    std::optional<int> selected;
+    for (const auto& component : plan.components) {
+        if (component.target.provider != "genie") {
+            throw std::invalid_argument(
+                "GenIEBackend: plan contains a non-GenIE target");
+        }
+        if (component.target.semantics !=
+                qai_forge::execution::TargetSemantics::PhysicalInstance ||
+            component.target.target_id.rfind("device_id=", 0) != 0) {
+            throw std::invalid_argument(
+                "GenIEBackend: placement plan must resolve to a physical "
+                "device_id target");
+        }
+
+        const std::string value =
+            component.target.target_id.substr(std::string("device_id=").size());
+        size_t consumed = 0;
+        int parsed = 0;
+        try {
+            parsed = std::stoi(value, &consumed, 10);
+        } catch (...) {
+            throw std::invalid_argument(
+                "GenIEBackend: invalid GenIE device_id: " + value);
+        }
+        if (consumed != value.size() || parsed < 0) {
+            throw std::invalid_argument(
+                "GenIEBackend: invalid GenIE device_id: " + value);
+        }
+
+        if (selected.has_value() && *selected != parsed) {
+            throw std::invalid_argument(
+                "GenIEBackend: plan contains conflicting device IDs");
+        }
+        selected = parsed;
+    }
+
+    if (!selected.has_value()) {
+        throw std::invalid_argument(
+            "GenIEBackend: placement plan has no physical GenIE device");
+    }
+    return *selected;
+}
+
+}  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
@@ -92,7 +158,28 @@ BackendCapabilities GenIEBackend::capabilities() const {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::loadModel(const std::string& model_id) {
-    const auto* model_config =
+    throw std::runtime_error(
+        "GenIEBackend: loadModel(model_id) is not supported — placement is "
+        "mandatory. Use loadModel(RuntimeLaunchRequest) or "
+        "loadModel(model_id, ExecutionPlan).");
+}
+
+void GenIEBackend::loadModel(
+    const qai_forge::execution::RuntimeLaunchRequest& request) {
+    loadModel(request.model_id, request.runtime_id, request.execution_plan);
+}
+
+void GenIEBackend::loadModel(
+    const std::string& model_id,
+    const qai_forge::execution::ExecutionPlan& plan) {
+    loadModel(model_id, qai_forge::execution::RuntimeId{model_id, 0}, plan);
+}
+
+void GenIEBackend::loadModel(
+    const std::string& model_id,
+    const qai_forge::execution::RuntimeId& runtime_id,
+    const qai_forge::execution::ExecutionPlan& plan) {
+    const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!model_config) {
         throw GenAIException(
@@ -101,9 +188,21 @@ void GenIEBackend::loadModel(const std::string& model_id) {
             404);
     }
 
-    ensureWorkerRunning(model_id,
-                        model_config->config_file,
-                        model_config->sampler_config_file);
+    const int device_id = selectedGenieDeviceId(plan);
+    qai_forge::execution::GenieConfigMaterializer materializer;
+    const auto launch = materializer.materialize(
+        model_config->config_file,
+        model_config->sampler_config_file,
+        runtime_id,
+        device_id,
+        model_config.generationToken());
+
+    ensureWorkerRunning(
+        model_id,
+        launch.config_file.string(),
+        launch.sampler_config_file.string(),
+        /*validate_ready=*/true);
+    runtime_artifacts_ = launch.artifacts;
 }
 
 void GenIEBackend::unloadModel(bool force) {
@@ -130,6 +229,7 @@ void GenIEBackend::unloadModel(bool force) {
 
     current_model_id_.clear();
     current_is_vlm_.store(false);
+    runtime_artifacts_.reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +239,13 @@ void GenIEBackend::unloadModel(bool force) {
 void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
                                        const std::string& config_file,
                                        const std::string& sampler_file) {
+    ensureWorkerRunning(model_id, config_file, sampler_file, /*validate_ready=*/false);
+}
+
+void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
+                                       const std::string& config_file,
+                                       const std::string& sampler_file,
+                                       bool validate_ready) {
     const bool is_vlm = ModelConfigManager::getInstance().supportsVision(model_id);
     const int max_concurrent = effectiveMaxConcurrent(model_id);
     if (!current_model_id_.empty() && current_is_vlm_.load() != is_vlm) {
@@ -148,14 +255,26 @@ void GenIEBackend::ensureWorkerRunning(const std::string& model_id,
     current_model_id_ = model_id;
     current_is_vlm_.store(is_vlm);
 
+    ReadyValidator validator;
+    if (validate_ready) {
+        validator = [](const json& ready) {
+            if (ready.value("provider", "") != "genie" ||
+                ready.value("binding_strength", "") != "preferred") {
+                throw std::runtime_error(
+                    "GenIEBackend: placement-aware READY metadata was not "
+                    "confirmed");
+            }
+        };
+    }
+
     if (is_vlm) {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: VLM model=" << model_id);
         vlmWorker().setMaxSlots(max_concurrent);
-        vlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
+        vlmWorker().ensureWorkerRunning(model_id, config_file, sampler_file, validator);
     } else {
         LOG_DEBUG("[GenIEBackend] ensureWorkerRunning: LLM model=" << model_id);
         llmWorker().setMaxSlots(max_concurrent);
-        llmWorker().ensureWorkerRunning(model_id, config_file, sampler_file);
+        llmWorker().ensureWorkerRunning(model_id, config_file, sampler_file, validator);
     }
 }
 
@@ -332,6 +451,7 @@ void GenIEBackend::terminateWorker(bool force) {
     }
     current_model_id_.clear();
     current_is_vlm_.store(false);
+    runtime_artifacts_.reset();
 }
 
 bool GenIEBackend::forceKillActiveWorker() {

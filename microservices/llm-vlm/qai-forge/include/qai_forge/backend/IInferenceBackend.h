@@ -5,6 +5,8 @@
 
 #include "qai_forge/backend/PredictiveSharedMemory.h"
 #include "qai_forge/dto/TensorDTOs.h"
+#include "qai_forge/execution/ExecutionPlan.h"
+#include <stdexcept>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,6 +46,22 @@ public:
      */
     virtual void initialize(const std::string& model_id,
                             const std::string& model_file) = 0;
+
+    /**
+     * Initialize this runtime through the provider-neutral placement
+     * boundary. Concrete adapters translate the execution plan into
+     * provider-specific init options. Default falls back to the
+     * model/file overload when no placement plan is present.
+     */
+    virtual void initialize(
+        const qai_forge::execution::RuntimeLaunchRequest& request) {
+        if (!request.execution_plan.components.empty() ||
+            !request.execution_plan.native_options.empty()) {
+            throw std::runtime_error(
+                "Backend does not support placement-aware initialize()");
+        }
+        initialize(request.model_id, {});
+    }
 
     /**
      * Run inference from non-owning tensor segments. Implementations write the

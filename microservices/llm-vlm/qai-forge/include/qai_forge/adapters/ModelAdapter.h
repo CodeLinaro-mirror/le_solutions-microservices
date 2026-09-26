@@ -10,7 +10,7 @@
 using json = nlohmann::ordered_json;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ModelAdapter — Abstract Interface (Section 3.E of architecture design)
+// ModelAdapter — Abstract Interface
 //
 // Defines the contract for all model-specific transformations.
 // The core orchestration pipeline (ChatOrchestratorImpl) calls these methods
@@ -123,4 +123,26 @@ public:
      * Returns true if this adapter supports tool calling.
      */
     virtual bool supportsToolCalling() const { return false; }
+
+    /**
+     * Returns the substring that marks the start of a tool-call payload in
+     * this model's raw output (e.g. "<tool_call>" for Qwen3, "<|tool_call>"
+     * for Gemma's LiteRT-LM FC grammar). Used only to gate per-token
+     * streaming suppression in orchestrators that stream raw tokens as they
+     * arrive: once this marker appears in the accumulated response text,
+     * raw tokens must be buffered (not forwarded to the client) rather than
+     * streamed, since the tool-call payload can only be safely parsed once
+     * complete (via parseToolCalls() on the full text).
+     *
+     * IMPORTANT: this must NOT be conflated with supportsToolCalling() — an
+     * adapter can support tool calling while returning "" here if
+     * suppression isn't needed, and conversely an orchestrator must only
+     * suppress once this marker is actually observed in the response, not
+     * merely because the adapter is tool-calling-capable in general.
+     *
+     * Returns "" (no suppression) for adapters that don't support tool
+     * calling, or whose tool-call syntax doesn't require full-response
+     * buffering to detect.
+     */
+    virtual std::string toolCallStartMarker() const { return ""; }
 };

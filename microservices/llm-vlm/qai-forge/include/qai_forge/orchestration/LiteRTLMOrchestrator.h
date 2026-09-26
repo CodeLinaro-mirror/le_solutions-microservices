@@ -6,6 +6,9 @@
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include "qai_forge/backend/LiteRTLMBackend.h"
 
+#include "minja/chat-template.hpp"
+
+#include <memory>
 #include <string>
 #include <mutex>
 
@@ -27,9 +30,9 @@ private:
 
     // ── Prompt rendering ───────────────────────────────────────────────────────
     // Renders the model's Jinja2 chat template (as provided by the LiteRT-LM
-    // worker's METADATA message) via jinja2cpp — a full Jinja2-compatible
-    // template engine. Falls back to a flat "role: content" formatter if the
-    // template is empty or fails to load/render.
+    // worker's METADATA message) via minja — a Jinja2 subset purpose-built
+    // for HuggingFace chat templates. Falls back to a flat "role: content"
+    // formatter if the template is empty or fails to compile/render.
     std::string renderPrompt(const json& messages,
                              const json& tools,
                              bool add_generation_prompt = true) const;
@@ -40,18 +43,14 @@ private:
                              const json& tools,
                              int max_context_length) const;
 
-    // ── Tool call parsing ──────────────────────────────────────────────────────
-    json parseToolCalls(const std::string& text,
-                        const std::string& delimiter) const;
-    std::string extractPreToolContent(const std::string& text,
-                                      const std::string& delimiter) const;
-
     // ── Mutable state for lazy init in const execute() ────────────────────────
     mutable std::string jinja_template_;
+    // Compiled minja chat template — built once in initMetadataIfNeeded()
+    // from jinja_template_. nullptr if the model's template is empty or
+    // fails to compile (renderPrompt() falls back to a flat formatter).
+    mutable std::unique_ptr<minja::chat_template> chat_template_;
     mutable std::string model_type_;
     mutable int         max_context_length_   = 0;
-    mutable std::string tool_call_delimiter_;
-    mutable std::string tool_response_delimiter_;
     mutable std::string think_start_;
     mutable std::string think_end_;
     mutable bool        metadata_initialized_ = false;

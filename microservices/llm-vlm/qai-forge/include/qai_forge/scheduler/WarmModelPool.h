@@ -7,6 +7,7 @@
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
+#include "qai_forge/scheduler/PlacementContext.h"
 #include "qai_forge/scheduler/SubmitResult.h"
 #include "qai_forge/backend/BackendFactory.h"
 
@@ -72,7 +73,8 @@ public:
                            std::shared_ptr<ConversationMemoryCoordinator>
                                memory_coordinator = {},
                            std::shared_ptr<ModelLoadCoordinator>
-                               load_coordinator = {});
+                               load_coordinator = {},
+                           std::shared_ptr<PlacementContext> placement = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -163,6 +165,7 @@ private:
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     bool owns_load_coordinator_ = false;
+    std::shared_ptr<PlacementContext> placement_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

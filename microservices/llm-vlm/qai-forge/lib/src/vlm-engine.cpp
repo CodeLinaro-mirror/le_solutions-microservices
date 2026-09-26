@@ -21,6 +21,7 @@
 #include "GenieSampler.h"
 
 #include <nlohmann/json.hpp>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -39,6 +40,7 @@
 #include <chrono>
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
@@ -200,10 +202,25 @@ VlmEngine::VlmEngine(const std::string& model_id,
         std::string model_key = root.begin().key();
         const auto& mc = root[model_key];
 
+        // Resolve node-config references against config_path's parent
+        // directory, since placement's GenieConfigMaterializer may write
+        // these as relative paths (relative to the materialized file).
+        const fs::path config_dir = fs::path(config_path).parent_path();
+        auto resolveNodeConfigPath = [&](const std::string& value) -> std::string {
+            const fs::path candidate(value);
+            if (candidate.is_absolute()) {
+                return value;
+            }
+            return (config_dir / candidate).string();
+        };
+
         const auto& nodes = mc.at("pipeline").at("nodes");
-        m_impl->model_config.imageEncoderConfig  = nodes.at("imageEncoder").get<std::string>();
-        m_impl->model_config.lutEncoderConfig    = nodes.at("lutEncoder").get<std::string>();
-        m_impl->model_config.textGeneratorConfig = nodes.at("textGenerator").get<std::string>();
+        m_impl->model_config.imageEncoderConfig  =
+            resolveNodeConfigPath(nodes.at("imageEncoder").get<std::string>());
+        m_impl->model_config.lutEncoderConfig    =
+            resolveNodeConfigPath(nodes.at("lutEncoder").get<std::string>());
+        m_impl->model_config.textGeneratorConfig =
+            resolveNodeConfigPath(nodes.at("textGenerator").get<std::string>());
 
         if (mc.contains("vision_start_token"))
             m_impl->model_config.visionStartToken = mc["vision_start_token"].get<std::string>();

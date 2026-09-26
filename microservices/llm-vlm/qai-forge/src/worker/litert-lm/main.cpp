@@ -12,9 +12,22 @@
 //
 //   Startup sequence:
 //     1. Worker sends READY (socket connected, binary loaded)
-//     2. Parent sends INIT  { model_id, config_file, sampler_config }
-//     3. Worker loads .litertlm model via LiteRT-LM engine
-//     4. Worker sends READY (model loaded, ready for inference)
+//     2. Parent sends INIT  { model_id, config_file, sampler_config,
+//                             litert_lm: { backend } }
+//        "litert_lm.backend" ("cpu"|"gpu"|"npu") is present only when the
+//        resolved ExecutionPlan specifies a backend-class override; the
+//        worker setenv()s LITERT_LM_BACKEND from it before loadModel(),
+//        overriding the env-derived default ("npu" unless
+//        LITERT_LM_BACKEND is already set).
+//     3. Worker loads .litertlm model via LiteRT-LM engine. loadModel()
+//        attempts the requested backend once; if engine creation fails and
+//        the requested backend was not already "cpu", it retries once with
+//        "cpu" (see tryCreateEngine()/automatic fallback for models that
+//        aren't fully NPU-compiled).
+//     4. Worker sends READY { provider: "litert_lm",
+//                              binding_strength: "automatic" } (model
+//        loaded, ready for inference — no further sub-object, since
+//        LiteRT-LM cannot confirm which physical target was used)
 //     5. Worker sends METADATA { model_type, max_context_length, ... }
 //
 //   Inference sequence (per request):
@@ -368,35 +381,63 @@ static bool loadModel(LiteRTLMSession& sess, const std::string& model_path) {
 #ifdef LITERT_LM_AVAILABLE
     // Determine backend from environment (default: npu)
     const char* backend_env = std::getenv("LITERT_LM_BACKEND");
-    const char* backend_str = backend_env ? backend_env : "npu";
+    const std::string requested_backend = backend_env ? backend_env : "npu";
 
-    // Create engine settings with model path and backend
-    sess.settings = litert_lm_engine_settings_create(
-        model_path.c_str(), backend_str, nullptr, nullptr);
-    if (!sess.settings) {
-        LOG_ERROR("[LiteRTLMWorker] Failed to create engine settings for: " << model_path);
-        return false;
-    }
-
-    // Configure max tokens
     const char* max_tokens_env = std::getenv("LITERT_LM_MAX_TOKENS");
     int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 4096;
-    litert_lm_engine_settings_set_max_num_tokens(sess.settings, max_tokens);
 
-    // Set dispatch lib dir for QNN NPU support
     const char* dispatch_lib_dir = std::getenv("LITERT_DISPATCH_DIR");
     if (!dispatch_lib_dir) dispatch_lib_dir = std::getenv("LITERT_LM_DISPATCH_LIB_DIR");
-    if (dispatch_lib_dir) {
-        litert_lm_engine_settings_set_litert_dispatch_lib_dir(
-            sess.settings, dispatch_lib_dir);
+
+    // Attempts to create engine settings + engine for a specific backend
+    // class ("npu"/"gpu"/"cpu"). Returns the created engine on success (and
+    // stores its settings into sess.settings), or nullptr on any failure
+    // (deleting any partially-created settings before returning).
+    auto tryCreateEngine = [&](const std::string& backend) -> LiteRtLmEngine* {
+        LiteRtLmEngineSettings* settings = litert_lm_engine_settings_create(
+            model_path.c_str(), backend.c_str(), nullptr, nullptr);
+        if (!settings) {
+            LOG_ERROR("[LiteRTLMWorker] Failed to create engine settings ("
+                      << backend << ") for: " << model_path);
+            return nullptr;
+        }
+        litert_lm_engine_settings_set_max_num_tokens(settings, max_tokens);
+        if (dispatch_lib_dir) {
+            litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+                settings, dispatch_lib_dir);
+        }
+        LiteRtLmEngine* engine = litert_lm_engine_create(settings);
+        if (!engine) {
+            litert_lm_engine_settings_delete(settings);
+            return nullptr;
+        }
+        sess.settings = settings;
+        return engine;
+    };
+
+    sess.engine = tryCreateEngine(requested_backend);
+
+    // Automatic CPU fallback: some .litertlm model exports are not fully
+    // NPU-compatible (missing required auxiliary sections such as
+    // TF_LITE_AUX, or missing an NPU-specific compiled-model signature) —
+    // the NPU executor fails with errors like "TF_LITE_AUX not found in the
+    // model" even though the model loads and runs fine on CPU. Retry once
+    // with CPU when the originally-requested backend was NPU/GPU and engine
+    // creation failed, so incompatible model assets self-heal instead of
+    // failing the whole model load.
+    if (!sess.engine && requested_backend != "cpu") {
+        LOG_WARN("[LiteRTLMWorker] Engine creation failed for backend='"
+                 << requested_backend << "' model=" << model_path
+                 << " — retrying automatically with backend='cpu'");
+        sess.engine = tryCreateEngine("cpu");
+        if (sess.engine) {
+            LOG_INFO("[LiteRTLMWorker] Automatic CPU fallback succeeded for: "
+                     << model_path);
+        }
     }
 
-    // Create engine (loads model)
-    sess.engine = litert_lm_engine_create(sess.settings);
     if (!sess.engine) {
         LOG_ERROR("[LiteRTLMWorker] Failed to create engine for: " << model_path);
-        litert_lm_engine_settings_delete(sess.settings);
-        sess.settings = nullptr;
         return false;
     }
 
@@ -794,6 +835,22 @@ int main() {
     LOG_INFO("[LiteRTLMWorker] INIT model_id=" << model_id
              << " config_file=" << config_file);
 
+    // Placement-aware plans carry a backend-class selector (cpu/gpu/npu)
+    // rather than a physical device id. Apply it before loadModel() reads
+    // LITERT_LM_BACKEND.
+    if (init_cmd.contains("litert_lm") && init_cmd["litert_lm"].is_object() &&
+        init_cmd["litert_lm"].contains("backend") &&
+        init_cmd["litert_lm"]["backend"].is_string()) {
+        const std::string backend =
+            init_cmd["litert_lm"]["backend"].get<std::string>();
+        if (backend == "cpu" || backend == "gpu" || backend == "npu") {
+            ::setenv("LITERT_LM_BACKEND", backend.c_str(), 1);
+        } else {
+            sendError("", "Unsupported INIT backend: " + backend);
+            return 1;
+        }
+    }
+
     // Step 3: Load model
     LiteRTLMSession sess;
     if (!loadModel(sess, config_file)) {
@@ -803,8 +860,13 @@ int main() {
 
     // Step 4: Send READY (model loaded, ready for inference)
     // Must be sent BEFORE METADATA so InferenceWorkerManager::startWorker()
-    // receives READY as expected and returns cleanly.
-    sendReady();
+    // receives READY as expected and returns cleanly. LiteRT-LM cannot
+    // confirm a physical HTP target, so binding is always automatic.
+    sendMessage({
+        {"type", "READY"},
+        {"provider", "litert_lm"},
+        {"binding_strength", "automatic"}
+    });
 
     // Step 5: Send METADATA after READY (LiteRTLMWorkerManager reads it
     // after base class ensureWorkerRunning() returns).

@@ -63,6 +63,26 @@ std::string modelsDir() {
     return env ? std::string(env) : "/mnt/work/models";
 }
 
+// GenieX SDK's own internal convention is to write pulled models under
+// <data_dir>/models/<org>/<repo> — this is fixed inside the closed-source
+// SDK (libgeniex.so) and cannot be changed, only the data_dir argument we
+// pass to it can be chosen. If data_dir were GENAI_MODELS_DIR itself (whose
+// directory name is already "models"), the SDK's own nested "models/"
+// subfolder would produce double nesting on disk, e.g.
+// /mnt/work/models/models/<org>/<repo>. Passing the *parent* of
+// GENAI_MODELS_DIR instead makes the SDK's nested path resolve back to
+// exactly GENAI_MODELS_DIR/<org>/<repo> — matching the AI-Hub install
+// convention and what ModelConfigManager::scanModelBundles() expects.
+//
+// Not set by our own docker-compose (deliberately not exposed there) —
+// GENIEX_DATADIR may still be supplied by an external orchestrator/program
+// if it needs a different cache root; falls back to "/mnt/work" (the
+// conventional parent of GENAI_MODELS_DIR=/mnt/work/models) otherwise.
+std::string genieXDataDir() {
+    const char* env = std::getenv("GENIEX_DATADIR");
+    return (env && env[0] != '\0') ? std::string(env) : "/mnt/work";
+}
+
 // Temp directory for ZIP downloads
 std::string tmpDownloadDir() {
     const char* env = std::getenv("QAISERVE_TMP_DIR");
@@ -458,7 +478,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                     // directory and force a redundant re-download.
                     bool use_hf_fallback = false;
                     {
-                        fs::path hf_bundle = fs::path(models_dir) / "models" / model;
+                        fs::path hf_bundle = fs::path(models_dir) / model;
                         if (fs::exists(hf_bundle / "hf_manifest.json")) {
                             use_hf_fallback = true;
                         }
@@ -467,7 +487,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                         GenieXClient::pull(
                             model, precision,
                             GenieXClient::Hub::Auto,   // auto-select hub from repo name
-                            chipset, models_dir,
+                            chipset, genieXDataDir(),
                             [&job](int64_t done, int64_t total) {
                                 job->bytes_downloaded.store(done);
                                 job->total_bytes.store(total);
@@ -492,10 +512,12 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                     }
 
                     if (use_hf_fallback) {
-                        // HF fallback installs to the same directory as GenieX SDK
-                        // (models_dir/models/<org>/<repo>), so DELETE and scan see
-                        // both paths consistently.
-                        fs::path hf_install = fs::path(models_dir) / "models" / model;
+                        // HF fallback installs directly under models_dir/<org>/<repo>,
+                        // matching where the GenieX SDK now also lands (since its
+                        // data_dir is set to genieXDataDir(), the parent of
+                        // models_dir) — so DELETE and scan see both paths
+                        // consistently.
+                        fs::path hf_install = fs::path(models_dir) / model;
                         {
                             admin::LockJson updated = admin::buildUpdatedDownloadLockJson(
                                 lock_path, models_dir, job->job_id, source, model,
@@ -508,7 +530,7 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                         }
 
                         HfDirectClient::pull(
-                            model, (fs::path(models_dir) / "models").string(),
+                            model, models_dir,
                             [&job](int64_t done, int64_t total) {
                                 job->bytes_downloaded.store(done);
                                 job->total_bytes.store(total);
@@ -802,13 +824,19 @@ void AdminController::fetchModel(const HttpRequestPtr& req,
                             }
                         }
                     };
-                    // Clean both the direct path and the double-prefix path that
-                    // GenieX SDK sometimes uses (GENIEX_DATADIR/models/org/repo).
+                    // Clean the current non-nested install path
+                    // (models_dir/org/repo, now that GenieX's data_dir is set to
+                    // genieXDataDir() rather than models_dir itself) as well as
+                    // the old double-nested path (models_dir/models/org/repo)
+                    // for backward compatibility with any bundle downloaded
+                    // before this fix.
                     cleanBundleIfEmpty(fs::path(models_dir) / model);
                     cleanBundleIfEmpty(fs::path(models_dir) / "models" / model);
-                    // Also remove empty parent org directory left behind
-                    {
-                        fs::path org_dir = (fs::path(models_dir) / "models" / model).parent_path();
+                    // Also remove empty parent org directories left behind,
+                    // under both the current and legacy nested locations.
+                    for (const fs::path& org_dir :
+                         {(fs::path(models_dir) / model).parent_path(),
+                          (fs::path(models_dir) / "models" / model).parent_path()}) {
                         if (fs::exists(org_dir, cleanup_ec)) {
                             bool org_empty = true;
                             for (const auto& e : fs::directory_iterator(org_dir, cleanup_ec))

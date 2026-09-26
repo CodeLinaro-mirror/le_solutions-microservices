@@ -78,11 +78,8 @@ services:
       - QAISERVE_MAX_BODY_SIZE=${QAISERVE_MAX_BODY_SIZE:-16777216}
 
       # Admin model management — set QAISERVE_ADMIN_TOKEN to enable /admin/models/*
-      # (unset ⇒ all admin endpoints return 403). GENIEX_DATADIR points the
-      # GenieX SDK cache at the scanned models dir so `source:geniex` pulls are
-      # hot-reloaded into the model list.
+      # (unset ⇒ all admin endpoints return 403).
       - QAISERVE_ADMIN_TOKEN=${QAISERVE_ADMIN_TOKEN:-}
-      - GENIEX_DATADIR=${GENIEX_DATADIR:-/mnt/work/models}
       # HuggingFace access token for GenieX SDK downloads of gated repos
       # (e.g. Google Gemma) — required whenever `source:geniex` pulls a
       # repo whose HF page shows "You need to agree to share your contact
@@ -124,9 +121,9 @@ services:
       - LITERT_COMPILER_PLUGIN_DIR=/usr/lib
       - LITERT_HW_ACCELERATORS=${LITERT_HW_ACCELERATORS:-5}
 
-      # LiteRT-LM generative AI worker (LLM inference via LiteRT-LM on Qualcomm NPU)
+      # LiteRT-LM generative AI worker (LLM inference via LiteRT-LM on Qualcomm NPU).
+      # LITERT_LM_BACKEND=cpu|gpu|npu explicitly to override.
       - LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
-      - LITERT_LM_BACKEND=${LITERT_LM_BACKEND:-cpu}
       - LITERT_LM_DISPATCH_LIB_DIR=${LITERT_LM_DISPATCH_LIB_DIR:-/usr/lib}
 
     volumes:

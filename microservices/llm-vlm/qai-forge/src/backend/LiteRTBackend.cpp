@@ -16,6 +16,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/LiteRTBackend.h"
+#include "qai_forge/execution/LiteRtLaunchOptions.h"
 #include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
@@ -57,13 +58,38 @@ LiteRTBackend& LiteRTBackend::getInstance() {
 }
 
 void LiteRTBackend::initialize(const std::string& model_id,
-                                const std::string& /*model_file*/) {
+                                const std::string& model_file) {
+    qai_forge::execution::ExecutionPlan automatic_plan;
+    automatic_plan.provider = "litert";
+    qai_forge::execution::ComponentPlacement component;
+    component.target.provider = "litert";
+    component.target.semantics =
+        qai_forge::execution::TargetSemantics::BackendAutomatic;
+    component.target.discovery_mode =
+        qai_forge::execution::DiscoveryMode::BackendManaged;
+    component.target.binding_strength =
+        qai_forge::execution::BindingStrength::Automatic;
+    automatic_plan.components.push_back(std::move(component));
+    initialize(model_id, model_file, automatic_plan);
+}
+
+void LiteRTBackend::initialize(
+    const qai_forge::execution::RuntimeLaunchRequest& request) {
+    initialize(request.model_id, "", request.execution_plan);
+}
+
+void LiteRTBackend::initialize(
+    const std::string& model_id,
+    const std::string& requested_model_file,
+    const qai_forge::execution::ExecutionPlan& plan) {
     // Resolve model config from ModelConfigManager
-    const ModelConfig* mc = ModelConfigManager::getInstance().getModelConfig(model_id);
+    const auto mc = ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!mc)
         throw std::runtime_error("LiteRTBackend: model not found: " + model_id);
 
-    std::string model_file = mc->config_file;
+    std::string model_file = requested_model_file.empty()
+        ? mc->config_file
+        : requested_model_file;
     if (model_file.empty())
         throw std::runtime_error("LiteRTBackend: no model_file for: " + model_id);
 
@@ -90,9 +116,51 @@ void LiteRTBackend::initialize(const std::string& model_id,
         {"hw_accelerators",     hw_accelerators}
     };
 
+    const auto launch_options =
+        qai_forge::execution::LiteRtLaunchOptions::toInitOptions(plan);
+    for (const auto& [key, value] : launch_options.items()) {
+        init_params[key] = value;
+    }
+    if (launch_options.contains("litert") &&
+        launch_options["litert"].contains("hw_accelerators")) {
+        hw_accelerators = launch_options["litert"]["hw_accelerators"].get<int>();
+        init_params["hw_accelerators"] = hw_accelerators;
+    }
+
     if (!shared_memory_) shared_memory_ = std::make_unique<PredictiveSharedMemory>(predictiveShmDirBytes());
-    worker_->ensureWorkerRunning(model_id, init_params,
-        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()});
+
+    const int expected_accelerators = hw_accelerators;
+    // ready_validator runs on the worker's post-INIT READY (see
+    // src/worker/litert/main.cpp) and confirms provider=="litert",
+    // binding_strength=="automatic" (LiteRT binding is always automatic —
+    // there is no per-plan exact/preferred override today), and that
+    // litert.hw_accelerators matches the mask sent in INIT. Throwing here
+    // fails startup.
+    worker_->ensureWorkerRunning(
+        model_id,
+        init_params,
+        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()},
+        [expected_accelerators](const json& ready) {
+            if (ready.value("provider", "") != "litert") {
+                throw std::runtime_error(
+                    "LiteRTBackend: worker READY reported an unexpected provider");
+            }
+            if (ready.value("binding_strength", "") != "automatic") {
+                throw std::runtime_error(
+                    "LiteRTBackend: worker READY reported an unexpected binding "
+                    "strength");
+            }
+            if (!ready.contains("litert") ||
+                !ready["litert"].is_object() ||
+                ready["litert"].value("hw_accelerators", -1) !=
+                    expected_accelerators) {
+                throw std::runtime_error(
+                    "LiteRTBackend: worker READY did not confirm requested "
+                    "accelerator classes");
+            }
+        });
+    current_plan_ = plan;
+    has_current_plan_ = true;
     current_model_id_ = model_id;
 
     LOG_INFO("[LiteRTBackend] Initialized model: " << model_id
@@ -142,7 +210,11 @@ PredictiveExecuteRequest LiteRTBackend::prepareWorkerRequest(
 TensorInferenceResponse LiteRTBackend::infer(
     const SegmentedTensorInferenceRequest& request) {
     if (!worker_->isWorkerRunning() || worker_->getCurrentModelId() != request.model) {
-        initialize(request.model, "");
+        if (has_current_plan_ && current_model_id_ == request.model) {
+            initialize(request.model, "", current_plan_);
+        } else {
+            initialize(request.model, "");
+        }
     }
 
     static int event_counter = 0;
@@ -181,10 +253,14 @@ void LiteRTBackend::shutdown() {
         try { worker_->terminateWorker(true); } catch (...) {}
         worker_->clearSharedMemory();
         shared_memory_.reset();
+        current_plan_ = {};
+        has_current_plan_ = false;
         current_model_id_.clear();
         throw;
     }
     worker_->clearSharedMemory();
     shared_memory_.reset();
+    current_plan_ = {};
+    has_current_plan_ = false;
     current_model_id_.clear();
 }

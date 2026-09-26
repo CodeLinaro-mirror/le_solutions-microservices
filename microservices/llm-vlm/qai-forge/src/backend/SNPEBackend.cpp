@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/backend/SNPEBackend.h"
+#include "qai_forge/execution/SnpeLaunchOptions.h"
 #include "qai_forge/worker/PredictiveWorkerManager.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
@@ -40,18 +41,57 @@ SNPEBackend& SNPEBackend::getInstance() {
 }
 
 void SNPEBackend::initialize(const std::string& model_id,
-                              const std::string& /*model_file*/) {
-    const ModelConfig* mc = ModelConfigManager::getInstance().getModelConfig(model_id);
+                              const std::string& model_file) {
+    // No placement plan supplied — build an automatic RuntimePreference plan
+    // seeded from SNPE_DELEGATE so the worker still sees a well-formed
+    // provider/binding_strength.
+    const char* delegate_env = std::getenv("SNPE_DELEGATE");
+    std::string delegate = delegate_env ? delegate_env : "dsp";
+    std::string runtime_order = "DSP,CPU";
+    if (delegate == "aip") runtime_order = "AIP_FIXED8_TF,CPU";
+    else if (delegate == "gpu") runtime_order = "GPU,CPU";
+    else if (delegate == "none" || delegate == "cpu") runtime_order = "CPU";
+
+    qai_forge::execution::ExecutionPlan automatic_plan;
+    automatic_plan.provider = "snpe";
+    qai_forge::execution::ComponentPlacement component;
+    component.target.provider = "snpe";
+    component.target.target_id = "runtime_order=" + runtime_order;
+    component.target.semantics =
+        qai_forge::execution::TargetSemantics::RuntimePreference;
+    component.target.discovery_mode =
+        qai_forge::execution::DiscoveryMode::Configured;
+    component.target.binding_strength =
+        qai_forge::execution::BindingStrength::Preferred;
+    automatic_plan.components.push_back(std::move(component));
+    initialize(model_id, model_file, automatic_plan);
+}
+
+void SNPEBackend::initialize(
+    const qai_forge::execution::RuntimeLaunchRequest& request) {
+    initialize(request.model_id, "", request.execution_plan);
+}
+
+void SNPEBackend::initialize(
+    const std::string& model_id,
+    const std::string& requested_model_file,
+    const qai_forge::execution::ExecutionPlan& plan) {
+    const auto mc = ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!mc)
         throw std::runtime_error("SNPEBackend: model not found: " + model_id);
 
-    std::string model_file = mc->config_file;
+    std::string model_file = requested_model_file.empty()
+        ? mc->config_file
+        : requested_model_file;
     if (model_file.empty())
         throw std::runtime_error("SNPEBackend: no model_file for: " + model_id);
 
-    // Delegate: read from env or default to "dsp"
-    const char* delegate_env = std::getenv("SNPE_DELEGATE");
-    std::string delegate = delegate_env ? delegate_env : "dsp";
+    std::string delegate =
+        qai_forge::execution::SnpeLaunchOptions::runtimeOrder(plan);
+    if (delegate.empty()) {
+        const char* delegate_env = std::getenv("SNPE_DELEGATE");
+        delegate = delegate_env ? delegate_env : "dsp";
+    }
 
     // Build INIT params
     nlohmann::ordered_json init_params = {
@@ -60,9 +100,60 @@ void SNPEBackend::initialize(const std::string& model_id,
         {"output_tensors", nlohmann::ordered_json::array()}  // empty = all outputs
     };
 
+    const auto launch_options =
+        qai_forge::execution::SnpeLaunchOptions::toInitOptions(plan);
+    for (const auto& [key, value] : launch_options.items()) {
+        init_params[key] = value;
+    }
+
     if (!shared_memory_) shared_memory_ = std::make_unique<PredictiveSharedMemory>(predictiveShmDirBytes());
-    worker_->ensureWorkerRunning(model_id, init_params,
-        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()});
+
+    const bool has_runtime_preference =
+        launch_options.contains("snpe") &&
+        launch_options["snpe"].contains("runtime_order");
+    const std::string expected_runtime_order =
+        has_runtime_preference
+            ? launch_options["snpe"]["runtime_order"].get<std::string>()
+            : std::string{};
+
+    // ready_validator runs on the worker's post-INIT READY (see
+    // src/worker/snpe/main.cpp) and confirms provider=="snpe" and the
+    // achieved binding_strength ("preferred" when the plan specified a
+    // runtime_order, "automatic" otherwise) — plus, when a runtime_order
+    // was requested, that snpe.runtime_order matches what was sent in INIT.
+    // Throwing here fails startup.
+    worker_->ensureWorkerRunning(
+        model_id,
+        init_params,
+        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()},
+        [has_runtime_preference, expected_runtime_order](const json& ready) {
+            if (ready.value("provider", "") != "snpe") {
+                throw std::runtime_error(
+                    "SNPEBackend: worker READY reported an unexpected provider");
+            }
+
+            const std::string expected_binding =
+                has_runtime_preference ? "preferred" : "automatic";
+            if (ready.value("binding_strength", "") != expected_binding) {
+                throw std::runtime_error(
+                    "SNPEBackend: worker READY reported binding_strength '" +
+                    ready.value("binding_strength", std::string{}) +
+                    "', expected '" + expected_binding + "'");
+            }
+
+            if (has_runtime_preference) {
+                if (!ready.contains("snpe") ||
+                    !ready["snpe"].is_object() ||
+                    ready["snpe"].value("runtime_order", "") !=
+                        expected_runtime_order) {
+                    throw std::runtime_error(
+                        "SNPEBackend: worker READY did not confirm requested "
+                        "SNPE runtime order");
+                }
+            }
+        });
+    current_plan_ = plan;
+    has_current_plan_ = true;
     current_model_id_ = model_id;
 
     LOG_INFO("[SNPEBackend] Initialized model: " << model_id
@@ -104,7 +195,11 @@ PredictiveExecuteRequest SNPEBackend::prepareWorkerRequest(
 TensorInferenceResponse SNPEBackend::infer(
     const SegmentedTensorInferenceRequest& request) {
     if (!worker_->isWorkerRunning() || worker_->getCurrentModelId() != request.model) {
-        initialize(request.model, "");
+        if (has_current_plan_ && current_model_id_ == request.model) {
+            initialize(request.model, "", current_plan_);
+        } else {
+            initialize(request.model, "");
+        }
     }
 
     static int event_counter = 0;
@@ -143,10 +238,14 @@ void SNPEBackend::shutdown() {
         try { worker_->terminateWorker(true); } catch (...) {}
         worker_->clearSharedMemory();
         shared_memory_.reset();
+        current_plan_ = {};
+        has_current_plan_ = false;
         current_model_id_.clear();
         throw;
     }
     worker_->clearSharedMemory();
     shared_memory_.reset();
+    current_plan_ = {};
+    has_current_plan_ = false;
     current_model_id_.clear();
 }

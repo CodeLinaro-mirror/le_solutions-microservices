@@ -5,8 +5,10 @@
 
 #include <string>
 #include <vector>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QNNEngine — Layer 4 wrapper around the QNN C API
@@ -62,7 +64,8 @@ public:
      */
     QNNEngine(const std::string& model_file,
               const std::string& backend_lib,
-              const std::string& sys_lib);
+              const std::string& sys_lib,
+              std::optional<uint32_t> selected_device_id = std::nullopt);
 
     ~QNNEngine();
 
@@ -80,6 +83,10 @@ public:
      * Returns the output tensor specifications of the loaded model.
      */
     const std::vector<QNNTensorSpec>& outputSpecs() const;
+
+    // Returns the effective QNN hardware device ID when exact placement was
+    // requested and the backend reported device information.
+    std::optional<uint32_t> effectiveDeviceId() const;
 
     /**
      * Run inference synchronously.

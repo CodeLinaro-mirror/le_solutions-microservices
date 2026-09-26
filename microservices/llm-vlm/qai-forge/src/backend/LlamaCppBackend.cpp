@@ -4,6 +4,7 @@
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 
 #include "qai_forge/backend/LlamaCppBackend.h"
+#include "qai_forge/execution/LlamaCppLaunchOptions.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 
@@ -49,6 +50,22 @@ BackendCapabilities LlamaCppBackend::capabilities() const {
     caps.backend_filters_think_tokens = false;  // No internal think filtering
     caps.supports_kv_save_restore = false;  // Not supported
     return caps;
+}
+
+void LlamaCppBackend::loadModel(
+    const qai_forge::execution::RuntimeLaunchRequest& request) {
+    loadModel(request.model_id, request.execution_plan);
+}
+
+void LlamaCppBackend::loadModel(
+    const std::string& model_id,
+    const qai_forge::execution::ExecutionPlan& plan) {
+    // Resolves and validates the Hexagon endpoint selector encoded in the
+    // plan (e.g. "HTP1:0"). Threading it into LlamaCppWorkerManager::startWorker()
+    // is a Phase E worker-protocol change; for now this call validates the
+    // plan and the legacy loadModel(model_id) path continues unchanged.
+    (void)qai_forge::execution::LlamaCppLaunchOptions::toInitOptions(plan);
+    loadModel(model_id);
 }
 
 void LlamaCppBackend::loadModel(const std::string& model_id) {

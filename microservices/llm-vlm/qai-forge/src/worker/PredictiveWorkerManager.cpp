@@ -72,7 +72,8 @@ std::string PredictiveWorkerManager::generateSocketPath(
 void PredictiveWorkerManager::ensureWorkerRunning(
     const std::string& model_id,
     const json&        init_params,
-    const PredictiveSharedMemoryView& shared_memory)
+    const PredictiveSharedMemoryView& shared_memory,
+    PredictiveReadyValidator ready_validator)
 {
     if (shared_memory.fd < 0 || shared_memory.ptr == nullptr || shared_memory.dir_bytes == 0) throw std::invalid_argument("[PredictiveWorkerManager] invalid backend-owned shared-memory view");
     const bool memory_changed = shm_fd_ != shared_memory.fd || shm_ptr_ != shared_memory.ptr || shm_dir_bytes_ != shared_memory.dir_bytes;
@@ -84,7 +85,7 @@ void PredictiveWorkerManager::ensureWorkerRunning(
     // If model changed or worker crashed, restart
     if (current_model_id_ != model_id || !isWorkerRunning()) {
         cleanupWorker(true);
-        startWorker(model_id, init_params);
+        startWorker(model_id, init_params, ready_validator);
     }
 }
 
@@ -96,7 +97,8 @@ void PredictiveWorkerManager::clearSharedMemory() noexcept {
 
 void PredictiveWorkerManager::startWorker(
     const std::string& model_id,
-    const json&        init_params)
+    const json&        init_params,
+    const PredictiveReadyValidator& ready_validator)
 {
     socket_path_ = generateSocketPath(model_id, process_type_);
 
@@ -158,6 +160,9 @@ void PredictiveWorkerManager::startWorker(
             std::string err = msg.value("message", "unknown error");
             cleanupWorker(true);
             throw std::runtime_error("[PredictiveWorkerManager] INIT failed: " + err);
+        }
+        if (ready_validator) {
+            ready_validator(msg);
         }
     } catch (const std::exception& e) {
         cleanupWorker(true);

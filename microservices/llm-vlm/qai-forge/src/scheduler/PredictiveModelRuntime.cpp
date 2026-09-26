@@ -105,11 +105,14 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     std::shared_ptr<PredictiveOrchestrator> orchestrator,
     std::shared_ptr<ModelLoadCoordinator> load_coordinator,
     long model_memory_mb,
+    std::shared_ptr<PlacementContext> placement,
     ModelRuntimeEvents events)
-    : model_id_(std::move(model_id)),
+    : model_id_(model_id),
+      runtime_id_{model_id, 0},
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
       load_coordinator_(std::move(load_coordinator)),
+      placement_(std::move(placement)),
       model_memory_mb_(model_memory_mb > 0 ? model_memory_mb : 512),
       events_(std::move(events)) {
     if (model_id_.empty()) {
@@ -127,6 +130,10 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     if (!load_coordinator_) {
         throw std::invalid_argument(
             "PredictiveModelRuntime requires a model load coordinator");
+    }
+    if (!placement_) {
+        throw std::invalid_argument(
+            "PredictiveModelRuntime requires a placement context");
     }
 }
 
@@ -254,7 +261,7 @@ void PredictiveModelRuntime::executorLoop() {
         std::vector<scheduler::PredictiveBatchEntry> batch;
         size_t capacity = 1;
         size_t used = 0;
-        const ModelConfig* stored_config =
+        const auto stored_config =
             ModelConfigManager::getInstance().getModelConfig(model_id_);
         const std::optional<ModelConfig> config =
             stored_config ? std::optional<ModelConfig>(*stored_config)
@@ -529,7 +536,7 @@ void PredictiveModelRuntime::ensureModelLoaded() {
         }
     }
 
-    const ModelConfig* config =
+    const auto config =
         ModelConfigManager::getInstance().getModelConfig(model_id_);
     if (!config) {
         setState(ModelRuntimeState::Failed);
@@ -582,7 +589,19 @@ void PredictiveModelRuntime::ensureModelLoaded() {
             LOG_INFO("[PredictiveModelRuntime] Loading backend: model="
                      << model_id_ << " attempt=" << attempt
                      << "/" << kMaxLoadAttempts);
-            backend_->initialize(model_id_, config->config_file);
+            auto placement_admission =
+                placement_->tryAcquireAutomatic(runtime_id_, model_id_);
+            if (!placement_admission.granted) {
+                throw GenAIException(
+                    GenAIErrorCode::HARDWARE_UNAVAILABLE,
+                    "Placement admission denied for model '" + model_id_ +
+                        "': " + placement_admission.denial_reason,
+                    503);
+            }
+            qai_forge::execution::RuntimeLaunchRequest launch_request{
+                runtime_id_, model_id_, placement_admission.reservation.plan()};
+            backend_->initialize(launch_request);
+            placement_reservation_ = std::move(placement_admission.reservation);
             if (!backend_->isHealthy()) {
                 throw std::runtime_error(
                     "Backend health check failed after initialization");
@@ -630,6 +649,10 @@ bool PredictiveModelRuntime::unloadBackend() {
         use_lock_written_ = false;
         backend_healthy_ = false;
     }
+    // Release any resource lease regardless of whether the backend actually
+    // started — a failed load attempt after placement admission but before
+    // backend_started_ was observably true must not leak the lease either.
+    placement_reservation_.release();
     if (!should_unload) {
         return false;
     }

@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
+#include "qai_forge/scheduler/PlacementContext.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 
@@ -77,6 +79,7 @@ public:
                  std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                  std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                  long model_memory_mb,
+                 std::shared_ptr<PlacementContext> placement,
                  ModelRuntimeEvents events = {});
     ~ModelRuntime();
 
@@ -134,11 +137,14 @@ private:
                             const GenAIException& error);
 
     const std::string model_id_;
+    const qai_forge::execution::RuntimeId runtime_id_;
     PriorityModelQueue queue_;
     std::unique_ptr<IGenerativeBackend> backend_;
     std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
+    std::shared_ptr<PlacementContext> placement_;
+    PlacementReservation placement_reservation_;
     std::unique_ptr<PostTurnWorker> post_turn_worker_;
     ModelRuntimeEvents events_;
     long model_memory_mb_ = 4096;

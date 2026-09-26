@@ -87,7 +87,8 @@ InferenceWorkerManager::~InferenceWorkerManager() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateSocketPath — Section 4.E: UUID suffix prevents clashes
+// generateSocketPath — UUID suffix prevents clashes when multiple workers
+// run for the same model
 // ─────────────────────────────────────────────────────────────────────────────
 std::string InferenceWorkerManager::generateSocketPath(const std::string& model_id) {
     static std::mt19937_64 rng(std::random_device{}());
@@ -118,6 +119,14 @@ std::string InferenceWorkerManager::generateCommandId(const std::string& prefix)
 void InferenceWorkerManager::ensureWorkerRunning(const std::string& model_id,
                                                   const std::string& config_file,
                                                   const std::string& sampler_config) {
+    ensureWorkerRunning(model_id, config_file, sampler_config, ReadyValidator{});
+}
+
+void InferenceWorkerManager::ensureWorkerRunning(
+    const std::string& model_id,
+    const std::string& config_file,
+    const std::string& sampler_config,
+    ReadyValidator ready_validator) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
     // Model switch: terminate old worker and start fresh
@@ -129,7 +138,7 @@ void InferenceWorkerManager::ensureWorkerRunning(const std::string& model_id,
 
     // Start worker if not running
     if (!isWorkerRunningLocked()) {
-        startWorker(model_id, config_file, sampler_config);
+        startWorker(model_id, config_file, sampler_config, ready_validator);
     }
 }
 
@@ -137,12 +146,22 @@ void InferenceWorkerManager::setMaxSlots(int max_slots) {
     max_slots_ = std::clamp(max_slots, 1, 16);
 }
 
+void InferenceWorkerManager::setInitOptions(const json& options) {
+    if (!options.is_object()) {
+        throw std::invalid_argument(
+            "InferenceWorkerManager::setInitOptions requires a JSON object");
+    }
+    init_options_ = options;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // startWorker — Fork/exec the genai-inference-worker binary
 // ─────────────────────────────────────────────────────────────────────────────
-void InferenceWorkerManager::startWorker(const std::string& model_id,
-                                          const std::string& config_file,
-                                          const std::string& sampler_config) {
+void InferenceWorkerManager::startWorker(
+    const std::string& model_id,
+    const std::string& config_file,
+    const std::string& sampler_config,
+    const ReadyValidator& ready_validator) {
     // max_slots_ is supplied by the backend; default remains one slot.
     const bool is_vlm_worker = (process_type_ == "vlm");
 
@@ -290,14 +309,27 @@ void InferenceWorkerManager::startWorker(const std::string& model_id,
 
     // Send INIT command
     json init_cmd = InferenceProtocol::createInitCommand(model_id, config_file, sampler_config, max_slots_);
+    if (init_options_.is_object()) {
+        for (const auto& [key, value] : init_options_.items()) {
+            init_cmd[key] = value;
+        }
+        init_options_ = json::object();
+    }
     sendMessage(init_cmd);
 
     // Wait for READY after INIT
-    json init_ready = readMessage(60);
-    if (init_ready.value("type", "") != ResponseType::READY) {
-        std::string err = init_ready.value("message", "Unknown error");
+    try {
+        json init_ready = readMessage(60);
+        if (init_ready.value("type", "") != ResponseType::READY) {
+            std::string err = init_ready.value("message", "Unknown error");
+            throw std::runtime_error("Worker INIT failed: " + err);
+        }
+        if (ready_validator) {
+            ready_validator(init_ready);
+        }
+    } catch (...) {
         cleanupWorker(true);
-        throw std::runtime_error("Worker INIT failed: " + err);
+        throw;
     }
 
     current_model_id_ = model_id;
@@ -781,7 +813,8 @@ void InferenceWorkerManager::executeStructuredRequest(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendReset — Called by Layer 2's ConcurrencyMiddleware (not by Layer 3 itself)
+// sendReset — Called by Layer 2's ConcurrencyMiddleware, not by this class
+// itself
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::sendReset(const std::string& session_id) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -944,7 +977,7 @@ void InferenceWorkerManager::joinAllResetThreads() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// saveKvCache / restoreKvCache — Section 6 (KV Cache Management)
+// saveKvCache / restoreKvCache — KV Cache Management
 // ─────────────────────────────────────────────────────────────────────────────
 bool InferenceWorkerManager::saveKvCache(const std::string& checkpoint_name,
                                           const std::string& session_id) {
@@ -1003,7 +1036,7 @@ bool InferenceWorkerManager::sendAbort(const std::string& session_id) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// terminateWorker — SIGKILL for whole-worker cancellation (Section 7)
+// terminateWorker — SIGKILL for whole-worker cancellation
 // ─────────────────────────────────────────────────────────────────────────────
 void InferenceWorkerManager::terminateWorker(bool force) {
     // Join any pending background KV resets BEFORE acquiring the exclusive
@@ -1107,12 +1140,12 @@ std::chrono::steady_clock::time_point InferenceWorkerManager::lastActivityTime()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Watchdog — Section 4.F
+// Watchdog
 // ─────────────────────────────────────────────────────────────────────────────
 
 // watchdogThreadFunc — runs on the background watchdog thread.
 //
-// Design constraints (see header Section 4.F):
+// Design constraints:
 //   • NEVER acquires mutex_.  All state is read via atomics.
 //   • Sends SIGKILL directly to watchdog_target_pid_ (no Layer-3 helpers).
 //   • Clears watchdog_target_pid_ before sending SIGKILL to prevent a

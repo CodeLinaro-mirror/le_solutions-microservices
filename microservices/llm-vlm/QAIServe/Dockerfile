@@ -372,11 +372,29 @@ RUN chmod +x /tmp/build-llamacpp-hexagon.sh && \
     fi && \
     rm /tmp/build-llamacpp-hexagon.sh
 
+# ── Pre-fetch stb / minja (NOT via CMake FetchContent) ───────────────────────
+# qai-forge/CMakeLists.txt requires STB_SOURCE_DIR unconditionally and
+# MINJA_SOURCE_DIR whenever QAI_FORGE_BUILD_LITERT_LM=ON — both must be
+# staged on disk *before* the `cmake -S` configure step below so that
+# configuration never performs git/network activity. Pins match the
+# commits previously hardcoded in qai-forge/CMakeLists.txt's FetchContent
+# calls.
+ENV STB_SRC_DIR=/opt/third_party/stb
+ENV STB_GIT_REF=2c980bb59875b0d32144a71867fbdebb2f77cd20
+RUN git clone https://github.com/nothings/stb.git ${STB_SRC_DIR} && \
+    cd ${STB_SRC_DIR} && git checkout ${STB_GIT_REF}
+
+ENV MINJA_SRC_DIR=/opt/third_party/minja
+ENV MINJA_GIT_REF=021c2293c187789ef13d56c6cfd89c9b134fd80f
+ARG BUILD_LITERT_LM
+RUN if [ "$BUILD_LITERT_LM" = "ON" ]; then \
+        git clone https://github.com/google/minja.git ${MINJA_SRC_DIR} && \
+        cd ${MINJA_SRC_DIR} && git checkout ${MINJA_GIT_REF}; \
+    fi
+
 # ── Build qai-forge (shared SDK: Layers 2-4 + worker binaries) ───────────────
 WORKDIR /build
 COPY qai-forge /build/qai-forge
-
-ARG BUILD_LITERT_LM
 
 RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DCMAKE_BUILD_TYPE=Release \
@@ -384,6 +402,8 @@ RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DGENIE_LIB_PATH=/usr/lib \
         -DQNN_INCLUDE_PATH=/usr/include \
         -DSNPE_INCLUDE_PATH=/usr/include \
+        -DSTB_SOURCE_DIR=${STB_SRC_DIR} \
+        -DMINJA_SOURCE_DIR=${MINJA_SRC_DIR} \
         -DQAI_FORGE_BUILD_QNN=ON \
         -DQAI_FORGE_BUILD_SNPE=ON \
         -DQAI_FORGE_BUILD_LITERT=ON \
@@ -440,7 +460,7 @@ RUN cmake -S /build/QAIServe -B /build/QAIServe/build \
 # Strips debug symbols from:
 #   - All executables in bin/ (our server + worker binaries)
 #   - Our own compiled .so files (Drogon, trantor, qai_forge, fastrpc)
-#   - Built-in postprocess plugin .so files 
+#   - Built-in postprocess plugin .so files
 # Deliberately skips ${DEPLOY_DIR}/usr/lib/rfsa/adsp/ — those are Hexagon DSP
 # blobs compiled for the DSP core, not ARM64; stripping them would corrupt them.
 # Vendor QAIRT .so files are already stripped release binaries; strip is a no-op.

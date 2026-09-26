@@ -9,7 +9,7 @@
 #include <shared_mutex>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SystemResourceManager — P9: Memory availability + LRU worker eviction
+// SystemResourceManager — Memory availability + LRU worker eviction
 //
 // Checks /proc/meminfo to determine if sufficient memory is available before
 // loading a new model. If memory is insufficient, evicts idle inference workers

@@ -13,7 +13,18 @@
 // qnn/main.cpp's header comment for the full message shapes). INIT command
 // parameters differ:
 //   {"type":"INIT","model_id":"...","model_file":"...","delegate":"dsp",
-//    "output_tensors":["..."]}
+//    "output_tensors":["..."],
+//    "snpe":{"runtime_order":"DSP,GPU,CPU"}}
+//   ("snpe" is present only when the resolved ExecutionPlan specifies a
+//    runtime order; the worker derives "delegate" from it via
+//    delegateFromRuntimeOrder(). When absent, the worker's own "delegate"
+//    field/default applies — automatic binding.)
+//
+// Post-INIT READY reports the achieved binding:
+//   {"type":"READY","provider":"snpe",
+//    "binding_strength":"preferred"|"automatic",
+//    "snpe":{"runtime_order":"...","delegate":"..."}}
+//   ("snpe" sub-object present only when runtime_order was supplied in INIT.)
 //
 // SNPE's ExecuteUserBuffers requires 128-byte-aligned I/O buffers (unaligned
 // -> error 407 MEMORY_MAPPING_FAILED). Tensor offsets within the shm region
@@ -35,6 +46,7 @@
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include <algorithm>
 
 using json = nlohmann::ordered_json;
 
@@ -49,6 +61,45 @@ static constexpr size_t kShmAlign = 128;
 
 static size_t alignUp(size_t offset, size_t align) {
     return (offset + align - 1) / align * align;
+}
+
+static std::string delegateFromRuntimeOrder(const std::string& order) {
+    if (order.empty()) {
+        throw std::invalid_argument("SNPE runtime_order must not be empty");
+    }
+
+    std::vector<std::string> runtimes;
+    size_t start = 0;
+    while (start <= order.size()) {
+        const size_t comma = order.find(',', start);
+        const std::string runtime =
+            order.substr(start, comma == std::string::npos
+                                   ? std::string::npos
+                                   : comma - start);
+        if (runtime.empty()) {
+            throw std::invalid_argument(
+                "SNPE runtime_order contains an empty runtime");
+        }
+        runtimes.push_back(runtime);
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    for (const auto& runtime : runtimes) {
+        if (runtime != "DSP" && runtime != "GPU" &&
+            runtime != "AIP_FIXED8_TF" && runtime != "CPU") {
+            throw std::invalid_argument(
+                "Unsupported SNPE runtime in runtime_order: " + runtime);
+        }
+    }
+
+    const std::string& first = runtimes.front();
+    if (first == "DSP") return "dsp";
+    if (first == "GPU") return "gpu";
+    if (first == "AIP_FIXED8_TF") return "aip";
+    return "none";
 }
 
 
@@ -138,16 +189,38 @@ int main() {
         if (type == "SHUTDOWN") break;
 
         if (type == "INIT") {
-            std::string model_file = msg.value("model_file", "");
-            std::string delegate   = msg.value("delegate",   "dsp");
-
-            std::vector<std::string> output_tensors;
-            for (const auto& t : msg.value("output_tensors", json::array()))
-                output_tensors.push_back(t.get<std::string>());
-
             try {
-                engine = std::make_unique<SNPEEngine>(model_file, delegate, output_tensors);
-                sendMsg({{"type", "READY"}});
+                std::string model_file = msg.value("model_file", "");
+                std::string delegate = msg.value("delegate", "dsp");
+                std::string runtime_order;
+
+                if (msg.contains("snpe") && msg["snpe"].is_object() &&
+                    msg["snpe"].contains("runtime_order")) {
+                    runtime_order =
+                        msg["snpe"]["runtime_order"].get<std::string>();
+                    delegate = delegateFromRuntimeOrder(runtime_order);
+                }
+
+                std::vector<std::string> output_tensors;
+                for (const auto& t :
+                     msg.value("output_tensors", json::array())) {
+                    output_tensors.push_back(t.get<std::string>());
+                }
+
+                engine = std::make_unique<SNPEEngine>(
+                    model_file, delegate, output_tensors);
+                json ready = {
+                    {"type", "READY"},
+                    {"provider", "snpe"}};
+                if (!runtime_order.empty()) {
+                    ready["snpe"] = {
+                        {"runtime_order", runtime_order},
+                        {"delegate", delegate}};
+                    ready["binding_strength"] = "preferred";
+                } else {
+                    ready["binding_strength"] = "automatic";
+                }
+                sendMsg(ready);
             } catch (const std::exception& e) {
                 sendMsg({{"type", "ERROR"}, {"message", e.what()}});
             }

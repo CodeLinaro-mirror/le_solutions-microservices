@@ -11,7 +11,7 @@
 #include <optional>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MetricsManager — P8: Per-model inference metrics (Section 5 of design)
+// MetricsManager — Per-model inference metrics
 //
 // Tracks moving averages for the last 100 requests per model:
 //   - TTFT (Time to First Token) in ms

@@ -9,7 +9,7 @@
 #include <optional>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ReasoningRouter — Layer 2 Stream Processor (Section 3.F of architecture design)
+// ReasoningRouter — Layer 2 Stream Processor
 //
 // Sits between the InferenceWorkerManager token stream and Layer 1.
 // Routes raw token fragments to the correct DTO field:

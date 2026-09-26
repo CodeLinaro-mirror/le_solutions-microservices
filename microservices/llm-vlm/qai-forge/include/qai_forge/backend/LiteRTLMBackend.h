@@ -4,35 +4,28 @@
 #pragma once
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/worker/LiteRTLMWorkerManager.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMBackend — Phase 3: IGenerativeBackend for LiteRT-LM
+// LiteRTLMBackend — IGenerativeBackend implementation for LiteRT-LM
 //
-// Wraps LiteRTLMWorkerManager to manage the litert-lm-inference-worker
-// subprocess. Supports .litertlm models with NPU acceleration via the
-// LiteRT-LM Session API.
+// Wraps LiteRTLMWorkerManager (which extends InferenceWorkerManager) to manage
+// the litert-lm-inference-worker subprocess. The worker uses the LiteRT-LM
+// Session API for raw inference; all chat intelligence lives in
+// LiteRTLMOrchestrator.
 //
-// Key design decisions:
-//   - Uses LiteRTLMWorkerManager (extends InferenceWorkerManager) to intercept
-//     the METADATA message sent by the worker after model load.
-//   - Exposes getMetadata() so LiteRTLMOrchestrator can retrieve the Jinja
-//     template, model type, and tool call delimiters at construction time.
-//   - unloadModel() always uses SIGKILL (force=true) to ensure clean DSP
-//     resource reclamation — same pattern as GenIEBackend::unloadModel().
-//   - Scheduler-owned: each ModelRuntime creates its own LiteRTLMBackend
-//     instance via BackendFactory::createGenerativeBackend("litert_lm").
+// Notes:
+//   - Exposes getMetadata() for LiteRTLMOrchestrator initialization
+//   - unloadModel() always uses SIGKILL for clean DSP resource reclamation
+//   - Supports scheduler-owned instances (one per ModelRuntime)
 //
-// metadata.json fields used:
-//   "runtime":    "litert_lm"
-//   "model_type": "generative"
-//   The config_file path points to the .litertlm model bundle.
-//
-// Environment variable overrides:
-//   LITERT_LM_WORKER_BINARY — path to litert-lm-inference-worker binary
-//   LITERT_LM_NUM_THREADS   — number of inference threads (default 4)
+// Placement: loadModel(RuntimeLaunchRequest) resolves a worker-facing
+// backend-class selector (backend=npu|cpu|gpu) via LiteRtLmLaunchOptions and
+// passes it to the worker through InferenceWorkerManager::setInitOptions(),
+// merged into the next INIT command.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class LiteRTLMBackend : public IGenerativeBackend {
@@ -49,39 +42,44 @@ public:
 
     /**
      * LiteRT-LM capabilities:
-     *   - RESET_KV context strategy (stateful KV cache; reset after compaction)
-     *   - Exclusive execution (one inference at a time per NPU handle)
-     *   - backend_filters_think_tokens = false (no internal think filtering)
-     *   - supports_kv_save_restore = false (not yet implemented)
+     *   - FULL_RECOMPUTE context strategy (per-request Session, no persistent KV)
+     *   - EXCLUSIVE concurrency (one inference at a time per backend instance)
+     *   - backend_filters_think_tokens = false (raw output, filtering happens
+     *     in LiteRTLMOrchestrator via ReasoningRouter like GenIE)
      */
     BackendCapabilities capabilities() const override;
 
     /**
-     * Load a model into this backend instance.
-     * Resolves the model config through ModelConfigManager and starts the
+     * Load a model into this LiteRTLMBackend instance.
+     * Starts (or restarts, if the model changed) the
      * litert-lm-inference-worker subprocess.
      */
     void loadModel(const std::string& model_id) override;
+    void loadModel(
+        const qai_forge::execution::RuntimeLaunchRequest& request) override;
+
+    /**
+     * Placement-aware overload used when a caller already has an
+     * ExecutionPlan for a default (replica_id=0) runtime identity.
+     */
+    void loadModel(
+        const std::string& model_id,
+        const qai_forge::execution::ExecutionPlan& plan);
 
     /**
      * Unload the model and terminate the worker subprocess.
-     * Always uses SIGKILL (force=true) to ensure clean DSP resource reclamation.
      */
     void unloadModel(bool force = false) override;
 
     /**
      * Ensure the litert-lm-inference-worker is running with the given model.
-     * Delegates to LiteRTLMWorkerManager::ensureWorkerRunning() which also
-     * intercepts the METADATA message from the worker.
      */
     void ensureWorkerRunning(const std::string& model_id,
                              const std::string& config_file,
-                             const std::string& sampler_config) override;
+                             const std::string& sampler_file) override;
 
     /**
      * Text-only LLM inference.
-     * Delegates to LiteRTLMWorkerManager::executeRequest().
-     * use_reasoning is ignored — LiteRT-LM does not filter <think> tokens.
      */
     void generate(
         const std::string& event_id,
@@ -101,11 +99,6 @@ public:
 
     /**
      * Text-only LLM inference with cross-request KV session reuse.
-     * Overrides IGenerativeBackend::generateWithSession() — this backend
-     * declares supports_kv_session_reuse=true in capabilities().
-     * Delegates to LiteRTLMWorkerManager::executeRequest() with session_id
-     * and kv_invalidated so the worker can reuse or rebuild the session's
-     * KV state (g_kv_sessions map).
      */
     void generateWithSession(
         const std::string& event_id,
@@ -124,10 +117,8 @@ public:
         std::function<void(const IPCErrorEvent&)>  on_error,
         bool               kv_invalidated = false) override;
 
-
     /**
-     * VLM inference — not supported by LiteRT-LM (LLM-only backend).
-     * Calls on_error immediately.
+     * Not supported by LiteRT-LM (LLM-only backend).
      */
     void generateVlm(
         const std::string&              event_id,
@@ -146,31 +137,23 @@ public:
         std::function<void(const IPCErrorEvent&)>  on_error) override;
 
     /**
-     * Called after context compaction — resets the KV cache.
-     * Delegates to LiteRTLMWorkerManager::sendReset().
+     * Resets the worker's KV cache after context compaction.
      */
     void onContextCompacted() override;
 
-    /**
-     * Initiate an eager background KV cache reset after inference completes.
-     * Delegates to LiteRTLMWorkerManager::initiateBackgroundReset().
-     */
     void resetKvAsync(const std::string& session_id = "") override;
 
     /**
-     * KV cache operations — not yet supported for LiteRT-LM.
-     * saveKv/restoreKv are no-ops; resetKv calls sendReset().
+     * KV cache checkpoint operations — not implemented for LiteRT-LM.
      */
     void saveKv(const std::string& name, const std::string& session_id = "")    override;
     void restoreKv(const std::string& name, const std::string& session_id = "") override;
     void resetKv(const std::string& session_id = "")                           override;
-    void clearSession(const std::string& session_id) override;
 
+    void clearSession(const std::string& session_id) override;
 
     /**
      * Terminate the worker subprocess.
-     * @param force  true → SIGKILL (immediate, used for client cancellation)
-     *               false → graceful SHUTDOWN command
      */
     void terminateWorker(bool force = false) override;
     bool forceKillActiveWorker() override;
@@ -181,18 +164,19 @@ public:
     bool isHealthy() const override;
 
     /**
-     * Return the metadata received from the worker after model load.
-     * Used by LiteRTLMOrchestrator to initialize prompt templating and
-     * tool call parsing.
+     * Return metadata received from worker after model load (jinja template,
+     * tool call delimiters, thinking tags, etc.) for LiteRTLMOrchestrator.
      */
     const LiteRTLMMetadata& getMetadata() const;
 
 private:
-    LiteRTLMBackend(const LiteRTLMBackend&)            = delete;
+    LiteRTLMBackend(const LiteRTLMBackend&) = delete;
     LiteRTLMBackend& operator=(const LiteRTLMBackend&) = delete;
 
     LiteRTLMWorkerManager& worker();
 
     std::string current_model_id_;
     std::unique_ptr<LiteRTLMWorkerManager> worker_;
+    qai_forge::execution::ExecutionPlan current_plan_;
+    bool has_current_plan_ = false;
 };

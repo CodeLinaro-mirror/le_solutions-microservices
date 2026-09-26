@@ -70,6 +70,12 @@
 using TokenCallback  = std::function<void(const IPCTokenEvent&)>;
 using DoneCallback   = std::function<void(const IPCDoneEvent&)>;
 using ErrorCallback  = std::function<void(const IPCErrorEvent&)>;
+// Invoked by startWorker() on the post-INIT READY message, before the
+// worker is published as ready. Throwing fails startup (mirrors
+// PredictiveWorkerManager's PredictiveReadyValidator). Used by backends
+// (GenIEBackend, LiteRTLMBackend) to confirm placement-derived fields such
+// as "provider"/"binding_strength" were echoed back correctly.
+using ReadyValidator = std::function<void(const json& ready_message)>;
 
 class InferenceWorkerManager {
 public:
@@ -96,8 +102,19 @@ public:
                                       const std::string& config_file,
                                       const std::string& sampler_config);
 
+    virtual void ensureWorkerRunning(const std::string& model_id,
+                                      const std::string& config_file,
+                                      const std::string& sampler_config,
+                                      ReadyValidator ready_validator);
+
     // Set the effective concurrency selected by the backend before startup.
     void setMaxSlots(int max_slots);
+
+    /**
+     * Set provider-specific fields to merge into the next INIT command.
+     * Consumed (and cleared) by startWorker() on the next worker launch.
+     */
+    void setInitOptions(const json& options);
 
     /**
      * Execute an inference request and stream tokens back to Layer 2.
@@ -195,8 +212,7 @@ public:
 
     /**
      * Save the KV cache to a named checkpoint.
-     * Used by Layer 2 for reasoning rewind (Section 6.B) and
-     * ADHOC mode context swapping (Section 6.C).
+     * Used by Layer 2 for reasoning rewind and ADHOC mode context swapping.
      */
     bool saveKvCache(const std::string& checkpoint_name,
                       const std::string& session_id = "");
@@ -266,6 +282,7 @@ private:
     // Bytes already read from sock_fd_ but not yet consumed as a full line —
     // owned exclusively by the reader thread once it starts.
     std::string read_buf_;
+    json init_options_;
 
     // Fixed-size VLM-only prompt shared-memory region. LLM prompts are inline.
     void*  prompt_shm_ptr_        = nullptr;
@@ -376,7 +393,8 @@ private:
     // ── Internal helpers (private — not accessible to subclasses) ─────────────
     void startWorker(const std::string& model_id,
                      const std::string& config_file,
-                     const std::string& sampler_config);
+                     const std::string& sampler_config,
+                     const ReadyValidator& ready_validator);
     void cleanupWorker(bool force = false);
 
     /**
@@ -433,8 +451,8 @@ private:
 
     /**
      * Generate a unique socket path: /tmp/genai-worker-{model_id}-{uuid}.sock
-     * Section 4.E: UUID suffix prevents clashes when multiple workers run
-     * for the same model.
+     * UUID suffix prevents clashes when multiple workers run for the same
+     * model.
      */
     static std::string generateSocketPath(const std::string& model_id);
 

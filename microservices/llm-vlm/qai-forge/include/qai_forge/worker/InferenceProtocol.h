@@ -29,7 +29,7 @@ inline std::string ipcGetStringOrDefault(const json& obj,
 // Defines the JSON Lines protocol used between the Drogon server (Layer 3
 // InferenceWorkerManager) and the genai-inference-worker subprocess.
 //
-// Design decisions (architecture_refactoring_design.md Section 4.B):
+// Design decisions:
 //   - All messages are typed via the "type" field.
 //   - Typed IPC event structs replace raw dictionary parsing.
 //   - The protocol is identical to the Python implementation, ensuring
@@ -65,7 +65,7 @@ namespace ResponseType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Typed IPC Event Structs (Section 4.B — DTOs at the IPC Boundary)
+// Typed IPC Event Structs — DTOs at the IPC Boundary
 //
 // These replace raw dictionary parsing (response["type"]) with strongly-typed
 // objects. The async socket loop yields these directly.

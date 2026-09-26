@@ -34,7 +34,7 @@ inline std::string sessionGetStringOrDefault(const json& obj,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConversationSession — Pure Data Record (Section 3.A of architecture design)
+// ConversationSession — Pure Data Record
 //
 // This is a transient data object used while preparing a Genie request and
 // running post-turn processing. Persistent runtime memory lives in the private
@@ -44,8 +44,8 @@ inline std::string sessionGetStringOrDefault(const json& obj,
 //   - session_id identifies the active backend execution.
 //   - messages contains the complete caller-supplied transcript for this turn.
 //   - Thinking content is stored with a private "_thinking_content" key and
-//     stripped before being sent to the model (Section 3.F).
-//   - Post-turn memory management (Phase 5):
+//     stripped before being sent to the model.
+//   - Post-turn memory management:
 //       evicted_message_count — number of oldest messages already summarized.
 //       summary_content       — rolling summary of evicted messages (Slot 3).
 //       facts                 — persistent key-value facts extracted from
@@ -208,7 +208,7 @@ struct ConversationSession {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DraftTurn — Unit of Work for atomic session state updates (Section 3.C)
+// DraftTurn — Unit of Work for atomic session state updates
 //
 // New messages are staged here before inference. If inference succeeds,
 // commit() atomically appends them to the session. If it fails, the draft
