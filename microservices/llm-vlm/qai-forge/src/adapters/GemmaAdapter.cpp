@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/adapters/GemmaAdapter.h"
+#include "qai_forge/adapters/ToolCallJsonUtils.h"
 #include "qai_forge/utils/Logger.h"
 #include <cctype>
 #include <random>
@@ -293,6 +294,11 @@ json toOpenAiToolCall(const json& fc_call) {
 } // namespace
 
 json GemmaAdapter::parseToolCalls(const std::string& response_text) const {
+    return parseToolCalls(response_text, json::array());
+}
+
+json GemmaAdapter::parseToolCalls(const std::string& response_text,
+                                   const json& tools) const {
     json tool_calls = json::array();
 
     static const std::string kOpenTag = "<|tool_call>";
@@ -342,6 +348,30 @@ json GemmaAdapter::parseToolCalls(const std::string& response_text) const {
                          << e.what());
             }
         }
+    }
+
+    // Case-insensitive tool-name remap / rejection against the caller's
+    // declared tools. Calls for names that don't match any declared tool
+    // are dropped rather than silently passed through with an
+    // unrecognized name.
+    if (!tool_calls.empty() && tools.is_array() && !tools.empty()) {
+        json filtered = json::array();
+        for (auto& call : tool_calls) {
+            std::string called_name =
+                call.value("function", json::object()).value("name", "");
+            auto normalized =
+                ToolCallJsonUtils::normalizeToolName(called_name, tools);
+            if (!normalized.has_value()) {
+                LOG_WARN("[GemmaAdapter] Dropping tool call for "
+                         "unrecognized tool name: " << called_name);
+                continue;
+            }
+            if (normalized.value() != called_name) {
+                call["function"]["name"] = normalized.value();
+            }
+            filtered.push_back(std::move(call));
+        }
+        tool_calls = std::move(filtered);
     }
 
     return tool_calls;

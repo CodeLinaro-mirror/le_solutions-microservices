@@ -25,6 +25,7 @@
 #include "qai_forge/reasoning/ReasoningRouter.h"
 #include "qai_forge/reasoning/ReasoningBudgetCalculator.h"
 #include "qai_forge/adapters/ModelAdapterFactory.h"
+#include "qai_forge/adapters/ToolCallJsonUtils.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
@@ -239,12 +240,6 @@ std::vector<std::vector<uint8_t>> preprocessImagesToBuffers(
         }
     }
 
-    if (image_urls.size() == 1) {
-        LOG_INFO("[GenieOrchestrator] Only one image supplied for VLM; "
-                 "duplicating image to satisfy backend minimum");
-        image_urls.push_back(image_urls[0]);
-    }
-
     std::vector<std::vector<uint8_t>> buffers;
     for (size_t i = 0; i < image_urls.size(); ++i) {
         try {
@@ -290,16 +285,6 @@ std::vector<std::vector<uint8_t>> preprocessImagesToBuffers(
                     std::to_string(i + 1) + ": " + e.what(),
                 400);
         }
-    }
-
-    if (buffers.size() == 1) {
-        LOG_INFO("[GenieOrchestrator] Only one image supplied for VLM; "
-                 "duplicating image to satisfy backend minimum");
-        // NOTE: buffers.push_back(buffers[0]) would be undefined behavior —
-        // push_back may reallocate before reading the reference argument,
-        // so the source could be freed before the copy happens. Copy first.
-        std::vector<uint8_t> duplicate = buffers[0];
-        buffers.push_back(std::move(duplicate));
     }
 
     return buffers;
@@ -717,9 +702,36 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
     }
 
     json tool_calls = json::array();
+    bool attempted_tool_call = false;
     if (prepared.tools.is_array() && !prepared.tools.empty()) {
         const auto& adapter = ModelAdapterFactory::getAdapter(job.model_id);
-        tool_calls = adapter.parseToolCalls(answer_content);
+        const std::string marker = adapter.toolCallStartMarker();
+        attempted_tool_call = !marker.empty() &&
+            answer_content.find(marker) != std::string::npos;
+        tool_calls = adapter.parseToolCalls(answer_content, prepared.tools);
+
+        // An explicit empty tool_calls array is the model's way of
+        // signalling "no tool needed" via the generic OpenAI-JSON
+        // convention — suppress the raw control JSON so it never leaks
+        // into the visible response content.
+        if (tool_calls.empty() &&
+            ToolCallJsonUtils::isEmptyToolCallResponse(answer_content)) {
+            answer_content.clear();
+        } else if (tool_calls.empty() && attempted_tool_call) {
+            // The model clearly attempted a native tool call (its
+            // start marker is present) but nothing could be parsed out of
+            // it — surface loudly instead of silently downgrading to a
+            // plain-text answer that would actually contain raw tool-call
+            // syntax.
+            LOG_ERROR("[GenieOrchestrator] TOOL_CALL_PARSE_FAILED: model="
+                      << job.model_id << " session=" << job.session_id
+                      << " raw_response=\"" << answer_content << "\"");
+            throw GenAIException(
+                GenAIErrorCode::INFERENCE_FAILED,
+                "The model attempted a tool call but produced output that "
+                "could not be parsed (tool_call_parse_failed)",
+                502);
+        }
     }
 
     if (job.isCancelled()) {
@@ -796,6 +808,20 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     bool had_error = false;
     std::string error_msg;
 
+    // Resolved once per execute() call — the marker that, once observed in
+    // the accumulated response text, indicates a tool-call payload has
+    // started and per-token streaming must be suppressed (the raw
+    // tool-call syntax must never reach the client) until the full
+    // response can be parsed via ModelAdapter::parseToolCalls() below.
+    // Empty for adapters that don't support tool calling, or whose
+    // tool-call syntax doesn't require full-response buffering to detect,
+    // or when the caller supplied no tools for this request.
+    const bool has_tools = prepared.tools.is_array() && !prepared.tools.empty();
+    const std::string tool_call_start_marker = has_tools
+        ? ModelAdapterFactory::getAdapter(job.model_id).toolCallStartMarker()
+        : std::string();
+    bool tool_call_suppressed = false;
+
     if (is_vlm) {
         LOG_INFO("[GenieOrchestrator] Streaming VLM execution: model="
                  << job.model_id
@@ -813,13 +839,21 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             generation.top_k,
             generation.presence_penalty,
             generation.frequency_penalty,
-            [&job, &callback, &full_response]
+            [&job, &callback, &full_response, &tool_call_start_marker,
+             &tool_call_suppressed]
             (const IPCTokenEvent& token) {
+                full_response += token.content;
+                if (!tool_call_suppressed && !tool_call_start_marker.empty() &&
+                    full_response.find(tool_call_start_marker) != std::string::npos) {
+                    tool_call_suppressed = true;
+                }
+                if (tool_call_suppressed) {
+                    return;
+                }
                 StreamChunk chunk;
                 chunk.id = job.response_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
-                full_response += token.content;
                 callback(chunk);
             },
             [&finish_reason](const IPCDoneEvent& done) {
@@ -842,26 +876,41 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             generation.presence_penalty,
             generation.frequency_penalty,
             generation.use_reasoning,
-            [&generation, &router, &job, &callback, &full_response]
+            [&generation, &router, &job, &callback, &full_response,
+             &tool_call_start_marker, &tool_call_suppressed]
             (const IPCTokenEvent& token) {
                 if (generation.use_reasoning) {
                     auto chunks = router.route(token.content);
                     for (auto& chunk : chunks) {
-                        chunk.id = job.response_id;
-                        chunk.model = job.model_id;
-                        callback(chunk);
                         if (chunk.content_delta.has_value()) {
                             full_response += chunk.content_delta.value();
                         }
+                        if (!tool_call_suppressed && !tool_call_start_marker.empty() &&
+                            full_response.find(tool_call_start_marker) != std::string::npos) {
+                            tool_call_suppressed = true;
+                        }
+                        if (tool_call_suppressed) {
+                            continue;
+                        }
+                        chunk.id = job.response_id;
+                        chunk.model = job.model_id;
+                        callback(chunk);
                     }
                     return;
                 }
 
+                full_response += token.content;
+                if (!tool_call_suppressed && !tool_call_start_marker.empty() &&
+                    full_response.find(tool_call_start_marker) != std::string::npos) {
+                    tool_call_suppressed = true;
+                }
+                if (tool_call_suppressed) {
+                    return;
+                }
                 StreamChunk chunk;
                 chunk.id = job.response_id;
                 chunk.model = job.model_id;
                 chunk.content_delta = token.content;
-                full_response += token.content;
                 callback(chunk);
             },
             [&finish_reason](const IPCDoneEvent& done) {
@@ -900,9 +949,35 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     }
 
     json tool_calls = json::array();
-    if (prepared.tools.is_array() && !prepared.tools.empty()) {
+    if (has_tools) {
         const auto& adapter = ModelAdapterFactory::getAdapter(job.model_id);
-        tool_calls = adapter.parseToolCalls(answer_content);
+        tool_calls = adapter.parseToolCalls(answer_content, prepared.tools);
+
+        // An explicit empty tool_calls array is the model's way of
+        // signalling "no tool needed" via the generic OpenAI-JSON
+        // convention — suppress the raw control JSON so it never leaks
+        // into the visible response content. Since streaming already
+        // withheld this content from the client (tool_call_suppressed),
+        // there is nothing further to flush here.
+        if (tool_calls.empty() &&
+            ToolCallJsonUtils::isEmptyToolCallResponse(answer_content)) {
+            answer_content.clear();
+        } else if (tool_calls.empty() && tool_call_suppressed) {
+            // The model's tool-call start marker was observed in the
+            // stream but nothing could be parsed out of the full
+            // response — surface loudly instead of silently downgrading.
+            // Streaming already withheld the raw tool-call syntax from
+            // the client, so there is no safe partial answer to fall
+            // back to.
+            LOG_ERROR("[GenieOrchestrator] TOOL_CALL_PARSE_FAILED (stream): model="
+                      << job.model_id << " session=" << job.session_id
+                      << " raw_response=\"" << answer_content << "\"");
+            throw GenAIException(
+                GenAIErrorCode::INFERENCE_FAILED,
+                "The model attempted a tool call but produced output that "
+                "could not be parsed (tool_call_parse_failed)",
+                502);
+        }
     }
 
     StreamChunk finish_chunk;

@@ -4,6 +4,7 @@
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 
 #include "qai_forge/adapters/ModelAdapterFactory.h"
+#include "qai_forge/adapters/ToolCallJsonUtils.h"
 #include "qai_forge/backend/LiteRTLMBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/reasoning/ReasoningRouter.h"
@@ -422,14 +423,41 @@ StandardResponse LiteRTLMOrchestrator::execute(
     // GenieOrchestrator's pattern exactly. Each model's own chat template
     // determines its tool-call syntax independent of backend, so
     // resolution is by model_id substring match via ModelAdapterFactory.
+    // Passing prepared->tools enables case-insensitive tool-name
+    // normalization/rejection and (for adapters that support it)
+    // schema-guided recovery against the caller's declared tools.
     const auto& adapter = ModelAdapterFactory::getAdapter(job.model_id);
-    json tool_calls = adapter.parseToolCalls(content_text);
+    const bool has_tools = prepared->tools.is_array() && !prepared->tools.empty();
+    json tool_calls = adapter.parseToolCalls(content_text, prepared->tools);
     if (tool_calls.is_array() && !tool_calls.empty()) {
         response.tool_calls = std::move(tool_calls);
         response.finish_reason = "tool_calls";
         // content left unset, matching GenieOrchestrator — avoids leaking
         // raw tool-call syntax into message.content when tool_calls already
         // carries the structured, parsed call(s).
+    } else if (has_tools &&
+               ToolCallJsonUtils::isEmptyToolCallResponse(content_text)) {
+        // An explicit empty tool_calls array is the model's way of
+        // signalling "no tool needed" via the generic OpenAI-JSON
+        // convention — suppress the raw control JSON so it never leaks
+        // into the visible response content.
+        response.content = "";
+    } else if (has_tools && !tool_call_start_marker.empty() &&
+               content_text.find(tool_call_start_marker) != std::string::npos) {
+        // The model's tool-call start marker was observed but nothing
+        // could be parsed out of the full response — surface loudly
+        // instead of silently downgrading to a plain-text answer that
+        // would actually contain raw tool-call syntax. Streaming already
+        // withheld this content from the client via the marker-gated
+        // suppression above.
+        LOG_ERROR("[LiteRTLMOrchestrator] TOOL_CALL_PARSE_FAILED: model="
+                  << job.model_id << " session=" << job.session_id
+                  << " raw_response=\"" << content_text << "\"");
+        throw GenAIException(
+            GenAIErrorCode::INFERENCE_FAILED,
+            "The model attempted a tool call but produced output that "
+            "could not be parsed (tool_call_parse_failed)",
+            502);
     } else {
         response.content = content_text;
     }

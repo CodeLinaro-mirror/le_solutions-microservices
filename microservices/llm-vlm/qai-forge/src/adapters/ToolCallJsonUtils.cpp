@@ -5,7 +5,13 @@
 #include "qai_forge/utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <functional>
 #include <regex>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 namespace ToolCallJsonUtils {
 
@@ -209,6 +215,229 @@ std::vector<json> extractAllJsonObjects(const std::string& text) {
     }
 
     return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-adapter tool-call post-processing helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+std::string toLower(const std::string& value) {
+    std::string lower;
+    lower.reserve(value.size());
+    for (const unsigned char ch : value) {
+        lower.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return lower;
+}
+
+// Builds a lowercased-name -> (original_name, expected_param_set) map from
+// an OpenAI-format tools array. Shared by normalizeToolName() and
+// extractSchemaGuidedToolCalls().
+std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>>
+buildToolSpecs(const json& tools) {
+    std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>> specs;
+    if (!tools.is_array()) {
+        return specs;
+    }
+    for (const auto& tool : tools) {
+        if (!tool.is_object()) {
+            continue;
+        }
+        json function = tool.value("function", json::object());
+        std::string name = function.value("name", "");
+        if (name.empty()) {
+            continue;
+        }
+        json parameters = function.value("parameters", json::object());
+        std::set<std::string> properties;
+        if (parameters.is_object() && parameters.contains("properties") &&
+            parameters["properties"].is_object()) {
+            for (const auto& item : parameters["properties"].items()) {
+                properties.insert(item.key());
+            }
+        }
+        specs[toLower(name)] = {name, std::move(properties)};
+    }
+    return specs;
+}
+
+std::string generateToolCallId() {
+    static const char kHexDigits[] = "0123456789abcdef";
+    std::string id = "call_";
+    // Not cryptographically random, but sufficient for de-duplication of
+    // recovered calls within a single response — matches the informal
+    // "call_<hex>" convention used elsewhere in qai-forge adapters.
+    std::hash<std::string> hasher;
+    std::size_t seed = hasher(std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    for (int i = 0; i < 24; ++i) {
+        id.push_back(kHexDigits[seed & 0xF]);
+        seed >>= 4;
+        if (seed == 0) {
+            seed = hasher(id);
+        }
+    }
+    return id;
+}
+
+// Recurses through `value` looking for tool-call-shaped JSON according to
+// `specs`, collecting every match found (not just the first), so multiple
+// back-to-back native calls in the same response are all recovered.
+void findAllSchemaGuidedCalls(
+    const json& value,
+    const std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>>& specs,
+    std::vector<std::pair<std::string, json>>& results) {
+    if (value.is_array()) {
+        for (const auto& item : value) {
+            findAllSchemaGuidedCalls(item, specs, results);
+        }
+        return;
+    }
+
+    if (!value.is_object()) {
+        return;
+    }
+
+    for (const auto& entry : value.items()) {
+        const std::string& key = entry.key();
+        const json& item = entry.value();
+
+        // Convention 2: tool name used as the dict key itself.
+        auto key_it = specs.find(toLower(key));
+        if (key_it != specs.end() && item.is_object()) {
+            const auto& expected = key_it->second.second;
+            bool matches = expected.empty();
+            if (!matches) {
+                for (const auto& arg_entry : item.items()) {
+                    if (expected.count(arg_entry.key())) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+            if (matches || item.empty()) {
+                results.emplace_back(key_it->second.first, item);
+            }
+        }
+
+        // Convention 1: tool name appears as a string value.
+        if (item.is_string()) {
+            auto value_it = specs.find(toLower(item.get<std::string>()));
+            if (value_it != specs.end()) {
+                const auto& expected = value_it->second.second;
+                bool found_sibling = false;
+                for (const auto& sibling_entry : value.items()) {
+                    if (sibling_entry.key() == key ||
+                        !sibling_entry.value().is_object()) {
+                        continue;
+                    }
+                    const json& sibling = sibling_entry.value();
+                    bool matches = expected.empty();
+                    if (!matches) {
+                        for (const auto& arg_entry : sibling.items()) {
+                            if (expected.count(arg_entry.key())) {
+                                matches = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (matches) {
+                        results.emplace_back(value_it->second.first, sibling);
+                        found_sibling = true;
+                    }
+                }
+                if (!found_sibling) {
+                    json flattened = json::object();
+                    for (const auto& sibling_entry : value.items()) {
+                        if (sibling_entry.key() != key &&
+                            expected.count(sibling_entry.key())) {
+                            flattened[sibling_entry.key()] = sibling_entry.value();
+                        }
+                    }
+                    if (!flattened.empty() || expected.empty()) {
+                        results.emplace_back(value_it->second.first, flattened);
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into nested structures regardless of whether this object
+    // itself matched, so calls nested inside e.g. a wrapper object are
+    // still discovered alongside sibling matches at this level.
+    for (const auto& entry : value.items()) {
+        if (entry.value().is_object() || entry.value().is_array()) {
+            findAllSchemaGuidedCalls(entry.value(), specs, results);
+        }
+    }
+}
+
+}  // namespace
+
+bool isEmptyToolCallResponse(const std::string& text) {
+    if (text.empty()) {
+        return false;
+    }
+    json parsed;
+    try {
+        parsed = json::parse(text);
+    } catch (...) {
+        return false;
+    }
+    return parsed.is_object() && parsed.contains("tool_calls") &&
+           parsed["tool_calls"].is_array() && parsed["tool_calls"].empty();
+}
+
+std::optional<std::string> normalizeToolName(const std::string& called_name,
+                                             const json& tools) {
+    if (called_name.empty()) {
+        return std::nullopt;
+    }
+    auto specs = buildToolSpecs(tools);
+    auto it = specs.find(toLower(called_name));
+    if (it == specs.end()) {
+        return std::nullopt;
+    }
+    return it->second.first;
+}
+
+json extractSchemaGuidedToolCalls(const std::string& text, const json& tools) {
+    json result = json::array();
+    auto specs = buildToolSpecs(tools);
+    if (specs.empty() || text.empty()) {
+        return result;
+    }
+
+    std::vector<json> candidates = extractAllJsonObjects(text);
+    std::unordered_set<std::string> seen;
+
+    for (const auto& candidate : candidates) {
+        std::vector<std::pair<std::string, json>> matches;
+        findAllSchemaGuidedCalls(candidate, specs, matches);
+        for (auto& match : matches) {
+            std::string dedup_key;
+            try {
+                dedup_key = match.first + "|" + match.second.dump();
+            } catch (...) {
+                dedup_key = match.first;
+            }
+            if (!seen.insert(dedup_key).second) {
+                continue;
+            }
+            result.push_back({
+                {"id", generateToolCallId()},
+                {"type", "function"},
+                {"function", {
+                    {"name", match.first},
+                    {"arguments", match.second.dump()}
+                }}
+            });
+        }
+    }
+
+    return result;
 }
 
 }  // namespace ToolCallJsonUtils

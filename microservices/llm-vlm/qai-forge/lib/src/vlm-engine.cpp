@@ -94,6 +94,24 @@ static GenieNode_IOName_t stringToNodeIO(const std::string& s) {
     throw std::invalid_argument("[VlmEngine] Unknown node IO: " + s);
 }
 
+// Qwen3-VL image encoders produce DeepStack outputs (additional per-layer
+// vision features + a visual-position mask) in addition to the regular
+// image embedding. The bundle reference pipeline routes these through a
+// wildcard image-encoder-to-generator connection. Qwen2.5-VL only uses the
+// regular embedding path and does not need this connection. Detected by
+// model_id prefix, mirroring the legacy genai-lib isQwen3VlModel() check.
+static bool isQwen3VlModel(const std::string& model_id) {
+    std::string normalized;
+    normalized.reserve(model_id.size());
+    for (const unsigned char ch : model_id) {
+        normalized.push_back(static_cast<char>(::tolower(ch)));
+    }
+    return normalized.rfind("qwen3-vl-", 0) == 0 ||
+           normalized.rfind("qwen3_vl_", 0) == 0 ||
+           normalized.rfind("qwen3-vl", 0) == 0 ||
+           normalized.rfind("qwen3_vl", 0) == 0;
+}
+
 // ── Per-request callback context ──────────────────────────────────────────────
 struct VlmCallbackCtx {
     TokenCallback*      callback = nullptr;
@@ -143,6 +161,7 @@ struct VlmEngine::Impl {
     GenieSampler_Handle_t  sampler_handle         = nullptr;  // lazy-initialized
     std::string            sampler_config_path;
     std::string            model_id;
+    bool                   requires_qwen3_vl_wildcard = false;
 
     struct CustomInput {
         std::string node;
@@ -181,6 +200,7 @@ VlmEngine::VlmEngine(const std::string& model_id,
     : m_impl(std::make_unique<Impl>()) {
     m_impl->model_id = model_id;
     m_impl->sampler_config_path = sampler_config_path.empty() ? "sampler.json" : sampler_config_path;
+    m_impl->requires_qwen3_vl_wildcard = isQwen3VlModel(model_id);
 
     // ── Log ───────────────────────────────────────────────────────────────────
     {
@@ -291,6 +311,21 @@ VlmEngine::VlmEngine(const std::string& model_id,
     GeniePipeline_connect(m_impl->pipeline_handle,
         m_impl->lut_encoder_node, GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT,
         m_impl->text_generator_node, GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT);
+
+    // Qwen3-VL image encoders emit additional DeepStack outputs (per-layer
+    // vision features + visual-position mask) beyond the regular embedding
+    // output connected above. Route these through a wildcard
+    // image-encoder-to-generator connection — without it, Qwen3-VL's extra
+    // outputs have no destination and the model will not receive the full
+    // vision signal it expects. Qwen2.5-VL does not produce these outputs
+    // and must not attempt this connection.
+    if (m_impl->requires_qwen3_vl_wildcard) {
+        GeniePipeline_connect(m_impl->pipeline_handle,
+            m_impl->image_encoder_node, GENIE_NODE_WILDCARD,
+            m_impl->text_generator_node, GENIE_NODE_WILDCARD);
+        std::cout << "[VlmEngine] Enabled Qwen3-VL wildcard vision connection"
+                  << std::endl;
+    }
 
     // ── Register text output callback (set once; userData passed per-execute) ─
     GenieNode_setTextCallback(m_impl->text_generator_node,

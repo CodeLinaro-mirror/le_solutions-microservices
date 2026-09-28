@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 #include "qai_forge/adapters/Qwen25Adapter.h"
+#include "qai_forge/adapters/ToolCallJsonUtils.h"
 #include "qai_forge/utils/Logger.h"
 #include <sstream>
 #include <regex>
@@ -161,6 +162,11 @@ std::string Qwen25Adapter::formatToolInstructions(const json& tools) const {
 // Parses <tool_call>{"name": "...", "arguments": {...}}</tool_call> from response.
 // ─────────────────────────────────────────────────────────────────────────────
 json Qwen25Adapter::parseToolCalls(const std::string& response_text) const {
+    return parseToolCalls(response_text, json::array());
+}
+
+json Qwen25Adapter::parseToolCalls(const std::string& response_text,
+                                    const json& tools) const {
     json tool_calls = json::array();
 
     static const std::regex tool_call_re(
@@ -171,8 +177,7 @@ json Qwen25Adapter::parseToolCalls(const std::string& response_text) const {
     auto begin = std::sregex_iterator(response_text.begin(), response_text.end(), tool_call_re);
     auto end = std::sregex_iterator();
 
-    int idx = 0;
-    for (auto it = begin; it != end; ++it, ++idx) {
+    for (auto it = begin; it != end; ++it) {
         std::string call_json = (*it)[1].str();
         try {
             json call = json::parse(call_json);
@@ -195,6 +200,43 @@ json Qwen25Adapter::parseToolCalls(const std::string& response_text) const {
         } catch (const std::exception& e) {
             LOG_WARN("[Qwen25Adapter] Failed to parse tool_call: " << e.what());
         }
+    }
+
+    // Schema-guided fallback: recover calls shaped according to the
+    // caller's declared tool parameter names when the model dropped its
+    // native <tool_call> tag/wrapper entirely.
+    if (tool_calls.empty() && tools.is_array() && !tools.empty()) {
+        json schema_guided =
+            ToolCallJsonUtils::extractSchemaGuidedToolCalls(response_text, tools);
+        if (!schema_guided.empty()) {
+            LOG_WARN("[Qwen25Adapter] Recovered tool call via schema-guided "
+                     "extraction");
+            tool_calls = std::move(schema_guided);
+        }
+    }
+
+    // Case-insensitive tool-name remap / rejection against the caller's
+    // declared tools. Calls for names that don't match any declared tool
+    // are dropped rather than silently passed through with an
+    // unrecognized name.
+    if (!tool_calls.empty() && tools.is_array() && !tools.empty()) {
+        json filtered = json::array();
+        for (auto& call : tool_calls) {
+            std::string called_name =
+                call.value("function", json::object()).value("name", "");
+            auto normalized =
+                ToolCallJsonUtils::normalizeToolName(called_name, tools);
+            if (!normalized.has_value()) {
+                LOG_WARN("[Qwen25Adapter] Dropping tool call for "
+                         "unrecognized tool name: " << called_name);
+                continue;
+            }
+            if (normalized.value() != called_name) {
+                call["function"]["name"] = normalized.value();
+            }
+            filtered.push_back(std::move(call));
+        }
+        tool_calls = std::move(filtered);
     }
 
     return tool_calls;

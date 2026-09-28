@@ -83,6 +83,29 @@ public:
     virtual json parseToolCalls(const std::string& response_text) const = 0;
 
     /**
+     * Parse tool calls from the model's raw text response, with the
+     * caller's declared tools schema available for validation/recovery.
+     *
+     * Default implementation forwards to the single-argument overload
+     * above (ignoring tools) — sufficient for adapters that don't need
+     * schema-guided recovery or name normalization. Adapters that support
+     * tool calling (Qwen25Adapter, Qwen3Adapter, GemmaAdapter) override
+     * this to additionally:
+     *   - drop/reject calls whose name doesn't match any declared tool
+     *     (case-insensitive match, remapped to the declared casing)
+     *   - recover calls from schema-shaped JSON when the model dropped
+     *     its native tag/wrapper syntax entirely
+     *
+     * Orchestrators should prefer this overload over the single-argument
+     * one whenever the request's tools array is available.
+     */
+    virtual json parseToolCalls(const std::string& response_text,
+                                const json& tools) const {
+        (void)tools;
+        return parseToolCalls(response_text);
+    }
+
+    /**
      * Format tool results into the model-specific input format.
      * Called when building the context for a tool continuation turn.
      *

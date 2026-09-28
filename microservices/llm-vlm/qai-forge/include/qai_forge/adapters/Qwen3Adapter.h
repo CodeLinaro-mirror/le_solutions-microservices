@@ -25,6 +25,13 @@ public:
     // ── Tool Calling ───────────────────────────────────────────────────────────
     std::string formatToolInstructions(const json& tools) const override;
     json parseToolCalls(const std::string& response_text) const override;
+    // Overload that also applies schema-guided recovery and case-insensitive
+    // name normalization against the caller's declared tools. The base
+    // parseToolCalls(response_text) override forwards to this with an empty
+    // tools array (preserving ABI compatibility with ModelAdapter callers
+    // that don't have the tools list on hand).
+    json parseToolCalls(const std::string& response_text,
+                        const json& tools) const override;
     std::string formatToolResponse(const json& tool_results) const override;
 
     // ── System Prompt ──────────────────────────────────────────────────────────

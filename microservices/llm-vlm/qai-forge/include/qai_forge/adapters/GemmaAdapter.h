@@ -37,6 +37,12 @@ public:
     }
 
     json parseToolCalls(const std::string& response_text) const override;
+    // Overload that also applies case-insensitive name normalization
+    // against the caller's declared tools. The base
+    // parseToolCalls(response_text) override forwards to this with an
+    // empty tools array.
+    json parseToolCalls(const std::string& response_text,
+                        const json& tools) const override;
 
     std::string formatToolResponse(const json& tool_results) const override {
         (void)tool_results;

@@ -242,6 +242,11 @@ std::string Qwen3Adapter::formatToolInstructions(const json& tools) const {
 // Same <tool_call> tag format as Qwen 2.5 but different JSON structure.
 // ─────────────────────────────────────────────────────────────────────────────
 json Qwen3Adapter::parseToolCalls(const std::string& response_text) const {
+    return parseToolCalls(response_text, json::array());
+}
+
+json Qwen3Adapter::parseToolCalls(const std::string& response_text,
+                                   const json& tools) const {
     json tool_calls = json::array();
 
     static const std::regex tool_call_re(
@@ -270,6 +275,47 @@ json Qwen3Adapter::parseToolCalls(const std::string& response_text) const {
         && tryParseBareToolCallJson(response_text, tool_calls, idx)) {
         LOG_WARN("[Qwen3Adapter] Parsed bare JSON tool_call without "
                  "<tool_call> tags");
+    }
+
+    // Schema-guided fallback: recover calls shaped according to the
+    // caller's declared tool parameter names when the model dropped its
+    // native tag/wrapper entirely (e.g. emitted a bare
+    // {"get_weather": {"location": "Paris"}} object with no surrounding
+    // <tool_call> tags and no "name"/"arguments" keys for
+    // tryParseBareToolCallJson() to recognize).
+    if (tool_calls.empty() && tools.is_array() && !tools.empty()) {
+        json schema_guided =
+            ToolCallJsonUtils::extractSchemaGuidedToolCalls(response_text, tools);
+        if (!schema_guided.empty()) {
+            LOG_WARN("[Qwen3Adapter] Recovered tool call via schema-guided "
+                     "extraction");
+            tool_calls = std::move(schema_guided);
+        }
+    }
+
+    // Case-insensitive tool-name remap / rejection against the caller's
+    // declared tools. Some quantized/fine-tuned models alter tool-name
+    // casing (e.g. "Get_Weather" instead of "get_weather"); calls for
+    // names that don't match any declared tool are dropped rather than
+    // silently passed through with an unrecognized name.
+    if (!tool_calls.empty() && tools.is_array() && !tools.empty()) {
+        json filtered = json::array();
+        for (auto& call : tool_calls) {
+            std::string called_name =
+                call.value("function", json::object()).value("name", "");
+            auto normalized =
+                ToolCallJsonUtils::normalizeToolName(called_name, tools);
+            if (!normalized.has_value()) {
+                LOG_WARN("[Qwen3Adapter] Dropping tool call for "
+                         "unrecognized tool name: " << called_name);
+                continue;
+            }
+            if (normalized.value() != called_name) {
+                call["function"]["name"] = normalized.value();
+            }
+            filtered.push_back(std::move(call));
+        }
+        tool_calls = std::move(filtered);
     }
 
     return tool_calls;
