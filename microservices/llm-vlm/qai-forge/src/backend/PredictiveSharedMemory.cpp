@@ -18,8 +18,10 @@ PredictiveSharedMemory::PredictiveSharedMemory(size_t dir_bytes)
         throw std::invalid_argument("PredictiveSharedMemory capacity must be greater than zero");
     }
 
-    // Do not use MFD_CLOEXEC: PredictiveWorkerManager passes this inherited fd
-    // to the worker through CONV_SHM_FD during fork()/execl().
+    // Do not use MFD_CLOEXEC: this fd is passed to the shared worker process
+    // (first via fork()/execl() inheritance for the process's initial model,
+    // and via SCM_RIGHTS/sendmsg for every subsequent model — see
+    // PredictiveWorkerChannel::loadModel()).
     fd_ = memfd_create("qai-forge-predictive-shm", 0);
     if (fd_ < 0) {
         throw std::runtime_error(

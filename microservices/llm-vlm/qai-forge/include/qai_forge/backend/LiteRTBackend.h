@@ -6,21 +6,23 @@
 #include "qai_forge/backend/IInferenceBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/worker/PredictiveWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerChannel.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
 //
-// Manages the litert-inference-worker subprocess via PredictiveWorkerManager.
-// The worker binary path is resolved from the LITERT_WORKER_BINARY environment
-// variable (default: /usr/local/bin/litert-inference-worker).
+// Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
+// manage the ONE litert-inference-worker process hosting ALL LiteRT-backed
+// resident models — not one process per model. The worker binary path is
+// resolved from the LITERT_WORKER_BINARY environment variable (default:
+// /usr/local/bin/litert-inference-worker).
 //
 // Placement: initialize(RuntimeLaunchRequest) translates the resolved
 // ExecutionPlan into a LiteRT hw_accelerators bitmask via LiteRtLaunchOptions.
 //
-// INIT params sent to the worker:
+// LOAD_MODEL params sent to the worker:
 //   model_file          — absolute path to the .tflite model
 //   dispatch_lib_dir    — directory containing LiteRT dispatch .so
 //   compiler_plugin_dir — directory containing LiteRT compiler plugin .so
@@ -67,7 +69,10 @@ private:
     LiteRTBackend& operator=(const LiteRTBackend&) = delete;
 
     std::unique_ptr<PredictiveSharedMemory> shared_memory_;
-    std::unique_ptr<PredictiveWorkerManager> worker_;
+    // Shared across ALL LiteRT-backed models in this process — obtained
+    // lazily from PredictiveWorkerProcessPool, never owned exclusively by
+    // this backend instance. Do not close/terminate it from here.
+    PredictiveWorkerChannel* channel_ = nullptr;
     qai_forge::execution::ExecutionPlan current_plan_;
     bool has_current_plan_ = false;
     std::string current_model_id_;

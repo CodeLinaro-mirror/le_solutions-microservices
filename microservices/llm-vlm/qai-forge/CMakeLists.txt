@@ -313,7 +313,8 @@ set(QAI_FORGE_SOURCES
     # Worker management (Layer 3)
     src/worker/InferenceWorkerManager.cpp
     src/worker/VlmInferenceWorkerManager.cpp
-    src/worker/PredictiveWorkerManager.cpp
+    src/worker/PredictiveWorkerChannel.cpp
+    src/worker/PredictiveWorkerProcessPool.cpp
 )
 
 # ── Conditionally add LiteRT-LM generative backend sources ───────────────────

@@ -3,7 +3,7 @@
 
 #include "qai_forge/backend/QNNBackend.h"
 #include "qai_forge/execution/QnnLaunchOptions.h"
-#include "qai_forge/worker/PredictiveWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerProcessPool.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <cstdint>
@@ -12,7 +12,12 @@
 #include <stdexcept>
 #include <utility>
 
-// Default worker binary path — overridable via QNN_WORKER_BINARY env var
+// Default worker binary path — overridable via QNN_WORKER_BINARY env var.
+// This binary is now shared by ALL QNN-backed models — one process, many
+// resident models multiplexed onto per-model executor threads inside it
+// (see src/worker/qnn/main.cpp). PredictiveWorkerProcessPool guarantees
+// exactly one PredictiveWorkerChannel (and therefore one subprocess) per
+// distinct binary path, lazily spawned on first use.
 static const char* DEFAULT_QNN_WORKER = "/usr/local/bin/qnn-inference-worker";
 constexpr size_t kDefaultShmDirBytes = 32u * 1024 * 1024;
 constexpr size_t kShmAlign = 128;
@@ -29,11 +34,14 @@ static size_t alignUp(size_t offset, size_t align) {
     return (offset + align - 1) / align * align;
 }
 
-QNNBackend::QNNBackend() {
+static std::string qnnWorkerBinaryPath() {
     const char* binary = std::getenv("QNN_WORKER_BINARY");
-    if (!binary) binary = DEFAULT_QNN_WORKER;
+    return binary ? binary : DEFAULT_QNN_WORKER;
+}
 
-    worker_ = std::make_unique<PredictiveWorkerManager>(binary, "qnn");
+QNNBackend::QNNBackend() {
+    channel_ = &PredictiveWorkerProcessPool::getInstance().getChannel(
+        qnnWorkerBinaryPath(), "qnn");
 }
 
 QNNBackend& QNNBackend::getInstance() {
@@ -71,7 +79,7 @@ void QNNBackend::initialize(
     const std::string& requested_model_file,
     const qai_forge::execution::ExecutionPlan& plan,
     qai_forge::execution::RuntimeId runtime_id) {
-    // Build INIT params from ModelConfigManager
+    // Build LOAD_MODEL params from ModelConfigManager
     const auto mc = ModelConfigManager::getInstance().getModelConfig(model_id);
     if (!mc)
         throw std::runtime_error("QNNBackend: model not found: " + model_id);
@@ -108,6 +116,8 @@ void QNNBackend::initialize(
         init_params[key] = value;
     }
 
+    // Each model keeps its own independent shared-memory region — the
+    // worker PROCESS is shared, but tensor transport memory is not.
     if (!shared_memory_) shared_memory_ = std::make_unique<PredictiveSharedMemory>(predictiveShmDirBytes());
 
     const bool has_exact_target =
@@ -119,16 +129,18 @@ void QNNBackend::initialize(
             : 0;
     const auto expected_runtime_id = runtime_id;
 
-    // ready_validator runs on the worker's post-INIT READY (see
+    // ready_validator runs on the worker's post-LOAD_MODEL READY (see
     // src/worker/qnn/main.cpp) and confirms it echoed back the same
     // runtime_id, provider=="qnn", and the achieved binding_strength
     // ("exact" when the plan requested a physical device_id, "automatic"
     // otherwise) — plus, for the exact case, that qnn.effective_device_id
     // matches the requested device_id. Throwing here fails startup.
-    worker_->ensureWorkerRunning(
+    channel_->loadModel(
         model_id,
         init_params,
-        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()},
+        shared_memory_->fd(),
+        shared_memory_->data(),
+        shared_memory_->dirBytes(),
         [expected_runtime_id, has_exact_target, expected_device_id](const json& ready) {
             if (!ready.contains("runtime_id") ||
                 !ready["runtime_id"].is_object() ||
@@ -170,7 +182,7 @@ void QNNBackend::initialize(
     has_current_plan_ = true;
     current_model_id_ = model_id;
 
-    LOG_INFO("[QNNBackend] Initialized model: " << model_id
+    LOG_INFO("[QNNBackend] Loaded model into shared worker process: " << model_id
              << " backend=" << backend_lib);
 }
 
@@ -208,8 +220,11 @@ PredictiveExecuteRequest QNNBackend::prepareWorkerRequest(
 
 TensorInferenceResponse QNNBackend::infer(
     const SegmentedTensorInferenceRequest& request) {
-    // Ensure worker is running (auto-restart if crashed)
-    if (!worker_->isWorkerRunning() || worker_->getCurrentModelId() != request.model) {
+    // Ensure this model is loaded in the shared worker process (auto-reload
+    // if the process crashed and was respawned, or if this is the first
+    // call for this model).
+    if (!channel_->isAlive() || !has_current_plan_ ||
+        current_model_id_ != request.model) {
         if (has_current_plan_ && current_model_id_ == request.model) {
             initialize(request.model, "", current_plan_, current_runtime_id_);
         } else {
@@ -220,46 +235,59 @@ TensorInferenceResponse QNNBackend::infer(
     static int event_counter = 0;
     std::string event_id = "qnn-evt-" + std::to_string(++event_counter);
 
-    TensorInferenceResponse result;
-    std::string error_msg;
-    bool had_error = false;
-
     const PredictiveExecuteRequest worker_request = prepareWorkerRequest(request);
-    worker_->executeInfer(
-        event_id,
-        worker_request,
-        [&result](const TensorInferenceResponse& r) {
-            result = r;
-        },
-        [&had_error, &error_msg](const std::string& msg) {
-            had_error = true;
-            error_msg = msg;
-        }
-    );
 
-    if (had_error)
-        throw std::runtime_error("QNNBackend::infer failed: " + error_msg);
+    json execute_message = {
+        {"type",         "EXECUTE"},
+        {"event_id",     event_id},
+        {"model",        worker_request.model},
+        {"inputs",       worker_request.inputs},
+        {"output_names", worker_request.output_names}
+    };
+
+    const auto exec_result =
+        channel_->executeInfer(request.model, event_id, execute_message);
+
+    if (!exec_result.ok)
+        throw std::runtime_error("QNNBackend::infer failed: " + exec_result.error_message);
+
+    TensorInferenceResponse result;
+    result.model      = request.model;
+    result.request_id = request.request_id;
+
+    for (const auto& t : exec_result.outputs) {
+        OutputTensor out;
+        out.name  = t.value("name", "");
+        out.dtype = tensorDataTypeFromString(t.value("dtype", "FP32"));
+
+        for (auto d : t.value("shape", json::array()))
+            out.shape.push_back(d.get<int64_t>());
+
+        const json& ref = t.at("data_ref");
+        size_t offset = ref.value("offset", (size_t)0);
+        size_t len    = ref.value("len", (size_t)0);
+        if (offset + len > 2 * shared_memory_->dirBytes())
+            throw std::runtime_error("output data_ref out of bounds");
+
+        out.data.resize(len);
+        std::memcpy(out.data.data(), shared_memory_->data() + offset, len);
+
+        result.outputs.push_back(std::move(out));
+    }
 
     return result;
 }
 
 bool QNNBackend::isHealthy() const {
-    return worker_->isWorkerRunning();
+    return channel_->isAlive();
 }
 
 void QNNBackend::shutdown() {
-    try { worker_->shutdown(); }
-    catch (...) {
-        try { worker_->terminateWorker(true); } catch (...) {}
-        worker_->clearSharedMemory();
-        shared_memory_.reset();
-        current_plan_ = {};
-        current_runtime_id_ = {};
-        has_current_plan_ = false;
-        current_model_id_.clear();
-        throw;
+    // Only unload THIS model from the shared process — other QNN-backed
+    // models resident in the same worker process are unaffected.
+    if (has_current_plan_ && !current_model_id_.empty()) {
+        channel_->unloadModel(current_model_id_);
     }
-    worker_->clearSharedMemory();
     shared_memory_.reset();
     current_plan_ = {};
     current_runtime_id_ = {};

@@ -35,12 +35,6 @@
 #include "qai_forge/backend/LlamaCppBackend.h"
 #include "qai_forge/orchestration/LlamaCppOrchestrator.h"
 #endif
-// PredictiveWorkerManager must be a complete type here because
-// std::make_unique<QNNBackend/SNPEBackend/LiteRTBackend>() instantiates
-// std::default_delete<T>, which calls ~T(), which destroys the
-// std::unique_ptr<PredictiveWorkerManager> member inside each backend.
-// The forward declaration in the backend headers is not sufficient.
-#include "qai_forge/worker/PredictiveWorkerManager.h"
 #include <memory>
 
 std::unique_ptr<IGenerativeBackend>

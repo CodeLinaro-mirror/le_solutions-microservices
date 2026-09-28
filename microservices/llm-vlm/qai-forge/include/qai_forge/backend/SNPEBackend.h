@@ -6,18 +6,21 @@
 #include "qai_forge/backend/IInferenceBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/worker/PredictiveWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerChannel.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SNPEBackend — IInferenceBackend implementation for SNPE Predictive AI
 //
-// Wraps PredictiveWorkerManager to manage the snpe-inference-worker subprocess.
-// Supports SNPE DLC container models with DSP/GPU/AIP/CPU delegates.
+// Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
+// manage the ONE snpe-inference-worker process hosting ALL SNPE-backed
+// resident models — not one process per model. Supports SNPE DLC container
+// models with DSP/GPU/AIP/CPU delegates.
 //
 // Placement: initialize(RuntimeLaunchRequest) translates the resolved
-// ExecutionPlan into an SNPE runtime_order INIT option via SnpeLaunchOptions.
+// ExecutionPlan into an SNPE runtime_order LOAD_MODEL option via
+// SnpeLaunchOptions.
 //
 // metadata.json fields used:
 //   "runtime": "snpe" or "qnn_dlc"
@@ -48,7 +51,7 @@ public:
 
     // Placement-aware additive overload. The common backend interface remains
     // unchanged; the SNPE adapter materializes RuntimePreference plans into
-    // native worker INIT options.
+    // native worker LOAD_MODEL options.
     void initialize(
         const std::string& model_id,
         const std::string& model_file,
@@ -67,7 +70,10 @@ private:
     SNPEBackend& operator=(const SNPEBackend&) = delete;
 
     std::unique_ptr<PredictiveSharedMemory> shared_memory_;
-    std::unique_ptr<PredictiveWorkerManager> worker_;
+    // Shared across ALL SNPE-backed models in this process — obtained lazily
+    // from PredictiveWorkerProcessPool, never owned exclusively by this
+    // backend instance. Do not close/terminate it from here.
+    PredictiveWorkerChannel* channel_ = nullptr;
     qai_forge::execution::ExecutionPlan current_plan_;
     bool has_current_plan_ = false;
     std::string current_model_id_;

@@ -4,11 +4,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
 //
-// Manages the litert-inference-worker subprocess via PredictiveWorkerManager.
-// The worker binary path is resolved from the LITERT_WORKER_BINARY environment
-// variable (default: /usr/local/bin/litert-inference-worker).
+// Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
+// manage the ONE litert-inference-worker process hosting ALL LiteRT-backed
+// resident models. The worker binary path is resolved from the
+// LITERT_WORKER_BINARY environment variable (default:
+// /usr/local/bin/litert-inference-worker).
 //
-// INIT params sent to the worker:
+// LOAD_MODEL params sent to the worker:
 //   model_file          — absolute path to the .tflite model
 //   dispatch_lib_dir    — directory containing LiteRT dispatch .so
 //   compiler_plugin_dir — directory containing LiteRT compiler plugin .so
@@ -17,7 +19,7 @@
 
 #include "qai_forge/backend/LiteRTBackend.h"
 #include "qai_forge/execution/LiteRtLaunchOptions.h"
-#include "qai_forge/worker/PredictiveWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerProcessPool.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include <cstdlib>
@@ -45,11 +47,14 @@ static size_t alignUp(size_t offset, size_t align) {
     return (offset + align - 1) / align * align;
 }
 
-LiteRTBackend::LiteRTBackend() {
+static std::string litertWorkerBinaryPath() {
     const char* binary = std::getenv("LITERT_WORKER_BINARY");
-    if (!binary) binary = DEFAULT_LITERT_WORKER;
+    return binary ? binary : DEFAULT_LITERT_WORKER;
+}
 
-    worker_ = std::make_unique<PredictiveWorkerManager>(binary, "litert");
+LiteRTBackend::LiteRTBackend() {
+    channel_ = &PredictiveWorkerProcessPool::getInstance().getChannel(
+        litertWorkerBinaryPath(), "litert");
 }
 
 LiteRTBackend& LiteRTBackend::getInstance() {
@@ -127,19 +132,23 @@ void LiteRTBackend::initialize(
         init_params["hw_accelerators"] = hw_accelerators;
     }
 
+    // Each model keeps its own independent shared-memory region — the
+    // worker PROCESS is shared, but tensor transport memory is not.
     if (!shared_memory_) shared_memory_ = std::make_unique<PredictiveSharedMemory>(predictiveShmDirBytes());
 
     const int expected_accelerators = hw_accelerators;
-    // ready_validator runs on the worker's post-INIT READY (see
+    // ready_validator runs on the worker's post-LOAD_MODEL READY (see
     // src/worker/litert/main.cpp) and confirms provider=="litert",
     // binding_strength=="automatic" (LiteRT binding is always automatic —
     // there is no per-plan exact/preferred override today), and that
-    // litert.hw_accelerators matches the mask sent in INIT. Throwing here
-    // fails startup.
-    worker_->ensureWorkerRunning(
+    // litert.hw_accelerators matches the mask sent in LOAD_MODEL. Throwing
+    // here fails startup.
+    channel_->loadModel(
         model_id,
         init_params,
-        {shared_memory_->fd(), shared_memory_->data(), shared_memory_->dirBytes()},
+        shared_memory_->fd(),
+        shared_memory_->data(),
+        shared_memory_->dirBytes(),
         [expected_accelerators](const json& ready) {
             if (ready.value("provider", "") != "litert") {
                 throw std::runtime_error(
@@ -163,7 +172,7 @@ void LiteRTBackend::initialize(
     has_current_plan_ = true;
     current_model_id_ = model_id;
 
-    LOG_INFO("[LiteRTBackend] Initialized model: " << model_id
+    LOG_INFO("[LiteRTBackend] Loaded model into shared worker process: " << model_id
              << " dispatch=" << dispatch_lib_dir
              << " plugin=" << compiler_plugin_dir
              << " hw_accel=" << hw_accelerators);
@@ -209,7 +218,8 @@ PredictiveExecuteRequest LiteRTBackend::prepareWorkerRequest(
 
 TensorInferenceResponse LiteRTBackend::infer(
     const SegmentedTensorInferenceRequest& request) {
-    if (!worker_->isWorkerRunning() || worker_->getCurrentModelId() != request.model) {
+    if (!channel_->isAlive() || !has_current_plan_ ||
+        current_model_id_ != request.model) {
         if (has_current_plan_ && current_model_id_ == request.model) {
             initialize(request.model, "", current_plan_);
         } else {
@@ -220,45 +230,59 @@ TensorInferenceResponse LiteRTBackend::infer(
     static int event_counter = 0;
     std::string event_id = "litert-evt-" + std::to_string(++event_counter);
 
-    TensorInferenceResponse result;
-    std::string error_msg;
-    bool had_error = false;
-
     const PredictiveExecuteRequest worker_request = prepareWorkerRequest(request);
-    worker_->executeInfer(
-        event_id,
-        worker_request,
-        [&result](const TensorInferenceResponse& r) {
-            result = r;
-        },
-        [&had_error, &error_msg](const std::string& msg) {
-            had_error = true;
-            error_msg = msg;
-        }
-    );
 
-    if (had_error)
-        throw std::runtime_error("LiteRTBackend::infer failed: " + error_msg);
+    json execute_message = {
+        {"type",         "EXECUTE"},
+        {"event_id",     event_id},
+        {"model",        worker_request.model},
+        {"inputs",       worker_request.inputs},
+        {"output_names", worker_request.output_names}
+    };
+
+    const auto exec_result =
+        channel_->executeInfer(request.model, event_id, execute_message);
+
+    if (!exec_result.ok)
+        throw std::runtime_error("LiteRTBackend::infer failed: " + exec_result.error_message);
+
+    TensorInferenceResponse result;
+    result.model      = request.model;
+    result.request_id = request.request_id;
+
+    for (const auto& t : exec_result.outputs) {
+        OutputTensor out;
+        out.name  = t.value("name", "");
+        out.dtype = tensorDataTypeFromString(t.value("dtype", "FP32"));
+
+        for (auto d : t.value("shape", json::array()))
+            out.shape.push_back(d.get<int64_t>());
+
+        const json& ref = t.at("data_ref");
+        size_t offset = ref.value("offset", (size_t)0);
+        size_t len    = ref.value("len", (size_t)0);
+        if (offset + len > 2 * shared_memory_->dirBytes())
+            throw std::runtime_error("output data_ref out of bounds");
+
+        out.data.resize(len);
+        std::memcpy(out.data.data(), shared_memory_->data() + offset, len);
+
+        result.outputs.push_back(std::move(out));
+    }
 
     return result;
 }
 
 bool LiteRTBackend::isHealthy() const {
-    return worker_->isWorkerRunning();
+    return channel_->isAlive();
 }
 
 void LiteRTBackend::shutdown() {
-    try { worker_->shutdown(); }
-    catch (...) {
-        try { worker_->terminateWorker(true); } catch (...) {}
-        worker_->clearSharedMemory();
-        shared_memory_.reset();
-        current_plan_ = {};
-        has_current_plan_ = false;
-        current_model_id_.clear();
-        throw;
+    // Only unload THIS model from the shared process — other LiteRT-backed
+    // models resident in the same worker process are unaffected.
+    if (has_current_plan_ && !current_model_id_.empty()) {
+        channel_->unloadModel(current_model_id_);
     }
-    worker_->clearSharedMemory();
     shared_memory_.reset();
     current_plan_ = {};
     has_current_plan_ = false;

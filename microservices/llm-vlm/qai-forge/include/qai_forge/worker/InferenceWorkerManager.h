@@ -72,7 +72,7 @@ using DoneCallback   = std::function<void(const IPCDoneEvent&)>;
 using ErrorCallback  = std::function<void(const IPCErrorEvent&)>;
 // Invoked by startWorker() on the post-INIT READY message, before the
 // worker is published as ready. Throwing fails startup (mirrors
-// PredictiveWorkerManager's PredictiveReadyValidator). Used by backends
+// PredictiveWorkerChannel's PredictiveChannelReadyValidator). Used by backends
 // (GenIEBackend, LiteRTLMBackend) to confirm placement-derived fields such
 // as "provider"/"binding_strength" were echoed back correctly.
 using ReadyValidator = std::function<void(const json& ready_message)>;

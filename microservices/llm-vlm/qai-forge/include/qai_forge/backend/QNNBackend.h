@@ -6,15 +6,17 @@
 #include "qai_forge/backend/IInferenceBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/worker/PredictiveWorkerManager.h"
+#include "qai_forge/worker/PredictiveWorkerChannel.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QNNBackend — IInferenceBackend implementation for QNN Predictive AI
 //
-// Wraps PredictiveWorkerManager to manage the qnn-inference-worker subprocess.
-// Supports QNN context binary (.bin) models compiled for HTP/GPU/CPU backends.
+// Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
+// manage the ONE qnn-inference-worker process hosting ALL QNN-backed
+// resident models — not one process per model. Supports QNN context binary
+// (.bin) models compiled for HTP/GPU/CPU backends.
 //
 // Placement: initialize(RuntimeLaunchRequest) translates the resolved
 // ExecutionPlan into a QNN device_id INIT option via QnnLaunchOptions.
@@ -68,7 +70,10 @@ private:
     QNNBackend& operator=(const QNNBackend&) = delete;
 
     std::unique_ptr<PredictiveSharedMemory> shared_memory_;
-    std::unique_ptr<PredictiveWorkerManager> worker_;
+    // Shared across ALL QNN-backed models in this process — obtained lazily
+    // from PredictiveWorkerProcessPool, never owned exclusively by this
+    // backend instance. Do not close/terminate it from here.
+    PredictiveWorkerChannel* channel_ = nullptr;
     qai_forge::execution::ExecutionPlan current_plan_;
     qai_forge::execution::RuntimeId current_runtime_id_;
     bool has_current_plan_ = false;

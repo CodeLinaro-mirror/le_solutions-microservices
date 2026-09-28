@@ -14,8 +14,10 @@
 //
 // Owns the memfd-backed mapping shared with a predictive inference worker.
 // The region is split into two equal halves: input (backend writes, worker
-// reads) and output (worker writes, backend reads). PredictiveWorkerManager
-// borrows the fd, pointer, and per-direction capacity only to fork/exec and
+// reads) and output (worker writes, backend reads). PredictiveWorkerChannel
+// borrows the fd, pointer, and per-direction capacity only to fork/exec (for
+// the shared worker process's first-ever model) or pass via SCM_RIGHTS (for
+// every subsequent model loaded into that already-running process) and to
 // exchange protocol data; it never closes or unmaps this resource.
 // ─────────────────────────────────────────────────────────────────────────────
 
