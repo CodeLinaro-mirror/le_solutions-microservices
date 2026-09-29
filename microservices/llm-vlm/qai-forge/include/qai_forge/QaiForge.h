@@ -226,6 +226,23 @@ public:
      */
     void clearSession(const std::string& model_id, const std::string& session_id);
 
+    /**
+     * Report which generative and predictive runtimes this specific build of
+     * libqai_forge.so actually supports, computed at compile time from the
+     * QAI_FORGE_BUILD_* flags this .so was built with.
+     *
+     * Intended for capability introspection by any consumer — in-repo or a
+     * future standalone process sharing a rootfs with a libqai_forge.so
+     * built by a different Docker stage with different flags — without
+     * requiring build-time knowledge of which flags were used. Complements
+     * the reactive GenAIException(INVALID_REQUEST) thrown by generate()/
+     * infer() for unsupported runtimes with a proactive query.
+     *
+     * @return JSON string of the form:
+     *   {"generative":["genie","litert_lm"],"predictive":["qnn","snpe"]}
+     */
+    std::string supportedRuntimes() const;
+
     QaiForge(const QaiForge&) = delete;
     QaiForge& operator=(const QaiForge&) = delete;
 

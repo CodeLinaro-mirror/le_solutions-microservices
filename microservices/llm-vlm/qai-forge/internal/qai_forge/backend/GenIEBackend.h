@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef QAI_FORGE_BUILD_GENIE
+
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/execution/GenieConfigMaterializer.h"
@@ -218,3 +220,5 @@ private:
     // alive across inference and same-runtime worker restarts.
     std::shared_ptr<qai_forge::execution::RuntimeArtifacts> runtime_artifacts_;
 };
+
+#endif // QAI_FORGE_BUILD_GENIE

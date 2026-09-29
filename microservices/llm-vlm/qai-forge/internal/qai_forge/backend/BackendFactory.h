@@ -6,6 +6,7 @@
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/backend/IInferenceBackend.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include <nlohmann/json.hpp>
 #include <functional>
 #include <memory>
 #include <string>
@@ -126,6 +127,32 @@ public:
     /** @brief Create the shared predictive job preparation pipeline. */
     static std::shared_ptr<PredictiveOrchestrator>
     createPredictiveOrchestrator();
+
+    // ── Capability discovery ──────────────────────────────────────────────────
+
+    /**
+     * Report which generative and predictive runtimes this specific build of
+     * libqai_forge.so actually supports, computed from the QAI_FORGE_BUILD_*
+     * compile-time macros visible inside this translation unit.
+     *
+     * This is the only place in the codebase that needs to enumerate every
+     * QAI_FORGE_BUILD_* flag — new runtimes should add one #ifdef branch here.
+     * Exposed publicly via qai_forge::QaiForge::supportedRuntimes() (C++) and
+     * qai_forge_supported_runtimes() (C API) so that any consumer — in-repo
+     * or a future standalone process on a shared rootfs — can introspect a
+     * given .so's actual compiled-in capabilities without needing build-time
+     * knowledge of which Docker stage produced it.
+     *
+     * @return JSON object of the form:
+     *   {
+     *     "generative": ["genie", "litert_lm", "llamacpp"],
+     *     "predictive": ["qnn", "snpe", "litert"]
+     *   }
+     *   Each array only lists runtimes actually compiled into this build.
+     *   "genie" is always present (GenIEBackend has no build flag — it is
+     *   the one runtime with no optional-SDK dependency).
+     */
+    static nlohmann::ordered_json supportedRuntimes();
 
     // BackendFactory is a pure static utility — no instances.
     BackendFactory() = delete;

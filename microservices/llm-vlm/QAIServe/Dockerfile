@@ -87,6 +87,7 @@ ARG LITERT_LM_VERSION=0.14.0
 ARG BUILD_LITERT_LM=ON
 ARG BUILD_LITERT_LM_CLI_TOOLS=false
 ARG BUILD_LLAMACPP=ON
+ARG BUILD_GENIE=true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage -1: qairt_fetcher
@@ -396,10 +397,14 @@ RUN if [ "$BUILD_LITERT_LM" = "ON" ]; then \
 WORKDIR /build
 COPY qai-forge /build/qai-forge
 
+ARG BUILD_LITERT_LM
+ARG BUILD_GENIE
+
 RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGENIE_INCLUDE_PATH=/usr/include \
         -DGENIE_LIB_PATH=/usr/lib \
+        -DQAI_FORGE_BUILD_GENIE=${BUILD_GENIE} \
         -DQNN_INCLUDE_PATH=/usr/include \
         -DSNPE_INCLUDE_PATH=/usr/include \
         -DSTB_SOURCE_DIR=${STB_SRC_DIR} \
@@ -435,7 +440,7 @@ RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
     done
 
 # When BUILD_LLAMACPP=OFF, qai-forge's CMakeLists (gated on the same flag) doesn't
-# build it — stage a stub so the unconditional `COPY --from=builder 
+# build it — stage a stub so the unconditional `COPY --from=builder
 # .../llamacpp-inference-worker` below still succeeds.
 RUN mkdir -p ${DEPLOY_DIR}/usr/bin && \
     if [ ! -f ${DEPLOY_DIR}/usr/bin/llamacpp-inference-worker ]; then \

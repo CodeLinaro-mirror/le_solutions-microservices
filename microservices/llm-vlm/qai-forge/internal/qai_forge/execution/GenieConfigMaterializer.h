@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef QAI_FORGE_BUILD_GENIE
+
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/execution/RuntimeArtifacts.h"
 
@@ -59,3 +61,5 @@ private:
 
 }  // namespace execution
 }  // namespace qai_forge
+
+#endif // QAI_FORGE_BUILD_GENIE

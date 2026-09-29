@@ -25,7 +25,6 @@
 #
 # Optional CMake variables:
 #   QAI_FORGE_BUILD_WORKERS  — Build worker binaries (default ON)
-#   QAI_FORGE_BUILD_GENAILIB — Build genai-lib (default ON; set OFF if pre-built)
 #   QAI_FORGE_INSTALL        — Install targets (default ON)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -38,7 +37,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ── Build options ─────────────────────────────────────────────────────────────
 option(QAI_FORGE_BUILD_WORKERS  "Build genai-inference-worker binaries" ON)
-option(QAI_FORGE_BUILD_GENAILIB "Build genai-lib (Layer 4)" ON)
+option(QAI_FORGE_BUILD_GENIE    "Build GenIE generative backend + worker" OFF)
 option(QAI_FORGE_BUILD_QNN       "Build QNN Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_SNPE      "Build SNPE Predictive AI engine + worker" OFF)
 option(QAI_FORGE_BUILD_LITERT    "Build LiteRT Predictive AI engine + worker" OFF)
@@ -170,8 +169,11 @@ endif()
 #
 # libllmengine — LlmEngine wrapping GenieDialog (replaces libllmservice)
 # libvlmengine — VlmEngine wrapping GeniePipeline (replaces libvlmservice)
+#
+# Nested under QAI_FORGE_BUILD_GENIE — genai-lib (and the worker binaries
+# that link it, below) only exist to serve the GenIE generative backend.
 # ─────────────────────────────────────────────────────────────────────────────
-if(QAI_FORGE_BUILD_GENAILIB)
+if(QAI_FORGE_BUILD_GENIE)
 
     # Locate libGenie.so
     find_library(GENIE_LIB
@@ -220,7 +222,7 @@ if(QAI_FORGE_BUILD_GENAILIB)
         SOVERSION 1
     )
 
-endif() # QAI_FORGE_BUILD_GENAILIB
+endif() # QAI_FORGE_BUILD_GENIE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layer 2-3: libqai_forge
@@ -279,8 +281,6 @@ set(QAI_FORGE_SOURCES
     src/execution/ExecutionPlan.cpp
     src/execution/ProviderRegistry.cpp
     src/execution/ExecutionPlanResolver.cpp
-    src/execution/RuntimeArtifacts.cpp
-    src/execution/GenieConfigMaterializer.cpp
     src/execution/QnnLaunchOptions.cpp
     src/execution/SnpeLaunchOptions.cpp
     src/execution/LiteRtLaunchOptions.cpp
@@ -288,7 +288,6 @@ set(QAI_FORGE_SOURCES
     src/execution/LlamaCppLaunchOptions.cpp
 
     # Orchestration (Layer 2)
-    src/orchestration/GenieOrchestrator.cpp
     src/orchestration/PredictiveOrchestrator.cpp
 
     # Reasoning (Layer 2)
@@ -301,7 +300,6 @@ set(QAI_FORGE_SOURCES
     src/utils/UseLock.cpp
 
     # Backend abstraction (Layer 3 — IGenerativeBackend implementations)
-    src/backend/GenIEBackend.cpp
     src/backend/BackendFactory.cpp
 
     # Predictive AI backends (Layer 3 — IInferenceBackend implementations)
@@ -311,11 +309,42 @@ set(QAI_FORGE_SOURCES
     src/backend/LiteRTBackend.cpp
 
     # Worker management (Layer 3)
+    # NOTE: InferenceWorkerManager.cpp is the shared base class used by
+    # VlmInferenceWorkerManager (GenIE), LiteRTLMWorkerManager, and
+    # LlamaCppWorkerManager — it must remain unconditional so LiteRT-LM/
+    # llama.cpp workers still build even with QAI_FORGE_BUILD_GENIE=OFF.
     src/worker/InferenceWorkerManager.cpp
-    src/worker/VlmInferenceWorkerManager.cpp
     src/worker/PredictiveWorkerChannel.cpp
     src/worker/PredictiveWorkerProcessPool.cpp
 )
+
+# ── Conditionally add GenIE generative backend sources ───────────────────────
+# GenIE is Qualcomm's own SDK — the one runtime historically always built in.
+# Gated the same way as the other optional runtimes so a shared-rootfs
+# libqai_forge.so's compiled-in capability set (as reported by
+# BackendFactory::supportedRuntimes()) always matches reality, and so a
+# from-source build with no GenIE SDK available can still configure cleanly.
+if(QAI_FORGE_BUILD_GENIE)
+    list(APPEND QAI_FORGE_SOURCES
+        # GenIE backend (Layer 3 — IGenerativeBackend implementation)
+        src/backend/GenIEBackend.cpp
+
+        # GenIE orchestrator (Layer 2)
+        src/orchestration/GenieOrchestrator.cpp
+
+        # GenIE config materialization (Layer 2 — device-placement config tree)
+        src/execution/GenieConfigMaterializer.cpp
+
+        # GenIE VLM worker management (Layer 3) — genie-specific subclass of
+        # the always-on InferenceWorkerManager base class above.
+        src/worker/VlmInferenceWorkerManager.cpp
+    )
+
+    # Define preprocessor macro for conditional compilation
+    add_compile_definitions(QAI_FORGE_BUILD_GENIE)
+
+    message(STATUS "[qai-forge] GenIE generative backend support enabled")
+endif()
 
 # ── Conditionally add LiteRT-LM generative backend sources ───────────────────
 # LiteRTLMOrchestrator.cpp depends on minja (see the minja FetchContent
@@ -365,10 +394,21 @@ add_library(qai_forge SHARED ${QAI_FORGE_SOURCES})
 
 target_include_directories(qai_forge
     PUBLIC
-        # SDK public headers — resolves #include "qai_forge/..."
+        # SDK public headers — resolves #include "qai_forge/..." for the
+        # stable facade surface (QaiForge.h, InternalDTOs.h, c_api/, etc.)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
+        # Internal SDK headers (backend/, orchestration/, scheduler/, worker/,
+        # execution/, resources/, reasoning/, session/, and the internal-only
+        # managers/utils/adapters split off from the public tree above).
+        # Build-time only — never added to INSTALL_INTERFACE, so it is never
+        # exported via qai_forgeConfig.cmake/qai_forgeTargets.cmake. External
+        # consumers (including future standalone processes on a shared
+        # rootfs) can only ever see and link against the public facade;
+        # they cannot #include these headers or depend on symbols whose
+        # existence varies by QAI_FORGE_BUILD_* flag combination.
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
         # genai-lib headers needed by SummarizationMiddleware and GenieOrchestrator
         # (they include InferenceProtocol.h which uses nlohmann/json)
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/include
@@ -380,6 +420,15 @@ target_include_directories(qai_forge
 if(QAI_FORGE_BUILD_QNN)
     target_include_directories(qai_forge PRIVATE ${QNN_INCLUDE_PATH})
     message(STATUS "[qai-forge] Added QNN include path to qai_forge: ${QNN_INCLUDE_PATH}")
+
+    # Define preprocessor macro for conditional compilation. Mirrors the
+    # QAI_FORGE_BUILD_LITERT_LM/_LLAMACPP pattern above — this lets
+    # BackendFactory::supportedRuntimes() (and any other compile-time check)
+    # accurately report whether QNN predictive-runtime support was actually
+    # built into this .so, since QNNBackend.cpp is otherwise unconditionally
+    # compiled in regardless of this flag (only the qnn-inference-worker
+    # binary itself is gated on QAI_FORGE_BUILD_QNN).
+    add_compile_definitions(QAI_FORGE_BUILD_QNN)
 endif()
 
 # ── Add llama.cpp include path if enabled ────────────────────────────────────
@@ -544,8 +593,12 @@ set_target_properties(qai_forge PROPERTIES
 #
 # These are the subprocess binaries spawned by InferenceWorkerManager.
 # They link genai-lib directly — no ctypes/CFFI overhead.
+#
+# Gated on QAI_FORGE_BUILD_GENIE (in addition to the pre-existing
+# QAI_FORGE_BUILD_WORKERS check) — these workers only exist to serve the
+# GenIE generative backend.
 # ─────────────────────────────────────────────────────────────────────────────
-if(QAI_FORGE_BUILD_WORKERS AND QAI_FORGE_BUILD_GENAILIB)
+if(QAI_FORGE_BUILD_GENIE AND QAI_FORGE_BUILD_WORKERS)
 
     # ── genai-inference-worker (LLM) ───────────────────────────────────────────
     add_executable(genai-inference-worker
@@ -641,6 +694,11 @@ if(QAI_FORGE_BUILD_TOPOLOGY_PROBE)
     )
     target_include_directories(topology-probe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        # topology-probe.cpp includes qai_forge/resources/{QnnTopologyProbe,
+        # StandardTopologies,TopologyRegistry}.h directly — these are internal
+        # SDK headers (see the internal/ include note on the qai_forge target
+        # above), so this build-only tool needs the same private search path.
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
     )
     target_link_libraries(topology-probe PRIVATE
         qai_forge
@@ -703,6 +761,17 @@ if(QAI_FORGE_BUILD_SNPE AND QAI_FORGE_BUILD_WORKERS)
     endif()
 
 endif() # QAI_FORGE_BUILD_SNPE
+
+# Define preprocessor macro for conditional compilation, gated only on
+# QAI_FORGE_BUILD_SNPE (not QAI_FORGE_BUILD_WORKERS) — SNPEBackend.cpp is
+# unconditionally compiled into qai_forge regardless of whether the
+# snpe-inference-worker binary itself gets built, so the macro must track
+# the SDK-support flag alone for BackendFactory::supportedRuntimes() to be
+# accurate even in a QAI_FORGE_BUILD_WORKERS=OFF configuration. Mirrors the
+# QAI_FORGE_BUILD_QNN pattern above.
+if(QAI_FORGE_BUILD_SNPE)
+    add_compile_definitions(QAI_FORGE_BUILD_SNPE)
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LiteRT engine + worker (Predictive AI — .tflite with NPU dispatch)
@@ -772,6 +841,16 @@ if(QAI_FORGE_BUILD_LITERT AND QAI_FORGE_BUILD_WORKERS)
     endif()
 
 endif() # QAI_FORGE_BUILD_LITERT
+
+# Define preprocessor macro for conditional compilation, gated only on
+# QAI_FORGE_BUILD_LITERT (not QAI_FORGE_BUILD_WORKERS) — LiteRTBackend.cpp is
+# unconditionally compiled into qai_forge regardless of whether the
+# litert-inference-worker binary itself gets built. Mirrors the
+# QAI_FORGE_BUILD_QNN/_SNPE pattern above so BackendFactory::
+# supportedRuntimes() accurately reports LiteRT predictive-runtime support.
+if(QAI_FORGE_BUILD_LITERT)
+    add_compile_definitions(QAI_FORGE_BUILD_LITERT)
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LiteRT-LM worker (generative AI — LLM inference via LiteRT-LM)
@@ -943,7 +1022,7 @@ if(QAI_FORGE_INSTALL)
     )
 
     # ── Install genai-lib shared libraries ────────────────────────────────────
-    if(QAI_FORGE_BUILD_GENAILIB)
+    if(QAI_FORGE_BUILD_GENIE)
         install(TARGETS llmengine vlmengine
             EXPORT qai_forgeTargets
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -951,7 +1030,7 @@ if(QAI_FORGE_INSTALL)
     endif()
 
     # ── Install worker binaries ────────────────────────────────────────────────
-    if(QAI_FORGE_BUILD_WORKERS AND QAI_FORGE_BUILD_GENAILIB)
+    if(QAI_FORGE_BUILD_WORKERS AND QAI_FORGE_BUILD_GENIE)
         install(TARGETS genai-inference-worker genai-vlm-inference-worker
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )

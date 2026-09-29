@@ -32,6 +32,7 @@ services:
       args:
         BUILD_LITERT_LM: "true"
         BUILD_LLAMACPP: "false"  # Set to "true" to enable llama.cpp backend
+        BUILD_GENIE: "true"
     ports:
       - "${RESPONSES_PORT:-9002}:${RESPONSES_PORT:-9002}"
 

@@ -10,6 +10,7 @@
 #include "qai_forge/scheduler/ToolChainTable.h"
 #include "qai_forge/utils/Logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -225,8 +226,18 @@ void validateSchedulableOrThrow(const CreateChatCompletionRequest& request,
     }
 
     const std::string runtime = config_manager.getRuntime(request.model);
-    if (runtime != "genie" && runtime != "litert_lm" &&
-        runtime != "llamacpp") {
+    const nlohmann::ordered_json supported_runtimes =
+        BackendFactory::supportedRuntimes();
+    const nlohmann::ordered_json& generative_runtimes =
+        supported_runtimes["generative"];
+    const bool runtime_supported = std::any_of(
+        generative_runtimes.begin(),
+        generative_runtimes.end(),
+        [&runtime](const nlohmann::ordered_json& supported) {
+            return supported.is_string() &&
+                   supported.get<std::string>() == runtime;
+        });
+    if (!runtime_supported) {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
             "Request cannot be scheduled: runtime '" + runtime +
@@ -523,6 +534,10 @@ struct QaiForge::Impl {
                              const std::string& conversation_id) {
         return memory_coordinator_->releaseConversation(
             namespace_id, conversation_id);
+    }
+
+    std::string supportedRuntimes() const {
+        return BackendFactory::supportedRuntimes().dump();
     }
 
 private:
@@ -1064,6 +1079,10 @@ void QaiForge::clearSession(const std::string& model_id,
         return;
     }
     scheduler::InferenceScheduler::getInstance().clearSession(model_id, session_id);
+}
+
+std::string QaiForge::supportedRuntimes() const {
+    return impl_->supportedRuntimes();
 }
 
 } // namespace qai_forge

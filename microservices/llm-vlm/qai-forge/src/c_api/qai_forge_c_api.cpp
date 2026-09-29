@@ -340,4 +340,16 @@ const char* qai_forge_version(void) {
     return "1.0.0";
 }
 
+// ── Capability discovery ──────────────────────────────────────────────────────
+
+const char* qai_forge_supported_runtimes(void) {
+    // Computed once — the QAI_FORGE_BUILD_* flags this .so was compiled
+    // with never change for the lifetime of the process, so a static
+    // cached string is safe and matches qai_forge_version()'s no-free
+    // lifetime contract.
+    static const std::string cached =
+        qai_forge::QaiForge::getInstance().supportedRuntimes();
+    return cached.c_str();
+}
+
 } // extern "C"

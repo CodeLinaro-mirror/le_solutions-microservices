@@ -7,6 +7,7 @@
 ARG BUILD_LITERT_LM=true
 ARG BUILD_LLAMACPP=false
 ARG QAIRT_SDK_VERSION=2.48.0.260626
+ARG BUILD_GENIE=true
 # ─────────────────────────────────────────────────────────────────────────────
 # responses/Dockerfile
 #
@@ -330,12 +331,14 @@ WORKDIR /build
 COPY qai-forge /build/qai-forge
 
 ARG BUILD_LLAMACPP
+ARG BUILD_GENIE
 RUN cmake -S /build/qai-forge -B /build/qai-forge/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGENIE_INCLUDE_PATH=/usr/include \
         -DGENIE_LIB_PATH=/usr/lib \
         -DSTB_SOURCE_DIR=${STB_SRC_DIR} \
         -DMINJA_SOURCE_DIR=${MINJA_SRC_DIR} \
+        -DQAI_FORGE_BUILD_GENIE=${BUILD_GENIE} \
         -DQAI_FORGE_BUILD_LITERT_LM=${BUILD_LITERT_LM} \
         -DLITERT_LM_INCLUDE_PATH=/usr/include \
         -DQAI_FORGE_BUILD_LLAMACPP=${BUILD_LLAMACPP} \

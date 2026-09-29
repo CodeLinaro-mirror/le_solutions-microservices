@@ -17,14 +17,17 @@
 
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/InternalDTOs.h"
-#include "qai_forge/backend/GenIEBackend.h"
 #include "qai_forge/backend/LiteRTBackend.h"
 #include "qai_forge/backend/QNNBackend.h"
 #include "qai_forge/backend/SNPEBackend.h"
 #include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/orchestration/GenieOrchestrator.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
+
+#ifdef QAI_FORGE_BUILD_GENIE
+#include "qai_forge/backend/GenIEBackend.h"
+#include "qai_forge/orchestration/GenieOrchestrator.h"
+#endif
 
 #ifdef QAI_FORGE_BUILD_LITERT_LM
 #include "qai_forge/backend/LiteRTLMBackend.h"
@@ -39,9 +42,11 @@
 
 std::unique_ptr<IGenerativeBackend>
 BackendFactory::createGenerativeBackend(const std::string& runtime) {
+#ifdef QAI_FORGE_BUILD_GENIE
     if (runtime == "genie") {
         return std::make_unique<GenIEBackend>();
     }
+#endif
 
 #ifdef QAI_FORGE_BUILD_LITERT_LM
     if (runtime == "litert_lm") {
@@ -78,9 +83,11 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
 
 std::shared_ptr<IGenerativeOrchestrator>
 BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
+#ifdef QAI_FORGE_BUILD_GENIE
     if (runtime == "genie") {
         return std::make_shared<GenieOrchestrator>();
     }
+#endif
 
 #ifdef QAI_FORGE_BUILD_LITERT_LM
     if (runtime == "litert_lm") {
@@ -180,4 +187,42 @@ BackendFactory::createPredictiveOrchestrator() {
     static const auto orchestrator =
         std::make_shared<PredictiveOrchestrator>();
     return orchestrator;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capability discovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+nlohmann::ordered_json BackendFactory::supportedRuntimes() {
+    nlohmann::ordered_json generative = nlohmann::ordered_json::array();
+    nlohmann::ordered_json predictive = nlohmann::ordered_json::array();
+
+#ifdef QAI_FORGE_BUILD_GENIE
+    generative.push_back("genie");
+#endif
+
+#ifdef QAI_FORGE_BUILD_LITERT_LM
+    generative.push_back("litert_lm");
+#endif
+
+#ifdef QAI_FORGE_BUILD_LLAMACPP
+    generative.push_back("llamacpp");
+#endif
+
+#ifdef QAI_FORGE_BUILD_QNN
+    predictive.push_back("qnn");
+#endif
+
+#ifdef QAI_FORGE_BUILD_SNPE
+    predictive.push_back("snpe");
+#endif
+
+#ifdef QAI_FORGE_BUILD_LITERT
+    predictive.push_back("litert");
+#endif
+
+    nlohmann::ordered_json result;
+    result["generative"] = std::move(generative);
+    result["predictive"] = std::move(predictive);
+    return result;
 }

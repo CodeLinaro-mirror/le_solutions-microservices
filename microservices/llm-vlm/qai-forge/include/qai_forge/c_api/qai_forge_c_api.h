@@ -152,6 +152,23 @@ void qai_forge_free_string(char* str);
 // Returns a static version string (e.g. "1.0.0"). Do NOT free this pointer.
 const char* qai_forge_version(void);
 
+// ── Capability discovery ──────────────────────────────────────────────────────
+
+// Returns a static JSON string describing which generative and predictive
+// runtimes this specific build of libqai_forge.so actually supports, e.g.:
+//   {"generative":["genie","litert_lm"],"predictive":["qnn","snpe"]}
+//
+// Computed once from the QAI_FORGE_BUILD_* flags this .so was compiled
+// with — the same value for the lifetime of the process. Lets any consumer
+// (in-repo or a future standalone process sharing a rootfs with a
+// libqai_forge.so built by a different Docker stage/flag combination)
+// introspect actual compiled-in capabilities before calling
+// qai_forge_generate()/qai_forge_infer() with a given runtime, rather than
+// relying solely on the reactive error returned for an unsupported one.
+//
+// Do NOT free this pointer (same lifetime contract as qai_forge_version()).
+const char* qai_forge_supported_runtimes(void);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Deprecated aliases (kept for one release cycle)
 //

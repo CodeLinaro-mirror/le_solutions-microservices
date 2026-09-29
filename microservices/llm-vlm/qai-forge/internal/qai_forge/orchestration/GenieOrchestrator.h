@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef QAI_FORGE_BUILD_GENIE
+
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include "qai_forge/session/ConversationSession.h"
 #include "qai_forge/managers/ModelConfigManager.h"
@@ -173,3 +175,5 @@ private:
                             const std::string& model_id,
                             IGenerativeBackend& backend) const;
 };
+
+#endif // QAI_FORGE_BUILD_GENIE

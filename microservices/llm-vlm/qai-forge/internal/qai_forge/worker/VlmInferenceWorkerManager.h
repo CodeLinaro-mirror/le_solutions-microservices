@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef QAI_FORGE_BUILD_GENIE
+
 #include "qai_forge/worker/InferenceWorkerManager.h"
 #include <string>
 #include <vector>
@@ -73,3 +75,5 @@ public:
      */
     static VlmInferenceWorkerManager& getInstance();
 };
+
+#endif // QAI_FORGE_BUILD_GENIE
