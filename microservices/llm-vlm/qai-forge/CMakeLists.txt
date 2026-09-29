@@ -47,8 +47,40 @@ option(QAI_FORGE_INSTALL         "Install targets and CMake package config" ON)
 option(QAI_FORGE_BUILD_TOPOLOGY_PROBE "Build the standalone topology-probe CLI" ON)
 
 # ── Required dependencies ─────────────────────────────────────────────────────
-find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
+
+include(FetchContent)
+
+# nlohmann/json is pinned via FetchContent (not find_package) so every
+# qai-forge target links the exact same ABI — mixed versions produce
+# unlinkable dlopen() "undefined symbol" errors across plugin .so files.
+#
+# NOT fetched during CMake configure. The source must be pre-fetched
+# (pinned commit 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03, i.e. tag
+# v3.11.3) by whichever build path is in use (Dockerfile RUN step or
+# scripts/build.sh) and its location passed in via
+# -DNLOHMANN_JSON_SOURCE_DIR=<path>. This avoids any network/git activity
+# at configure time.
+set(NLOHMANN_JSON_SOURCE_DIR "" CACHE PATH "Path to pre-fetched nlohmann/json source (must contain CMakeLists.txt)")
+if(NOT NLOHMANN_JSON_SOURCE_DIR)
+    message(FATAL_ERROR
+        "[qai-forge] NLOHMANN_JSON_SOURCE_DIR is not set.\n"
+        "  nlohmann/json must be pre-fetched (pinned commit 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03,\n"
+        "  tag v3.11.3) before configuring qai-forge. Pass:\n"
+        "  -DNLOHMANN_JSON_SOURCE_DIR=<path-containing-CMakeLists.txt>")
+endif()
+
+set(JSON_Install ON CACHE BOOL "" FORCE)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+# Content-name stays "json" (unchanged from the previous live-fetch version)
+# — minja's own CMakeLists.txt (see the minja block below) later does an
+# identical FetchContent_Declare(json ...) + FetchContent_MakeAvailable(json)
+# call. Because we've already declared+populated "json" here, FetchContent
+# treats minja's call as a no-op instead of trying to fetch its own copy.
+# SOURCE_DIR points at the pre-fetched local checkout — MakeAvailable() then
+# only runs add_subdirectory(), with no git clone/fetch of any kind.
+FetchContent_Declare(json SOURCE_DIR "${NLOHMANN_JSON_SOURCE_DIR}")
+FetchContent_MakeAvailable(json)
 
 # ── stb_image (header-only image decoder — JPEG, PNG, WEBP, BMP, GIF) ────────
 # Compiled into libqai_forge (no runtime .so). stb_image.h is defined in
@@ -94,19 +126,12 @@ if(QAI_FORGE_BUILD_LITERT_LM)
     endif()
 
     # minja's own CMakeLists.txt unconditionally does its own
-    # FetchContent_Declare(json ...) + FetchContent_MakeAvailable(json),
-    # which would re-create the nlohmann_json target our own
-    # find_package(nlohmann_json REQUIRED) call above already created,
-    # causing a duplicate-target CMake error. Pre-declaring the same
-    # FetchContent name ("json") pointed at an empty stub directory makes
-    # FetchContent treat it as already populated, so minja's identical call
-    # becomes a no-op and it links against our imported target instead.
-    set(_qai_forge_minja_json_stub "${CMAKE_CURRENT_BINARY_DIR}/_minja_json_stub")
-    file(MAKE_DIRECTORY "${_qai_forge_minja_json_stub}")
-    file(WRITE "${_qai_forge_minja_json_stub}/CMakeLists.txt" "")
-    FetchContent_Declare(json SOURCE_DIR "${_qai_forge_minja_json_stub}")
-    FetchContent_MakeAvailable(json)
-
+    # FetchContent_Declare(json ...) + FetchContent_MakeAvailable(json).
+    # Since we've already FetchContent_Declare(json ...)'d and populated
+    # the exact same content-name ("json") above with our pinned tag,
+    # minja's identical call is a no-op — FetchContent treats it as
+    # already-populated and minja links against our pinned target
+    # instead of fetching its own. No stub workaround needed.
     set(MINJA_TEST_ENABLED OFF CACHE BOOL "" FORCE)
     set(MINJA_EXAMPLE_ENABLED OFF CACHE BOOL "" FORCE)
     # SOURCE_DIR points FetchContent at the pre-fetched local checkout —
@@ -281,6 +306,7 @@ set(QAI_FORGE_SOURCES
     src/execution/ExecutionPlan.cpp
     src/execution/ProviderRegistry.cpp
     src/execution/ExecutionPlanResolver.cpp
+    src/execution/RuntimeArtifacts.cpp
     src/execution/QnnLaunchOptions.cpp
     src/execution/SnpeLaunchOptions.cpp
     src/execution/LiteRtLaunchOptions.cpp
@@ -300,19 +326,25 @@ set(QAI_FORGE_SOURCES
     src/utils/UseLock.cpp
 
     # Backend abstraction (Layer 3 — IGenerativeBackend implementations)
+    # BackendFactory now delegates entirely to RuntimePluginRegistry — it no
+    # longer needs compile-time knowledge of any concrete backend type.
     src/backend/BackendFactory.cpp
+    src/backend/RuntimePluginRegistry.cpp
+    src/backend/PluginLoader.cpp
 
-    # Predictive AI backends (Layer 3 — IInferenceBackend implementations)
+    # Predictive AI backend shared infra (Layer 3) — PredictiveSharedMemory
+    # and the PredictiveWorkerChannel/ProcessPool below are used by all
+    # predictive plugins (QNN/SNPE/LiteRT); QNNBackend.cpp/SNPEBackend.cpp/
+    # LiteRTBackend.cpp themselves have moved into their own plugin targets
+    # (see the qaiforge_plugin_qnn/snpe/litert blocks below).
     src/backend/PredictiveSharedMemory.cpp
-    src/backend/QNNBackend.cpp
-    src/backend/SNPEBackend.cpp
-    src/backend/LiteRTBackend.cpp
 
     # Worker management (Layer 3)
     # NOTE: InferenceWorkerManager.cpp is the shared base class used by
-    # VlmInferenceWorkerManager (GenIE), LiteRTLMWorkerManager, and
-    # LlamaCppWorkerManager — it must remain unconditional so LiteRT-LM/
-    # llama.cpp workers still build even with QAI_FORGE_BUILD_GENIE=OFF.
+    # VlmInferenceWorkerManager (GenIE plugin), LiteRTLMWorkerManager
+    # (LiteRT-LM plugin), and LlamaCppWorkerManager (llama.cpp plugin) — it
+    # must remain in core so any subset of those plugins can be dlopen'd
+    # independently.
     src/worker/InferenceWorkerManager.cpp
     src/worker/PredictiveWorkerChannel.cpp
     src/worker/PredictiveWorkerProcessPool.cpp
@@ -325,23 +357,17 @@ set(QAI_FORGE_SOURCES
 # BackendFactory::supportedRuntimes()) always matches reality, and so a
 # from-source build with no GenIE SDK available can still configure cleanly.
 if(QAI_FORGE_BUILD_GENIE)
-    list(APPEND QAI_FORGE_SOURCES
-        # GenIE backend (Layer 3 — IGenerativeBackend implementation)
-        src/backend/GenIEBackend.cpp
+    # GenIEBackend.cpp, GenieOrchestrator.cpp, GenieConfigMaterializer.cpp,
+    # and VlmInferenceWorkerManager.cpp have moved into the qaiforge_plugin_genie
+    # target (see the "Runtime plugins" section below) — they no longer
+    # compile into the core qai_forge.so.
 
-        # GenIE orchestrator (Layer 2)
-        src/orchestration/GenieOrchestrator.cpp
-
-        # GenIE config materialization (Layer 2 — device-placement config tree)
-        src/execution/GenieConfigMaterializer.cpp
-        src/execution/RuntimeArtifacts.cpp
-
-        # GenIE VLM worker management (Layer 3) — genie-specific subclass of
-        # the always-on InferenceWorkerManager base class above.
-        src/worker/VlmInferenceWorkerManager.cpp
-    )
-
-    # Define preprocessor macro for conditional compilation
+    # Define preprocessor macro for conditional compilation. Still needed —
+    # GenIEBackend.h/GenieOrchestrator.h are guarded by #ifdef
+    # QAI_FORGE_BUILD_GENIE, and this directory-scoped definition applies to
+    # the qaiforge_plugin_genie target as well (CMake directory-level compile
+    # definitions apply to every target in the same CMakeLists.txt file,
+    # regardless of definition order).
     add_compile_definitions(QAI_FORGE_BUILD_GENIE)
 
     message(STATUS "[qai-forge] GenIE generative backend support enabled")
@@ -352,18 +378,12 @@ endif()
 # block above, itself gated on this same flag) — gating these together
 # ensures a non-LiteRT-LM build never pulls in the minja dependency.
 if(QAI_FORGE_BUILD_LITERT_LM)
-    list(APPEND QAI_FORGE_SOURCES
-        # LiteRT-LM backend (Layer 3 — IGenerativeBackend implementation)
-        src/backend/LiteRTLMBackend.cpp
+    # LiteRTLMBackend.cpp, LiteRTLMOrchestrator.cpp, and
+    # LiteRTLMWorkerManager.cpp have moved into the qaiforge_plugin_litertlm
+    # target (see the "Runtime plugins" section below).
 
-        # LiteRT-LM orchestrator (Layer 2)
-        src/orchestration/LiteRTLMOrchestrator.cpp
-
-        # LiteRT-LM worker management (Layer 3)
-        src/worker/LiteRTLMWorkerManager.cpp
-    )
-
-    # Define preprocessor macro for conditional compilation
+    # Define preprocessor macro for conditional compilation. Still needed —
+    # applies directory-wide, including to the qaiforge_plugin_litertlm target.
     add_compile_definitions(QAI_FORGE_BUILD_LITERT_LM)
 
     message(STATUS "[qai-forge] LiteRT-LM generative backend support enabled")
@@ -371,21 +391,19 @@ endif()
 
 # ── Conditionally add llama.cpp backend sources ──────────────────────────────
 if(QAI_FORGE_BUILD_LLAMACPP)
+    # LlamaCppBackend.cpp, LlamaCppOrchestrator.cpp, and
+    # LlamaCppWorkerManager.cpp have moved into the qaiforge_plugin_llamacpp
+    # target (see the "Runtime plugins" section below). GgufMetadataReader.cpp
+    # stays in core — it's a standalone zero-copy header parser with no
+    # dependency on the plugin split, and other code may want to use it
+    # independently of whether the llamacpp plugin itself loads.
     list(APPEND QAI_FORGE_SOURCES
-        # llama.cpp backend (Layer 3 — IGenerativeBackend implementation)
-        src/backend/LlamaCppBackend.cpp
-
-        # llama.cpp orchestrator (Layer 2)
-        src/orchestration/LlamaCppOrchestrator.cpp
-
-        # llama.cpp worker management (Layer 3)
-        src/worker/LlamaCppWorkerManager.cpp
-
         # GGUF metadata reader (Layer 2 — zero-copy header parser)
         src/utils/GgufMetadataReader.cpp
     )
 
-    # Define preprocessor macro for conditional compilation
+    # Define preprocessor macro for conditional compilation. Still needed —
+    # applies directory-wide, including to the qaiforge_plugin_llamacpp target.
     add_compile_definitions(QAI_FORGE_BUILD_LLAMACPP)
 
     message(STATUS "[qai-forge] llama.cpp backend support enabled")
@@ -556,6 +574,9 @@ target_link_libraries(qai_forge
         nlohmann_json::nlohmann_json
     PRIVATE
         Threads::Threads
+        # dlopen/dlsym/dlclose/dlerror — used by PluginLoader.cpp to discover
+        # and load qaiforge_plugin_*.so files at startup.
+        dl
 )
 
 if(QAI_FORGE_BUILD_LLAMACPP AND LLAMACPP_LLAMA_LIB AND LLAMACPP_GGML_LIB)
@@ -588,6 +609,222 @@ set_target_properties(qai_forge PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime plugins — dlopen-loaded backend/orchestrator implementations
+#
+# Each plugin is a standalone shared library exporting one extern "C" entry
+# point (qai_forge_register_plugin) that registers its runtime(s) against
+# RuntimePluginRegistry. PluginLoader (core qai_forge.so) discovers and
+# dlopen()'s every *.so in the plugin directory at process startup —
+# BackendFactory never needs compile-time knowledge of these types.
+#
+# None of these plugins link the underlying native SDK directly (libGenie,
+# libllama, QNN/SNPE/LiteRT libs) — that linkage lives entirely in the
+# separate worker subprocess binaries (genai-inference-worker,
+# llamacpp-inference-worker, qnn-inference-worker, etc., built further
+# below), which the plugin's backend class talks to over IPC. Plugins only
+# need qai_forge's own headers/symbols (InferenceWorkerManager,
+# PredictiveWorkerProcessPool, ModelConfigManager, DTOs, Logger, etc.).
+#
+# Each plugin is still gated by its corresponding QAI_FORGE_BUILD_* option —
+# unbuilt SDK support ⇒ the plugin target simply isn't configured, exactly
+# as the old #ifdef'd source lists behaved, just at the CMake-target level.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set(QAI_FORGE_PLUGIN_INSTALL_SUBDIR "lib/qai-forge/plugins" CACHE STRING
+    "Relative install destination for runtime plugin shared libraries")
+
+# ── qaiforge_plugin_genie ─────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_GENIE)
+    add_library(qaiforge_plugin_genie SHARED
+        src/backend/GenIEBackend.cpp
+        src/orchestration/GenieOrchestrator.cpp
+        src/execution/GenieConfigMaterializer.cpp
+        src/worker/VlmInferenceWorkerManager.cpp
+        src/backend/plugins/GeniePluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_genie PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/include
+    )
+    target_link_libraries(qaiforge_plugin_genie PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_genie PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_genie"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_genie
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_genie")
+endif()
+
+# ── qaiforge_plugin_litertlm ──────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_LITERT_LM)
+    add_library(qaiforge_plugin_litertlm SHARED
+        src/backend/LiteRTLMBackend.cpp
+        src/orchestration/LiteRTLMOrchestrator.cpp
+        src/worker/LiteRTLMWorkerManager.cpp
+        src/backend/plugins/LiteRTLMPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_litertlm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/include
+    )
+    target_link_libraries(qaiforge_plugin_litertlm PRIVATE
+        qai_forge
+        minja
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_litertlm PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_litertlm"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_litertlm
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_litertlm")
+endif()
+
+# ── qaiforge_plugin_llamacpp ──────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_LLAMACPP)
+    add_library(qaiforge_plugin_llamacpp SHARED
+        src/backend/LlamaCppBackend.cpp
+        src/orchestration/LlamaCppOrchestrator.cpp
+        src/worker/LlamaCppWorkerManager.cpp
+        src/backend/plugins/LlamaCppPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_llamacpp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/include
+    )
+    target_link_libraries(qaiforge_plugin_llamacpp PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_llamacpp PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_llamacpp"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_llamacpp
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_llamacpp")
+endif()
+
+# ── qaiforge_plugin_qnn ───────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_QNN)
+    add_library(qaiforge_plugin_qnn SHARED
+        src/backend/QNNBackend.cpp
+        src/backend/plugins/QnnPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_qnn PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+    )
+    target_link_libraries(qaiforge_plugin_qnn PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_qnn PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_qnn"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_qnn
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_qnn")
+endif()
+
+# ── qaiforge_plugin_snpe ──────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_SNPE)
+    add_library(qaiforge_plugin_snpe SHARED
+        src/backend/SNPEBackend.cpp
+        src/backend/plugins/SnpePluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_snpe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+    )
+    target_link_libraries(qaiforge_plugin_snpe PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_snpe PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_snpe"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_snpe
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_snpe")
+endif()
+
+# ── qaiforge_plugin_litert ────────────────────────────────────────────────────
+if(QAI_FORGE_BUILD_LITERT)
+    add_library(qaiforge_plugin_litert SHARED
+        src/backend/LiteRTBackend.cpp
+        src/backend/plugins/LiteRTPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_litert PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+    )
+    target_link_libraries(qaiforge_plugin_litert PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(qaiforge_plugin_litert PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_litert"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_litert
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_litert")
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker binaries (Layer 3 → Layer 4)

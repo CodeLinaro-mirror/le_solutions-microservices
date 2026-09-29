@@ -1,0 +1,23 @@
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LiteRTPluginEntry — dlopen entry point for the "litert" predictive AI
+// runtime plugin (qaiforge_plugin_litert.so).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#include "qai_forge/backend/LiteRTBackend.h"
+#include "qai_forge/backend/RuntimePluginRegistry.h"
+
+#include <memory>
+
+extern "C" void qai_forge_register_plugin(RuntimePluginRegistry& registry) {
+    RuntimePluginRegistry::PredictiveEntry entry;
+    entry.create_backend = []() -> std::unique_ptr<IInferenceBackend> {
+        return std::make_unique<LiteRTBackend>();
+    };
+    registry.registerPredictive("litert", entry);
+    // "tflite" is the same backend under an alternate runtime name used by
+    // some model configs — register both.
+    registry.registerPredictive("tflite", std::move(entry));
+}

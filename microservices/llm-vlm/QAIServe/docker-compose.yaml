@@ -35,6 +35,13 @@ services:
         - BUILD_LITERT_LM=ON
         - BUILD_LLAMACPP=ON
         - BUILD_GENIE=true
+        # Predictive-AI backends (QNN context-binary, SNPE DLC, LiteRT
+        # .tflite-with-NPU-dispatch). Default ON to preserve this image's
+        # historical "all backends" behavior; override e.g.
+        # BUILD_QNN=OFF to build a smaller/GenIE-only image.
+        - BUILD_QNN=${BUILD_QNN:-ON}
+        - BUILD_SNPE=${BUILD_SNPE:-ON}
+        - BUILD_LITERT=${BUILD_LITERT:-ON}
         # Bazel concurrency for the LiteRT / LiteRT-LM stages. Low by default
         # because the Bazel server JVM deadlocks under QEMU-user emulation when
         # building for arm64 on an x86 host; set BAZEL_JOBS=$(nproc) on a native
@@ -133,6 +140,12 @@ services:
       # LITERT_LM_BACKEND=cpu|gpu|npu explicitly to override.
       - LITERT_LM_WORKER_BINARY=/usr/bin/litert-lm-inference-worker
       - LITERT_LM_DISPATCH_LIB_DIR=${LITERT_LM_DISPATCH_LIB_DIR:-/usr/lib}
+
+      # Directory PluginLoader scans at startup for qaiforge_plugin_*.so
+      # files (RuntimePluginRegistry) — GenIE/LiteRT-LM/llama.cpp/QNN/SNPE/
+      # LiteRT backend implementations. Override to point at a custom
+      # plugin directory (e.g. a bind-mounted volume) without rebuilding.
+      - QAI_FORGE_PLUGIN_DIR=${QAI_FORGE_PLUGIN_DIR:-/usr/lib/qai-forge/plugins}
 
     volumes:
       # fastrpc reads the device model name from this file to select the

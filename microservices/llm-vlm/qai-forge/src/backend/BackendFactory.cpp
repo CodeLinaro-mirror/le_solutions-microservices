@@ -5,66 +5,39 @@
 // BackendFactory — Runtime-based backend selection
 //
 // Routes the "runtime" field from metadata.json to the correct
-// IGenerativeBackend implementation. Scheduler-owned execution creates a fresh
-// backend instance per ModelRuntime so each resident model owns its worker.
+// IGenerativeBackend/IInferenceBackend implementation. All routing now
+// delegates to RuntimePluginRegistry, which is populated at process startup
+// by PluginLoader (dlopen-based discovery of qaiforge_plugin_*.so files) —
+// BackendFactory itself no longer needs to know which concrete backend
+// types exist or maintain a compile-time #ifdef ladder per runtime.
 //
-// Current routing table:
-//   "genie"     → GenIEBackend + GenieOrchestrator (scheduler-owned)
-//   "litert_lm" → LiteRTLMBackend + LiteRTLMOrchestrator (scheduler-owned)
-//   "llamacpp"  → LlamaCppBackend + LlamaCppOrchestrator (scheduler-owned, requires BUILD_LLAMACPP=ON)
-//   "onnxrt"    → unsupported until implemented
+// Scheduler-owned execution creates a fresh backend instance per
+// ModelRuntime/PredictiveModelRuntime so each resident model owns its own
+// worker/session state.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/InternalDTOs.h"
-#include "qai_forge/backend/LiteRTBackend.h"
-#include "qai_forge/backend/QNNBackend.h"
-#include "qai_forge/backend/SNPEBackend.h"
+#include "qai_forge/backend/RuntimePluginRegistry.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
 
-#ifdef QAI_FORGE_BUILD_GENIE
-#include "qai_forge/backend/GenIEBackend.h"
-#include "qai_forge/orchestration/GenieOrchestrator.h"
-#endif
-
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-#include "qai_forge/backend/LiteRTLMBackend.h"
-#include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
-#endif
-
-#ifdef QAI_FORGE_BUILD_LLAMACPP
-#include "qai_forge/backend/LlamaCppBackend.h"
-#include "qai_forge/orchestration/LlamaCppOrchestrator.h"
-#endif
+#include <algorithm>
 #include <memory>
+#include <vector>
 
 std::unique_ptr<IGenerativeBackend>
 BackendFactory::createGenerativeBackend(const std::string& runtime) {
-#ifdef QAI_FORGE_BUILD_GENIE
-    if (runtime == "genie") {
-        return std::make_unique<GenIEBackend>();
+    auto backend =
+        RuntimePluginRegistry::instance().createGenerativeBackend(runtime);
+    if (!backend) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Unsupported generative backend runtime '" + runtime + "'.",
+            400);
     }
-#endif
-
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-    if (runtime == "litert_lm") {
-        return std::make_unique<LiteRTLMBackend>();
-    }
-#endif
-
-#ifdef QAI_FORGE_BUILD_LLAMACPP
-    if (runtime == "llamacpp") {
-        // Phase 4: Scheduler-owned LlamaCppBackend instance
-        return std::make_unique<qai_forge::LlamaCppBackend>();
-    }
-#endif
-
-    throw GenAIException(
-        GenAIErrorCode::INVALID_REQUEST,
-        "Unsupported generative backend runtime '" + runtime + "'.",
-        400);
+    return backend;
 }
 
 std::unique_ptr<IGenerativeBackend>
@@ -83,28 +56,15 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
 
 std::shared_ptr<IGenerativeOrchestrator>
 BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
-#ifdef QAI_FORGE_BUILD_GENIE
-    if (runtime == "genie") {
-        return std::make_shared<GenieOrchestrator>();
+    auto orchestrator =
+        RuntimePluginRegistry::instance().createGenerativeOrchestrator(runtime);
+    if (!orchestrator) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Unsupported generative orchestrator runtime '" + runtime + "'.",
+            400);
     }
-#endif
-
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-    if (runtime == "litert_lm") {
-        return std::make_shared<LiteRTLMOrchestrator>();
-    }
-#endif
-
-#ifdef QAI_FORGE_BUILD_LLAMACPP
-    if (runtime == "llamacpp") {
-        return std::make_shared<qai_forge::LlamaCppOrchestrator>();
-    }
-#endif
-
-    throw GenAIException(
-        GenAIErrorCode::INVALID_REQUEST,
-        "Unsupported generative orchestrator runtime '" + runtime + "'.",
-        400);
+    return orchestrator;
 }
 
 std::shared_ptr<IGenerativeOrchestrator>
@@ -146,26 +106,16 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
 
 std::unique_ptr<IInferenceBackend>
 BackendFactory::createPredictiveBackend(const std::string& runtime) {
-    // QNN context binary (HTP/GPU/CPU)
-    if (runtime == "qnn" || runtime == "qnn_context_binary") {
-        return std::make_unique<QNNBackend>();
+    auto backend =
+        RuntimePluginRegistry::instance().createPredictiveBackend(runtime);
+    if (!backend) {
+        throw GenAIException(
+            GenAIErrorCode::INVALID_REQUEST,
+            "Unknown predictive AI runtime '" + runtime + "'. "
+            "Supported runtimes: qnn, qnn_context_binary, snpe, qnn_dlc, litert, tflite.",
+            400);
     }
-
-    // SNPE DLC container (DSP/GPU/AIP/CPU)
-    if (runtime == "snpe" || runtime == "qnn_dlc") {
-        return std::make_unique<SNPEBackend>();
-    }
-
-    // LiteRT / TFLite (NPU dispatch + CPU fallback)
-    if (runtime == "litert" || runtime == "tflite") {
-        return std::make_unique<LiteRTBackend>();
-    }
-
-    throw GenAIException(
-        GenAIErrorCode::INVALID_REQUEST,
-        "Unknown predictive AI runtime '" + runtime + "'. "
-        "Supported runtimes: qnn, qnn_context_binary, snpe, qnn_dlc, litert, tflite.",
-        400);
+    return backend;
 }
 
 std::unique_ptr<IInferenceBackend>
@@ -194,32 +144,27 @@ BackendFactory::createPredictiveOrchestrator() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 nlohmann::ordered_json BackendFactory::supportedRuntimes() {
+    // Reflects the RuntimePluginRegistry's actual current contents — i.e.
+    // what plugin .so's were successfully dlopen'd and registered at
+    // startup, not a compile-time macro echo. Sorted for stable output.
+    auto& registry = RuntimePluginRegistry::instance();
+
+    std::vector<std::string> generative_runtimes =
+        registry.registeredGenerativeRuntimes();
+    std::vector<std::string> predictive_runtimes =
+        registry.registeredPredictiveRuntimes();
+    std::sort(generative_runtimes.begin(), generative_runtimes.end());
+    std::sort(predictive_runtimes.begin(), predictive_runtimes.end());
+
     nlohmann::ordered_json generative = nlohmann::ordered_json::array();
+    for (const auto& runtime : generative_runtimes) {
+        generative.push_back(runtime);
+    }
+
     nlohmann::ordered_json predictive = nlohmann::ordered_json::array();
-
-#ifdef QAI_FORGE_BUILD_GENIE
-    generative.push_back("genie");
-#endif
-
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-    generative.push_back("litert_lm");
-#endif
-
-#ifdef QAI_FORGE_BUILD_LLAMACPP
-    generative.push_back("llamacpp");
-#endif
-
-#ifdef QAI_FORGE_BUILD_QNN
-    predictive.push_back("qnn");
-#endif
-
-#ifdef QAI_FORGE_BUILD_SNPE
-    predictive.push_back("snpe");
-#endif
-
-#ifdef QAI_FORGE_BUILD_LITERT
-    predictive.push_back("litert");
-#endif
+    for (const auto& runtime : predictive_runtimes) {
+        predictive.push_back(runtime);
+    }
 
     nlohmann::ordered_json result;
     result["generative"] = std::move(generative);

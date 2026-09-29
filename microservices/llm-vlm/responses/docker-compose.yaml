@@ -89,6 +89,12 @@ services:
       - GGML_LOG_LEVEL=${GGML_LOG_LEVEL:-1}
       - LLAMACPP_SOCKET_TIMEOUT_SEC=${LLAMACPP_SOCKET_TIMEOUT_SEC:-180}
 
+      # Directory PluginLoader scans at startup for qaiforge_plugin_*.so
+      # files (RuntimePluginRegistry) — GenIE/LiteRT-LM/llama.cpp backend
+      # implementations. Override to point at a custom plugin directory
+      # (e.g. a bind-mounted volume) without rebuilding.
+      - QAI_FORGE_PLUGIN_DIR=${QAI_FORGE_PLUGIN_DIR:-/usr/lib/qai-forge/plugins}
+
     volumes:
       # fastrpc reads the device model name from this file to select the
       # correct DSP library path from hexagon-dsp-binaries.yaml

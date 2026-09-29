@@ -50,9 +50,12 @@ SKIP_QAIRT=false
 SKIP_DEPS=false
 DEBUG=false
 
-# stb / minja — pre-fetched (not via CMake FetchContent) so that the
-# subsequent `cmake -S` configure step below never performs any network/git
-# activity. Pinned commits match qai-forge/CMakeLists.txt's requirements.
+# nlohmann/json / stb / minja — pre-fetched (not via CMake FetchContent) so
+# that the subsequent `cmake -S` configure step below never performs any
+# network/git activity. Pinned commits match qai-forge/CMakeLists.txt's
+# requirements.
+NLOHMANN_JSON_SRC_DIR="${NLOHMANN_JSON_SRC_DIR:-/opt/third_party/nlohmann_json}"
+NLOHMANN_JSON_GIT_REF="${NLOHMANN_JSON_GIT_REF:-9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03}"
 STB_SRC_DIR="${STB_SRC_DIR:-/opt/third_party/stb}"
 STB_GIT_REF="${STB_GIT_REF:-2c980bb59875b0d32144a71867fbdebb2f77cd20}"
 MINJA_SRC_DIR="${MINJA_SRC_DIR:-/opt/third_party/minja}"
@@ -165,6 +168,17 @@ if [ "$SKIP_DEPS" = "false" ]; then
         sh "${SCRIPT_DIR}/deps/fetch-qairt-sdk.sh"
     fi
 
+    # Always pre-fetch nlohmann/json — avoids any network activity during
+    # the `cmake -S` configure step below (qai-forge/CMakeLists.txt requires
+    # NLOHMANN_JSON_SOURCE_DIR unconditionally).
+    if [ -f "${NLOHMANN_JSON_SRC_DIR}/CMakeLists.txt" ]; then
+        echo "nlohmann/json already present at ${NLOHMANN_JSON_SRC_DIR} (pinned ${NLOHMANN_JSON_GIT_REF}); skipping fetch."
+    else
+        echo "Fetching nlohmann/json (pinned ${NLOHMANN_JSON_GIT_REF})..."
+        git clone https://github.com/nlohmann/json.git "${NLOHMANN_JSON_SRC_DIR}"
+        (cd "${NLOHMANN_JSON_SRC_DIR}" && git checkout "${NLOHMANN_JSON_GIT_REF}")
+    fi
+
     # Always pre-fetch stb (header-only image decoder) — avoids any network
     # activity during the `cmake -S` configure step below.
     if [ -f "${STB_SRC_DIR}/stb_image.h" ]; then
@@ -237,6 +251,7 @@ cmake -S "${QAI_FORGE_DIR}" -B "${QAI_FORGE_DIR}/build" \
     -DCMAKE_PREFIX_PATH="${DEPLOY_DIR}/usr" \
     -DGENIE_INCLUDE_PATH=/usr/include \
     -DGENIE_LIB_PATH=/usr/lib \
+    -DNLOHMANN_JSON_SOURCE_DIR="${NLOHMANN_JSON_SRC_DIR}" \
     -DSTB_SOURCE_DIR="${STB_SRC_DIR}" \
     -DMINJA_SOURCE_DIR="${MINJA_SRC_DIR}" \
     -DQAI_FORGE_BUILD_LITERT="${BUILD_LITERT}" \
