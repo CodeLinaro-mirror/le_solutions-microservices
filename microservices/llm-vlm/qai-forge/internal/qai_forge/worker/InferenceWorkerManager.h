@@ -5,6 +5,7 @@
 
 #include "qai_forge/worker/InferenceProtocol.h"
 #include "qai_forge/InternalDTOs.h"
+#include "qai_forge/utils/ThreadPool.h"
 #include <string>
 #include <functional>
 #include <memory>
@@ -350,8 +351,6 @@ private:
     struct PendingReset {
         std::promise<void> completion_promise;
         std::shared_future<void> completion;
-        std::mutex worker_mutex;
-        std::thread worker;
 
         PendingReset()
             : completion(completion_promise.get_future().share()) {}
@@ -361,6 +360,18 @@ private:
     std::unordered_map<std::string, std::shared_ptr<PendingReset>> reset_threads_;
     void joinAllResetThreads();
     void sendReinitialize(const std::string& session_id);
+
+    // Bounded worker-thread pool used by initiateBackgroundReset() to run
+    // each session's KV reset instead of spawning a new std::thread per
+    // call. This fires after *every* inference call under GenieOrchestrator's
+    // eager background-reset pattern, making it the highest-frequency
+    // thread-spawn site in the stack prior to this pool's introduction.
+    // Concurrency is already bounded by max_slots_ (at most max_slots_
+    // sessions can have a reset in flight at once), so a pool sized to
+    // max_slots_ (grown via resize() in setMaxSlots()) provides identical
+    // effective concurrency without per-call OS thread creation. See
+    // ThreadPool.h for the pool's shutdown/lifecycle contract.
+    qai_forge::utils::ThreadPool reset_pool_{1};
 
     // ── Reader-thread demux (Section A) ─────────────────────────────────────
     struct PendingExecute {

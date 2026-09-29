@@ -277,7 +277,11 @@ void LiteRTLMBackend::onContextCompacted() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void LiteRTLMBackend::resetKvAsync(const std::string& session_id) {
-    LOG_INFO("[LiteRTLMBackend] Initiating background KV reset for model: "
+    // Demoted to DEBUG — see GenIEBackend::resetKvAsync()'s identical
+    // rationale: this fires unconditionally after every inference call and
+    // carries no diagnostic value at INFO beyond confirming the call
+    // happened. Failures remain at WARN below.
+    LOG_DEBUG("[LiteRTLMBackend] Initiating background KV reset for model: "
              << current_model_id_);
     try {
         if (worker_) {

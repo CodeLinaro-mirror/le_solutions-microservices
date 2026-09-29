@@ -36,10 +36,6 @@ public:
         IGenerativeBackend& backend) const override;
 
 private:
-    int estimateTokens(const json& messages, const json& tools) const;
-    int applyContextEviction(json& messages,
-                             const json& tools,
-                             int max_context_length) const;
     json parseToolCalls(const std::string& text,
                         const std::string& delimiter) const;
     std::string extractPreToolContent(

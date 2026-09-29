@@ -36,7 +36,8 @@
 //
 // The request flows through a clean pipeline:
 //   Step 1: Extractor     — parse messages and config from the request DTO
-//   Step 2: Session Resolver — find/create ConversationSession, issue DraftTurn
+//   Step 2: Session Resolver — rehydrate a transient ConversationSession
+//           from the private GenieMemoryState (summary/facts/eviction ptr)
 //   Step 3: Context prep   — prompt construction
 //   Step 4: Execution      — injected backend → ReasoningRouter → yield DTOs
 //   Step 5: Post-turn      — resetKvAsync

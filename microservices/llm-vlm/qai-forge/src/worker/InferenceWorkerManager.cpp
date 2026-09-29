@@ -146,6 +146,11 @@ void InferenceWorkerManager::ensureWorkerRunning(
 
 void InferenceWorkerManager::setMaxSlots(int max_slots) {
     max_slots_ = std::clamp(max_slots, 1, 16);
+    // Grow (never shrink) the KV-reset pool to match the new slot capacity —
+    // at most max_slots_ sessions can have a background reset in flight at
+    // once, so the pool never needs more workers than that. See reset_pool_'s
+    // declaration comment in InferenceWorkerManager.h.
+    reset_pool_.resize(static_cast<std::size_t>(max_slots_));
 }
 
 void InferenceWorkerManager::setInitOptions(const json& options) {
@@ -610,7 +615,9 @@ void InferenceWorkerManager::dispatchExecuteEvent(const std::string& type,
         pending->on_token(InferenceProtocol::parseToken(msg));
     } else if (type == ResponseType::DONE) {
         const auto done = InferenceProtocol::parseDone(msg);
-        LOG_INFO("[" << process_type_ << "Worker] INFERENCE_SUCCESS event="
+        // Demoted to DEBUG — redundant with ModelRuntime's/GenieOrchestrator's
+        // "execution completed"/"inference completed" logs one layer up.
+        LOG_DEBUG("[" << process_type_ << "Worker] INFERENCE_SUCCESS event="
                  << done.event_id << " session=" << done.session_id
                  << " finish_reason=" << done.finish_reason);
         pending->on_done(done);
@@ -723,7 +730,11 @@ void InferenceWorkerManager::sendExecuteAndStream(const json& execute_cmd,
                                                    ErrorCallback on_error) {
     const std::string session_id = execute_cmd.value("session_id", "");
 
-    LOG_INFO("[" << process_type_ << "Worker] INFERENCE_START event=" << event_id
+    // Demoted to DEBUG — redundant with ModelRuntime's "Streaming/Blocking
+    // execution started" log one layer up, which already carries the job_id
+    // and model. This IPC-level detail (event_id/session_id) remains
+    // available for low-level troubleshooting via LOG_LEVEL=DEBUG.
+    LOG_DEBUG("[" << process_type_ << "Worker] INFERENCE_START event=" << event_id
              << " session=" << session_id
              << " physical_genie_batch=unknown");
 
@@ -895,13 +906,16 @@ void InferenceWorkerManager::initiateBackgroundReset(const std::string& session_
             reset_threads_.erase(it);
         }
     }
-    // Join outside the global map lock so unrelated sessions are not blocked.
-    // Same-session ordering is handled by ModelRuntime.
+    // Wait outside the global map lock so unrelated sessions are not
+    // blocked. Same-session ordering is handled by ModelRuntime. There is
+    // no per-task thread to join anymore (see reset_pool_) — the shared
+    // completion future is the only synchronization needed here.
     if (previous) {
-        previous->completion.wait();
-        std::lock_guard<std::mutex> worker_lock(previous->worker_mutex);
-        if (previous->worker.joinable()) {
-            previous->worker.join();
+        try {
+            previous->completion.wait();
+        } catch (...) {
+            // Swallow — this call only cares that the previous reset has
+            // finished (successfully or not) before starting a new one.
         }
     }
 
@@ -909,35 +923,32 @@ void InferenceWorkerManager::initiateBackgroundReset(const std::string& session_
     {
         std::lock_guard<std::mutex> lock(reset_threads_mutex_);
         reset_threads_[session_id] = pending;
-        try {
-            pending->worker = std::thread([this, session_id, pending]() {
-                try {
-                    sendReset(session_id);
-                } catch (...) {
-                    try {
-                        LOG_WARN("[" << process_type_
-                                 << "Worker] KV reset failed for session="
-                                 << session_id
-                                 << "; attempting lane reinitialization");
-                        sendReinitialize(session_id);
-                    } catch (...) {
-                        LOG_ERROR("[" << process_type_
-                                  << "Worker] Lane reinitialization failed for session="
-                                  << session_id
-                                  << "; worker recovery is required");
-                        pending->completion_promise.set_exception(
-                            std::current_exception());
-                        return;
-                    }
-                }
-                pending->completion_promise.set_value();
-            });
-        } catch (...) {
-            reset_threads_.erase(session_id);
-            pending->completion_promise.set_exception(std::current_exception());
-            throw;
-        }
     }
+    // submit() never blocks and never spawns a new OS thread — the task
+    // runs on one of reset_pool_'s persistent workers (sized to
+    // max_slots_ via setMaxSlots()).
+    reset_pool_.submit([this, session_id, pending]() {
+        try {
+            sendReset(session_id);
+        } catch (...) {
+            try {
+                LOG_WARN("[" << process_type_
+                         << "Worker] KV reset failed for session="
+                         << session_id
+                         << "; attempting lane reinitialization");
+                sendReinitialize(session_id);
+            } catch (...) {
+                LOG_ERROR("[" << process_type_
+                          << "Worker] Lane reinitialization failed for session="
+                          << session_id
+                          << "; worker recovery is required");
+                pending->completion_promise.set_exception(
+                    std::current_exception());
+                return;
+            }
+        }
+        pending->completion_promise.set_value();
+    });
 }
 
 // waitForPendingReset — Block until the session's background reset completes
@@ -962,19 +973,20 @@ void InferenceWorkerManager::waitForPendingReset(const std::string& session_id) 
         LOG_INFO("[" << process_type_ << "Worker] Background KV reset (session=" << session_id
                  << ") complete - ready for inference");
     }
-    std::thread completed_worker;
+    // No per-task thread to join anymore (see reset_pool_) — the completion
+    // future above is the only synchronization needed. Just drop this
+    // session's map entry once its reset has finished, so a later
+    // initiateBackgroundReset() for the same session doesn't need to wait
+    // on an already-completed future.
     {
         std::lock_guard<std::mutex> lock(reset_threads_mutex_);
         auto pending_it = reset_threads_.find(session_id);
         if (pending_it != reset_threads_.end() && pending_it->second == pending &&
             pending->completion.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
-            std::lock_guard<std::mutex> worker_lock(pending->worker_mutex);
-            completed_worker = std::move(pending->worker);
             reset_threads_.erase(pending_it);
         }
     }
-    if (completed_worker.joinable()) completed_worker.join();
     if (error) {
         std::rethrow_exception(error);
     }
@@ -997,15 +1009,15 @@ void InferenceWorkerManager::joinAllResetThreads() {
         }
         reset_threads_.clear();
     }
+    // Reset tasks now run on reset_pool_'s persistent workers rather than
+    // per-task std::thread objects, so there is nothing to join here beyond
+    // waiting for each pending reset's completion future — the pool itself
+    // is torn down separately (its destructor joins its worker threads).
     for (const auto& pending : pending_resets) {
         try {
             pending->completion.wait();
         } catch (...) {
-            // Teardown still must join the worker even when reset failed.
-        }
-        std::lock_guard<std::mutex> worker_lock(pending->worker_mutex);
-        if (pending->worker.joinable()) {
-            pending->worker.join();
+            // Teardown still proceeds even when a reset failed.
         }
     }
 }

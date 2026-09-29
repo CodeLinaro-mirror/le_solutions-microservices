@@ -9,6 +9,7 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/reasoning/ReasoningRouter.h"
 #include "qai_forge/utils/Logger.h"
+#include "qai_forge/utils/TokenEstimation.h"
 
 #include "minja/minja.hpp"
 #include "minja/chat-template.hpp"
@@ -158,10 +159,11 @@ scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
     }
 
     json tools = std::move(context.request.tools).value_or(json::array());
-    const int evicted = applyContextEviction(
+    const int evicted = qai_forge::utils::applyFrontEviction(
         messages,
         tools,
-        ModelConfigManager::getInstance().getContextSize(context.model_id));
+        ModelConfigManager::getInstance().getContextSize(context.model_id),
+        compactionThreshold());
     if (evicted > 0) {
         LOG_INFO("[LiteRTLMOrchestrator] Evicted " << evicted
                  << " messages while preparing model=" << context.model_id
@@ -298,6 +300,11 @@ StandardResponse LiteRTLMOrchestrator::execute(
     const std::string tool_call_start_marker =
         ModelAdapterFactory::getAdapter(job.model_id).toolCallStartMarker();
 
+    // Reused across calls (cleared each token) to avoid a fresh heap
+    // allocation on every streamed token when reasoning routing is active —
+    // see ReasoningRouter::route()'s doc comment.
+    std::vector<StreamChunk> reasoning_chunks_scratch;
+
     backend.generateWithSession(
         event_id, job.session_id, prompt, streaming,
         prepared->generation.max_tokens,
@@ -321,10 +328,11 @@ StandardResponse LiteRTLMOrchestrator::execute(
             // complete response afterward — matching the old blocking-path
             // behavior of splitting over the *entire* accumulated_text
             // unconditionally.
-            std::vector<StreamChunk> chunks;
+            reasoning_chunks_scratch.clear();
             if (has_thinking) {
-                chunks = router->route(token.content);
+                router->route(token.content, reasoning_chunks_scratch);
             }
+            std::vector<StreamChunk>& chunks = reasoning_chunks_scratch;
 
             if (!streaming || !job.callbacks.on_token) return;
             // Suppress raw per-token streaming ONLY once the adapter's
@@ -469,35 +477,4 @@ StandardResponse LiteRTLMOrchestrator::execute(
     }
 
     return response;
-}
-
-int LiteRTLMOrchestrator::estimateTokens(
-    const json& messages,
-    const json& tools) const {
-    const std::size_t characters = messages.dump().size() + tools.dump().size();
-    return static_cast<int>(characters / 4) + 1;
-}
-
-int LiteRTLMOrchestrator::applyContextEviction(
-    json& messages,
-    const json& tools,
-    int max_context_length) const {
-    if (max_context_length <= 0) {
-        return 0;
-    }
-
-    const int limit = static_cast<int>(
-        max_context_length * compactionThreshold());
-    int evicted = 0;
-    while (messages.size() > 2 && estimateTokens(messages, tools) > limit) {
-        const bool has_system =
-            getStringOrDefault(messages.front(), "role", "") == "system";
-        const std::size_t index = has_system ? 1 : 0;
-        if (index >= messages.size() - 1) {
-            break;
-        }
-        messages.erase(index);
-        ++evicted;
-    }
-    return evicted;
 }

@@ -92,12 +92,17 @@ public:
 
     /**
      * Process a raw token fragment from the inference worker.
-     * Returns zero or more StreamChunk DTOs to be sent to Layer 1.
+     * Appends zero or more StreamChunk DTOs to `out` (does NOT clear `out`
+     * first — callers streaming per-token should clear/reuse a single
+     * caller-owned vector across calls to avoid a fresh heap allocation
+     * every token; the vector is typically empty or holds 0-1 elements per
+     * call, so returning by value here would allocate on virtually every
+     * invocation during a streamed reasoning response).
      *
      * Handles partial tag buffering: if a fragment ends mid-tag (e.g. "<thi"),
      * the partial tag is held in the carry buffer until the next fragment arrives.
      */
-    std::vector<StreamChunk> route(const std::string& token_fragment);
+    void route(const std::string& token_fragment, std::vector<StreamChunk>& out);
 
     /**
      * Returns true if the router is currently inside a thinking block.

@@ -109,9 +109,18 @@ std::optional<std::string> ReasoningRouter::findPartialPrefix(const std::string&
 
 // ─────────────────────────────────────────────────────────────────────────────
 // route — main routing logic
+//
+// Appends to caller-owned `out` rather than returning a freshly-allocated
+// vector — this is invoked once per streamed token when reasoning routing
+// is active, and the common case produces 0-1 chunks, so a per-call heap
+// allocation here would otherwise dominate a long streamed reasoning
+// response's allocator traffic. Callers that stream per-token should
+// clear() and reuse a single vector across calls (see call sites in
+// GenieOrchestrator/LiteRTLMOrchestrator).
 // ─────────────────────────────────────────────────────────────────────────────
-std::vector<StreamChunk> ReasoningRouter::route(const std::string& token_fragment) {
-    std::vector<StreamChunk> results;
+void ReasoningRouter::route(const std::string& token_fragment,
+                            std::vector<StreamChunk>& out) {
+    std::vector<StreamChunk>& results = out;
 
     // Prepend any carry buffer from previous fragment
     carry_buffer_ += token_fragment;
@@ -205,8 +214,6 @@ std::vector<StreamChunk> ReasoningRouter::route(const std::string& token_fragmen
             }
         }
     }
-
-    return results;
 }
 
 void ReasoningRouter::emitThinkingChunk(const std::string& text,

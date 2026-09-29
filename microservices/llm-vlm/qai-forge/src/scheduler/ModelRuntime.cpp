@@ -168,7 +168,7 @@ void ModelRuntime::start() {
 void ModelRuntime::enqueue(GenerativeJobPtr job) {
     const std::string job_id = job ? job->job_id : std::string("<null>");
     queue_.push(std::move(job));
-    LOG_INFO("[ModelRuntime] Enqueued job: model=" << model_id_
+    LOG_DEBUG("[ModelRuntime] Enqueued job: model=" << model_id_
              << " job=" << job_id);
     cv_.notify_one();
 }
@@ -696,6 +696,13 @@ void ModelRuntime::executorLoop() {
                                 ? static_cast<std::size_t>(caps.max_concurrent)
                                 : 1;
                             post_turn_worker_->setMaxQueueDepth(max_concurrent_);
+                            // Grow (never shrink) the job-dispatch pool to
+                            // match the backend's concurrency bound so
+                            // runJobEntry() calls never queue behind each
+                            // other when admission already allows them to
+                            // run in parallel. See job_pool_'s declaration
+                            // comment in ModelRuntime.h.
+                            job_pool_.resize(max_concurrent_);
                             LOG_INFO("[ModelRuntime] BATCH_CAPACITY model=" << model_id_
                                      << " backend_max_concurrent=" << caps.max_concurrent
                                      << " effective_capacity=" << max_concurrent_
@@ -751,7 +758,10 @@ void ModelRuntime::executorLoop() {
         }
 
         for (auto& dispatch_job : jobs_to_dispatch) {
-            std::thread(&ModelRuntime::runJobEntry, this, dispatch_job).detach();
+            GenerativeJobPtr job_to_run = dispatch_job;
+            job_pool_.submit([this, job_to_run]() {
+                runJobEntry(job_to_run);
+            });
         }
     }
 
@@ -855,13 +865,13 @@ void ModelRuntime::runJobEntry(GenerativeJobPtr job) {
 
     bool recover_backend = false;
     try {
-        LOG_INFO("[ModelRuntime] Running job: model=" << model_id_
+        LOG_DEBUG("[ModelRuntime] Running job: model=" << model_id_
                  << " job=" << job->job_id
                  << " priority=" << static_cast<int>(job->priority)
                  << " stream="
                  << (job->callbacks.on_token ? "true" : "false"));
         runJob(*job);
-        LOG_INFO("[ModelRuntime] Job run returned: model=" << model_id_
+        LOG_DEBUG("[ModelRuntime] Job run returned: model=" << model_id_
                  << " job=" << job->job_id);
     } catch (const GenAIException& error) {
         recover_backend = shouldRecoverBackend(error);

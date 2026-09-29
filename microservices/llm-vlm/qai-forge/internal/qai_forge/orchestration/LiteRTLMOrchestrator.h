@@ -37,12 +37,6 @@ private:
                              const json& tools,
                              bool add_generation_prompt = true) const;
 
-    // ── Context management ─────────────────────────────────────────────────────
-    int estimateTokens(const json& messages, const json& tools) const;
-    int applyContextEviction(json& messages,
-                             const json& tools,
-                             int max_context_length) const;
-
     // ── Mutable state for lazy init in const execute() ────────────────────────
     mutable std::string jinja_template_;
     // Compiled minja chat template — built once in initMetadataIfNeeded()

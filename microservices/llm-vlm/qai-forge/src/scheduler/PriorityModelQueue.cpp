@@ -35,7 +35,8 @@ void PriorityModelQueue::push(GenerativeJobPtr job) {
     const JobPriority priority = job->priority;
     std::lock_guard<std::mutex> lock(mutex_);
     laneFor(job->priority).push_back(std::move(job));
-    LOG_INFO("[PriorityModelQueue] Pushed job: job=" << job_id
+    // Redundant with WarmModelPool's per-submit INFO log.
+    LOG_DEBUG("[PriorityModelQueue] Pushed job: job=" << job_id
              << " priority=" << priorityToString(priority));
 }
 
@@ -93,7 +94,8 @@ GenerativeJobPtr PriorityModelQueue::cancel(const std::string& job_id) {
                 GenerativeJobPtr cancelled = job;
                 cancelled->cancel();
                 lane.erase(it);
-                LOG_INFO("[PriorityModelQueue] Cancelled queued job: job="
+                // Redundant with ModelRuntime::cancel()'s INFO log.
+                LOG_DEBUG("[PriorityModelQueue] Cancelled queued job: job="
                          << job_id);
                 return cancelled;
             }

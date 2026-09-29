@@ -8,6 +8,7 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
+#include "qai_forge/utils/TokenEstimation.h"
 
 #include <cctype>
 #include <iomanip>
@@ -38,10 +39,11 @@ scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
         extractImagesFromMessages(merged_messages);
 
     json tools = std::move(context.request.tools).value_or(json::array());
-    const int evicted = applyContextEviction(
+    const int evicted = qai_forge::utils::applyFrontEviction(
         merged_messages,
         tools,
-        ModelConfigManager::getInstance().getContextSize(context.model_id));
+        ModelConfigManager::getInstance().getContextSize(context.model_id),
+        kCompactionThreshold);
     if (evicted > 0) {
         LOG_INFO("[LlamaCppOrchestrator] Evicted " << evicted
                  << " messages while preparing model=" << context.model_id);
@@ -176,7 +178,7 @@ StandardResponse LlamaCppOrchestrator::execute(
     response.model = job.model_id;
     response.role = "assistant";
     response.finish_reason = finish_reason;
-    response.prompt_tokens = estimateTokens(
+    response.prompt_tokens = qai_forge::utils::estimateTokensApprox(
         prepared->messages, prepared->tools);
     response.completion_tokens = completion_tokens;
     response.total_tokens = response.prompt_tokens + completion_tokens;
@@ -210,13 +212,6 @@ StandardResponse LlamaCppOrchestrator::execute(
     }
 
     return response;
-}
-
-int LlamaCppOrchestrator::estimateTokens(
-    const json& messages,
-    const json& tools) const {
-    const std::size_t characters = messages.dump().size() + tools.dump().size();
-    return static_cast<int>(characters / 4) + 1;
 }
 
 std::vector<std::vector<uint8_t>> LlamaCppOrchestrator::extractImagesFromMessages(
@@ -274,30 +269,6 @@ std::vector<std::vector<uint8_t>> LlamaCppOrchestrator::extractImagesFromMessage
         }
     }
     return images;
-}
-
-int LlamaCppOrchestrator::applyContextEviction(
-    json& messages,
-    const json& tools,
-    int max_context_length) const {
-    if (max_context_length <= 0) {
-        return 0;
-    }
-
-    const int limit = static_cast<int>(
-        max_context_length * kCompactionThreshold);
-    int evicted = 0;
-    while (messages.size() > 2 && estimateTokens(messages, tools) > limit) {
-        const bool has_system =
-            messages.front().value("role", "") == "system";
-        const std::size_t index = has_system ? 1 : 0;
-        if (index >= messages.size() - 1) {
-            break;
-        }
-        messages.erase(index);
-        ++evicted;
-    }
-    return evicted;
 }
 
 json LlamaCppOrchestrator::parseToolCalls(

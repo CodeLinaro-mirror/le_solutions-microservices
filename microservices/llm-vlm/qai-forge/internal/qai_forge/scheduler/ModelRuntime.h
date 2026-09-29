@@ -10,6 +10,7 @@
 #include "qai_forge/scheduler/PlacementContext.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/utils/ThreadPool.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -169,6 +170,20 @@ private:
     std::unordered_set<std::string> post_turn_sessions_;
     std::size_t max_concurrent_ = 1;
     bool recovery_in_progress_ = false;
+
+    // Bounded worker-thread pool used by executorLoop() to run admitted
+    // jobs (see runJobEntry()) instead of spawning a new std::thread per
+    // job. Jobs are already bounded in concurrency by max_concurrent_
+    // admission gating above, so a pool sized to that same bound (grown
+    // via resize() whenever max_concurrent_ increases after a backend
+    // load — see the BATCH_CAPACITY log site in executorLoop()) provides
+    // identical effective concurrency without per-job OS thread creation.
+    // The cancel-watchdog force-kill path (armCancelWatchdog) is
+    // deliberately NOT routed through this pool — it fires far less
+    // frequently than job dispatch and has its own generation-based
+    // replace/join lifecycle that is easier to reason about as a
+    // dedicated std::thread per in-flight cancel.
+    qai_forge::utils::ThreadPool job_pool_{1};
 
     struct CancelWatchdogEntry {
         std::thread thread;

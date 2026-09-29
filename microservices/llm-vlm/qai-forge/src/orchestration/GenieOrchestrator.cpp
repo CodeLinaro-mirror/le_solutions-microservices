@@ -29,6 +29,7 @@
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/ImageUtils.h"
 #include "qai_forge/utils/Logger.h"
+#include "qai_forge/utils/TokenEstimation.h"
 #include <algorithm>
 #include <cstdint>
 #include <exception>
@@ -695,7 +696,8 @@ StandardResponse GenieOrchestrator::executeBlockingPrepared(
             generation.thinking_start_tag,
             generation.thinking_end_tag,
             generation.thinking_budget);
-        router.route(full_response);
+        std::vector<StreamChunk> discard_chunks;
+        router.route(full_response, discard_chunks);
         thinking_content = router.getThinkingContent();
         answer_content = router.getAnswerContent();
         reasoning_token_count = router.getThinkingTokenCount();
@@ -864,6 +866,7 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
                 error_msg = err.message;
             });
     } else {
+        std::vector<StreamChunk> reasoning_chunks_scratch;
         backend.generate(
             event_id,
             job.session_id,
@@ -877,10 +880,16 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
             generation.frequency_penalty,
             generation.use_reasoning,
             [&generation, &router, &job, &callback, &full_response,
-             &tool_call_start_marker, &tool_call_suppressed]
+             &tool_call_start_marker, &tool_call_suppressed,
+             &reasoning_chunks_scratch]
             (const IPCTokenEvent& token) {
                 if (generation.use_reasoning) {
-                    auto chunks = router.route(token.content);
+                    // Reused across calls (cleared each token) to avoid a
+                    // fresh heap allocation on every streamed token — see
+                    // ReasoningRouter::route()'s doc comment.
+                    reasoning_chunks_scratch.clear();
+                    router.route(token.content, reasoning_chunks_scratch);
+                    auto& chunks = reasoning_chunks_scratch;
                     for (auto& chunk : chunks) {
                         if (chunk.content_delta.has_value()) {
                             full_response += chunk.content_delta.value();
@@ -1099,11 +1108,6 @@ scheduler::GenieMemoryState GenieOrchestrator::executePostTurn(
 
 namespace {
 
-// Simple token estimator: 1 token ≈ 4 characters.
-static int estimateTokens(const std::string& text) {
-    return static_cast<int>(text.size() / 4) + 1;
-}
-
 // Build a chat-template-formatted prompt for a single user message.
 static std::string buildSingleTurnPrompt(
     const std::string& user_content,
@@ -1151,7 +1155,7 @@ GenieOrchestrator::generateSummary(
     // Prepend prior summary for continuity (rolling summary).
     if (!session.summary_content.empty()) {
         conv << "[Prior summary]: " << session.summary_content << "\n\n";
-        input_tokens += estimateTokens(session.summary_content);
+        input_tokens += qai_forge::utils::estimateTokensApprox(session.summary_content);
     }
 
     for (const auto& msg : messages_to_summarize) {
@@ -1161,7 +1165,7 @@ GenieOrchestrator::generateSummary(
         std::string content = messageText(msg);
         if (content.empty()) continue;
 
-        int msg_tokens = estimateTokens(content);
+        int msg_tokens = qai_forge::utils::estimateTokensApprox(content);
         if (input_tokens + msg_tokens > input_budget) break;
 
         std::string role_label = (role == "user") ? "User" : "Assistant";
@@ -1221,7 +1225,7 @@ GenieOrchestrator::generateSummary(
     };
     summary_text = trim(summary_text);
 
-    int summary_tokens = estimateTokens(summary_text);
+    int summary_tokens = qai_forge::utils::estimateTokensApprox(summary_text);
     LOG_INFO("[GenieOrchestrator] generateSummary: "
              << messages_to_summarize.size() << " messages → "
              << summary_tokens << " tokens");

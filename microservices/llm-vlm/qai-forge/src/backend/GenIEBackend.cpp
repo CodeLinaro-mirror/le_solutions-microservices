@@ -379,7 +379,12 @@ void GenIEBackend::onContextCompacted() {
 
 void GenIEBackend::resetKvAsync(const std::string& session_id) {
     const bool is_vlm = current_is_vlm_.load();
-    LOG_INFO("[GenIEBackend] Initiating background KV reset for model: "
+    // Demoted to DEBUG — this fires unconditionally after *every* inference
+    // call (GenieOrchestrator's eager background-reset pattern), so at INFO
+    // it was pure per-request bookkeeping noise with no diagnostic value
+    // beyond confirming the call happened. Failures are still logged at WARN
+    // below.
+    LOG_DEBUG("[GenIEBackend] Initiating background KV reset for model: "
              << current_model_id_
              << (is_vlm ? " (VLM)" : " (LLM)")
              << " session=" << session_id);

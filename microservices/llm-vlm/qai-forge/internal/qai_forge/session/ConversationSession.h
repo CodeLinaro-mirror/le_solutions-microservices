@@ -36,9 +36,13 @@ inline std::string sessionGetStringOrDefault(const json& obj,
 // ─────────────────────────────────────────────────────────────────────────────
 // ConversationSession — Pure Data Record
 //
-// This is a transient data object used while preparing a Genie request and
-// running post-turn processing. Persistent runtime memory lives in the private
-// ConversationMemoryCoordinator tree.
+// This is a transient data object, reconstructed fresh on every request from
+// the caller-supplied transcript plus the private GenieMemoryState rehydrated
+// out of ConversationMemoryCoordinator, used while preparing a Genie request
+// and running post-turn processing. Persistent runtime memory lives in the
+// private ConversationMemoryCoordinator tree — this object is never itself
+// persisted between requests; GenieOrchestrator::createJob() and
+// ::executePostTurn() each construct their own instance per call.
 //
 // Key design decisions:
 //   - session_id identifies the active backend execution.
@@ -54,8 +58,6 @@ inline std::string sessionGetStringOrDefault(const json& obj,
 
 struct ConversationSession {
     std::string session_id;
-    std::string user_id;
-    std::string current_model_id;
 
     // Shared OpenAI-format message history
     std::vector<json> messages;
@@ -78,18 +80,14 @@ struct ConversationSession {
     // Updated by GenieOrchestrator::postTurnProcessing() after each eviction.
     std::unordered_map<std::string, std::string> facts;
 
-    // ── Prompt accounting ─────────────────────────────────────────────────────
-    int system_prompt_tokens = 0;
-    std::string system_prompt_content;
-    int total_cumulative_tokens = 0;
-
-    // Timestamps
-    std::chrono::system_clock::time_point created_at;
+    // Timestamp of the most recent message append. Used only to compute
+    // wall-clock recency within this transient object's own lifetime; no
+    // code currently reads this field, but it's retained since addMessage()
+    // updates it as a natural side effect of appending.
     std::chrono::system_clock::time_point last_activity;
 
-    explicit ConversationSession(const std::string& id, const std::string& uid = "default_user")
-        : session_id(id), user_id(uid),
-          created_at(std::chrono::system_clock::now()),
+    explicit ConversationSession(const std::string& id)
+        : session_id(id),
           last_activity(std::chrono::system_clock::now()) {}
 
     // Add a message to history. Returns the index of the added message.
@@ -103,28 +101,6 @@ struct ConversationSession {
         messages.push_back(std::move(message));
         last_activity = std::chrono::system_clock::now();
         return messages.size() - 1;
-    }
-
-    /**
-     * @brief Get messages suitable for sending to the model.
-     *
-     * Strips private "_*" keys (e.g. "_thinking_content").
-     * Returns ALL messages (including evicted ones).
-     * Use getHistoryMessages() for the history queue slot.
-     */
-    std::vector<json> getCleanMessages() const {
-        std::vector<json> clean;
-        clean.reserve(messages.size());
-        for (const auto& msg : messages) {
-            json clean_msg = json::object();
-            for (const auto& [k, v] : msg.items()) {
-                if (k.empty() || k[0] != '_') {
-                    clean_msg[k] = v;
-                }
-            }
-            clean.push_back(clean_msg);
-        }
-        return clean;
     }
 
     /**
@@ -150,23 +126,6 @@ struct ConversationSession {
             result.push_back(std::move(clean_msg));
         }
         return result;
-    }
-
-    /**
-     * @brief Estimate total tokens in the active history queue.
-     *
-     * Counts tokens in messages[evicted_message_count..end], excluding system
-     * messages. Uses a simple heuristic: 1 token ≈ 4 characters.
-     */
-    int estimateHistoryTokens() const {
-        int total = 0;
-        for (size_t i = evicted_message_count; i < messages.size(); ++i) {
-            const auto& msg = messages[i];
-            if (sessionGetStringOrDefault(msg, "role", "") == "system") continue;
-            std::string content = sessionGetStringOrDefault(msg, "content", "");
-            total += static_cast<int>(content.size() / 4) + 4;  // +4 per-message overhead
-        }
-        return total;
     }
 
     /**
@@ -204,39 +163,5 @@ struct ConversationSession {
         while (facts.size() > max_facts) {
             facts.erase(facts.begin());
         }
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DraftTurn — Unit of Work for atomic session state updates
-//
-// New messages are staged here before inference. If inference succeeds,
-// commit() atomically appends them to the session. If it fails, the draft
-// is simply discarded — no messy rollback logic needed.
-// ─────────────────────────────────────────────────────────────────────────────
-struct DraftTurn {
-    std::string session_id;
-    std::string model_id;
-    std::vector<json> new_messages;     // Messages to be committed on success
-    std::vector<size_t> staged_indices; // Indices in session.messages after commit
-
-    bool committed = false;
-
-    explicit DraftTurn(const std::string& sid, const std::string& mid)
-        : session_id(sid), model_id(mid) {}
-
-    void addMessage(const json& msg) {
-        new_messages.push_back(msg);
-    }
-
-    // Commit staged messages to the session. Returns indices of committed messages.
-    std::vector<size_t> commit(ConversationSession& session) {
-        staged_indices.clear();
-        for (const auto& msg : new_messages) {
-            staged_indices.push_back(session.addMessage(msg));
-        }
-        session.current_model_id = model_id;
-        committed = true;
-        return staged_indices;
     }
 };
