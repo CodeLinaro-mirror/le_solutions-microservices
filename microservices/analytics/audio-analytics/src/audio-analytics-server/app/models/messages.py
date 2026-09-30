@@ -29,6 +29,7 @@ class TranscriptionsCreateRequest:
     model: str = "whisper-1"                           # ASR model to use
     language: Optional[str] = None                     # e.g., "en", "es"
     stream: bool = False                               # Streaming output?
+    translate: bool = False                            # If True, ASR engine translates recognized speech to English
     parameters: Optional[Union[str, List[Dict[str, Any]]]] = None  # Custom parameters (e.g., sampling_rate, channels)
     channels: Optional[int] = None                     # Number of audio channels (1=mono, 2=stereo)
     file: Optional[str] = None                         # Base64 encoded audio (or null for live stream)
@@ -52,6 +53,9 @@ class TranscriptionsCreateRequest:
         # Coerce keep_alive to bool — form fields arrive as strings "true"/"false"
         if 'keep_alive' in filtered_data and not isinstance(filtered_data['keep_alive'], bool):
             filtered_data['keep_alive'] = str(filtered_data['keep_alive']).lower() in ('true', '1', 'yes')
+        # Coerce translate to bool — form fields arrive as strings "true"/"false"
+        if 'translate' in filtered_data and not isinstance(filtered_data['translate'], bool):
+            filtered_data['translate'] = str(filtered_data['translate']).lower() in ('true', '1', 'yes')
         return cls(**filtered_data)
 
 

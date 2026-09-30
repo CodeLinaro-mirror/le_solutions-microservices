@@ -1018,6 +1018,13 @@ components:
           default: false
           description: "If true, results will be streamed via WebSocket. If false, complete transcription returned in response."
           example: false
+        translate:
+          oneOf:
+            - type: string
+            - type: boolean
+          default: false
+          description: "Optional. If true, the ASR engine translates the recognized speech to English instead of transcribing in the source language."
+          example: false
         channels:
           oneOf:
             - type: integer

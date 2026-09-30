@@ -565,10 +565,11 @@ class ASRService(BaseService):
                 'ASR',
                 self.cleanup_resources_for_service_switch
             )
+            
             self.logger.info(
                 f'Transcription request: model={request.model}, '
                 f'stream={request.stream}, has_file={request.file is not None}, '
-                f'filename={request.filename}, language={request.language}, keep_alive={request.keep_alive}')
+                f'filename={request.filename}, language={request.language}, translate={request.translate}, keep_alive={request.keep_alive}')
 
             # Extract optional parameters
             sampling_rate = 16000  # Default to 16kHz
@@ -810,7 +811,7 @@ class ASRService(BaseService):
                             f"detected rate={detected_rate}Hz, channels={detected_channels}, bits={bits_per_sample}"
                         )
                         
-                                                # Always resample to 16000 Hz mono — the ASR engine requires it.
+                        # Always resample to 16000 Hz mono — the ASR engine requires it.
                         # sampling_rate/channels describe what the client sent; the
                         # detected_rate/detected_channels come from the WAV header.
                         # Use whichever source is more reliable: if the WAV header
@@ -967,11 +968,11 @@ class ASRService(BaseService):
                                     f"({'custom VAD' if vad_value is not None else 'env default'})"
                                 )
                             
-                                logger.info(f"asr-service process_file_transcription language={language}, continuous={continuous_mode}, partial_transcriptions={request.stream}")
+                                logger.info(f"asr-service process_file_transcription language={language}, continuous={continuous_mode}, partial_transcriptions={request.stream}, translate={request.translate}")
                                 
                                 self.whisper_wrapper = self.asr_engine.WhisperWrapper(
                                     language=language,
-                                    translation_enabled=False,
+                                    translation_enabled=request.translate,
                                     continuous=continuous_mode,
                                     partial_transcriptions=request.stream,
                                     on_transcription=TranscriptionCallback(capture_transcription),
@@ -1015,6 +1016,13 @@ class ASRService(BaseService):
                                 self.whisper_wrapper.lib.whisper_set_language_code(
                                     self.whisper_wrapper.handle, language
                                 )
+
+                                # Update translation setting for this request
+                                self.logger.info(f"Updating translation_enabled to: {request.translate}")
+                                self.whisper_wrapper.lib.whisper_set_translation_enabled(
+                                    self.whisper_wrapper.handle, request.translate
+                                )
+                                self.whisper_wrapper.translation_enabled = request.translate
 
                                 # Update VAD setting if provided
                                 vad_value = getattr(request, 'vad_value', None)
@@ -1541,12 +1549,12 @@ class ASRService(BaseService):
                             f"({'custom VAD' if vad_value is not None else 'env default'})"
                         )
                         
-                        logger.info(f"asr-service streaming session language={language}, continuous={continuous_mode}, partial_transcriptions=True")
+                        logger.info(f"asr-service streaming session language={language}, continuous={continuous_mode}, partial_transcriptions=True, translate={request.translate}")
                         
                         # For streaming sessions, always enable partial transcriptions
                         self.whisper_wrapper = self.asr_engine.WhisperWrapper(
                             language=language,
-                            translation_enabled=False,
+                            translation_enabled=request.translate,
                             continuous=continuous_mode,
                             partial_transcriptions=True,  # Always True for streaming sessions
                             on_transcription=TranscriptionCallback(capture_transcription),
@@ -1589,6 +1597,13 @@ class ASRService(BaseService):
                         self.whisper_wrapper.lib.whisper_set_language_code(
                             self.whisper_wrapper.handle, language
                         )
+
+                        # Update translation setting for this request
+                        self.logger.info(f"Updating translation_enabled to: {request.translate}")
+                        self.whisper_wrapper.lib.whisper_set_translation_enabled(
+                            self.whisper_wrapper.handle, request.translate
+                        )
+                        self.whisper_wrapper.translation_enabled = request.translate
 
                         # Update VAD setting if provided
                         vad_value = getattr(request, 'vad_value', None)
@@ -1976,12 +1991,14 @@ class ASRService(BaseService):
 
     async def handle_session_audio(self, message: str):
         """Handle incoming audio chunks for live streaming."""
+        self.logger.info(f'[audio] handle_session_audio ENTRY, msg_len={len(message) if message else 0}')
         try:
             # Check if the message is a JSON string or binary data
             if message.startswith('{'): 
                 # JSON message format
                 audio_msg = TranscriptionsSessionAudio.from_json(message)
                 session_id = audio_msg.session_id
+                self.logger.info(f'[audio] parsed JSON, session_id={session_id}')
                 
                 self.logger.debug(f'Received session audio message: session_id="{session_id}", data_length={len(audio_msg.data) if audio_msg.data else 0}')
                 
@@ -2029,15 +2046,15 @@ class ASRService(BaseService):
                     # The message itself is the binary audio data
                     audio_bytes = message.encode('latin1') if isinstance(message, str) else message
 
-                        # Store chunk
+            # Store chunk
             session = self.active_sessions[session_id]
             session['audio_chunks'].append(audio_bytes)
             # Reset inactivity timer
             session['last_audio_time'] = time.time()
             
-            self.logger.debug(
+            self.logger.info(
                 f'Received audio chunk for session {session_id}: '
-                f'{len(audio_bytes)} bytes'
+                f'{len(audio_bytes)} bytes, last_audio_time updated'
             )
             
             # Process audio chunk

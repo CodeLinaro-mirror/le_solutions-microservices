@@ -43,7 +43,7 @@ const config = {
     asrDevices: process.env.ASR_DEVICES || 'asr.devices',
 
     // KPIs Channel
-    audioKPI: 'audio.kpi',
+    audioKPI: process.env.AUDIO_KPI || 'audio.kpi',
 
     // Upload Path
     uploadPath: process.env.uploadPath || '/app/uploads/',

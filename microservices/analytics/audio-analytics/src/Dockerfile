@@ -1,4 +1,4 @@
-#  Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 # Multi-stage Dockerfile for Audio Analytics
@@ -180,8 +180,8 @@ FROM base AS server-builder
 
 ARG INSTALL_NATIVE_LIBS
 ARG INSTALL_PULSE_AUDIO=false
-ARG VERSION_TAG=1.0.3
-ARG ARTIFACTORY_BASE_URL=https://artifacts.codelinaro.org/artifactory/clo-561-iot-solutions-microservices-test-generic/audio-analytics
+ARG VERSION_TAG=1.0.5
+ARG ARTIFACTORY_BASE_URL=https://artifacts.codelinaro.org/artifactory/iot-solutions-microservices-components/audio-analytics
 ARG JFROG_USERNAME
 ARG JFROG_PASSWORD
 
@@ -460,8 +460,28 @@ set -e
 chmod 666 /dev/fastrpc* 2>/dev/null || true
 chmod -R 777 /var/log/supervisor 2>/dev/null || true
 chmod 666 /proc/1/fd/1 /proc/1/fd/2 2>/dev/null || true
-mkdir -p /usr/share/qcom/conf.d
-cp /etc/fastrpc/hexagon-dsp-binaries.yaml /usr/share/qcom/conf.d/audio-analytics-hexagon-dsp-binaries.yaml
+umask 022
+
+HOST_QCOM="${HOST_QCOM:-/run/host-qcom}"
+QCOM="${QCOM:-/usr/share/qcom}"
+
+mkdir -p "$QCOM/conf.d"
+
+if [ -d "$HOST_QCOM" ]; then
+  for entry in "$HOST_QCOM"/*; do
+    [ -e "$entry" ] || continue
+    name=$(basename "$entry")
+    [ "$name" = "conf.d" ] && continue
+    ln -sfn "$entry" "$QCOM/$name"
+  done
+  # conf.d entries must be regular files: fastrpc skips symlinks
+  if [ -d "$HOST_QCOM/conf.d" ]; then
+    find "$HOST_QCOM/conf.d" -maxdepth 1 -type f \
+      \( -name '*.yaml' -o -name '*.yml' \) -exec cp -f {} "$QCOM/conf.d/" \;
+  fi
+fi
+
+cp -f /etc/fastrpc/hexagon-dsp-binaries.yaml "$QCOM/conf.d/00-audio-analytics-dsp-binaries.yaml"
 export DSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 export ADSP_LIBRARY_PATH=/usr/lib/rfsa/adsp
 export CDSP_LIBRARY_PATH=/usr/lib/rfsa/adsp

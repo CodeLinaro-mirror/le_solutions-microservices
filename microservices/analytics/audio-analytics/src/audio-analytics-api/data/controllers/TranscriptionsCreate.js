@@ -17,6 +17,9 @@ module.exports.createTranscription = async function createTranscription (req, re
         const model = body.model || 'whisper-1';
         const language = body.language || null;
         const stream = body.stream === 'true' || body.stream === true || false;
+        const translate = body.translate === 'true' || body.translate === true || false;
+        // Normalize on the body so the server always sees a boolean
+        body.translate = translate;
         const parameters = body.parameters
             ? (typeof body.parameters === 'string' ? JSON.parse(body.parameters) : body.parameters)
             : [];
@@ -24,6 +27,7 @@ module.exports.createTranscription = async function createTranscription (req, re
         console.log('   Model:', model);
         console.log('   Language:', language);
         console.log('   Stream:', stream);
+        console.log('   Translate:', translate);
 
         // Clear the previous transcription messages if any
         messages.clearQueue();

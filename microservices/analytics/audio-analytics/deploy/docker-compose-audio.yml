@@ -5,7 +5,7 @@
 
 services:
   audio-analytics:
-    image: artifacts.codelinaro.org/iot-solutions-microservices/audio-analytics:1.0.2
+    image: artifacts.codelinaro.org/iot-solutions-microservices/audio-analytics:1.0.5
     platform: linux/arm64
     container_name: audio-analytics
     hostname: audio-analytics
@@ -40,12 +40,11 @@ services:
       # Mount /run/user for additional runtime files
       - /run/user/${UID:-1000}:/run/user/${UID:-1000}:rw
       - /sys/firmware/devicetree/base/model:/run/device-model
-      - /usr/share/qcom:/usr/share/qcom
+      - ${QCOM:-/usr/share/qcom}:${HOST_QCOM:-/run/host-qcom}:ro
     # Use tmpfs for uploads to ensure proper permissions
     tmpfs:
       - /app/uploads:rw,size=500m,mode=777
       - /tmp/audio-cache:rw,size=2g,mode=777
-      - /usr/share/qcom/conf.d:rw,size=2m,mode=777
 
 
 # persistent volumes for cache and IPC socket across container restarts
