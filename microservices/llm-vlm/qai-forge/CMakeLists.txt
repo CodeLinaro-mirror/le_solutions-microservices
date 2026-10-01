@@ -45,6 +45,8 @@ option(QAI_FORGE_BUILD_LITERT_LM "Build LiteRT-LM generative worker" OFF)
 option(QAI_FORGE_BUILD_LLAMACPP  "Build llama.cpp backend support" OFF)
 option(QAI_FORGE_INSTALL         "Install targets and CMake package config" ON)
 option(QAI_FORGE_BUILD_TOPOLOGY_PROBE "Build the standalone topology-probe CLI" ON)
+option(QAI_FORGE_BUILD_ADAPTER_QWEN  "Build Qwen model-adapter plugin (2.5+3+vision)" ON)
+option(QAI_FORGE_BUILD_ADAPTER_GEMMA "Build Gemma model-adapter plugin" ON)
 
 # ── Required dependencies ─────────────────────────────────────────────────────
 find_package(Threads REQUIRED)
@@ -263,16 +265,24 @@ set(QAI_FORGE_SOURCES
     src/c_api/qai_forge_c_api.cpp
 
     # Adapters (Layer 2 — Model Adapter Pattern)
+    # Qwen25Adapter.cpp/Qwen3Adapter.cpp/ToolCallJsonUtils.cpp/
+    # QwenVisionPreprocessAdapter.cpp (qaiforge_plugin_adapter_qwen) and
+    # GemmaAdapter.cpp (qaiforge_plugin_adapter_gemma) have moved into their
+    # own plugin targets (see the "Runtime plugins" section below) —
+    # ModelAdapterFactory/VisionPreprocessAdapterFactory now resolve
+    # adapters via PluginRegistry instead of a compile-time type list.
+    # DefaultAdapter.h (header-only) stays in core as the always-available
+    # fallback.
     src/adapters/ModelAdapterFactory.cpp
-    src/adapters/Qwen25Adapter.cpp
-    src/adapters/Qwen3Adapter.cpp
-    src/adapters/GemmaAdapter.cpp
+
+    # Shared helper used by multiple adapter plugins (Qwen25Adapter,
+    # Qwen3Adapter, GemmaAdapter) — kept in core so each plugin resolves it
+    # via the qai_forge.so link rather than depending on another plugin.
     src/adapters/ToolCallJsonUtils.cpp
 
     # Vision Preprocessing Adapters (Layer 2 — VLM Patch Ordering)
     src/adapters/VisionPreprocessAdapterFactory.cpp
     src/adapters/DefaultVisionPreprocessAdapter.cpp
-    src/adapters/QwenVisionPreprocessAdapter.cpp
 
     # Managers (Layer 2)
     src/managers/MetricsManager.cpp
@@ -326,11 +336,11 @@ set(QAI_FORGE_SOURCES
     src/utils/UseLock.cpp
 
     # Backend abstraction (Layer 3 — IGenerativeBackend implementations)
-    # BackendFactory now delegates entirely to RuntimePluginRegistry — it no
+    # BackendFactory now delegates entirely to PluginRegistry — it no
     # longer needs compile-time knowledge of any concrete backend type.
     src/backend/BackendFactory.cpp
-    src/backend/RuntimePluginRegistry.cpp
-    src/backend/PluginLoader.cpp
+    src/plugin/PluginRegistry.cpp
+    src/plugin/PluginLoader.cpp
 
     # Predictive AI backend shared infra (Layer 3) — PredictiveSharedMemory
     # and the PredictiveWorkerChannel/ProcessPool below are used by all
@@ -615,7 +625,7 @@ set_target_properties(qai_forge PROPERTIES
 #
 # Each plugin is a standalone shared library exporting one extern "C" entry
 # point (qai_forge_register_plugin) that registers its runtime(s) against
-# RuntimePluginRegistry. PluginLoader (core qai_forge.so) discovers and
+# PluginRegistry. PluginLoader (core qai_forge.so) discovers and
 # dlopen()'s every *.so in the plugin directory at process startup —
 # BackendFactory never needs compile-time knowledge of these types.
 #
@@ -824,6 +834,71 @@ if(QAI_FORGE_BUILD_LITERT)
     endif()
 
     message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_litert")
+endif()
+
+# ── qaiforge_plugin_adapter_qwen ──────────────────────────────────────────────
+# Model-adapter plugin: Qwen2.5/Qwen3 tool-calling adapters + Qwen vision
+# preprocessing adapter. Registers against PluginRegistry's model/vision
+# adapter extension points (the public, out-of-tree Level-B ABI) rather
+# than being wired into BackendFactory. No native SDK dependency.
+if(QAI_FORGE_BUILD_ADAPTER_QWEN)
+    add_library(qaiforge_plugin_adapter_qwen SHARED
+        src/adapters/Qwen25Adapter.cpp
+        src/adapters/Qwen3Adapter.cpp
+        src/adapters/QwenVisionPreprocessAdapter.cpp
+        src/adapters/plugins/QwenAdapterPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_adapter_qwen PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+    )
+    target_link_libraries(qaiforge_plugin_adapter_qwen PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+    )
+    set_target_properties(qaiforge_plugin_adapter_qwen PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_adapter_qwen"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_adapter_qwen
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_adapter_qwen")
+endif()
+
+# ── qaiforge_plugin_adapter_gemma ─────────────────────────────────────────────
+# Model-adapter plugin: Gemma tool-calling adapter (LiteRT-LM FC grammar).
+if(QAI_FORGE_BUILD_ADAPTER_GEMMA)
+    add_library(qaiforge_plugin_adapter_gemma SHARED
+        src/adapters/GemmaAdapter.cpp
+        src/adapters/plugins/GemmaAdapterPluginEntry.cpp
+    )
+    target_include_directories(qaiforge_plugin_adapter_gemma PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/internal
+    )
+    target_link_libraries(qaiforge_plugin_adapter_gemma PRIVATE
+        qai_forge
+        nlohmann_json::nlohmann_json
+    )
+    set_target_properties(qaiforge_plugin_adapter_gemma PROPERTIES
+        OUTPUT_NAME "qaiforge_plugin_adapter_gemma"
+        BUILD_RPATH "$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN/.."
+    )
+
+    if(QAI_FORGE_INSTALL)
+        install(TARGETS qaiforge_plugin_adapter_gemma
+            LIBRARY DESTINATION ${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}
+        )
+    endif()
+
+    message(STATUS "[qai-forge] Built plugin: qaiforge_plugin_adapter_gemma")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────

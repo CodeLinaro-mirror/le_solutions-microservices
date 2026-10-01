@@ -6,7 +6,7 @@
 //
 // Routes the "runtime" field from metadata.json to the correct
 // IGenerativeBackend/IInferenceBackend implementation. All routing now
-// delegates to RuntimePluginRegistry, which is populated at process startup
+// delegates to PluginRegistry, which is populated at process startup
 // by PluginLoader (dlopen-based discovery of qaiforge_plugin_*.so files) —
 // BackendFactory itself no longer needs to know which concrete backend
 // types exist or maintain a compile-time #ifdef ladder per runtime.
@@ -18,7 +18,7 @@
 
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/InternalDTOs.h"
-#include "qai_forge/backend/RuntimePluginRegistry.h"
+#include "qai_forge/plugin/PluginRegistry.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/utils/Logger.h"
@@ -30,7 +30,7 @@
 std::unique_ptr<IGenerativeBackend>
 BackendFactory::createGenerativeBackend(const std::string& runtime) {
     auto backend =
-        RuntimePluginRegistry::instance().createGenerativeBackend(runtime);
+        PluginRegistry::instance().createGenerativeBackend(runtime);
     if (!backend) {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
@@ -57,7 +57,7 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
 std::shared_ptr<IGenerativeOrchestrator>
 BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
     auto orchestrator =
-        RuntimePluginRegistry::instance().createGenerativeOrchestrator(runtime);
+        PluginRegistry::instance().createGenerativeOrchestrator(runtime);
     if (!orchestrator) {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
@@ -107,7 +107,7 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
 std::unique_ptr<IInferenceBackend>
 BackendFactory::createPredictiveBackend(const std::string& runtime) {
     auto backend =
-        RuntimePluginRegistry::instance().createPredictiveBackend(runtime);
+        PluginRegistry::instance().createPredictiveBackend(runtime);
     if (!backend) {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
@@ -144,10 +144,10 @@ BackendFactory::createPredictiveOrchestrator() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 nlohmann::ordered_json BackendFactory::supportedRuntimes() {
-    // Reflects the RuntimePluginRegistry's actual current contents — i.e.
+    // Reflects the PluginRegistry's actual current contents — i.e.
     // what plugin .so's were successfully dlopen'd and registered at
     // startup, not a compile-time macro echo. Sorted for stable output.
-    auto& registry = RuntimePluginRegistry::instance();
+    auto& registry = PluginRegistry::instance();
 
     std::vector<std::string> generative_runtimes =
         registry.registeredGenerativeRuntimes();

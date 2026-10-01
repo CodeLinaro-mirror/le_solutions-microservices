@@ -7,12 +7,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/QNNBackend.h"
-#include "qai_forge/backend/RuntimePluginRegistry.h"
+#include "qai_forge/plugin/PluginRegistry.h"
 
 #include <memory>
 
-extern "C" void qai_forge_register_plugin(RuntimePluginRegistry& registry) {
-    RuntimePluginRegistry::PredictiveEntry entry;
+extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
+    PluginRegistry::PredictiveEntry entry;
     entry.create_backend = []() -> std::unique_ptr<IInferenceBackend> {
         return std::make_unique<QNNBackend>();
     };

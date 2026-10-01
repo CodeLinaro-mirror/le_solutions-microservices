@@ -7,13 +7,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/backend/LiteRTLMBackend.h"
-#include "qai_forge/backend/RuntimePluginRegistry.h"
+#include "qai_forge/plugin/PluginRegistry.h"
 #include "qai_forge/orchestration/LiteRTLMOrchestrator.h"
 
 #include <memory>
 
-extern "C" void qai_forge_register_plugin(RuntimePluginRegistry& registry) {
-    RuntimePluginRegistry::GenerativeEntry entry;
+extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
+    PluginRegistry::GenerativeEntry entry;
     entry.create_backend = []() -> std::unique_ptr<IGenerativeBackend> {
         return std::make_unique<LiteRTLMBackend>();
     };

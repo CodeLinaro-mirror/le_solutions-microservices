@@ -25,7 +25,13 @@ struct VisionPreprocessConfig;
 //   L = (W / patch_size) * (H / patch_size)   — number of patches
 //   D = C * temporal_patch_size * patch_size²  — floats per patch
 //
-// Resolved by VisionPreprocessAdapterFactory::getAdapter(model_id).
+// Resolved by PluginRegistry::resolveVisionAdapter(model_id) (via
+// VisionPreprocessAdapterFactory::getAdapter(model_id)).
+//
+// This header is PUBLIC — a third-party vision-preprocessing adapter plugin
+// implements this interface and registers against PluginRegistry (see
+// qai_forge/plugin/PluginRegistry.h) with no access to qai-forge's source
+// tree required.
 // ─────────────────────────────────────────────────────────────────────────────
 class VisionPreprocessAdapter {
 public:

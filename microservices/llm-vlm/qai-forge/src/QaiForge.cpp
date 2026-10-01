@@ -4,7 +4,7 @@
 #include "qai_forge/QaiForge.h"
 
 #include "qai_forge/backend/BackendFactory.h"
-#include "qai_forge/backend/PluginLoader.h"
+#include "qai_forge/plugin/PluginLoader.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/InferenceScheduler.h"
@@ -458,7 +458,7 @@ struct QaiForge::Impl {
 
         // Discover and dlopen() every qaiforge_plugin_*.so in the plugin
         // directory (QAI_FORGE_PLUGIN_DIR env var, or the installed default)
-        // before anything else runs, so BackendFactory/RuntimePluginRegistry
+        // before anything else runs, so BackendFactory/PluginRegistry
         // are fully populated before the scheduler starts accepting jobs.
         PluginLoader::loadAll();
         LOG_INFO("[QaiForge] Available runtimes: "
