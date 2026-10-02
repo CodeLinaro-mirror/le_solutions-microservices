@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
@@ -20,8 +21,6 @@
 #include <string>
 #include <thread>
 
-class IInferenceBackend;
-
 namespace scheduler {
 
 // Owns one predictive model's bounded FIFO and backend lifecycle. One executor
@@ -30,7 +29,7 @@ class PredictiveModelRuntime {
 public:
     PredictiveModelRuntime(
         std::string model_id,
-        std::unique_ptr<IInferenceBackend> backend,
+        std::unique_ptr<PredictiveBackendAdapter> backend,
         std::shared_ptr<PredictiveOrchestrator> orchestrator,
         std::shared_ptr<ModelLoadCoordinator> load_coordinator,
         long model_memory_mb,
@@ -46,7 +45,7 @@ public:
     void start();
     bool enqueue(PredictiveJobPtr job, size_t max_queue_depth);
 
-    // IInferenceBackend cannot interrupt a running infer(), so force=true still
+    // PredictiveBackendAdapter cannot interrupt a running infer(), so force=true still
     // joins the executor and waits for in-flight work before backend teardown.
     void stop(bool force = false);
 
@@ -77,7 +76,7 @@ private:
 
     const std::string model_id_;
     const qai_forge::execution::RuntimeId runtime_id_;
-    std::unique_ptr<IInferenceBackend> backend_;
+    std::unique_ptr<PredictiveBackendAdapter> backend_;
     std::shared_ptr<PredictiveOrchestrator> orchestrator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     std::shared_ptr<PlacementContext> placement_;

@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -25,26 +29,47 @@
 // qai-forge's source or build system required.
 //
 // Backend registration (registerGenerative/registerPredictive) remains
-// internal-only for now — IGenerativeOrchestrator is not yet cleanly
-// separable from internal scheduler state, so a public backend ABI needs
-// its own follow-up design.
+// internal-only for now — only the orchestrator half of a generative
+// runtime plugin has a public ABI today (qai_forge::IGenerativeOrchestrator,
+// wrapped internally by OrchestratorAdapter before being handed to the
+// scheduler). Promoting registerGenerative/registerPredictive themselves to
+// a public ABI — so a third party can register an entirely new backend
+// without any access to qai-forge's internal headers at all — is an
+// explicit follow-up phase.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class IGenerativeBackend;
-class IInferenceBackend;
-class IGenerativeOrchestrator;
+class BackendAdapter;
+class PredictiveBackendAdapter;
+class OrchestratorAdapter;
 class ModelAdapter;
 class VisionPreprocessAdapter;
 
 class PluginRegistry {
 public:
     struct GenerativeEntry {
-        std::function<std::unique_ptr<IGenerativeBackend>()> create_backend;
-        std::function<std::shared_ptr<IGenerativeOrchestrator>()> create_orchestrator;
+        // Public ABI: plugin entry points construct and return a
+        // qai_forge::IGenerativeBackend — PluginRegistry wraps it in an
+        // internal BackendAdapter before returning it from
+        // createGenerativeBackend() below, so scheduler code continues to
+        // see only the internal BackendAdapter type.
+        std::function<std::unique_ptr<qai_forge::IGenerativeBackend>()>
+            create_backend;
+        // Public ABI: plugin entry points construct and return a
+        // qai_forge::IGenerativeOrchestrator — PluginRegistry wraps it in
+        // an internal OrchestratorAdapter before returning it from
+        // createGenerativeOrchestrator() below, so scheduler code
+        // continues to see only the private IGenerativeOrchestrator type.
+        std::function<std::shared_ptr<qai_forge::IGenerativeOrchestrator>()>
+            create_orchestrator;
     };
 
     struct PredictiveEntry {
-        std::function<std::unique_ptr<IInferenceBackend>()> create_backend;
+        // Public ABI: plugin entry points construct and return a
+        // qai_forge::IInferenceBackend — PluginRegistry wraps it in an
+        // internal PredictiveBackendAdapter before returning it from
+        // createPredictiveBackend() below.
+        std::function<std::unique_ptr<qai_forge::IInferenceBackend>()>
+            create_backend;
     };
 
     // `matches` tests a model_id; `priority` breaks ties when multiple
@@ -70,11 +95,11 @@ public:
     void registerGenerative(const std::string& runtime, GenerativeEntry entry);
     void registerPredictive(const std::string& runtime, PredictiveEntry entry);
 
-    std::unique_ptr<IGenerativeBackend> createGenerativeBackend(
+    std::unique_ptr<BackendAdapter> createGenerativeBackend(
         const std::string& runtime) const;
-    std::shared_ptr<IGenerativeOrchestrator> createGenerativeOrchestrator(
+    std::shared_ptr<OrchestratorAdapter> createGenerativeOrchestrator(
         const std::string& runtime) const;
-    std::unique_ptr<IInferenceBackend> createPredictiveBackend(
+    std::unique_ptr<PredictiveBackendAdapter> createPredictiveBackend(
         const std::string& runtime) const;
 
     std::vector<std::string> registeredGenerativeRuntimes() const;

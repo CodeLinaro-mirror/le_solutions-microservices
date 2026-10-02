@@ -3,8 +3,8 @@
 
 #include "qai_forge/scheduler/ModelRuntime.h"
 
-#include "qai_forge/backend/IGenerativeBackend.h"
-#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/backend/BackendAdapter.h"
+#include "qai_forge/orchestration/OrchestratorAdapter.h"
 #include "qai_forge/scheduler/PostTurnWorker.h"
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
@@ -88,8 +88,8 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
 } // namespace
 
 ModelRuntime::ModelRuntime(std::string model_id,
-                     std::unique_ptr<IGenerativeBackend> backend,
-                     std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+                     std::unique_ptr<BackendAdapter> backend,
+                     std::shared_ptr<OrchestratorAdapter> orchestrator,
                      std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                      std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                      long model_memory_mb,

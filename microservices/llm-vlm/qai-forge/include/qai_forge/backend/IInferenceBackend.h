@@ -5,16 +5,34 @@
 
 #include "qai_forge/backend/PredictiveSharedMemory.h"
 #include "qai_forge/dto/TensorDTOs.h"
-#include "qai_forge/execution/ExecutionPlan.h"
-#include <stdexcept>
 #include <string>
 
+namespace qai_forge {
+
 // ─────────────────────────────────────────────────────────────────────────────
-// IInferenceBackend — Layer 3 interface for Predictive AI inference
+// qai_forge::IInferenceBackend — public, out-of-tree ("Level B") Predictive
+// AI backend ABI.
 //
-// Implemented by:
+// This is the contract a third party implements to plug a new predictive
+// (tensor-in/tensor-out) inference backend into qai-forge without access to
+// qai-forge's source tree or internal scheduler plumbing.
+//
+// NOTE on history: this interface was promoted from an internal,
+// global-namespace ::IInferenceBackend (internal/qai_forge/backend/
+// IInferenceBackend.h, now deleted) — same contract, minus the
+// placement-aware initialize(RuntimeLaunchRequest) overload, which remains
+// an internal-only concern (see internal/qai_forge/backend/
+// IPlacementAwarePredictiveBackend.h — the device-placement subsystem is a
+// separate, not-yet-public ABI). internal/qai_forge/backend/
+// PredictiveBackendAdapter.h wraps any registered qai_forge::IInferenceBackend
+// and adds back placement-aware initialization via dynamic_cast to that
+// internal mixin, with a graceful fallback to initialize(model_id, {}) for
+// backends (including out-of-tree third-party ones) that don't implement it.
+//
+// Implemented internally (see internal/qai_forge/backend/) by:
 //   LiteRTBackend — wraps TFLite C++ API (TfLiteInterpreter)
 //   QNNBackend    — wraps QNN SDK C++ API
+//   SNPEBackend   — wraps SNPE SDK C++ API
 //
 // Design invariants:
 //   - PredictiveOrchestrator ONLY calls methods on this interface.
@@ -22,18 +40,16 @@
 //   - The backend runs in a subprocess (same fault isolation as GenIEBackend).
 //   - infer() is blocking — returns when all outputs are ready.
 //
-// Contrast with IGenerativeBackend:
-//   - IGenerativeBackend: text in → streaming tokens out (stateful, sessions)
+// Contrast with qai_forge::IGenerativeBackend:
+//   - qai_forge::IGenerativeBackend: text in → streaming tokens out (stateful, sessions)
 //   - IInferenceBackend:  tensors in → tensors out (stateless, no sessions)
-//
-// See docs/unified-inference-service.md §5 for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class IInferenceBackend {
 public:
     virtual ~IInferenceBackend() = default;
 
-    // Human-readable name for logging ("LiteRT", "QNN")
+    // Human-readable name for logging ("LiteRT", "QNN", "SNPE")
     virtual std::string name() const = 0;
 
     /**
@@ -46,22 +62,6 @@ public:
      */
     virtual void initialize(const std::string& model_id,
                             const std::string& model_file) = 0;
-
-    /**
-     * Initialize this runtime through the provider-neutral placement
-     * boundary. Concrete adapters translate the execution plan into
-     * provider-specific init options. Default falls back to the
-     * model/file overload when no placement plan is present.
-     */
-    virtual void initialize(
-        const qai_forge::execution::RuntimeLaunchRequest& request) {
-        if (!request.execution_plan.components.empty() ||
-            !request.execution_plan.native_options.empty()) {
-            throw std::runtime_error(
-                "Backend does not support placement-aware initialize()");
-        }
-        initialize(request.model_id, {});
-    }
 
     /**
      * Run inference from non-owning tensor segments. Implementations write the
@@ -89,3 +89,5 @@ public:
      */
     virtual void shutdown() = 0;
 };
+
+} // namespace qai_forge

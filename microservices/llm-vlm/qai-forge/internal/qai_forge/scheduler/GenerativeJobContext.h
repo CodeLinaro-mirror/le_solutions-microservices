@@ -29,6 +29,14 @@ enum class JobKind {
     INTERNAL_SUMMARIZATION,
 };
 
+// GenerationConfig is retained here for backward-source-compatibility with
+// any code that still references scheduler::GenerationConfig — the
+// individual orchestrator plugins now define their own private prepared-
+// state structs (see qai_forge::PreparedGenerationState) that embed
+// equivalent generation-parameter fields directly, since the old closed
+// std::variant<GeniePreparedRequest, LlamaCppPreparedRequest,
+// LiteRTLMPreparedRequest> has been removed in favor of the public,
+// per-orchestrator-opaque IGenerativeOrchestrator::prepare() contract.
 struct GenerationConfig {
     int max_tokens = 512;
     float temperature = 1.0f;
@@ -46,47 +54,6 @@ struct GenerationConfig {
 struct PreparedVisionInputs {
     std::vector<std::vector<uint8_t>> buffers;
 };
-
-struct GeniePreparedRequest {
-    std::string final_prompt;
-    GenerationConfig generation;
-    PreparedVisionInputs vision;
-    json tools = json::array();
-    json conversation_messages = json::array();
-    GenieMemoryState input_memory;
-    bool uses_private_memory = false;
-};
-
-struct LlamaCppPreparedRequest {
-    json messages = json::array();
-    json tools = json::array();
-    GenerationConfig generation;
-    PreparedVisionInputs vision;
-};
-
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-struct LiteRTLMPreparedRequest {
-    json messages = json::array();
-    json tools = json::array();
-    GenerationConfig generation;
-    bool kv_invalidated = false;  // true when context eviction occurred — worker must reset KV
-
-    // OIP raw_prompt bypass: set from CreateChatCompletionRequest::raw_prompt
-    // when the caller (OIP /generate with text_input) supplied an
-    // already-fully-formatted prompt. When set, LiteRTLMOrchestrator::execute()
-    // uses this string directly instead of calling renderPrompt() on
-    // `messages`/`tools`, so the prompt is fed to the worker verbatim.
-    std::optional<std::string> raw_prompt;
-};
-#endif
-
-using PreparedGenerativeRequest =
-    std::variant<GeniePreparedRequest,
-                 LlamaCppPreparedRequest
-#ifdef QAI_FORGE_BUILD_LITERT_LM
-                 , LiteRTLMPreparedRequest
-#endif
-                 >;
 
 struct GenerativeJobContext {
     std::string job_id;

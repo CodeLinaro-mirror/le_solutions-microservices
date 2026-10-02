@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
+// LiteRTBackend — qai_forge::IInferenceBackend implementation for LiteRT Predictive AI
 //
 // Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
 // manage the ONE litert-inference-worker process hosting ALL LiteRT-backed

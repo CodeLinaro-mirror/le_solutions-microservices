@@ -12,21 +12,41 @@
 #include <string>
 #include <mutex>
 
-class LiteRTLMOrchestrator : public IGenerativeOrchestrator {
+// ─────────────────────────────────────────────────────────────────────────────
+// LiteRTLMOrchestrator — concrete qai_forge::IGenerativeOrchestrator
+// implementation for the LiteRT-LM backend.
+//
+// Internal, qai-forge-owned implementation — a third party implementing a
+// new orchestrator only needs qai_forge/orchestration/IGenerativeOrchestrator.h
+// (public) and never needs to see this class.
+//
+// LiteRT-LM has no private per-turn memory of its own (no postTurn()
+// override — uses the public interface's default std::nullopt-returning
+// implementation).
+// ─────────────────────────────────────────────────────────────────────────────
+class LiteRTLMOrchestrator : public qai_forge::IGenerativeOrchestrator {
 public:
     LiteRTLMOrchestrator() = default;
 
-    scheduler::GenerativeJobPtr createJob(
-        scheduler::GenerativeJobContext context,
-        scheduler::GenerativeCallbacks callbacks) const override;
+    std::unique_ptr<qai_forge::PreparedGenerationState> prepare(
+        const CreateChatCompletionRequest& request,
+        const qai_forge::ConversationMemorySnapshot& memory,
+        const std::string& session_id) const override;
 
     StandardResponse execute(
-        scheduler::GenerativeJob& job,
-        IGenerativeBackend& backend) const override;
+        const qai_forge::GenerationJobInfo& info,
+        qai_forge::PreparedGenerationState& prepared,
+        qai_forge::IGenerativeBackend& backend,
+        std::function<void(const StreamChunk&)> on_token) const override;
 
 private:
+    // Concrete prepared-state subclass — opaque to all scheduler and
+    // OrchestratorAdapter code, which only ever hold a
+    // unique_ptr<qai_forge::PreparedGenerationState>.
+    struct PreparedState;
+
     // ── Lazy metadata initialization ───────────────────────────────────────────
-    bool initMetadataIfNeeded(IGenerativeBackend& backend) const;
+    bool initMetadataIfNeeded(qai_forge::IGenerativeBackend& backend) const;
 
     // ── Prompt rendering ───────────────────────────────────────────────────────
     // Renders the model's Jinja2 chat template (as provided by the LiteRT-LM

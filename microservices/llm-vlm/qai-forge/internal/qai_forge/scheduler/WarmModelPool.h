@@ -22,8 +22,6 @@
 #include <unordered_map>
 #include <vector>
 
-class IGenerativeBackend;
-
 namespace scheduler {
 
 class EvictionPolicy;
@@ -106,7 +104,7 @@ public:
      * ever lives on the one model that session actually used. No-op if
      * model_id has no resident runtime. Intended for LiteRT-LM Conversation
      * API cleanup; all other backends ignore it (default no-op in
-     * IGenerativeBackend).
+     * qai_forge::IGenerativeBackend).
      */
     void clearSession(const std::string& model_id, const std::string& session_id);
 

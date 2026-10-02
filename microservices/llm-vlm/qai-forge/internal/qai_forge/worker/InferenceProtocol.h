@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "qai_forge/worker/InferenceEvents.h"
+
 #include <string>
 #include <nlohmann/json.hpp>
 
@@ -67,33 +69,13 @@ namespace ResponseType {
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed IPC Event Structs — DTOs at the IPC Boundary
 //
-// These replace raw dictionary parsing (response["type"]) with strongly-typed
-// objects. The async socket loop yields these directly.
+// IPCReadyEvent/IPCTokenEvent/IPCDoneEvent/IPCErrorEvent now live in the
+// public qai_forge/worker/InferenceEvents.h (included above) — they are part
+// of the public qai_forge::IGenerativeBackend ABI's generate()/
+// generateWithSession()/generateVlm() callback signatures. This header keeps
+// only the wire-protocol machinery below, which is NOT part of the public
+// backend ABI.
 // ─────────────────────────────────────────────────────────────────────────────
-
-struct IPCReadyEvent {
-    std::string command_id;  // Optional: matches the command that triggered READY
-    std::string event_id;    // Optional: matches the EXECUTE event_id
-};
-
-struct IPCTokenEvent {
-    std::string event_id;
-    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
-    std::string content;
-};
-
-struct IPCDoneEvent {
-    std::string event_id;
-    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
-    std::string finish_reason;  // "stop", "length", "error"
-};
-
-struct IPCErrorEvent {
-    std::string event_id;
-    std::string session_id;  // Continuous-batching slot key; empty in single-slot mode
-    std::string command_id;
-    std::string message;
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceProtocol — Serialization / Deserialization helpers

@@ -3,13 +3,14 @@
 
 #pragma once
 
+#include "qai_forge/backend/BackendAdapter.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/scheduler/CancelResult.h"
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/PlacementContext.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
-#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/orchestration/OrchestratorAdapter.h"
 #include "qai_forge/utils/ThreadPool.h"
 
 #include <chrono>
@@ -22,8 +23,6 @@
 #include <unordered_map>
 #include <vector>
 #include <unordered_set>
-
-class IGenerativeBackend;
 
 namespace scheduler {
 
@@ -69,14 +68,16 @@ struct ModelRuntimeEvents {
 // A runtime can exist while cold: jobs are queued, but
 // backend.loadModel(model_id) only happens after admission calls activate().
 //
-// Each ModelRuntime shares one IGenerativeOrchestrator instance (created by
-// BackendFactory::createRuntimePair). The orchestrator is stateless and
-// receives the backend as an injected parameter on each execute() call.
+// Each ModelRuntime shares one OrchestratorAdapter instance (created by
+// BackendFactory::createRuntimePair, wrapping whatever
+// qai_forge::IGenerativeOrchestrator was registered for this model's
+// runtime). The orchestrator is stateless and receives the backend as an
+// injected parameter on each execute() call.
 class ModelRuntime {
 public:
     ModelRuntime(std::string model_id,
-                 std::unique_ptr<IGenerativeBackend> backend,
-                 std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+                 std::unique_ptr<BackendAdapter> backend,
+                 std::shared_ptr<OrchestratorAdapter> orchestrator,
                  std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                  std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                  long model_memory_mb,
@@ -140,8 +141,8 @@ private:
     const std::string model_id_;
     const qai_forge::execution::RuntimeId runtime_id_;
     PriorityModelQueue queue_;
-    std::unique_ptr<IGenerativeBackend> backend_;
-    std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
+    std::unique_ptr<BackendAdapter> backend_;
+    std::shared_ptr<OrchestratorAdapter> orchestrator_;
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     std::shared_ptr<PlacementContext> placement_;

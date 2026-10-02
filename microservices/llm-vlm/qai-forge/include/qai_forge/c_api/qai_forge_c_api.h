@@ -12,8 +12,6 @@
 //
 // Thread safety: All functions are thread-safe. The internal scheduler
 // serializes per-model execution while allowing concurrent requests.
-//
-// See: docs/qaiforge-api-design.md
 // ─────────────────────────────────────────────────────────────────────────────
 
 #pragma once

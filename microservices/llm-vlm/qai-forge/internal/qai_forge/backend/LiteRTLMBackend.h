@@ -4,13 +4,14 @@
 #pragma once
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/backend/IPlacementAwareGenerativeBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/worker/LiteRTLMWorkerManager.h"
 #include <memory>
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMBackend — IGenerativeBackend implementation for LiteRT-LM
+// LiteRTLMBackend — qai_forge::IGenerativeBackend implementation for LiteRT-LM
 //
 // Wraps LiteRTLMWorkerManager (which extends InferenceWorkerManager) to manage
 // the litert-lm-inference-worker subprocess. The worker uses the LiteRT-LM
@@ -28,7 +29,8 @@
 // merged into the next INIT command.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class LiteRTLMBackend : public IGenerativeBackend {
+class LiteRTLMBackend : public qai_forge::IGenerativeBackend,
+                         public IPlacementAwareGenerativeBackend {
 public:
     /**
      * Public constructor — creates an owned (non-singleton) instance.

@@ -22,8 +22,6 @@
 //   - Orchestration layer receives raw bytes, runs inference, returns raw bytes
 //   - Transport layer encodes OutputTensor.data → base64/JSON arrays
 //   - The orchestration layer NEVER sees base64 or HTTP multipart
-//
-// See docs/unified-inference-service.md §4 for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**

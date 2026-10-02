@@ -29,8 +29,6 @@
 //
 // Thread safety: all methods are thread-safe. Multiple callers may call
 // generate() concurrently; the internal scheduler serializes per-model.
-//
-// See docs/qaiforge-api-design.md for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace qai_forge {

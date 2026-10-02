@@ -4,15 +4,14 @@
 #pragma once
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BackendCapabilities — Capability contract for IGenerativeBackend implementations
+// BackendCapabilities — Capability contract for qai_forge::IGenerativeBackend implementations
 //
-// Each IGenerativeBackend declares its capabilities via this struct.
+// Each qai_forge::IGenerativeBackend declares its capabilities via this struct.
 // GenerativeOrchestrator reads it at startup to configure the middleware pipeline.
 // No orchestrator code branches on backend type strings — it only reads these flags.
 //
-// Design rationale (docs/genai-backend-decoupling.md):
-//   Decouples GenIE-specific assumptions (DSP lock, KV reset, bypass_think_filter)
-//   from ChatOrchestratorImpl so the orchestrator works with any generative backend.
+// Decouples GenIE-specific assumptions (DSP lock, KV reset, bypass_think_filter)
+// from ChatOrchestratorImpl so the orchestrator works with any generative backend.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -56,7 +55,7 @@ enum class ConcurrencyModel {
 };
 
 /**
- * BackendCapabilities — declared by each IGenerativeBackend implementation.
+ * BackendCapabilities — declared by each qai_forge::IGenerativeBackend implementation.
  *
  * The GenerativeOrchestrator reads this struct at startup to build the
  * appropriate middleware pipeline. No orchestrator code branches on backend
@@ -98,7 +97,7 @@ struct BackendCapabilities {
     // supports_kv_session_reuse:
     //   true  → Backend maintains a per-session KV cache across requests,
     //            keyed by session_id. The orchestrator must call
-    //            IGenerativeBackend::generateWithSession() (not generate())
+    //            qai_forge::IGenerativeBackend::generateWithSession() (not generate())
     //            and pass session_id + kv_invalidated so the backend can
     //            decide whether to reuse the existing session's KV state or
     //            rebuild it from scratch (e.g. after context eviction).
@@ -108,7 +107,7 @@ struct BackendCapabilities {
     //            The orchestrator calls plain generate(). Backends that
     //            don't set this to true never need session_id or
     //            kv_invalidated — they are not part of the shared
-    //            IGenerativeBackend::generate() signature.
+    //            qai_forge::IGenerativeBackend::generate() signature.
     bool supports_kv_session_reuse       = false;
 
     // supports_vision:

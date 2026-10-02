@@ -3,9 +3,8 @@
 
 #pragma once
 
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/scheduler/PredictiveJob.h"
-
-class IInferenceBackend;
 
 class PredictiveOrchestrator {
 public:
@@ -17,5 +16,5 @@ public:
     /**  Execute a scheduler-created batch and return the combined response. */
     TensorInferenceResponse executeBatch(
         const scheduler::PredictiveBatch& batch,
-        IInferenceBackend& backend) const;
+        PredictiveBackendAdapter& backend) const;
 };

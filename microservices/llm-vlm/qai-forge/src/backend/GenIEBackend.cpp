@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GenIEBackend — IGenerativeBackend implementation for Qualcomm GenIE SDK
+// GenIEBackend — qai_forge::IGenerativeBackend implementation for Qualcomm GenIE SDK
 //
 // Wraps InferenceWorkerManager (LLM) and VlmInferenceWorkerManager (VLM).
 // The static worker singletons previously in ChatOrchestratorImpl.cpp have
@@ -361,7 +361,7 @@ void GenIEBackend::generateVlm(
 // onContextCompacted()
 //
 // No-op: KV reset is initiated by resetKvAsync() for both LLM and VLM.
-// Kept for interface compatibility with IGenerativeBackend.
+// Kept for interface compatibility with qai_forge::IGenerativeBackend.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void GenIEBackend::onContextCompacted() {

@@ -5,7 +5,7 @@
 // BackendFactory — Runtime-based backend selection
 //
 // Routes the "runtime" field from metadata.json to the correct
-// IGenerativeBackend/IInferenceBackend implementation. All routing now
+// qai_forge::IGenerativeBackend/qai_forge::IInferenceBackend implementation. All routing now
 // delegates to PluginRegistry, which is populated at process startup
 // by PluginLoader (dlopen-based discovery of qaiforge_plugin_*.so files) —
 // BackendFactory itself no longer needs to know which concrete backend
@@ -27,7 +27,7 @@
 #include <memory>
 #include <vector>
 
-std::unique_ptr<IGenerativeBackend>
+std::unique_ptr<BackendAdapter>
 BackendFactory::createGenerativeBackend(const std::string& runtime) {
     auto backend =
         PluginRegistry::instance().createGenerativeBackend(runtime);
@@ -40,7 +40,7 @@ BackendFactory::createGenerativeBackend(const std::string& runtime) {
     return backend;
 }
 
-std::unique_ptr<IGenerativeBackend>
+std::unique_ptr<BackendAdapter>
 BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
     const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);
@@ -54,7 +54,7 @@ BackendFactory::createGenerativeBackendForModel(const std::string& model_id) {
     return createGenerativeBackend(model_config->runtime);
 }
 
-std::shared_ptr<IGenerativeOrchestrator>
+std::shared_ptr<OrchestratorAdapter>
 BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
     auto orchestrator =
         PluginRegistry::instance().createGenerativeOrchestrator(runtime);
@@ -67,7 +67,7 @@ BackendFactory::createGenerativeOrchestrator(const std::string& runtime) {
     return orchestrator;
 }
 
-std::shared_ptr<IGenerativeOrchestrator>
+std::shared_ptr<OrchestratorAdapter>
 BackendFactory::createGenerativeOrchestratorForModel(
     const std::string& model_id) {
     const auto model_config =
@@ -104,7 +104,7 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
 // Predictive AI backends
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::unique_ptr<IInferenceBackend>
+std::unique_ptr<PredictiveBackendAdapter>
 BackendFactory::createPredictiveBackend(const std::string& runtime) {
     auto backend =
         PluginRegistry::instance().createPredictiveBackend(runtime);
@@ -118,7 +118,7 @@ BackendFactory::createPredictiveBackend(const std::string& runtime) {
     return backend;
 }
 
-std::unique_ptr<IInferenceBackend>
+std::unique_ptr<PredictiveBackendAdapter>
 BackendFactory::createPredictiveBackendForModel(const std::string& model_id) {
     const auto model_config =
         ModelConfigManager::getInstance().getModelConfig(model_id);

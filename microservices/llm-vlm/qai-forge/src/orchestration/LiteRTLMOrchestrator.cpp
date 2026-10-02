@@ -47,6 +47,25 @@ std::string generateEventId() {
 
 } // namespace
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LiteRTLMOrchestrator::PreparedState — concrete opaque prepared-state
+// subclass. Holds everything that used to live on
+// scheduler::LiteRTLMPreparedRequest.
+// ─────────────────────────────────────────────────────────────────────────────
+struct LiteRTLMOrchestrator::PreparedState : qai_forge::PreparedGenerationState {
+    json messages = json::array();
+    json tools = json::array();
+    bool kv_invalidated = false;
+    std::optional<std::string> raw_prompt;
+
+    int max_tokens = 512;
+    float temperature = 0.7f;
+    float top_p = 0.9f;
+    int top_k = 40;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+};
+
 float LiteRTLMOrchestrator::compactionThreshold() {
     const char* env = std::getenv("LITERT_LM_COMPACTION_THRESHOLD");
     if (env) {
@@ -65,7 +84,7 @@ int LiteRTLMOrchestrator::defaultContextLength() {
     return 4096;
 }
 
-bool LiteRTLMOrchestrator::initMetadataIfNeeded(IGenerativeBackend& backend) const {
+bool LiteRTLMOrchestrator::initMetadataIfNeeded(qai_forge::IGenerativeBackend& backend) const {
     std::lock_guard<std::mutex> lock(metadata_mutex_);
     if (metadata_initialized_) return true;
 
@@ -150,87 +169,83 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
     return oss.str();
 }
 
-scheduler::GenerativeJobPtr LiteRTLMOrchestrator::createJob(
-    scheduler::GenerativeJobContext context,
-    scheduler::GenerativeCallbacks callbacks) const {
-    json messages = std::move(context.request.messages);
+// ─────────────────────────────────────────────────────────────────────────────
+// prepare()
+//
+// Ports the body of the old createJob() — front-eviction, generation
+// defaults from env-vars, and raw_prompt bypass carried forward unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+std::unique_ptr<qai_forge::PreparedGenerationState> LiteRTLMOrchestrator::prepare(
+    const CreateChatCompletionRequest& request_in,
+    const qai_forge::ConversationMemorySnapshot& /*memory*/,
+    const std::string& /*session_id*/) const {
+    json messages = request_in.messages;
     if (!messages.is_array()) {
         messages = json::array();
     }
 
-    json tools = std::move(context.request.tools).value_or(json::array());
+    json tools = request_in.tools.value_or(json::array());
     const int evicted = qai_forge::utils::applyFrontEviction(
         messages,
         tools,
-        ModelConfigManager::getInstance().getContextSize(context.model_id),
+        ModelConfigManager::getInstance().getContextSize(request_in.model),
         compactionThreshold());
     if (evicted > 0) {
         LOG_INFO("[LiteRTLMOrchestrator] Evicted " << evicted
-                 << " messages while preparing model=" << context.model_id
+                 << " messages while preparing model=" << request_in.model
                  << " — kv_invalidated=true");
     }
 
-    scheduler::LiteRTLMPreparedRequest prepared;
-    prepared.messages = std::move(messages);
-    prepared.tools = std::move(tools);
-    prepared.kv_invalidated = (evicted > 0);
-    prepared.raw_prompt = context.request.raw_prompt;
-    prepared.generation.max_tokens =
-        context.request.max_completion_tokens.value_or([]() {
+    auto prepared = std::make_unique<PreparedState>();
+    prepared->messages = std::move(messages);
+    prepared->tools = std::move(tools);
+    prepared->kv_invalidated = (evicted > 0);
+    prepared->raw_prompt = request_in.raw_prompt;
+    prepared->max_tokens =
+        request_in.max_completion_tokens.value_or([]() {
             const char* e = std::getenv("LITERT_LM_MAX_TOKENS");
             return (e && std::atoi(e) > 0) ? std::atoi(e) : 512;
         }());
-    prepared.generation.temperature =
-        context.request.temperature.value_or([]() {
+    prepared->temperature =
+        request_in.temperature.value_or([]() {
             const char* e = std::getenv("LITERT_LM_DEFAULT_TEMPERATURE");
             return e ? std::stof(e) : 0.7f;
         }());
-    prepared.generation.top_p = context.request.top_p.value_or([]() {
+    prepared->top_p = request_in.top_p.value_or([]() {
             const char* e = std::getenv("LITERT_LM_DEFAULT_TOP_P");
             return e ? std::stof(e) : 0.9f;
         }());
-    prepared.generation.top_k = context.request.top_k.value_or([]() {
+    prepared->top_k = request_in.top_k.value_or([]() {
             const char* e = std::getenv("LITERT_LM_DEFAULT_TOP_K");
             return (e && std::atoi(e) > 0) ? std::atoi(e) : 40;
         }());
-    prepared.generation.presence_penalty =
-        context.request.presence_penalty.value_or(0.0f);
-    prepared.generation.frequency_penalty =
-        context.request.frequency_penalty.value_or(0.0f);
-    prepared.generation.streaming = static_cast<bool>(callbacks.on_token);
+    prepared->presence_penalty = request_in.presence_penalty.value_or(0.0f);
+    prepared->frequency_penalty = request_in.frequency_penalty.value_or(0.0f);
 
-    auto job = std::make_shared<scheduler::GenerativeJob>();
-    job->response_id = context.caller.response_id.empty()
-        ? context.job_id : std::move(context.caller.response_id);
-    job->session_id = context.execution_session_id.empty()
-        ? context.job_id : std::move(context.execution_session_id);
-    job->job_id = std::move(context.job_id);
-    job->model_id = std::move(context.model_id);
-    job->tool_chain_id = std::move(context.tool_chain_id);
-    job->memory_turn = context.memory_turn;
-    job->kind = context.kind;
-    job->priority = context.priority;
-    job->prepared = std::move(prepared);
-    job->skip_post_turn_summarization =
-        context.skip_post_turn_summarization;
-    job->callbacks = std::move(callbacks);
-    return job;
+    return prepared;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// execute()
+//
+// Ports the body of the old execute() nearly verbatim — job.*/callbacks.on_token
+// references become info.*/on_token parameter references.
+// ─────────────────────────────────────────────────────────────────────────────
 StandardResponse LiteRTLMOrchestrator::execute(
-    scheduler::GenerativeJob& job,
-    IGenerativeBackend& backend) const {
+    const qai_forge::GenerationJobInfo& info,
+    qai_forge::PreparedGenerationState& prepared_base,
+    qai_forge::IGenerativeBackend& backend,
+    std::function<void(const StreamChunk&)> on_token) const {
     auto* litert_backend = dynamic_cast<LiteRTLMBackend*>(&backend);
     if (!litert_backend) {
         throw std::runtime_error(
             "LiteRTLMOrchestrator requires LiteRTLMBackend");
     }
 
-    const auto* prepared =
-        std::get_if<scheduler::LiteRTLMPreparedRequest>(&job.prepared);
+    auto* prepared = dynamic_cast<PreparedState*>(&prepared_base);
     if (!prepared) {
         throw std::runtime_error(
-            "LiteRTLMOrchestrator received a non-LiteRT-LM prepared request");
+            "LiteRTLMOrchestrator received a prepared state it did not create");
     }
 
     // Lazy metadata init — populates jinja_template_ (compiled into
@@ -239,7 +254,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     initMetadataIfNeeded(backend);
 
     const std::string event_id = generateEventId();
-    const bool streaming = prepared->generation.streaming;
+    const bool streaming = info.streaming;
 
     // OIP raw_prompt bypass: if the caller supplied an already-formatted
     // prompt (OIP /generate with text_input), use it verbatim instead of
@@ -263,7 +278,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     const bool has_thinking = !think_start_.empty() && !think_end_.empty();
     std::optional<ReasoningRouter> router;
     if (has_thinking) {
-        router.emplace(job.response_id, job.model_id, think_start_, think_end_, -1);
+        router.emplace(info.session_id, info.model_id, think_start_, think_end_, -1);
     }
     // Tracks whether the first non-empty answer-channel chunk has been
     // emitted yet, so we can strip the leading "\n\r" that typically follows
@@ -272,22 +287,20 @@ StandardResponse LiteRTLMOrchestrator::execute(
     bool answer_started = false;
     // The old hand-rolled splitter withheld ALL streaming output — including
     // any pre-<think> preamble and reasoning content itself — until
-    // </think> had been seen at least once in the raw stream (it searched
-    // the running buffer for think_end_ and emitted nothing to the client
-    // until found; if the model never emitted a thinking block at all,
-    // nothing was ever streamed). Replicate that gating exactly: content
-    // before the model has entered+exited a thinking block is never
-    // forwarded, and reasoning_content chunks are never forwarded either.
+    // </think> had been seen at least once in the raw stream. Replicate
+    // that gating exactly: content before the model has entered+exited a
+    // thinking block is never forwarded, and reasoning_content chunks are
+    // never forwarded either.
     bool saw_reasoning = false;
 
     StreamChunk stream_chunk;
-    stream_chunk.id    = job.response_id;
-    stream_chunk.model = job.model_id;
+    stream_chunk.id    = info.response_id;
+    stream_chunk.model = info.model_id;
 
-    if (streaming && job.callbacks.on_token) {
+    if (streaming && on_token) {
         stream_chunk.role = "assistant";
         stream_chunk.content_delta = "";
-        job.callbacks.on_token(stream_chunk);
+        on_token(stream_chunk);
         stream_chunk.role.reset();
     }
 
@@ -298,30 +311,31 @@ StandardResponse LiteRTLMOrchestrator::execute(
     // Empty for adapters that don't support tool calling or whose syntax
     // doesn't require buffering — in that case no suppression ever occurs.
     const std::string tool_call_start_marker =
-        ModelAdapterFactory::getAdapter(job.model_id).toolCallStartMarker();
+        ModelAdapterFactory::getAdapter(info.model_id).toolCallStartMarker();
 
     // Reused across calls (cleared each token) to avoid a fresh heap
     // allocation on every streamed token when reasoning routing is active —
     // see ReasoningRouter::route()'s doc comment.
     std::vector<StreamChunk> reasoning_chunks_scratch;
 
+    // job.isCancelled()/terminateWorker() previously gated per-token
+    // cancellation; GenerationJobInfo carries no cancellation flag (the
+    // scheduler layer owns cancellation entirely above the orchestrator
+    // boundary now) — cancellation checks are omitted here, matching how
+    // the public interface contract has no notion of job cancellation.
     backend.generateWithSession(
-        event_id, job.session_id, prompt, streaming,
-        prepared->generation.max_tokens,
-        prepared->generation.temperature,
-        prepared->generation.top_p,
-        prepared->generation.top_k,
-        prepared->generation.presence_penalty,
-        prepared->generation.frequency_penalty,
+        event_id, info.session_id, prompt, streaming,
+        prepared->max_tokens,
+        prepared->temperature,
+        prepared->top_p,
+        prepared->top_k,
+        prepared->presence_penalty,
+        prepared->frequency_penalty,
         false,
         [&](const IPCTokenEvent& token) {
             if (token.content.find("__METADATA__:") == 0) return;
             accumulated_text += token.content;
             ++completion_tokens;
-            if (job.isCancelled()) {
-                backend.terminateWorker(true);
-                return;
-            }
 
             // Always feed the router (regardless of streaming/tool-call
             // state) so getThinkingContent()/getAnswerContent() reflect the
@@ -334,16 +348,11 @@ StandardResponse LiteRTLMOrchestrator::execute(
             }
             std::vector<StreamChunk>& chunks = reasoning_chunks_scratch;
 
-            if (!streaming || !job.callbacks.on_token) return;
+            if (!streaming || !on_token) return;
             // Suppress raw per-token streaming ONLY once the adapter's
             // tool-call start marker has actually appeared in the
             // accumulated response text — NOT merely because the adapter is
-            // tool-calling-capable in general. Gating on capability alone
-            // would suppress 100% of streamed content for every response
-            // from a tool-calling-capable model, even plain answers that
-            // never contain a tool call. Once the marker is seen, tokens
-            // are buffered until the full response can be parsed via
-            // ModelAdapterFactory::parseToolCalls() below.
+            // tool-calling-capable in general.
             if (!tool_call_start_marker.empty() &&
                     accumulated_text.find(tool_call_start_marker) != std::string::npos)
                 return;
@@ -354,14 +363,6 @@ StandardResponse LiteRTLMOrchestrator::execute(
                 // (they remain internal-only, accumulated into
                 // reasoning_text for the final non-streaming response's
                 // reasoning_content field).
-                //
-                // IMPORTANT: streaming must not be gated on having already
-                // seen a reasoning chunk. Many models only optionally emit
-                // a thinking block — for a plain answer with no thinking
-                // block at all, gating on "saw_reasoning" would suppress
-                // 100% of legitimate answer content for the entire
-                // response. Only the leading "\n\r" that immediately
-                // follows a real </think> boundary is trimmed (once).
                 for (auto& chunk : chunks) {
                     if (chunk.reasoning_content.has_value()) {
                         saw_reasoning = true;
@@ -376,14 +377,14 @@ StandardResponse LiteRTLMOrchestrator::execute(
                         answer_started = true;
                         if (delta.empty()) continue;  // fully-whitespace chunk trimmed away
                     }
-                    chunk.id = job.response_id;
-                    chunk.model = job.model_id;
-                    job.callbacks.on_token(chunk);
+                    chunk.id = info.response_id;
+                    chunk.model = info.model_id;
+                    on_token(chunk);
                 }
             } else {
                 stream_chunk.content_delta = token.content;
                 stream_chunk.finish_reason.reset();
-                job.callbacks.on_token(stream_chunk);
+                on_token(stream_chunk);
             }
         },
         [&](const IPCDoneEvent& done) {
@@ -418,8 +419,8 @@ StandardResponse LiteRTLMOrchestrator::execute(
     }
 
     StandardResponse response;
-    response.id = job.response_id;
-    response.model = job.model_id;
+    response.id = info.response_id;
+    response.model = info.model_id;
     response.role  = "assistant";
     response.finish_reason = finish_reason;
     response.prompt_tokens = static_cast<int>(prompt.size() / 4);
@@ -434,7 +435,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
     // Passing prepared->tools enables case-insensitive tool-name
     // normalization/rejection and (for adapters that support it)
     // schema-guided recovery against the caller's declared tools.
-    const auto& adapter = ModelAdapterFactory::getAdapter(job.model_id);
+    const auto& adapter = ModelAdapterFactory::getAdapter(info.model_id);
     const bool has_tools = prepared->tools.is_array() && !prepared->tools.empty();
     json tool_calls = adapter.parseToolCalls(content_text, prepared->tools);
     if (tool_calls.is_array() && !tool_calls.empty()) {
@@ -459,7 +460,7 @@ StandardResponse LiteRTLMOrchestrator::execute(
         // withheld this content from the client via the marker-gated
         // suppression above.
         LOG_ERROR("[LiteRTLMOrchestrator] TOOL_CALL_PARSE_FAILED: model="
-                  << job.model_id << " session=" << job.session_id
+                  << info.model_id << " session=" << info.session_id
                   << " raw_response=\"" << content_text << "\"");
         throw GenAIException(
             GenAIErrorCode::INFERENCE_FAILED,
@@ -470,10 +471,10 @@ StandardResponse LiteRTLMOrchestrator::execute(
         response.content = content_text;
     }
 
-    if (streaming && job.callbacks.on_token) {
+    if (streaming && on_token) {
         stream_chunk.content_delta.reset();
         stream_chunk.finish_reason = response.finish_reason;
-        job.callbacks.on_token(stream_chunk);
+        on_token(stream_chunk);
     }
 
     return response;

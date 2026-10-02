@@ -3,7 +3,7 @@
 
 #include "qai_forge/scheduler/PredictiveModelRuntime.h"
 
-#include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/utils/Logger.h"
 #include "qai_forge/utils/UseLock.h"
@@ -101,7 +101,7 @@ void waitForDspMemoryReclaim(const std::string& model_id,
 
 PredictiveModelRuntime::PredictiveModelRuntime(
     std::string model_id,
-    std::unique_ptr<IInferenceBackend> backend,
+    std::unique_ptr<PredictiveBackendAdapter> backend,
     std::shared_ptr<PredictiveOrchestrator> orchestrator,
     std::shared_ptr<ModelLoadCoordinator> load_coordinator,
     long model_memory_mb,
@@ -601,6 +601,8 @@ void PredictiveModelRuntime::ensureModelLoaded() {
             qai_forge::execution::RuntimeLaunchRequest launch_request{
                 runtime_id_, model_id_, placement_admission.reservation.plan()};
             backend_->initialize(launch_request);
+            // (unchanged call site — PredictiveBackendAdapter::initialize()
+            // takes the same RuntimeLaunchRequest signature)
             placement_reservation_ = std::move(placement_admission.reservation);
             if (!backend_->isHealthy()) {
                 throw std::runtime_error(

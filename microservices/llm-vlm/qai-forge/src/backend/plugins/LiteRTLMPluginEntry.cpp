@@ -14,10 +14,10 @@
 
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::GenerativeEntry entry;
-    entry.create_backend = []() -> std::unique_ptr<IGenerativeBackend> {
+    entry.create_backend = []() -> std::unique_ptr<qai_forge::IGenerativeBackend> {
         return std::make_unique<LiteRTLMBackend>();
     };
-    entry.create_orchestrator = []() -> std::shared_ptr<IGenerativeOrchestrator> {
+    entry.create_orchestrator = []() -> std::shared_ptr<qai_forge::IGenerativeOrchestrator> {
         return std::make_shared<LiteRTLMOrchestrator>();
     };
     registry.registerGenerative("litert_lm", std::move(entry));

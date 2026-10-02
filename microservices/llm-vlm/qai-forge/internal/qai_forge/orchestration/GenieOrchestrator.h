@@ -6,20 +6,27 @@
 #ifdef QAI_FORGE_BUILD_GENIE
 
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
-#include "qai_forge/session/ConversationSession.h"
-#include "qai_forge/managers/ModelConfigManager.h"
-#include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/InternalDTOs.h"
+
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+class ConversationSession;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GenieOrchestrator — Genie-specific generative orchestrator implementation
 //
-// Implements IGenerativeOrchestrator for the Qualcomm GenIE SDK backend.
-// This is the concrete orchestrator for all Genie-based LLM and VLM models.
+// Internal, qai-forge-owned implementation of the public
+// qai_forge::IGenerativeOrchestrator interface for the Qualcomm GenIE SDK
+// backend. This header stays internal — a third party implementing a new
+// orchestrator only needs qai_forge/orchestration/IGenerativeOrchestrator.h
+// (public) and never needs to see this class, exactly as Qwen25Adapter.h /
+// GemmaAdapter.h (internal, concrete) relate to ModelAdapter.h (public,
+// interface) in the adapters plugin pattern.
 //
 // Genie-specific responsibilities:
 //   1. Universal post-inference KV reset via backend.resetKvAsync() — called
@@ -29,68 +36,47 @@
 //      proportional token ceilings scaled to the model's context window.
 //   3. Genie-specific reasoning budget calculation via ReasoningBudgetCalculator.
 //
-// Each ModelRuntime owns one GenieOrchestrator instance (created by
-// BackendFactory::createRuntimePair). The orchestrator is stateless with
-// respect to model backends — it receives the backend as an injected parameter
-// on each execute() call.
-//
 // The request flows through a clean pipeline:
-//   Step 1: Extractor     — parse messages and config from the request DTO
-//   Step 2: Session Resolver — rehydrate a transient ConversationSession
-//           from the private GenieMemoryState (summary/facts/eviction ptr)
-//   Step 3: Context prep   — prompt construction
-//   Step 4: Execution      — injected backend → ReasoningRouter → yield DTOs
-//   Step 5: Post-turn      — resetKvAsync
+//   prepare()  — Step 1: extract/validate request
+//               Step 2: rehydrate a transient ConversationSession from the
+//                       public ConversationMemorySnapshot (summary/facts)
+//               Step 3: prompt construction, reasoning budget, vision
+//                       preprocessing — all stashed in PreparedState
+//   execute()  — Step 4: run inference → ReasoningRouter → yield DTOs
+//   postTurn() — Step 5: summarization / fact extraction / eviction
 // ─────────────────────────────────────────────────────────────────────────────
-class GenieOrchestrator : public IGenerativeOrchestrator {
+class GenieOrchestrator : public qai_forge::IGenerativeOrchestrator {
 public:
-    using CancellationPredicate = std::function<bool()>;
-
-    // Constructor — public so BackendFactory::createRuntimePair() can create
-    // per-model instances for the scheduler path.
     GenieOrchestrator();
 
-    scheduler::GenerativeJobPtr createJob(
-        scheduler::GenerativeJobContext context,
-        scheduler::GenerativeCallbacks callbacks) const override;
+    std::unique_ptr<qai_forge::PreparedGenerationState> prepare(
+        const CreateChatCompletionRequest& request,
+        const qai_forge::ConversationMemorySnapshot& memory,
+        const std::string& session_id) const override;
 
     StandardResponse execute(
-        scheduler::GenerativeJob& job,
-        IGenerativeBackend& backend) const override;
+        const qai_forge::GenerationJobInfo& info,
+        qai_forge::PreparedGenerationState& prepared,
+        qai_forge::IGenerativeBackend& backend,
+        std::function<void(const StreamChunk&)> on_token) const override;
 
-    std::optional<scheduler::PostTurnTask> createPostTurnTask(
-        scheduler::GenerativeJob& job,
-        const StandardResponse& response) const override;
-
-    scheduler::GenieMemoryState executePostTurn(
-        scheduler::PostTurnTask& task,
-        IGenerativeBackend& backend) const override;
+    std::optional<qai_forge::ConversationMemorySnapshot> postTurn(
+        const qai_forge::GenerationJobInfo& info,
+        qai_forge::PreparedGenerationState& prepared,
+        const StandardResponse& response,
+        qai_forge::IGenerativeBackend& backend) const override;
 
 private:
+    // Concrete prepared-state subclass — opaque to all scheduler and
+    // OrchestratorAdapter code, which only ever hold a
+    // unique_ptr<qai_forge::PreparedGenerationState>.
+    struct PreparedState;
+
     GenieOrchestrator(const GenieOrchestrator&) = delete;
     GenieOrchestrator& operator=(const GenieOrchestrator&) = delete;
 
-    // ── Pipeline steps ─────────────────────────────────────────────────────────
-
-    /**
-     * Step 1: Extract and validate the request.
-     * Throws GenAIException(INVALID_REQUEST) if model is not found.
-     */
     void validateRequest(const CreateChatCompletionRequest& request) const;
 
-    /**
-     * Build the compacted context prompt for the inference worker.
-     *
-     * Slot assembly (highest priority = never evicted):
-     *   Slot 1 — System block:      caller's system prompt + tool instructions
-     *   Slot 1.5 — Budget info:     reasoning budget notification (if applicable)
-     *   Slot 2 — Persistent facts:  key-value facts extracted from evicted history
-     *   Slot 3 — Episodic summary:  rolling summary of evicted history
-     *   Slot 4 — History queue:     recent turns not yet evicted, oldest-first
-     *   Slot 5 — Current turn:      new user/tool messages
-     *
-     * @param has_tool_response Whether the submitted round contains tool output.
-     */
     std::string buildContextPrompt(const ConversationSession& session,
                                    const CreateChatCompletionRequest& request,
                                    int thinking_budget = 0,
@@ -98,83 +84,31 @@ private:
                                    bool has_tool_response = false) const;
 
     StandardResponse executeBlockingPrepared(
-        scheduler::GenerativeJob& job,
-        const scheduler::GeniePreparedRequest& prepared,
-        IGenerativeBackend& backend) const;
+        const qai_forge::GenerationJobInfo& info,
+        PreparedState& prepared,
+        qai_forge::IGenerativeBackend& backend) const;
 
     StandardResponse executeStreamingPrepared(
-        scheduler::GenerativeJob& job,
-        const scheduler::GeniePreparedRequest& prepared,
-        IGenerativeBackend& backend) const;
+        const qai_forge::GenerationJobInfo& info,
+        PreparedState& prepared,
+        qai_forge::IGenerativeBackend& backend,
+        const std::function<void(const StreamChunk&)>& on_token) const;
 
-    // ── Post-turn memory management ────────────────────────────────────────────
-
-    /**
-     * Run a summarization inference pass on the given messages.
-     *
-     * Builds a structured summarization prompt, calls backend.generate() with
-     * low temperature, and returns (summary_text, token_count).
-     * The KV cache must be clean before this call (caller ensures this via
-     * backend.resetKvAsync() + waitForPendingReset() inside executeRequest).
-     *
-     * @param session               Current session (for prior summary context).
-     * @param messages_to_summarize Messages to summarize (eviction batch).
-     * @param model_id              Model identifier for chat template lookup.
-     * @param max_summary_tokens    Token budget for the generated summary.
-     * @param backend               Backend to run inference on.
-     * @return (summary_text, token_count) — empty string on failure.
-     */
     std::pair<std::string, int> generateSummary(
         const ConversationSession& session,
         const std::vector<json>& messages_to_summarize,
         const std::string& model_id,
         int max_summary_tokens,
-        IGenerativeBackend& backend) const;
+        qai_forge::IGenerativeBackend& backend) const;
 
-    /**
-     * Run a fact extraction inference pass on the given messages.
-     *
-     * Asks the model to return a JSON object of key-value facts. Parses the
-     * response and merges new facts into session.facts.
-     *
-     * @param session               Session to update (facts written here).
-     * @param messages_to_extract   Messages to extract facts from.
-     * @param model_id              Model identifier for chat template lookup.
-     * @param backend               Backend to run inference on.
-     */
     void extractFacts(ConversationSession& session,
                       const std::vector<json>& messages_to_extract,
                       const std::string& model_id,
-                      IGenerativeBackend& backend) const;
+                      qai_forge::IGenerativeBackend& backend) const;
 
-    /**
-     * Post-turn memory management: eviction, summarization, and fact extraction.
-     *
-     * Called after every complete non-tool-call LLM turn (not VLM, not tool
-     * continuations). Runs synchronously before returning the response so the
-     * next turn's prompt is fully prepared.
-     *
-     * Sequence:
-     *   1. Estimate history token usage (messages[evicted_message_count..end])
-     *   2. If over eviction threshold: identify oldest messages to evict
-     *   3. Summarize eviction batch → session.summary_content updated
-     *   4. backend.resetKvAsync() — reset KV after summarization inference
-     *   5. Extract facts from eviction batch → session.facts updated
-     *   6. backend.resetKvAsync() — reset KV after fact extraction inference
-     *   7. session.evicted_message_count += eviction batch size
-     *
-     * Thresholds (matching Python service):
-     *   eviction_threshold = 0.80 × history_budget
-     *   eviction_target    = 0.60 × history_budget
-     *   history_budget     = context_size × 0.40
-     *
-     * @param session    Session to update.
-     * @param model_id   Model identifier (for context size + chat template).
-     * @param backend    Backend to run summarization/fact inference on.
-     */
     void postTurnProcessing(ConversationSession& session,
                             const std::string& model_id,
-                            IGenerativeBackend& backend) const;
+                            qai_forge::IGenerativeBackend& backend) const;
 };
 
 #endif // QAI_FORGE_BUILD_GENIE

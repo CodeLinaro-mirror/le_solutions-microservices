@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // -----------------------------------------------------------------------------
-// LlamaCppBackend  IGenerativeBackend implementation wrapping the direct-
+// LlamaCppBackend — qai_forge::IGenerativeBackend implementation wrapping the direct-
 // libllama llamacpp-inference-worker subprocess (no llama-server, no HTTP).
 // Mirrors LiteRTLMBackend's structure.
 // -----------------------------------------------------------------------------
@@ -28,7 +28,7 @@ namespace fs = std::filesystem;
 LlamaCppBackend::LlamaCppBackend() = default;
 
 // -----------------------------------------------------------------------------
-// worker()  lazy-initialize the LlamaCppWorkerManager
+// worker() — lazy-initialize the LlamaCppWorkerManager
 // -----------------------------------------------------------------------------
 
 LlamaCppWorkerManager& LlamaCppBackend::worker() {
@@ -46,7 +46,7 @@ BackendCapabilities LlamaCppBackend::capabilities() const {
     auto& cfg = ModelConfigManager::getInstance();
     return BackendCapabilities{
         // MVP: full merged message history is re-rendered and re-decoded
-        // every EXECUTE (KV cache cleared at the start of handleExecute()) 
+        // every EXECUTE (KV cache cleared at the start of handleExecute()) —
         // no incremental KV reuse across turns yet.
         .context_strategy             = ContextStrategy::FULL_RECOMPUTE,
         .context_window               = current_model_id_.empty()
@@ -79,7 +79,7 @@ void LlamaCppBackend::loadModel(
 }
 
 // -----------------------------------------------------------------------------
-// writeWorkerConfigFile()  synthesize the JSON sidecar the worker's
+// writeWorkerConfigFile() — synthesize the JSON sidecar the worker's
 // loadModel() parses. ModelConfigManager's GGUF auto-discovery sets
 // ModelConfig::config_file to the raw .gguf path directly (there is no
 // processed-bundle step for bare .gguf files), so this backend has to
@@ -133,7 +133,7 @@ void LlamaCppBackend::loadModel(const std::string& model_id) {
     }
 
     // model_config->config_file is the raw .gguf path for llamacpp models
-    // (see ModelConfigManager's GGUF auto-discovery)  not the sidecar the
+    // (see ModelConfigManager's GGUF auto-discovery) — not the sidecar the
     // worker expects, so build the sidecar here.
     const std::string sidecar_path =
         writeWorkerConfigFile(model_id, model_config->config_file,
@@ -152,7 +152,7 @@ void LlamaCppBackend::loadModel(const std::string& model_id) {
 // -----------------------------------------------------------------------------
 // unloadModel()
 //
-// Always uses SIGKILL (force=true)  same rationale as GenIEBackend/
+// Always uses SIGKILL (force=true) — same rationale as GenIEBackend/
 // LiteRTLMBackend: keeping shutdown uniform across all backends is simpler
 // than special-casing llama.cpp's CPU/GPU paths, which could also shut down
 // gracefully.
@@ -184,7 +184,7 @@ void LlamaCppBackend::ensureWorkerRunning(const std::string& model_id,
 }
 
 // -----------------------------------------------------------------------------
-// generate()  legacy plain-text path, not used by LlamaCppOrchestrator
+// generate() — legacy plain-text path, not used by LlamaCppOrchestrator
 // -----------------------------------------------------------------------------
 
 void LlamaCppBackend::generate(
@@ -218,7 +218,7 @@ void LlamaCppBackend::generate(
 }
 
 // -----------------------------------------------------------------------------
-// generateStructured()  structured chat inference
+// generateStructured() — structured chat inference
 // -----------------------------------------------------------------------------
 
 void LlamaCppBackend::generateStructured(
@@ -256,7 +256,7 @@ void LlamaCppBackend::generateStructured(
 }
 
 // -----------------------------------------------------------------------------
-// KV cache operations  RESET is the only meaningful one (MVP: no save/restore)
+// KV cache operations — RESET is the only meaningful one (MVP: no save/restore)
 // -----------------------------------------------------------------------------
 
 void LlamaCppBackend::saveKv(const std::string& name, const std::string& /*session_id*/) {

@@ -54,7 +54,7 @@ struct ModelConfig {
     std::optional<json> vision_preprocessing; // VLM-specific preprocessing params
 
     // Runtime identifier from metadata.json "runtime" field.
-    // Used by BackendFactory to select the correct IGenerativeBackend.
+    // Used by BackendFactory to select the correct qai_forge::IGenerativeBackend.
     // Defaults to "genie" for backward compatibility with existing bundles
     // that already have "runtime": "genie" in their metadata.json.
     // Future values: "litert_lm", "onnxrt"
@@ -167,7 +167,7 @@ public:
 
     // Returns the runtime identifier for a model ("genie", "litert_lm", "onnxrt").
     // Returns "genie" if the model is not found (safe default — existing behaviour).
-    // Used by BackendFactory to select the correct IGenerativeBackend implementation.
+    // Used by BackendFactory to select the correct qai_forge::IGenerativeBackend implementation.
     //
     // WARNING: Callers MUST check validateModel() or getModelConfig() first —
     // this method does not distinguish a registered "genie" model from an

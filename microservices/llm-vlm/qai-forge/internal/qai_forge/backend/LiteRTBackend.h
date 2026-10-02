@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/IPlacementAwarePredictiveBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/worker/PredictiveWorkerChannel.h"
@@ -11,7 +12,7 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTBackend — IInferenceBackend implementation for LiteRT Predictive AI
+// LiteRTBackend — qai_forge::IInferenceBackend implementation for LiteRT Predictive AI
 //
 // Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
 // manage the ONE litert-inference-worker process hosting ALL LiteRT-backed
@@ -29,7 +30,8 @@
 //   hw_accelerators     — bitmask (NPU=4, CPU=1; default 5 = NPU|CPU)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class LiteRTBackend : public IInferenceBackend {
+class LiteRTBackend : public qai_forge::IInferenceBackend,
+                       public IPlacementAwarePredictiveBackend {
 public:
     /**
      * Public constructor — creates an owned (non-singleton) instance.

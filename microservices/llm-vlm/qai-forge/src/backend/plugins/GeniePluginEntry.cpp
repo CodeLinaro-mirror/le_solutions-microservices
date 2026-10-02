@@ -22,10 +22,10 @@
 
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::GenerativeEntry entry;
-    entry.create_backend = []() -> std::unique_ptr<IGenerativeBackend> {
+    entry.create_backend = []() -> std::unique_ptr<qai_forge::IGenerativeBackend> {
         return std::make_unique<GenIEBackend>();
     };
-    entry.create_orchestrator = []() -> std::shared_ptr<IGenerativeOrchestrator> {
+    entry.create_orchestrator = []() -> std::shared_ptr<qai_forge::IGenerativeOrchestrator> {
         return std::make_shared<GenieOrchestrator>();
     };
     registry.registerGenerative("genie", std::move(entry));

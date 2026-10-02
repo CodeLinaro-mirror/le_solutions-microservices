@@ -3,7 +3,7 @@
 
 #include "qai_forge/scheduler/PredictiveModelPool.h"
 #include "qai_forge/backend/BackendFactory.h"
-#include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/managers/SystemResourceManager.h"
@@ -343,7 +343,7 @@ PredictiveModelPool::RuntimeRecord& PredictiveModelPool::createRuntimeLocked(
     LOG_INFO("[PredictiveModelPool] Creating runtime for model '" << model_id << "'");
 
     // Create backend instance
-    std::unique_ptr<IInferenceBackend> backend;
+    std::unique_ptr<PredictiveBackendAdapter> backend;
     try {
         backend = factory_(model_id);
     } catch (const std::exception& e) {

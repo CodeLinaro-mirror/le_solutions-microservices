@@ -14,11 +14,11 @@
 
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::GenerativeEntry entry;
-    entry.create_backend = []() -> std::unique_ptr<IGenerativeBackend> {
+    entry.create_backend = []() -> std::unique_ptr<qai_forge::IGenerativeBackend> {
         return std::make_unique<qai_forge::LlamaCppBackend>();
     };
-    entry.create_orchestrator = []() -> std::shared_ptr<IGenerativeOrchestrator> {
-        return std::make_shared<qai_forge::LlamaCppOrchestrator>();
+    entry.create_orchestrator = []() -> std::shared_ptr<qai_forge::IGenerativeOrchestrator> {
+        return std::make_shared<LlamaCppOrchestrator>();
     };
     registry.registerGenerative("llamacpp", std::move(entry));
 }

@@ -4,32 +4,45 @@
 #pragma once
 
 #include "qai_forge/backend/BackendCapabilities.h"
-#include "qai_forge/execution/ExecutionPlan.h"
-#include "qai_forge/worker/InferenceProtocol.h"
+#include "qai_forge/worker/InferenceEvents.h"
 #include <string>
 #include <vector>
 #include <functional>
 #include <stdexcept>
 #include <cstdint>
 
+namespace qai_forge {
+
 // ─────────────────────────────────────────────────────────────────────────────
-// IGenerativeBackend — Layer 3 interface for generative AI inference
+// qai_forge::IGenerativeBackend — public, out-of-tree ("Level B") generative
+// backend ABI.
 //
-// This interface sits between ChatOrchestratorImpl (Layer 2) and the worker
-// subprocess managers (Layer 3). It replaces the direct calls to
-// InferenceWorkerManager / VlmInferenceWorkerManager that were previously
-// embedded in ChatOrchestratorImpl.
+// This is the contract a third party implements to plug a new generative
+// inference backend into qai-forge without access to qai-forge's source tree
+// or internal scheduler plumbing. It sits between a
+// qai_forge::IGenerativeOrchestrator implementation (Layer 2) and whatever
+// worker subprocess / SDK call the backend wraps (Layer 3).
 //
-// Current implementations:
-//   GenIEBackend    — wraps InferenceWorkerManager (LLM) +
-//                     VlmInferenceWorkerManager (VLM)
+// NOTE on history: this interface was promoted from an internal,
+// global-namespace ::IGenerativeBackend (internal/qai_forge/backend/
+// IGenerativeBackend.h, now deleted) — same contract, minus the
+// placement-aware loadModel(RuntimeLaunchRequest) overload, which remains an
+// internal-only concern (see internal/qai_forge/backend/
+// IPlacementAwareGenerativeBackend.h — the device-placement subsystem is a
+// separate, not-yet-public ABI). internal/qai_forge/backend/BackendAdapter.h
+// wraps any registered qai_forge::IGenerativeBackend and adds back
+// placement-aware loading via dynamic_cast to that internal mixin, with a
+// graceful fallback to loadModel(model_id) for backends (including
+// out-of-tree third-party ones) that don't implement it.
 //
-// Future implementations:
-//   LiteRTLMBackend — wraps LiteRT LM (MediaPipe Tasks LlmInference)
-//   OnnxRTBackend   — wraps ONNX Runtime encode/decode loop
+// Current implementations (all internal, see internal/qai_forge/backend/):
+//   GenIEBackend     — wraps InferenceWorkerManager (LLM) +
+//                      VlmInferenceWorkerManager (VLM)
+//   LiteRTLMBackend  — wraps LiteRT LM (MediaPipe Tasks LlmInference)
+//   LlamaCppBackend  — wraps a direct-libllama worker subprocess
 //
-// Design invariants (docs/genai-backend-decoupling.md):
-//   - ChatOrchestratorImpl ONLY calls methods on this interface.
+// Design invariants:
+//   - The orchestrator ONLY calls methods on this interface.
 //   - bypass_think_filter is NOT in this interface. It is a GenIE SDK internal
 //     detail handled inside GenIEBackend::generate().
 //   - The orchestrator passes use_reasoning=true/false; the backend decides
@@ -44,12 +57,12 @@ class IGenerativeBackend {
 public:
     virtual ~IGenerativeBackend() = default;
 
-    // Human-readable name for logging ("GenIE", "LiteRTLM", "OnnxRT")
+    // Human-readable name for logging ("GenIE", "LiteRTLM", "LlamaCpp")
     virtual std::string name() const = 0;
 
     /**
      * Declare this backend's capabilities.
-     * Called by GenerativeOrchestrator at startup to build the middleware pipeline.
+     * Called by the orchestrator at startup to build the middleware pipeline.
      * The returned struct reflects the currently loaded model's constraints.
      */
     virtual BackendCapabilities capabilities() const = 0;
@@ -64,22 +77,6 @@ public:
     virtual void loadModel(const std::string& model_id) {
         (void)model_id;
         throw std::runtime_error("Backend does not implement loadModel()");
-    }
-
-    /**
-     * Load this runtime through the provider-neutral placement boundary.
-     * Concrete adapters translate the execution plan into provider-specific
-     * launch configuration. Default falls back to the model-only overload
-     * when no placement plan is present.
-     */
-    virtual void loadModel(
-        const qai_forge::execution::RuntimeLaunchRequest& request) {
-        if (!request.execution_plan.components.empty() ||
-            !request.execution_plan.native_options.empty()) {
-            throw std::runtime_error(
-                "Backend does not support placement-aware loadModel()");
-        }
-        loadModel(request.model_id);
     }
 
     /**
@@ -149,8 +146,8 @@ public:
      * this method — backends that don't support session-based KV reuse throw
      * std::runtime_error from the default implementation below. This keeps
      * session_id/kv_invalidated out of the shared generate() signature that
-     * every backend (GenIE, QNN, SNPE, LiteRT, LlamaCpp) must implement,
-     * since only LiteRT-LM currently has a meaningful use for them.
+     * every backend must implement, since only some backends currently have
+     * a meaningful use for them.
      *
      * @param session_id      Stable session identifier used by the backend to
      *                        key its cross-request KV cache (e.g. worker-side
@@ -231,17 +228,11 @@ public:
     /**
      * Initiate an eager background KV cache reset after inference completes.
      *
-     * Called by GenieOrchestrator immediately after generate() / generateVlm()
+     * Called by the orchestrator immediately after generate() / generateVlm()
      * returns. The reset runs in a background thread so it overlaps with
      * returning the response to the HTTP layer and sending it to the client.
      * The next generate() call waits for the reset to complete before sending
      * the EXECUTE command, ensuring clean KV state with minimal added latency.
-     *
-     * GenIEBackend:    starts a worker-side RESET asynchronously for the
-     *                  completed LLM/VLM session. The scheduler keeps the
-     *                  session and capacity reserved until it completes.
-     * LiteRTLMBackend: calls LlmInference::ResetContext() asynchronously (future).
-     * OnnxRTBackend:   no-op — OnnxRT recomputes full context each turn anyway.
      *
      * Default implementation is a no-op.
      */
@@ -270,40 +261,9 @@ public:
 
     /**
      * Release per-session KV state in the worker.
-     * Called when a chat session ends so the worker can free g_kv_sessions entries.
-     * Default is a no-op — only LiteRTLMBackend overrides this.
-     *
-     * Transport invocation discipline (current, intentional — see
-     * docs/genai-backend-decoupling.md for the full design rationale):
-     *
-     *   HTTP (QAIServe/responses):
-     *     ChatCompletionStore::deleteSession() and ResponseStore::deleteCascade()
-     *     call QaiForge::clearSession(model_id, session_id) on explicit client
-     *     DELETE of a session/response resource. This is the only transport
-     *     with an explicit, caller-driven session-deletion lifecycle event.
-     *
-     *   WebSocket (QAIServe WsResponsesController):
-     *     WsResponsesController::handleConnectionClosed() calls clearSession()
-     *     best-effort when the underlying connection closes. There is no
-     *     explicit "session.delete" event in the WS protocol today, so this
-     *     is the closest approximation to explicit cleanup — a session left
-     *     open by an abnormal disconnect will still be cleared once the
-     *     socket-close callback fires.
-     *
-     *   gRPC (QAIServe ChatServiceImpl):
-     *     Never calls clearSession(). gRPC calls in this codebase are
-     *     stateless single-shot completions — each RPC call is a complete,
-     *     independent turn that never creates per-session backend KV state
-     *     to begin with, so there is nothing to clear. This is documented,
-     *     intentional behavior, not an oversight.
-     *
-     *   Guidance for future transports: any new transport that creates
-     *   multi-turn, per-session backend state (i.e. anything that calls
-     *   generateWithSession() rather than one-shot generate()) should
-     *   evaluate whether/how it needs to invoke clearSession() at the
-     *   appropriate point in its own connection/request lifecycle, following
-     *   one of the two patterns above (explicit delete event, or best-effort
-     *   on connection/session teardown).
+     * Called when a chat session ends so the worker can free any per-session
+     * state. Default is a no-op — only backends with session-scoped KV
+     * state override this.
      */
     virtual void clearSession(const std::string& /*session_id*/) {}
 
@@ -342,3 +302,5 @@ public:
      */
     virtual bool isHealthy() const = 0;
 };
+
+} // namespace qai_forge

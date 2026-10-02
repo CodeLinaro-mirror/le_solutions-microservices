@@ -6,6 +6,7 @@
 #ifdef QAI_FORGE_BUILD_GENIE
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/backend/IPlacementAwareGenerativeBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/execution/GenieConfigMaterializer.h"
 #include <string>
@@ -16,7 +17,7 @@ class InferenceWorkerManager;
 class VlmInferenceWorkerManager;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GenIEBackend — IGenerativeBackend implementation for Qualcomm GenIE SDK
+// GenIEBackend — qai_forge::IGenerativeBackend implementation for Qualcomm GenIE SDK
 //
 // Wraps InferenceWorkerManager (LLM) and VlmInferenceWorkerManager (VLM).
 // Both LLM and VLM models with "runtime": "genie" in metadata.json use this
@@ -37,11 +38,10 @@ class VlmInferenceWorkerManager;
 // GenIE config tree via GenieConfigMaterializer and patches devices[0].device_id
 // per the resolved ExecutionPlan. runtime_artifacts_ keeps that tree alive
 // until the worker is torn down.
-//
-// See docs/genai-backend-decoupling.md for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class GenIEBackend : public IGenerativeBackend {
+class GenIEBackend : public qai_forge::IGenerativeBackend,
+                      public IPlacementAwareGenerativeBackend {
 public:
     GenIEBackend();
     ~GenIEBackend() override;
@@ -147,7 +147,7 @@ public:
     /**
      * No-op: KV cache reset is now handled by resetKvAsync() which is called
      * by GenieOrchestrator immediately after every generate() / generateVlm()
-     * call. Kept for interface compatibility with IGenerativeBackend.
+     * call. Kept for interface compatibility with qai_forge::IGenerativeBackend.
      */
     void onContextCompacted() override;
 

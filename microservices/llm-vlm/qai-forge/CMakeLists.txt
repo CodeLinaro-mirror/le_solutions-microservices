@@ -325,6 +325,22 @@ set(QAI_FORGE_SOURCES
 
     # Orchestration (Layer 2)
     src/orchestration/PredictiveOrchestrator.cpp
+    # OrchestratorAdapter — internal glue between the public
+    # qai_forge::IGenerativeOrchestrator ABI (implemented by each runtime
+    # plugin's concrete orchestrator) and the scheduler (ModelRuntime/
+    # WarmModelPool/PostTurnWorker). Core, runtime-agnostic — stays in
+    # qai_forge.so regardless of which generative runtime plugins are built.
+    src/orchestration/OrchestratorAdapter.cpp
+
+    # BackendAdapter / PredictiveBackendAdapter — internal glue between the
+    # public qai_forge::IGenerativeBackend / qai_forge::IInferenceBackend
+    # ABIs (implemented by each runtime plugin's concrete backend) and the
+    # scheduler (ModelRuntime/PostTurnWorker for generative,
+    # PredictiveModelRuntime for predictive). Core, runtime-agnostic — stay
+    # in qai_forge.so regardless of which backend plugins are built. Mirror
+    # OrchestratorAdapter.cpp's role on the backend side.
+    src/backend/BackendAdapter.cpp
+    src/backend/PredictiveBackendAdapter.cpp
 
     # Reasoning (Layer 2)
     src/reasoning/ReasoningRouter.cpp

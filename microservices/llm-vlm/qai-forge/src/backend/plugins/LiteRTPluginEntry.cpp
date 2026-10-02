@@ -13,7 +13,7 @@
 
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::PredictiveEntry entry;
-    entry.create_backend = []() -> std::unique_ptr<IInferenceBackend> {
+    entry.create_backend = []() -> std::unique_ptr<qai_forge::IInferenceBackend> {
         return std::make_unique<LiteRTBackend>();
     };
     registry.registerPredictive("litert", entry);

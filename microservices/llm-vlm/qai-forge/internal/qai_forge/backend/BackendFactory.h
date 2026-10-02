@@ -3,18 +3,19 @@
 
 #pragma once
 
+#include "qai_forge/backend/BackendAdapter.h"
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/backend/IInferenceBackend.h"
-#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
+#include "qai_forge/orchestration/OrchestratorAdapter.h"
+#include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include <nlohmann/json.hpp>
 #include <functional>
 #include <memory>
 #include <string>
 
-class PredictiveOrchestrator;
-
 // ─────────────────────────────────────────────────────────────────────────────
-// BackendFactory — Selects the correct IGenerativeBackend based on runtime
+// BackendFactory — Selects the correct qai_forge::IGenerativeBackend based on runtime
 //
 // The "runtime" field in metadata.json is the routing key:
 //   "genie"     → GenIEBackend   (Qualcomm GenIE SDK)
@@ -26,8 +27,6 @@ class PredictiveOrchestrator;
 //
 // Legacy path may still use singleton access until the scheduler-only cutover
 // removes ChatOrchestratorImpl::handleBlocking/handleStreaming fallback.
-//
-// See docs/genai-backend-decoupling.md §8 for the full design rationale.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,18 +36,19 @@ class PredictiveOrchestrator;
 // ModelRuntime takes ownership of both members.
 // ─────────────────────────────────────────────────────────────────────────────
 struct RuntimePair {
-    std::unique_ptr<IGenerativeBackend> backend;
-    std::shared_ptr<IGenerativeOrchestrator> orchestrator;
+    std::unique_ptr<BackendAdapter> backend;
+    std::shared_ptr<OrchestratorAdapter> orchestrator;
 };
 
 // Factory function type used by WarmModelPool to create RuntimePairs.
 using ModelRuntimePairFactory =
     std::function<RuntimePair(const std::string& model_id)>;
 
-// Factory function type used by PredictiveModelPool to create IInferenceBackend instances.
-// Each call returns a new owned instance — not a singleton.
+// Factory function type used by PredictiveModelPool to create
+// PredictiveBackendAdapter instances. Each call returns a new owned
+// instance — not a singleton.
 using PredictiveBackendFactory =
-    std::function<std::unique_ptr<IInferenceBackend>(const std::string& model_id)>;
+    std::function<std::unique_ptr<PredictiveBackendAdapter>(const std::string& model_id)>;
 
 class BackendFactory {
 public:
@@ -60,13 +60,13 @@ public:
      * @param runtime  Runtime identifier from ModelConfig.runtime
      *                 ("genie", "litert_lm", "onnxrt")
      */
-    static std::unique_ptr<IGenerativeBackend>
+    static std::unique_ptr<BackendAdapter>
     createGenerativeBackend(const std::string& runtime);
 
     /**
      * Resolve a model id to its runtime and create a scheduler-owned backend.
      */
-    static std::unique_ptr<IGenerativeBackend>
+    static std::unique_ptr<BackendAdapter>
     createGenerativeBackendForModel(const std::string& model_id);
 
     /**
@@ -74,13 +74,13 @@ public:
      *
      * @param runtime Runtime identifier from ModelConfig.runtime.
      */
-    static std::shared_ptr<IGenerativeOrchestrator>
+    static std::shared_ptr<OrchestratorAdapter>
     createGenerativeOrchestrator(const std::string& runtime);
 
     /**
      * Resolve a model ID to its runtime and create its orchestrator.
      */
-    static std::shared_ptr<IGenerativeOrchestrator>
+    static std::shared_ptr<OrchestratorAdapter>
     createGenerativeOrchestratorForModel(const std::string& model_id);
 
     /**
@@ -99,7 +99,7 @@ public:
     /**
      * Create a scheduler-owned predictive backend instance for the given runtime.
      *
-     * Returns a new owned IInferenceBackend — NOT a singleton. Each
+     * Returns a new owned qai_forge::IInferenceBackend — NOT a singleton. Each
      * PredictiveModelRuntime calls this to get its own backend instance,
      * enabling multiple models of the same runtime to coexist.
      *
@@ -107,7 +107,7 @@ public:
      *                 "snpe", "qnn_dlc", "litert", "tflite"
      * @throws GenAIException(INVALID_REQUEST, 400) for unknown runtimes.
      */
-    static std::unique_ptr<IInferenceBackend>
+    static std::unique_ptr<PredictiveBackendAdapter>
     createPredictiveBackend(const std::string& runtime);
 
     /**
@@ -121,7 +121,7 @@ public:
      * @throws GenAIException(MODEL_NOT_FOUND, 404) if model is unknown.
      * @throws GenAIException(INVALID_REQUEST, 400) for unknown runtimes.
      */
-    static std::unique_ptr<IInferenceBackend>
+    static std::unique_ptr<PredictiveBackendAdapter>
     createPredictiveBackendForModel(const std::string& model_id);
 
     /** @brief Create the shared predictive job preparation pipeline. */

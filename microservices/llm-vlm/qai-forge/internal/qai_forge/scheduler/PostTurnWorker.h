@@ -15,8 +15,8 @@
 #include <string>
 #include <thread>
 
-class IGenerativeBackend;
-class IGenerativeOrchestrator;
+class BackendAdapter;
+class OrchestratorAdapter;
 
 namespace scheduler {
 
@@ -26,8 +26,8 @@ class PostTurnWorker {
 public:
     PostTurnWorker(
         std::string model_id,
-        IGenerativeBackend& backend,
-        std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+        BackendAdapter& backend,
+        std::shared_ptr<OrchestratorAdapter> orchestrator,
         std::shared_ptr<ConversationMemoryCoordinator> coordinator,
         std::function<void(const std::string& session_id)> finish_post_turn,
         size_t max_queue_depth = 1);
@@ -47,8 +47,8 @@ private:
     bool forceRequested() const;
 
     const std::string model_id_;
-    IGenerativeBackend& backend_;
-    std::shared_ptr<IGenerativeOrchestrator> orchestrator_;
+    BackendAdapter& backend_;
+    std::shared_ptr<OrchestratorAdapter> orchestrator_;
     std::shared_ptr<ConversationMemoryCoordinator> coordinator_;
     std::function<void(const std::string& session_id)> finish_post_turn_;
     size_t max_queue_depth_;

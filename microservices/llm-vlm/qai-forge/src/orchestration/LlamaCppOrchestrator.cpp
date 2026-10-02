@@ -16,8 +16,6 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace qai_forge {
-
 namespace {
 std::string generateEventId() {
     static std::mt19937_64 rng(std::random_device{}());
@@ -27,10 +25,36 @@ std::string generateEventId() {
 }
 } // namespace
 
-scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
-    scheduler::GenerativeJobContext context,
-    scheduler::GenerativeCallbacks callbacks) const {
-    json merged_messages = std::move(context.request.messages);
+// ─────────────────────────────────────────────────────────────────────────────
+// LlamaCppOrchestrator::PreparedState — concrete opaque prepared-state
+// subclass. Holds everything that used to live on
+// scheduler::LlamaCppPreparedRequest.
+// ─────────────────────────────────────────────────────────────────────────────
+struct LlamaCppOrchestrator::PreparedState : qai_forge::PreparedGenerationState {
+    json messages = json::array();
+    json tools = json::array();
+    std::vector<std::vector<uint8_t>> vision_buffers;
+
+    int max_tokens = 512;
+    float temperature = 0.7f;
+    float top_p = 0.9f;
+    int top_k = 40;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// prepare()
+//
+// Ports the body of the old createJob() — merges inline images extracted
+// from message content, applies front eviction, and stashes generation
+// parameters into a PreparedState.
+// ─────────────────────────────────────────────────────────────────────────────
+std::unique_ptr<qai_forge::PreparedGenerationState> LlamaCppOrchestrator::prepare(
+    const CreateChatCompletionRequest& request_in,
+    const qai_forge::ConversationMemorySnapshot& /*memory*/,
+    const std::string& /*session_id*/) const {
+    json merged_messages = request_in.messages;
     if (!merged_messages.is_array()) {
         merged_messages = json::array();
     }
@@ -38,76 +62,63 @@ scheduler::GenerativeJobPtr LlamaCppOrchestrator::createJob(
     std::vector<std::vector<uint8_t>> inline_images =
         extractImagesFromMessages(merged_messages);
 
-    json tools = std::move(context.request.tools).value_or(json::array());
+    json tools = request_in.tools.value_or(json::array());
     const int evicted = qai_forge::utils::applyFrontEviction(
         merged_messages,
         tools,
-        ModelConfigManager::getInstance().getContextSize(context.model_id),
+        ModelConfigManager::getInstance().getContextSize(request_in.model),
         kCompactionThreshold);
     if (evicted > 0) {
         LOG_INFO("[LlamaCppOrchestrator] Evicted " << evicted
-                 << " messages while preparing model=" << context.model_id);
+                 << " messages while preparing model=" << request_in.model);
     }
 
-    scheduler::LlamaCppPreparedRequest prepared;
-    prepared.messages = std::move(merged_messages);
-    prepared.tools = std::move(tools);
-    prepared.vision.buffers = std::move(context.request.raw_images);
+    auto prepared = std::make_unique<PreparedState>();
+    prepared->messages = std::move(merged_messages);
+    prepared->tools = std::move(tools);
+    prepared->vision_buffers = request_in.raw_images;
     if (!inline_images.empty()) {
-        prepared.vision.buffers.insert(
-            prepared.vision.buffers.end(),
+        prepared->vision_buffers.insert(
+            prepared->vision_buffers.end(),
             std::make_move_iterator(inline_images.begin()),
             std::make_move_iterator(inline_images.end()));
     }
-    prepared.generation.max_tokens =
-        context.request.max_completion_tokens.value_or(512);
-    prepared.generation.temperature =
-        context.request.temperature.value_or(0.7f);
-    prepared.generation.top_p = context.request.top_p.value_or(0.9f);
-    prepared.generation.top_k = context.request.top_k.value_or(40);
-    prepared.generation.presence_penalty =
-        context.request.presence_penalty.value_or(0.0f);
-    prepared.generation.frequency_penalty =
-        context.request.frequency_penalty.value_or(0.0f);
-    prepared.generation.streaming = static_cast<bool>(callbacks.on_token);
+    prepared->max_tokens = request_in.max_completion_tokens.value_or(512);
+    prepared->temperature = request_in.temperature.value_or(0.7f);
+    prepared->top_p = request_in.top_p.value_or(0.9f);
+    prepared->top_k = request_in.top_k.value_or(40);
+    prepared->presence_penalty = request_in.presence_penalty.value_or(0.0f);
+    prepared->frequency_penalty = request_in.frequency_penalty.value_or(0.0f);
 
-    auto job = std::make_shared<scheduler::GenerativeJob>();
-    job->response_id = context.caller.response_id.empty()
-        ? context.job_id : std::move(context.caller.response_id);
-    job->session_id = context.execution_session_id.empty()
-        ? context.job_id : std::move(context.execution_session_id);
-    job->job_id = std::move(context.job_id);
-    job->model_id = std::move(context.model_id);
-    job->tool_chain_id = std::move(context.tool_chain_id);
-    job->memory_turn = context.memory_turn;
-    job->kind = context.kind;
-    job->priority = context.priority;
-    job->prepared = std::move(prepared);
-    job->skip_post_turn_summarization =
-        context.skip_post_turn_summarization;
-    job->callbacks = std::move(callbacks);
-    return job;
+    return prepared;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// execute()
+//
+// Ports the body of the old execute() nearly verbatim — job.*/callbacks.on_token
+// references become info.*/on_token parameter references.
+// ─────────────────────────────────────────────────────────────────────────────
 StandardResponse LlamaCppOrchestrator::execute(
-    scheduler::GenerativeJob& job,
-    IGenerativeBackend& backend) const {
+    const qai_forge::GenerationJobInfo& info,
+    qai_forge::PreparedGenerationState& prepared_base,
+    qai_forge::IGenerativeBackend& backend,
+    std::function<void(const StreamChunk&)> on_token) const {
     auto* llama_backend = dynamic_cast<LlamaCppBackend*>(&backend);
     if (!llama_backend) {
         throw std::runtime_error(
             "LlamaCppOrchestrator requires LlamaCppBackend");
     }
 
-    const auto* prepared =
-        std::get_if<scheduler::LlamaCppPreparedRequest>(&job.prepared);
+    auto* prepared = dynamic_cast<PreparedState*>(&prepared_base);
     if (!prepared) {
         throw std::runtime_error(
-            "LlamaCppOrchestrator received a non-llama.cpp prepared request");
+            "LlamaCppOrchestrator received a prepared state it did not create");
     }
 
-    const bool streaming = prepared->generation.streaming;
+    const bool streaming = info.streaming;
     json profile =
-        ModelConfigManager::getInstance().getChatTemplate(job.model_id);
+        ModelConfigManager::getInstance().getChatTemplate(info.model_id);
     const std::string tool_call_delimiter =
         profile.value("tool_call_delimiter", "<|tool_call|>");
 
@@ -117,43 +128,39 @@ StandardResponse LlamaCppOrchestrator::execute(
     bool inference_error = false;
     std::string error_message;
 
-    if (streaming && job.callbacks.on_token) {
+    if (streaming && on_token) {
         StreamChunk role_chunk;
-        role_chunk.id = job.session_id;
-        role_chunk.model = job.model_id;
+        role_chunk.id = info.session_id;
+        role_chunk.model = info.model_id;
         role_chunk.role = "assistant";
-        job.callbacks.on_token(role_chunk);
+        on_token(role_chunk);
     }
 
     llama_backend->generateStructured(
-        job.response_id,
-        job.session_id,
+        info.response_id,
+        info.session_id,
         prepared->messages,
         prepared->tools,
         streaming,
-        prepared->generation.max_tokens,
-        prepared->generation.temperature,
-        prepared->generation.top_p,
-        prepared->generation.top_k,
-        prepared->generation.presence_penalty,
-        prepared->generation.frequency_penalty,
+        prepared->max_tokens,
+        prepared->temperature,
+        prepared->top_p,
+        prepared->top_k,
+        prepared->presence_penalty,
+        prepared->frequency_penalty,
         [&](const IPCTokenEvent& token) {
             accumulated_text += token.content;
             ++completion_tokens;
-            if (job.isCancelled()) {
-                backend.terminateWorker(true);
-                return;
-            }
-            if (!streaming || !job.callbacks.on_token ||
+            if (!streaming || !on_token ||
                 accumulated_text.find(tool_call_delimiter) !=
                     std::string::npos) {
                 return;
             }
             StreamChunk chunk;
-            chunk.id = job.session_id;
-            chunk.model = job.model_id;
+            chunk.id = info.session_id;
+            chunk.model = info.model_id;
             chunk.content_delta = token.content;
-            job.callbacks.on_token(chunk);
+            on_token(chunk);
         },
         [&](const IPCDoneEvent& done) {
             finish_reason = done.finish_reason.empty()
@@ -163,7 +170,7 @@ StandardResponse LlamaCppOrchestrator::execute(
             inference_error = true;
             error_message = error.message;
         },
-        prepared->vision.buffers);
+        prepared->vision_buffers);
 
     backend.resetKvAsync();
     if (inference_error) {
@@ -174,8 +181,8 @@ StandardResponse LlamaCppOrchestrator::execute(
     }
 
     StandardResponse response;
-    response.id = job.session_id;
-    response.model = job.model_id;
+    response.id = info.session_id;
+    response.model = info.model_id;
     response.role = "assistant";
     response.finish_reason = finish_reason;
     response.prompt_tokens = qai_forge::utils::estimateTokensApprox(
@@ -203,12 +210,12 @@ StandardResponse LlamaCppOrchestrator::execute(
         response.content = accumulated_text;
     }
 
-    if (streaming && job.callbacks.on_token) {
+    if (streaming && on_token) {
         StreamChunk finish_chunk;
-        finish_chunk.id = job.session_id;
-        finish_chunk.model = job.model_id;
+        finish_chunk.id = info.session_id;
+        finish_chunk.model = info.model_id;
         finish_chunk.finish_reason = response.finish_reason;
-        job.callbacks.on_token(finish_chunk);
+        on_token(finish_chunk);
     }
 
     return response;
@@ -350,7 +357,5 @@ std::string LlamaCppOrchestrator::extractPreToolContent(
     }
     return content;
 }
-
-} // namespace qai_forge
 
 #endif // QAI_FORGE_BUILD_LLAMACPP

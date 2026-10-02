@@ -7,9 +7,12 @@
 #include "qai_forge/adapters/VisionPreprocessAdapter.h"
 #include "qai_forge/adapters/DefaultAdapter.h"
 #include "qai_forge/adapters/DefaultVisionPreprocessAdapter.h"
+#include "qai_forge/backend/BackendAdapter.h"
 #include "qai_forge/backend/IGenerativeBackend.h"
 #include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/orchestration/OrchestratorAdapter.h"
 
 #include <algorithm>
 
@@ -36,34 +39,59 @@ void PluginRegistry::registerPredictive(const std::string& runtime,
     predictive_[runtime] = std::move(entry);
 }
 
-std::unique_ptr<IGenerativeBackend> PluginRegistry::createGenerativeBackend(
+std::unique_ptr<BackendAdapter> PluginRegistry::createGenerativeBackend(
     const std::string& runtime) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = generative_.find(runtime);
-    if (it == generative_.end() || !it->second.create_backend) {
+    std::unique_ptr<qai_forge::IGenerativeBackend> public_backend;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = generative_.find(runtime);
+        if (it == generative_.end() || !it->second.create_backend) {
+            return nullptr;
+        }
+        public_backend = it->second.create_backend();
+    }
+    if (!public_backend) {
         return nullptr;
     }
-    return it->second.create_backend();
+    return std::make_unique<BackendAdapter>(std::move(public_backend));
 }
 
-std::shared_ptr<IGenerativeOrchestrator> PluginRegistry::createGenerativeOrchestrator(
+std::shared_ptr<OrchestratorAdapter> PluginRegistry::createGenerativeOrchestrator(
     const std::string& runtime) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = generative_.find(runtime);
-    if (it == generative_.end() || !it->second.create_orchestrator) {
+    std::shared_ptr<qai_forge::IGenerativeOrchestrator> public_orchestrator;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = generative_.find(runtime);
+        if (it == generative_.end() || !it->second.create_orchestrator) {
+            return nullptr;
+        }
+        public_orchestrator = it->second.create_orchestrator();
+    }
+    if (!public_orchestrator) {
         return nullptr;
     }
-    return it->second.create_orchestrator();
+    // Wrap the public, out-of-tree-safe qai_forge::IGenerativeOrchestrator
+    // in the internal OrchestratorAdapter so scheduler code (ModelRuntime/
+    // WarmModelPool/PostTurnWorker) continues to see only the private
+    // IGenerativeOrchestrator type, exactly as before this change.
+    return std::make_shared<OrchestratorAdapter>(std::move(public_orchestrator));
 }
 
-std::unique_ptr<IInferenceBackend> PluginRegistry::createPredictiveBackend(
+std::unique_ptr<PredictiveBackendAdapter> PluginRegistry::createPredictiveBackend(
     const std::string& runtime) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = predictive_.find(runtime);
-    if (it == predictive_.end() || !it->second.create_backend) {
+    std::unique_ptr<qai_forge::IInferenceBackend> public_backend;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = predictive_.find(runtime);
+        if (it == predictive_.end() || !it->second.create_backend) {
+            return nullptr;
+        }
+        public_backend = it->second.create_backend();
+    }
+    if (!public_backend) {
         return nullptr;
     }
-    return it->second.create_backend();
+    return std::make_unique<PredictiveBackendAdapter>(std::move(public_backend));
 }
 
 std::vector<std::string> PluginRegistry::registeredGenerativeRuntimes() const {

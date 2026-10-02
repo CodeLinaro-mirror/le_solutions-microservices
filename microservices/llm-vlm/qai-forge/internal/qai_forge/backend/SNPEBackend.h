@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/IPlacementAwarePredictiveBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/worker/PredictiveWorkerChannel.h"
@@ -11,7 +12,7 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SNPEBackend — IInferenceBackend implementation for SNPE Predictive AI
+// SNPEBackend — qai_forge::IInferenceBackend implementation for SNPE Predictive AI
 //
 // Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
 // manage the ONE snpe-inference-worker process hosting ALL SNPE-backed
@@ -30,7 +31,8 @@
 //   SNPE_WORKER_BINARY, SNPE_DELEGATE
 // ─────────────────────────────────────────────────────────────────────────────
 
-class SNPEBackend : public IInferenceBackend {
+class SNPEBackend : public qai_forge::IInferenceBackend,
+                     public IPlacementAwarePredictiveBackend {
 public:
     /**
      * Public constructor — creates an owned (non-singleton) instance.

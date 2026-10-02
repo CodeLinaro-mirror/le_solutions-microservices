@@ -3,7 +3,7 @@
 
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 
-#include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 
 #include <algorithm>
@@ -257,7 +257,7 @@ scheduler::PredictiveJobPtr PredictiveOrchestrator::createJob(
 
 TensorInferenceResponse PredictiveOrchestrator::executeBatch(
     const scheduler::PredictiveBatch& batch,
-    IInferenceBackend& backend) const {
+    PredictiveBackendAdapter& backend) const {
     if (batch.entries.empty()) {
         throw GenAIException(
             GenAIErrorCode::INVALID_REQUEST,
@@ -365,7 +365,7 @@ TensorInferenceResponse PredictiveOrchestrator::executeBatch(
         throw std::runtime_error("Predictive batch contains no samples");
     }
 
-    TensorInferenceResponse combined = backend.infer(request);
+    TensorInferenceResponse combined = backend.publicBackend().infer(request);
     combined.stats.backend_name = backend.name();
     return combined;
 }

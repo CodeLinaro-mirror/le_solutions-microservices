@@ -3,8 +3,8 @@
 
 #include "qai_forge/scheduler/PostTurnWorker.h"
 
-#include "qai_forge/backend/IGenerativeBackend.h"
-#include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/backend/BackendAdapter.h"
+#include "qai_forge/orchestration/OrchestratorAdapter.h"
 #include "qai_forge/utils/Logger.h"
 
 #include <optional>
@@ -27,8 +27,8 @@ bool memoryChanged(const GenieMemoryState& before,
 
 PostTurnWorker::PostTurnWorker(
     std::string model_id,
-    IGenerativeBackend& backend,
-    std::shared_ptr<IGenerativeOrchestrator> orchestrator,
+    BackendAdapter& backend,
+    std::shared_ptr<OrchestratorAdapter> orchestrator,
     std::shared_ptr<ConversationMemoryCoordinator> coordinator,
     std::function<void(const std::string& session_id)> finish_post_turn,
     size_t max_queue_depth)
@@ -117,7 +117,7 @@ void PostTurnWorker::workerLoop() {
         }
 
         try {
-            const GenieMemoryState& before = task.input.input_memory;
+            const GenieMemoryState before = task.input.before_memory;
             GenieMemoryState updated = orchestrator_->executePostTurn(
                 task, backend_);
             if (forceRequested()) {

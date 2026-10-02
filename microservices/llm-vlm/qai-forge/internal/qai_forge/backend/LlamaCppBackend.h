@@ -6,6 +6,7 @@
 #ifdef QAI_FORGE_BUILD_LLAMACPP
 
 #include "qai_forge/backend/IGenerativeBackend.h"
+#include "qai_forge/backend/IPlacementAwareGenerativeBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/worker/LlamaCppWorkerManager.h"
 #include <nlohmann/json.hpp>
@@ -20,7 +21,7 @@ using json = nlohmann::ordered_json;
 namespace qai_forge {
 
 // -----------------------------------------------------------------------------
-// LlamaCppBackend � IGenerativeBackend for llama.cpp (direct libllama worker)
+// LlamaCppBackend — qai_forge::IGenerativeBackend for llama.cpp (direct libllama worker)
 //
 // Wraps LlamaCppWorkerManager to manage the llamacpp-inference-worker
 // subprocess, which links libllama directly (no llama-server, no HTTP/SSE).
@@ -37,7 +38,7 @@ namespace qai_forge {
 //   - forceKillActiveWorker() delegates to the worker manager's native
 //     support � fixes the old HTTP-based backend's inability to cancel a
 //     single in-flight request without killing the whole worker.
-//   - generateVlm() is left as the IGenerativeBackend default no-op � vision
+//   - generateVlm() is left as the qai_forge::IGenerativeBackend default no-op — vision
 //     support is reached through generateStructured()'s images parameter
 //     instead (mirrors how this backend already bypasses generate() for
 //     structured/messages-based requests), since llamacpp requests are
@@ -48,7 +49,8 @@ namespace qai_forge {
 //                            (default /usr/local/bin/llamacpp-inference-worker)
 // -----------------------------------------------------------------------------
 
-class LlamaCppBackend : public IGenerativeBackend {
+class LlamaCppBackend : public IGenerativeBackend,
+                         public ::IPlacementAwareGenerativeBackend {
 public:
     LlamaCppBackend();
     ~LlamaCppBackend() override = default;

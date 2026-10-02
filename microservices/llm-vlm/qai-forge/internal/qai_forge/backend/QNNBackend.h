@@ -4,6 +4,7 @@
 #pragma once
 
 #include "qai_forge/backend/IInferenceBackend.h"
+#include "qai_forge/backend/IPlacementAwarePredictiveBackend.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/worker/PredictiveWorkerChannel.h"
@@ -11,7 +12,7 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QNNBackend — IInferenceBackend implementation for QNN Predictive AI
+// QNNBackend — qai_forge::IInferenceBackend implementation for QNN Predictive AI
 //
 // Uses a shared PredictiveWorkerChannel (via PredictiveWorkerProcessPool) to
 // manage the ONE qnn-inference-worker process hosting ALL QNN-backed
@@ -29,7 +30,8 @@
 //   QNN_WORKER_BINARY, QNN_BACKEND_LIB, QNN_SYS_LIB
 // ─────────────────────────────────────────────────────────────────────────────
 
-class QNNBackend : public IInferenceBackend {
+class QNNBackend : public qai_forge::IInferenceBackend,
+                    public IPlacementAwarePredictiveBackend {
 public:
     /**
      * Public constructor — creates an owned (non-singleton) instance.

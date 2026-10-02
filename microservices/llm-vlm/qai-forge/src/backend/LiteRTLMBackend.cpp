@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiteRTLMBackend — IGenerativeBackend implementation for LiteRT-LM
+// LiteRTLMBackend — qai_forge::IGenerativeBackend implementation for LiteRT-LM
 //
 // Wraps LiteRTLMWorkerManager (which extends InferenceWorkerManager) to manage
 // the litert-lm-inference-worker subprocess. The worker uses the LiteRT-LM
