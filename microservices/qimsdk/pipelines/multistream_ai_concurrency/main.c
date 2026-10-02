@@ -36,7 +36,7 @@
 #include <gst/sampleapps/gst_sample_apps_utils.h>
 
 /* Maximum number of concurrent streams this app will build. */
-#define MAX_STREAMS 24
+#define MAX_STREAMS 32
 
 /* Composed output canvas the grid is laid out within. */
 #define CANVAS_WIDTH  1920

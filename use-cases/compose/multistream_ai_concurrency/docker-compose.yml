@@ -14,7 +14,7 @@ services:
       - ${HOME}/Downloads/qimsdk_samples:/home/qimsdk/Downloads/qimsdk_samples
     command: >
       gst-ai-stream-concurrency
-      --num-streams=${NUM_STREAMS:-4}
+      --num-streams=${NUM_STREAMS:-32}
       --input=${INPUT_CONFIG:-/home/qimsdk/Downloads/qimsdk_samples/media/Draw_1080p_180s_30FPS.mp4}
       --model=${MODEL_PATH_MULTISTREAM:-/home/qimsdk/Downloads/qimsdk_samples/models/yolox-yolo-x-w8a8.tflite}
       --labels=${LABELS_PATH_MULTISTREAM:-/home/qimsdk/Downloads/qimsdk_samples/labels/yolov8n.json}
@@ -29,3 +29,7 @@ services:
               capabilities:
                 - hw-acc
     network_mode: host
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
