@@ -105,7 +105,7 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     std::shared_ptr<PredictiveOrchestrator> orchestrator,
     std::shared_ptr<ModelLoadCoordinator> load_coordinator,
     long model_memory_mb,
-    std::shared_ptr<PlacementContext> placement,
+    std::shared_ptr<PlacementAdmissionGateway> placement,
     ModelRuntimeEvents events)
     : model_id_(model_id),
       runtime_id_{model_id, 0},
@@ -133,7 +133,7 @@ PredictiveModelRuntime::PredictiveModelRuntime(
     }
     if (!placement_) {
         throw std::invalid_argument(
-            "PredictiveModelRuntime requires a placement context");
+            "PredictiveModelRuntime requires a placement admission gateway");
     }
 }
 

@@ -90,16 +90,14 @@ void waitForDspMemoryReclaim(const std::string& model_id, bool stop_requested) {
 ModelRuntime::ModelRuntime(std::string model_id,
                      std::unique_ptr<BackendAdapter> backend,
                      std::shared_ptr<OrchestratorAdapter> orchestrator,
-                     std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                      std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                      long model_memory_mb,
-                     std::shared_ptr<PlacementContext> placement,
+                     std::shared_ptr<PlacementAdmissionGateway> placement,
                      ModelRuntimeEvents events)
     : model_id_(model_id),
       runtime_id_{model_id, 0},
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
-      memory_coordinator_(std::move(coordinator)),
       load_coordinator_(std::move(load_coordinator)),
       placement_(std::move(placement)),
       events_(std::move(events)),
@@ -113,23 +111,17 @@ ModelRuntime::ModelRuntime(std::string model_id,
     if (!orchestrator_) {
         throw std::invalid_argument("ModelRuntime requires an orchestrator");
     }
-    if (!memory_coordinator_) {
-        throw std::invalid_argument(
-            "ModelRuntime requires a conversation memory coordinator");
-    }
     if (!load_coordinator_) {
         throw std::invalid_argument(
             "ModelRuntime requires a model load coordinator");
     }
     if (!placement_) {
         throw std::invalid_argument(
-            "ModelRuntime requires a placement context");
+            "ModelRuntime requires a placement admission gateway");
     }
     post_turn_worker_ = std::make_unique<PostTurnWorker>(
         model_id_,
         *backend_,
-        orchestrator_,
-        memory_coordinator_,
         [this](const std::string& session_id) {
             finishPostTurn(session_id);
         });
@@ -356,6 +348,30 @@ void ModelRuntime::failQueued(const GenAIException& error) {
     while (GenerativeJobPtr job = queue_.pop()) {
         notifyError(job, error);
     }
+}
+
+void ModelRuntime::expireStaleQueuedJobs() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<GenerativeJobPtr> expired = queue_.expireOlderThan(now);
+    if (expired.empty()) {
+        return;
+    }
+
+    static const GenAIException kAdmissionTimeoutError(
+        GenAIErrorCode::INSUFFICIENT_MEMORY,
+        "Request exceeded maximum queue admission wait time",
+        503);
+
+    for (const GenerativeJobPtr& job : expired) {
+        LOG_WARN("[ModelRuntime] Queued job exceeded admission timeout: model="
+                 << model_id_ << " job=" << (job ? job->job_id : std::string()));
+        notifyError(job, kAdmissionTimeoutError);
+    }
+}
+
+std::chrono::steady_clock::time_point
+ModelRuntime::earliestQueueDeadline() const {
+    return queue_.earliestDeadline();
 }
 
 void ModelRuntime::stop(bool force) {
@@ -1095,76 +1111,47 @@ bool ModelRuntime::runJob(GenerativeJob& job) {
 bool ModelRuntime::beginPostTurn(
     GenerativeJob& job,
     const StandardResponse& response) {
-    std::optional<PostTurnTask> task;
+    // OrchestratorAdapter owns ALL conversation-memory bookkeeping — it
+    // internally handles the "no deferred work" branches (markAwaitingTool/
+    // completeStructural/abortTurn) and returns nullptr for them. ModelRuntime
+    // only ever sees an opaque PostTurnWork or nullptr; it has no knowledge
+    // of MemoryTurnCommitToken/MemoryOutcome/ConversationMemoryCoordinator.
+    std::unique_ptr<PostTurnWork> work;
     try {
-        task = orchestrator_->createPostTurnTask(job, response);
+        work = orchestrator_->createPostTurnTask(job, response);
     } catch (const std::exception& error) {
         LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
                  << model_id_ << " session=" << job.session_id
                  << " message=\"" << error.what() << "\"");
-        if (job.memory_turn.has_value()) {
-            memory_coordinator_->publish(
-                job.memory_turn.value(), MemoryOutcome::Failed);
-        }
         return false;
     } catch (...) {
         LOG_WARN("[ModelRuntime] Failed to prepare post-turn work: model="
                  << model_id_ << " session=" << job.session_id
                  << " message=<unknown>");
-        if (job.memory_turn.has_value()) {
-            memory_coordinator_->publish(
-                job.memory_turn.value(), MemoryOutcome::Failed);
-        }
         return false;
     }
-    if (!task.has_value()) {
-        if (job.memory_turn.has_value()) {
-            const bool has_tool_calls = response.finish_reason == "tool_calls" &&
-                response.tool_calls.has_value() &&
-                !response.tool_calls.value().empty();
-            if (has_tool_calls && job.kind == JobKind::MCP_ROUND) {
-                memory_coordinator_->markAwaitingTool(
-                    job.memory_turn.value());
-            } else {
-                memory_coordinator_->completeStructural(
-                    job.memory_turn.value());
-            }
-        }
+    if (!work) {
         return false;
     }
-    const bool began_post_turn =
-        memory_coordinator_->beginPostTurn(task->input.memory_turn);
-    if (!began_post_turn) {
-        LOG_WARN("[ModelRuntime] Post-turn state transition rejected: model="
-                 << model_id_ << " session=" << task->input.session_id);
-        memory_coordinator_->abortTurn(
-            task->input.memory_turn,
-            MemoryTurnState::GenerationFailed);
-        return false;
-    }
-    const std::string session_id = task->input.session_id;
-    const MemoryTurnCommitToken memory_turn = task->input.memory_turn;
+
+    const std::string session_id = work->sessionId();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_requested_) {
-            memory_coordinator_->abortTurn(
-                task->input.memory_turn,
-                MemoryTurnState::Cancelled);
+            work->cancel();
             return false;
         }
         if (!post_turn_sessions_.insert(session_id).second) {
             LOG_WARN("[ModelRuntime] Post-turn session reservation already exists: model="
                      << model_id_ << " session=" << session_id);
-            memory_coordinator_->abortTurn(
-                task->input.memory_turn,
-                MemoryTurnState::GenerationFailed);
+            work->cancel();
             return false;
         }
     }
 
     try {
-        if (post_turn_worker_->enqueue(std::move(task.value()))) {
+        if (post_turn_worker_->enqueue(std::move(work))) {
             return true;
         }
     } catch (const std::exception& error) {
@@ -1177,8 +1164,6 @@ bool ModelRuntime::beginPostTurn(
                  << " message=<unknown>");
     }
 
-    memory_coordinator_->publish(
-        memory_turn, MemoryOutcome::Failed);
     finishPostTurn(session_id);
     return false;
 }

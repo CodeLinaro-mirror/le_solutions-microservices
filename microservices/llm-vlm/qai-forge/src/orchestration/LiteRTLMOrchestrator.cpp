@@ -47,11 +47,9 @@ std::string generateEventId() {
 
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
 // LiteRTLMOrchestrator::PreparedState — concrete opaque prepared-state
-// subclass. Holds everything that used to live on
-// scheduler::LiteRTLMPreparedRequest.
-// ─────────────────────────────────────────────────────────────────────────────
+// subclass. Holds the rendered messages/tools and generation parameters
+// needed by execute()/postTurn().
 struct LiteRTLMOrchestrator::PreparedState : qai_forge::PreparedGenerationState {
     json messages = json::array();
     json tools = json::array();
@@ -169,12 +167,9 @@ std::string LiteRTLMOrchestrator::renderPrompt(const json& messages,
     return oss.str();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// prepare()
-//
-// Ports the body of the old createJob() — front-eviction, generation
-// defaults from env-vars, and raw_prompt bypass carried forward unchanged.
-// ─────────────────────────────────────────────────────────────────────────────
+// prepare() applies front-eviction when the context is near capacity,
+// resolves generation defaults from env-vars, and carries forward the
+// OIP raw_prompt bypass unchanged.
 std::unique_ptr<qai_forge::PreparedGenerationState> LiteRTLMOrchestrator::prepare(
     const CreateChatCompletionRequest& request_in,
     const qai_forge::ConversationMemorySnapshot& /*memory*/,
@@ -225,12 +220,9 @@ std::unique_ptr<qai_forge::PreparedGenerationState> LiteRTLMOrchestrator::prepar
     return prepared;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// execute()
-//
-// Ports the body of the old execute() nearly verbatim — job.*/callbacks.on_token
-// references become info.*/on_token parameter references.
-// ─────────────────────────────────────────────────────────────────────────────
+// execute() drives one generation call against the backend, routing
+// reasoning content through ReasoningRouter and tool calls through the
+// model-family adapter.
 StandardResponse LiteRTLMOrchestrator::execute(
     const qai_forge::GenerationJobInfo& info,
     qai_forge::PreparedGenerationState& prepared_base,
@@ -271,26 +263,21 @@ StandardResponse LiteRTLMOrchestrator::execute(
 
     // Reasoning routing: only meaningful when the model declares both a
     // think-start and think-end tag. ReasoningRouter's find()-based state
-    // machine treats an empty tag as matching at every position, which would
-    // infinite-loop on a non-empty buffer — so the router is only
-    // constructed/used when both tags are non-empty, exactly mirroring the
-    // guard the old hand-rolled splitting logic used.
+    // machine treats an empty tag as matching at every position, which
+    // would infinite-loop on a non-empty buffer — so the router is only
+    // constructed/used when both tags are non-empty.
     const bool has_thinking = !think_start_.empty() && !think_end_.empty();
     std::optional<ReasoningRouter> router;
     if (has_thinking) {
         router.emplace(info.session_id, info.model_id, think_start_, think_end_, -1);
     }
     // Tracks whether the first non-empty answer-channel chunk has been
-    // emitted yet, so we can strip the leading "\n\r" that typically follows
-    // </think> — matching the old manual splitter's trim behavior — without
-    // trimming subsequent answer chunks.
+    // emitted yet, so we can strip the leading "\n\r" that typically
+    // follows </think> without trimming subsequent answer chunks.
     bool answer_started = false;
-    // The old hand-rolled splitter withheld ALL streaming output — including
-    // any pre-<think> preamble and reasoning content itself — until
-    // </think> had been seen at least once in the raw stream. Replicate
-    // that gating exactly: content before the model has entered+exited a
-    // thinking block is never forwarded, and reasoning_content chunks are
-    // never forwarded either.
+    // Content before the model has entered+exited a thinking block is
+    // never forwarded to the client, and reasoning_content chunks are
+    // never forwarded either — only answer-channel content streams out.
     bool saw_reasoning = false;
 
     StreamChunk stream_chunk;
@@ -318,11 +305,9 @@ StandardResponse LiteRTLMOrchestrator::execute(
     // see ReasoningRouter::route()'s doc comment.
     std::vector<StreamChunk> reasoning_chunks_scratch;
 
-    // job.isCancelled()/terminateWorker() previously gated per-token
-    // cancellation; GenerationJobInfo carries no cancellation flag (the
-    // scheduler layer owns cancellation entirely above the orchestrator
-    // boundary now) — cancellation checks are omitted here, matching how
-    // the public interface contract has no notion of job cancellation.
+    // GenerationJobInfo carries no cancellation flag — the scheduler layer
+    // owns cancellation entirely above the orchestrator boundary, so no
+    // per-token cancellation check is needed here.
     backend.generateWithSession(
         event_id, info.session_id, prompt, streaming,
         prepared->max_tokens,
@@ -338,10 +323,8 @@ StandardResponse LiteRTLMOrchestrator::execute(
             ++completion_tokens;
 
             // Always feed the router (regardless of streaming/tool-call
-            // state) so getThinkingContent()/getAnswerContent() reflect the
-            // complete response afterward — matching the old blocking-path
-            // behavior of splitting over the *entire* accumulated_text
-            // unconditionally.
+            // state) so getThinkingContent()/getAnswerContent() reflect
+            // the complete response afterward.
             reasoning_chunks_scratch.clear();
             if (has_thinking) {
                 router->route(token.content, reasoning_chunks_scratch);

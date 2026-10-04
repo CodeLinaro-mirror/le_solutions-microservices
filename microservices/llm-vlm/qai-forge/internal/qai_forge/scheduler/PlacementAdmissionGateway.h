@@ -18,7 +18,7 @@
 namespace scheduler {
 
 // Move-only resource admission reservation owned by one resident runtime.
-class PlacementContext;
+class PlacementAdmissionGateway;
 
 class PlacementReservation {
 public:
@@ -40,7 +40,7 @@ public:
     void release() noexcept { lease_.release(); }
 
 private:
-    friend class PlacementContext;
+    friend class PlacementAdmissionGateway;
 
     PlacementReservation(
         qai_forge::execution::ExecutionPlan plan,
@@ -65,15 +65,15 @@ struct PlacementAdmissionResult {
         delete;
 };
 
-// Scheduler composition of topology, plan validation, and leases. Performs
-// placement admission only; the granted reservation is transferred to one
-// ModelRuntime or PredictiveModelRuntime, which passes the execution plan
-// to its owned backend adapter.
-class PlacementContext {
+// Gatekeeps resource admission against the topology/provider registries.
+// The granted reservation is transferred to one ModelRuntime or
+// PredictiveModelRuntime, which passes the execution plan to its owned
+// backend adapter.
+class PlacementAdmissionGateway {
 public:
-    static std::shared_ptr<PlacementContext> createDefault();
+    static std::shared_ptr<PlacementAdmissionGateway> createDefault();
 
-    PlacementContext(
+    PlacementAdmissionGateway(
         std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology,
         qai_forge::execution::ProviderRegistry providers);
 

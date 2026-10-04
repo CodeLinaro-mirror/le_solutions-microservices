@@ -5,12 +5,14 @@
 
 #include "qai_forge/InternalDTOs.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
+#include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/GenerativeJobContext.h"
 
 #include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace scheduler {
@@ -22,29 +24,9 @@ struct GenerativeCallbacks {
     std::function<void()> on_cancelled;
 };
 
-struct PostTurnInput {
-    std::string session_id;
-    MemoryTurnCommitToken memory_turn;
-    // The memory snapshot fed into IGenerativeOrchestrator::prepare() for
-    // this job, translated to GenieMemoryState. OrchestratorAdapter uses
-    // this as the "before" value to detect whether postTurn() actually
-    // changed anything (postTurn() returning std::nullopt means "no
-    // change" — the adapter echoes this value back unchanged so
-    // PostTurnWorker's memoryChanged() comparison correctly reports
-    // MemoryOutcome::Unchanged rather than treating a no-op as a change).
-    GenieMemoryState before_memory;
-    // Opaque state produced by IGenerativeOrchestrator::prepare() for this
-    // job, carried forward so postTurn() can inspect/reuse whatever the
-    // orchestrator stashed in it (e.g. the full conversation_messages for
-    // the completed turn). Replaces the old request_messages/input_memory
-    // fields — OrchestratorAdapter now owns translating memory snapshots.
-    std::unique_ptr<qai_forge::PreparedGenerationState> prepared_state;
-};
-
-struct PostTurnTask {
-    PostTurnInput input;
-    StandardResponse response;
-};
+// The scheduler (ModelRuntime/PostTurnWorker) only ever deals with the
+// opaque PostTurnWork interface (see OrchestratorAdapter.h) returned from
+// OrchestratorAdapter::createPostTurnTask().
 
 struct GenerativeJob {
     std::string job_id;
@@ -69,6 +51,14 @@ struct GenerativeJob {
 
     std::chrono::steady_clock::time_point created_at =
         std::chrono::steady_clock::now();
+    // Set by WarmModelPool::submit() to created_at + queue_admission_timeout
+    // when WarmModelPoolConfig::queue_admission_timeout > 0 (0/default =
+    // disabled, this field stays time_point::max()). Enforced by
+    // ModelRuntime::expireStaleQueuedJobs() / PriorityModelQueue::
+    // expireOlderThan(), which proactively fail (via on_error,
+    // INSUFFICIENT_MEMORY/503) any job still queued past this deadline
+    // instead of letting it eventually run for a caller that may have
+    // long since given up.
     std::chrono::steady_clock::time_point enqueue_deadline =
         std::chrono::steady_clock::time_point::max();
 

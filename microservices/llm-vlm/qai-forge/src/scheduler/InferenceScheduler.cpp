@@ -83,6 +83,17 @@ InferenceSchedulerConfig configFromEnvironment() {
         "MAX_QUEUE_DEPTH_PER_MODEL",
         config.predictive_pool_config.max_queue_depth_per_model);
 
+    // Generative-pool-only: maximum time a job may sit queued before being
+    // proactively failed (see WarmModelPoolConfig::queue_admission_timeout
+    // doc comment). 0/unset = disabled (default) — predictive jobs have no
+    // enqueue_deadline field and are intentionally not covered by this
+    // knob. parseSecondsEnv() only overrides when the env var is a valid
+    // positive integer, so the explicit zero-default above is preserved
+    // when the var is absent.
+    config.generative_pool_config.queue_admission_timeout = parseSecondsEnv(
+        "QUEUE_ADMISSION_TIMEOUT_SECONDS",
+        config.generative_pool_config.queue_admission_timeout);
+
     return config;
 }
 
@@ -268,7 +279,7 @@ InferenceScheduler::InferenceScheduler(
       model_load_coordinator_(std::make_shared<ModelLoadCoordinator>(
           std::max(config_.generative_pool_config.memory_headroom_mb,
                    config_.predictive_pool_config.memory_headroom_mb))),
-      placement_context_(PlacementContext::createDefault()),
+      placement_context_(PlacementAdmissionGateway::createDefault()),
       generative_pool_(
           config_.generative_pool_config,
           std::move(generative_factory),

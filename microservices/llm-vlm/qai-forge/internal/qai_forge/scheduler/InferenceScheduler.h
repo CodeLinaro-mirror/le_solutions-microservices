@@ -147,7 +147,7 @@ private:
     std::shared_ptr<ModelLoadCoordinator> model_load_coordinator_;
     // Shared across both pools so generative and predictive residents
     // contend for the same underlying HTP/device capacity accounting.
-    std::shared_ptr<PlacementContext> placement_context_;
+    std::shared_ptr<PlacementAdmissionGateway> placement_context_;
     WarmModelPool generative_pool_;
     PredictiveModelPool predictive_pool_;
 };

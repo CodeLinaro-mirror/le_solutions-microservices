@@ -5,6 +5,7 @@
 
 #include "qai_forge/utils/Logger.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -82,6 +83,51 @@ GenerativeJobPtr PriorityModelQueue::popIf(
     if (auto job = pop_matching(control_)) return job;
     if (auto job = pop_matching(tool_continuation_)) return job;
     return pop_matching(any_request_);
+}
+
+std::vector<GenerativeJobPtr> PriorityModelQueue::expireOlderThan(
+    std::chrono::steady_clock::time_point now) {
+    std::vector<GenerativeJobPtr> expired;
+
+    auto expire_from = [&expired, now](Lane& lane) {
+        for (auto it = lane.begin(); it != lane.end();) {
+            const GenerativeJobPtr& job = *it;
+            if (!job) {
+                it = lane.erase(it);
+                continue;
+            }
+            if (job->enqueue_deadline <= now) {
+                expired.push_back(*it);
+                it = lane.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    };
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    expire_from(control_);
+    expire_from(tool_continuation_);
+    expire_from(any_request_);
+    return expired;
+}
+
+std::chrono::steady_clock::time_point PriorityModelQueue::earliestDeadline() const {
+    auto earliest = std::chrono::steady_clock::time_point::max();
+
+    auto scan = [&earliest](const Lane& lane) {
+        for (const GenerativeJobPtr& job : lane) {
+            if (job) {
+                earliest = std::min(earliest, job->enqueue_deadline);
+            }
+        }
+    };
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    scan(control_);
+    scan(tool_continuation_);
+    scan(any_request_);
+    return earliest;
 }
 
 GenerativeJobPtr PriorityModelQueue::cancel(const std::string& job_id) {

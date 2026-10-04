@@ -18,7 +18,7 @@ PredictiveModelPool::PredictiveModelPool(
     PredictiveBackendFactory factory,
     ModelRuntimeEvents runtime_events,
     std::shared_ptr<ModelLoadCoordinator> load_coordinator,
-    std::shared_ptr<PlacementContext> placement)
+    std::shared_ptr<PlacementAdmissionGateway> placement)
     : config_(std::move(config))
     , factory_(std::move(factory))
     , runtime_events_(std::move(runtime_events))
@@ -38,7 +38,7 @@ PredictiveModelPool::PredictiveModelPool(
         load_coordinator_->start();
     }
     if (!placement_) {
-        placement_ = PlacementContext::createDefault();
+        placement_ = PlacementAdmissionGateway::createDefault();
     }
 
     LOG_INFO("[PredictiveModelPool] Initialized with max_active_models="

@@ -82,7 +82,7 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
                                  memory_coordinator,
                              std::shared_ptr<ModelLoadCoordinator>
                                  load_coordinator,
-                             std::shared_ptr<PlacementContext> placement)
+                             std::shared_ptr<PlacementAdmissionGateway> placement)
     : config_(config),
       runtime_factory_(runtime_factory ? std::move(runtime_factory)
                                        : defaultRuntimeFactory()),
@@ -105,7 +105,7 @@ WarmModelPool::WarmModelPool(WarmModelPoolConfig config,
         load_coordinator_->start();
     }
     if (!placement_) {
-        placement_ = PlacementContext::createDefault();
+        placement_ = PlacementAdmissionGateway::createDefault();
     }
     if (config_.cold_model_fairness_wait.count() <= 0) {
         config_.cold_model_fairness_wait = std::chrono::seconds(120);
@@ -216,6 +216,9 @@ SubmitResult WarmModelPool::submit(ModelRuntime* runtime,
         }
 
         record.last_used_at = now;
+        if (config_.queue_admission_timeout.count() > 0) {
+            job->enqueue_deadline = now + config_.queue_admission_timeout;
+        }
         record.runtime->enqueue(job);
         event_pending_ = true;
         LOG_INFO("[WarmModelPool] Enqueued job: job=" << job->job_id
@@ -316,8 +319,8 @@ bool WarmModelPool::openToolLease(const std::string& model_id,
 
         const auto now = std::chrono::steady_clock::now();
         RuntimeRecord& record = it->second;
-        record.tool_chain_id = chain_id;
-        record.tool_lease_until =
+        record.tool_lease.chain_id = chain_id;
+        record.tool_lease.lease_until =
             now + effectiveTtl(ttl, config_.tool_response_timeout);
         record.eviction_requested = false;
         LOG_INFO("[WarmModelPool] Opened tool lease: model=" << model_id
@@ -359,7 +362,7 @@ bool WarmModelPool::closeToolLease(const std::string& model_id,
         }
 
         RuntimeRecord& record = it->second;
-        if (record.tool_chain_id != chain_id) {
+        if (record.tool_lease.chain_id != chain_id) {
             return false;
         }
 
@@ -427,9 +430,9 @@ ModelPoolSnapshot WarmModelPool::snapshotLocked() const {
             record.active_reserved,
             record.reservation_count,
             record.eviction_requested,
-            static_cast<bool>(record.tool_lease_until),
-            record.tool_chain_id,
-            record.tool_lease_until,
+            record.tool_lease.active(),
+            record.tool_lease.chain_id,
+            record.tool_lease.lease_until,
             record.last_used_at,
             record.idle_since,
         });
@@ -443,13 +446,16 @@ void WarmModelPool::refreshTimedStateLocked(
     for (auto& entry : runtimes_) {
         RuntimeRecord& record = entry.second;
 
-        if (record.tool_lease_until &&
-            now >= *record.tool_lease_until) {
+        if (record.tool_lease.lease_until &&
+            now >= *record.tool_lease.lease_until) {
             LOG_WARN("[WarmModelPool] Tool lease expired: model="
-                     << entry.first << " chain=" << record.tool_chain_id);
+                     << entry.first << " chain=" << record.tool_lease.chain_id);
             clearToolLeaseLocked(record);
         }
 
+        if (config_.queue_admission_timeout.count() > 0 && record.runtime) {
+            record.runtime->expireStaleQueuedJobs();
+        }
     }
 }
 
@@ -701,7 +707,7 @@ void WarmModelPool::handleRuntimeStateChanged(const std::string& model_id,
                  << " eviction_requested="
                  << (record.eviction_requested ? "true" : "false")
                  << " tool_lease="
-                 << (record.tool_lease_until ? "true" : "false"));
+                 << (record.tool_lease.active() ? "true" : "false"));
     }
 
     cv_.notify_one();
@@ -721,14 +727,16 @@ WarmModelPool::RuntimeRecord& WarmModelPool::getOrCreateRuntimeLocked(
             handleRuntimeStateChanged(changed_model_id, state);
         };
 
-    // Create backend + orchestrator pair via factory
+    // Create backend + orchestrator pair via factory and inject the
+    // memory coordinator into the orchestrator adapter — conversation
+    // memory bookkeeping lives inside OrchestratorAdapter.
     RuntimePair pair = runtime_factory_(model_id);
+    pair.orchestrator->attachMemoryCoordinator(memory_coordinator_);
 
     auto runtime = std::make_unique<ModelRuntime>(
         model_id,
         std::move(pair.backend),
         std::move(pair.orchestrator),
-        memory_coordinator_,
         load_coordinator_,
         modelMemoryMb(model_id),
         placement_,
@@ -773,8 +781,7 @@ bool WarmModelPool::runtimeHasQueuedWorkLocked(const RuntimeRecord& record) cons
 }
 
 void WarmModelPool::clearToolLeaseLocked(RuntimeRecord& record) {
-    record.tool_chain_id.clear();
-    record.tool_lease_until.reset();
+    record.tool_lease.clear();
 }
 
 std::chrono::steady_clock::time_point
@@ -786,8 +793,14 @@ WarmModelPool::nextPolicyDeadlineLocked(
 
     for (const auto& entry : runtimes_) {
         const RuntimeRecord& record = entry.second;
-        if (record.tool_lease_until) {
-            next_deadline = std::min(next_deadline, *record.tool_lease_until);
+        if (record.tool_lease.lease_until) {
+            next_deadline = std::min(next_deadline, *record.tool_lease.lease_until);
+        }
+
+        if (config_.queue_admission_timeout.count() > 0 && record.runtime) {
+            next_deadline = std::min(
+                next_deadline,
+                record.runtime->earliestQueueDeadline());
         }
 
         if (config_.idle_timeout.count() > 0 &&
@@ -795,7 +808,7 @@ WarmModelPool::nextPolicyDeadlineLocked(
             record.active_reserved &&
             record.reservation_count == 0 &&
             !record.eviction_requested &&
-            !record.tool_lease_until &&
+            !record.tool_lease.active() &&
             record.idle_since &&
             !runtimeHasQueuedWorkLocked(record)) {
             next_deadline = std::min(

@@ -1,7 +1,7 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
-#include "qai_forge/scheduler/PlacementContext.h"
+#include "qai_forge/scheduler/PlacementAdmissionGateway.h"
 
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/resources/QnnTopologyProbe.h"
@@ -21,7 +21,7 @@ std::shared_ptr<const qai_forge::resources::TopologyRegistry> requireTopology(
     std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology) {
     if (!topology) {
         throw std::invalid_argument(
-            "PlacementContext requires a topology registry");
+            "PlacementAdmissionGateway requires a topology registry");
     }
     return topology;
 }
@@ -122,14 +122,15 @@ uint32_t sharedUsersFor(
 
 }  // namespace
 
-std::shared_ptr<PlacementContext> PlacementContext::createDefault() {
+std::shared_ptr<PlacementAdmissionGateway>
+PlacementAdmissionGateway::createDefault() {
     auto topology = topologyFromEnvironment();
-    return std::make_shared<PlacementContext>(
+    return std::make_shared<PlacementAdmissionGateway>(
         std::move(topology),
         qai_forge::execution::ProviderRegistry::createDefault());
 }
 
-PlacementContext::PlacementContext(
+PlacementAdmissionGateway::PlacementAdmissionGateway(
     std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology,
     qai_forge::execution::ProviderRegistry providers)
     : topology_(requireTopology(std::move(topology))),
@@ -138,13 +139,13 @@ PlacementContext::PlacementContext(
           std::make_shared<qai_forge::resources::ResourceManager>(topology_)),
       resolver_(topology_, providers_) {}
 
-PlacementAdmissionResult PlacementContext::tryAcquire(
+PlacementAdmissionResult PlacementAdmissionGateway::tryAcquire(
     const qai_forge::execution::RuntimeId& runtime_id,
     const std::string& model_id) const {
     return tryAcquirePlan(runtime_id, model_id, defaultPlan(model_id));
 }
 
-PlacementAdmissionResult PlacementContext::tryAcquireAutomatic(
+PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireAutomatic(
     const qai_forge::execution::RuntimeId& runtime_id,
     const std::string& model_id) const {
     PlacementAdmissionResult result;
@@ -258,7 +259,7 @@ PlacementAdmissionResult PlacementContext::tryAcquireAutomatic(
     return result;
 }
 
-PlacementAdmissionResult PlacementContext::tryAcquireQnnDevice(
+PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireQnnDevice(
     const qai_forge::execution::RuntimeId& runtime_id,
     const std::string& model_id,
     uint32_t qnn_device_id) const {
@@ -273,7 +274,7 @@ PlacementAdmissionResult PlacementContext::tryAcquireQnnDevice(
         runtime_id, model_id, qnnExactPlan(qnn_device_id));
 }
 
-PlacementAdmissionResult PlacementContext::tryAcquirePlan(
+PlacementAdmissionResult PlacementAdmissionGateway::tryAcquirePlan(
     const qai_forge::execution::RuntimeId& runtime_id,
     const std::string& model_id,
     const qai_forge::execution::ExecutionPlan& plan) const {
@@ -305,8 +306,8 @@ PlacementAdmissionResult PlacementContext::tryAcquirePlan(
     return result;
 }
 
-qai_forge::execution::ExecutionPlan PlacementContext::geniePreferredPlan(
-    uint32_t genie_device_id) const {
+qai_forge::execution::ExecutionPlan
+PlacementAdmissionGateway::geniePreferredPlan(uint32_t genie_device_id) const {
     qai_forge::execution::ExecutionPlan plan;
     plan.provider = "genie";
 
@@ -360,8 +361,8 @@ qai_forge::execution::ExecutionPlan PlacementContext::geniePreferredPlan(
     return plan;
 }
 
-qai_forge::execution::ExecutionPlan PlacementContext::qnnExactPlan(
-    uint32_t qnn_device_id) const {
+qai_forge::execution::ExecutionPlan
+PlacementAdmissionGateway::qnnExactPlan(uint32_t qnn_device_id) const {
     qai_forge::execution::ExecutionPlan plan;
     plan.provider = "qnn";
 
@@ -416,7 +417,7 @@ qai_forge::execution::ExecutionPlan PlacementContext::qnnExactPlan(
     return plan;
 }
 
-qai_forge::execution::ExecutionPlan PlacementContext::defaultPlan(
+qai_forge::execution::ExecutionPlan PlacementAdmissionGateway::defaultPlan(
     const std::string& model_id) const {
     qai_forge::execution::ExecutionPlan plan;
     plan.provider = providerForModel(model_id);

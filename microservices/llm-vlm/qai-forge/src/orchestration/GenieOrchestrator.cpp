@@ -294,14 +294,10 @@ std::string buildSingleTurnPrompt(
 
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GenieOrchestrator::PreparedState — concrete opaque prepared-state subclass.
-//
-// Holds everything that used to live on scheduler::GeniePreparedRequest,
-// plus the "before" memory snapshot (used to be
-// GeniePreparedRequest::input_memory) and the conversation messages carried
-// forward for postTurn() to consume.
-// ─────────────────────────────────────────────────────────────────────────────
+// GenieOrchestrator::PreparedState — concrete opaque prepared-state
+// subclass. Holds the final prompt, generation parameters, and the "before"
+// memory snapshot + conversation messages carried forward for postTurn()
+// to consume.
 struct GenieOrchestrator::PreparedState : qai_forge::PreparedGenerationState {
     std::string final_prompt;
 
@@ -480,13 +476,9 @@ std::string GenieOrchestrator::buildContextPrompt(const ConversationSession& ses
     return prompt.str();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// prepare()
-//
-// Ports the body of the old createJob() — builds the final prompt, computes
-// the reasoning budget, preprocesses VLM images, and stashes everything an
-// orchestrator needs into a PreparedState for execute()/postTurn().
-// ─────────────────────────────────────────────────────────────────────────────
+// prepare() builds the final prompt, computes the reasoning budget,
+// preprocesses VLM images, and stashes everything an orchestrator needs
+// into a PreparedState for execute()/postTurn().
 std::unique_ptr<qai_forge::PreparedGenerationState> GenieOrchestrator::prepare(
     const CreateChatCompletionRequest& request_in,
     const qai_forge::ConversationMemorySnapshot& memory,
@@ -497,12 +489,11 @@ std::unique_ptr<qai_forge::PreparedGenerationState> GenieOrchestrator::prepare(
     ConversationSession session(session_id);
     auto& config_manager = ModelConfigManager::getInstance();
     const bool is_vlm = config_manager.supportsVision(request.model);
-    // VLM turns never use private per-turn memory (matches the old
-    // createJob()'s `uses_private_memory && !is_vlm` gate below) — treat
-    // non-VLM turns as private-memory candidates; OrchestratorAdapter only
-    // calls postTurn() afterward when the caller actually opted into a
-    // memory turn, so this flag purely controls whether this prepare()
-    // call bothers rehydrating/canonicalizing the transcript.
+    // VLM turns never use private per-turn memory — treat non-VLM turns as
+    // private-memory candidates; OrchestratorAdapter only calls postTurn()
+    // afterward when the caller actually opted into a memory turn, so this
+    // flag purely controls whether this prepare() call bothers rehydrating/
+    // canonicalizing the transcript.
     const bool uses_private_memory = !is_vlm;
 
     json complete_messages = json::array();
@@ -983,15 +974,10 @@ StandardResponse GenieOrchestrator::executeStreamingPrepared(
     return response;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// postTurn()
-//
-// Ports the old createPostTurnTask()+executePostTurn() combined logic. The
-// VLM/tool-call skip conditions that used to live in createPostTurnTask()
-// now live here (OrchestratorAdapter's own gating only checks
-// memory_turn.has_value() / skip_post_turn_summarization / prepared_state
-// non-null — it has no visibility into VLM or tool-call state).
-// ─────────────────────────────────────────────────────────────────────────────
+// postTurn() applies the VLM/tool-call skip conditions (OrchestratorAdapter's
+// own gating only checks memory_turn.has_value() /
+// skip_post_turn_summarization / prepared_state non-null — it has no
+// visibility into VLM or tool-call state).
 std::optional<qai_forge::ConversationMemorySnapshot> GenieOrchestrator::postTurn(
     const qai_forge::GenerationJobInfo& info,
     qai_forge::PreparedGenerationState& prepared_base,

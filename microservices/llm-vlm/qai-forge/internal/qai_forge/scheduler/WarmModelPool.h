@@ -7,7 +7,7 @@
 #include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
-#include "qai_forge/scheduler/PlacementContext.h"
+#include "qai_forge/scheduler/PlacementAdmissionGateway.h"
 #include "qai_forge/scheduler/SubmitResult.h"
 #include "qai_forge/backend/BackendFactory.h"
 
@@ -34,6 +34,12 @@ struct WarmModelPoolConfig {
     std::chrono::milliseconds tool_response_timeout = std::chrono::seconds(30);
     size_t max_queue_depth_per_model = 0; // 0 = unlimited
     long memory_headroom_mb = 1024;
+    // Maximum time a generative job may sit queued before being
+    // proactively failed via on_error with INSUFFICIENT_MEMORY/503.
+    // 0 = disabled (default). Enforced by
+    // ModelRuntime::expireStaleQueuedJobs() from this pool's event loop.
+    std::chrono::milliseconds queue_admission_timeout =
+        std::chrono::milliseconds(0);
 };
 
 struct ModelPoolRuntimeSnapshot {
@@ -61,6 +67,19 @@ struct ModelPoolSnapshot {
     std::vector<ModelPoolRuntimeSnapshot> runtimes;
 };
 
+// Tool-chain lease deadline bookkeeping for one resident runtime: how long
+// a lease keeps WarmModelPool from draining/evicting it for chain_id.
+struct ToolLeaseState {
+    std::string chain_id;
+    std::optional<std::chrono::steady_clock::time_point> lease_until;
+
+    bool active() const noexcept { return lease_until.has_value(); }
+    void clear() noexcept {
+        chain_id.clear();
+        lease_until.reset();
+    }
+};
+
 // Owns warm model residency. It coordinates which ModelRuntime may load/unload,
 // but ModelRuntime still owns actual per-model execution.
 class WarmModelPool {
@@ -72,7 +91,7 @@ public:
                                memory_coordinator = {},
                            std::shared_ptr<ModelLoadCoordinator>
                                load_coordinator = {},
-                           std::shared_ptr<PlacementContext> placement = {});
+                           std::shared_ptr<PlacementAdmissionGateway> placement = {});
     ~WarmModelPool();
 
     WarmModelPool(const WarmModelPool&) = delete;
@@ -115,8 +134,7 @@ private:
         bool active_reserved = false;
         size_t reservation_count = 0;
         bool eviction_requested = false;
-        std::string tool_chain_id;
-        std::optional<std::chrono::steady_clock::time_point> tool_lease_until;
+        ToolLeaseState tool_lease;
         std::chrono::steady_clock::time_point last_used_at =
             std::chrono::steady_clock::now();
         std::optional<std::chrono::steady_clock::time_point> idle_since;
@@ -163,7 +181,7 @@ private:
     std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     bool owns_load_coordinator_ = false;
-    std::shared_ptr<PlacementContext> placement_;
+    std::shared_ptr<PlacementAdmissionGateway> placement_;
     std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     mutable std::mutex mutex_;

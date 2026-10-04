@@ -6,9 +6,8 @@
 #include "qai_forge/backend/BackendAdapter.h"
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/scheduler/CancelResult.h"
-#include "qai_forge/scheduler/ConversationMemoryCoordinator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
-#include "qai_forge/scheduler/PlacementContext.h"
+#include "qai_forge/scheduler/PlacementAdmissionGateway.h"
 #include "qai_forge/scheduler/PriorityModelQueue.h"
 #include "qai_forge/orchestration/OrchestratorAdapter.h"
 #include "qai_forge/utils/ThreadPool.h"
@@ -56,6 +55,13 @@ struct ModelRuntimeAdmissionSnapshot {
     bool has_running_job = false;
     std::string running_job_id;
     bool healthy = false;
+    // Earliest GenerativeJob::enqueue_deadline across all currently-queued
+    // jobs for this model, or time_point::max() if none are queued or the
+    // admission-timeout feature is disabled (see
+    // WarmModelPoolConfig::queue_admission_timeout). Lets WarmModelPool's
+    // event loop wake up exactly when the next expiration is due.
+    std::chrono::steady_clock::time_point earliest_queue_deadline =
+        std::chrono::steady_clock::time_point::max();
 };
 
 struct ModelRuntimeEvents {
@@ -78,10 +84,9 @@ public:
     ModelRuntime(std::string model_id,
                  std::unique_ptr<BackendAdapter> backend,
                  std::shared_ptr<OrchestratorAdapter> orchestrator,
-                 std::shared_ptr<ConversationMemoryCoordinator> coordinator,
                  std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                  long model_memory_mb,
-                 std::shared_ptr<PlacementContext> placement,
+                 std::shared_ptr<PlacementAdmissionGateway> placement,
                  ModelRuntimeEvents events = {});
     ~ModelRuntime();
 
@@ -97,6 +102,20 @@ public:
     CancelResult cancel(const std::string& job_id);
     void requestDrain();
     void failQueued(const GenAIException& error);
+
+    // Selectively fails (via on_error) every queued job whose
+    // GenerativeJob::enqueue_deadline has passed, instead of draining the
+    // entire queue like failQueued() does. No-op if the admission-timeout
+    // feature is disabled (jobs default to enqueue_deadline ==
+    // time_point::max(), which never compares <= now). Called from
+    // WarmModelPool's event loop on every policy tick when
+    // WarmModelPoolConfig::queue_admission_timeout > 0.
+    void expireStaleQueuedJobs();
+
+    // Earliest enqueue_deadline across this runtime's queued jobs, or
+    // time_point::max() if none are queued or the feature is disabled.
+    std::chrono::steady_clock::time_point earliestQueueDeadline() const;
+
     void stop(bool force = false);
 
     ModelRuntimeSnapshot snapshot() const;
@@ -143,9 +162,8 @@ private:
     PriorityModelQueue queue_;
     std::unique_ptr<BackendAdapter> backend_;
     std::shared_ptr<OrchestratorAdapter> orchestrator_;
-    std::shared_ptr<ConversationMemoryCoordinator> memory_coordinator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
-    std::shared_ptr<PlacementContext> placement_;
+    std::shared_ptr<PlacementAdmissionGateway> placement_;
     PlacementReservation placement_reservation_;
     std::unique_ptr<PostTurnWorker> post_turn_worker_;
     ModelRuntimeEvents events_;

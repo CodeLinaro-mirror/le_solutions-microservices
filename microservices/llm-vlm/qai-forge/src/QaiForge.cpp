@@ -7,8 +7,9 @@
 #include "qai_forge/plugin/PluginLoader.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
+#include "qai_forge/scheduler/ActiveOperationRegistry.h"
 #include "qai_forge/scheduler/InferenceScheduler.h"
-#include "qai_forge/scheduler/ToolChainTable.h"
+#include "qai_forge/scheduler/ToolChainLeaseManager.h"
 #include "qai_forge/utils/Logger.h"
 
 #include <algorithm>
@@ -272,7 +273,8 @@ struct QaiForge::Impl {
     explicit Impl(QaiForgeConfig config = configFromEnvironment())
         : config_(std::move(config)),
           scheduler_(scheduler::InferenceScheduler::getInstance()),
-          memory_coordinator_(scheduler_.memoryCoordinator()) {}
+          memory_coordinator_(scheduler_.memoryCoordinator()),
+          tool_chains_(scheduler_) {}
 
     ~Impl() {
         shutdown(false);
@@ -282,7 +284,6 @@ struct QaiForge::Impl {
                               const GenerateOptions& options) {
         validateSchedulableOrThrow(request, "Blocking");
 
-        // Task 4 step ⓪ seam: await session memory readiness before context reads.
         scheduler::GenerativeJobContext context = prepareContext(
             request,
             options,
@@ -352,7 +353,6 @@ struct QaiForge::Impl {
         CreateChatCompletionRequest streaming_request = request;
         streaming_request.stream = true;
 
-        // Task 4 step ⓪ seam: await session memory readiness before context reads.
         scheduler::GenerativeJobContext context = prepareContext(
             streaming_request,
             options,
@@ -489,11 +489,6 @@ struct QaiForge::Impl {
         scheduler_.shutdown(force);
         memory_coordinator_->clear();
 
-        {
-            std::lock_guard<std::mutex> active_lock(active_operations_mutex_);
-            active_operations_.clear();
-        }
-
         std::lock_guard<std::mutex> lock(maintenance_mutex_);
         started_ = false;
     }
@@ -502,29 +497,15 @@ struct QaiForge::Impl {
         if (response_id.empty()) {
             return false;
         }
-        std::string job_id = response_id;
-        std::string lease_model_id;
-        std::string lease_id;
-        std::optional<scheduler::MemoryTurnCommitToken> memory_turn;
-        bool found_operation = false;
-        {
-            std::lock_guard<std::mutex> lock(active_operations_mutex_);
-            auto found = active_operations_.find(response_id);
-            if (found != active_operations_.end()) {
-                found_operation = true;
-                found->second.cancelled = true;
-                found->second.last_activity =
-                    std::chrono::steady_clock::now();
-                job_id = found->second.job_id;
-                lease_model_id = found->second.lease_model_id;
-                lease_id = found->second.lease_id;
-                memory_turn = found->second.memory_turn;
-            }
-        }
-        closeChainIfPresent(lease_model_id, lease_id);
-        if (memory_turn.has_value()) {
+
+        const scheduler::ActiveOperationRegistry::CancelInfo info =
+            active_operations_.markCancelled(response_id);
+        std::string job_id = info.found ? info.job_id : response_id;
+
+        tool_chains_.closeChain(info.lease_model_id, info.lease_id);
+        if (info.memory_turn.has_value()) {
             memory_coordinator_->abortTurn(
-                memory_turn.value(), scheduler::MemoryTurnState::Cancelled);
+                info.memory_turn.value(), scheduler::MemoryTurnState::Cancelled);
         }
         const scheduler::CancelResult result = job_id.empty()
             ? scheduler::CancelResult{}
@@ -532,7 +513,7 @@ struct QaiForge::Impl {
         LOG_INFO("[QaiForge] Cancel result: response=" << response_id
                  << " status=" << cancelStatusToString(result.status)
                  << " message=\"" << result.message << "\"");
-        return found_operation || result.cancelled();
+        return info.found || result.cancelled();
     }
 
     bool releaseConversationSubtree(
@@ -551,21 +532,11 @@ struct QaiForge::Impl {
     }
 
 private:
-    struct ActiveOperation {
-        std::string job_id;
-        std::string lease_model_id;
-        std::string lease_id;
-        std::optional<scheduler::MemoryTurnCommitToken> memory_turn;
-        bool cancelled = false;
-        std::chrono::steady_clock::time_point last_activity =
-            std::chrono::steady_clock::now();
-    };
-
     scheduler::GenerativeJobContext prepareContext(
         const CreateChatCompletionRequest& request,
         const GenerateOptions& options,
         scheduler::JobKind kind) {
-        expireStaleToolChains();
+        tool_chains_.expireStale();
 
         scheduler::GenerativeJobContext context;
         context.job_id = generatedJobId();
@@ -598,7 +569,7 @@ private:
             context.tool_chain_id = internalMcpLeaseId(response_id);
             context.priority = scheduler::JobPriority::TOOL_CONTINUATION;
             context.tool_continuation = true;
-            scheduler_.renewToolLease(
+            tool_chains_.renewLease(
                 context.model_id,
                 context.tool_chain_id,
                 config_.tool_response_timeout);
@@ -641,9 +612,10 @@ private:
                 context.execution_session_id = chain.session_id;
                 context.priority = scheduler::JobPriority::TOOL_CONTINUATION;
                 context.tool_continuation = true;
-                if (!tool_chains_.markContinuationQueued(
+                if (!tool_chains_.markContinuationQueuedAndRenew(
                         chain.chain_id,
                         context.job_id,
+                        chain.model_id,
                         config_.tool_response_timeout)) {
                     if (!options.allow_tool_chain_fallback) {
                         throw submitErrorToException(rejected(
@@ -659,11 +631,6 @@ private:
                     context.execution_session_id = session_id;
                     context.priority = scheduler::JobPriority::ANY_REQUEST;
                     context.tool_continuation = false;
-                } else {
-                    scheduler_.renewToolLease(
-                        chain.model_id,
-                        chain.chain_id,
-                        config_.tool_response_timeout);
                 }
             }
         }
@@ -673,21 +640,9 @@ private:
             context.priority = scheduler::JobPriority::ANY_REQUEST;
         }
 
-        if (context.caller.conversation.has_value()) {
-            scheduler::MemoryTurnStartResult memory_turn =
-                memory_coordinator_->beginTurn(
-                    context.caller.conversation.value());
-            if (!memory_turn.accepted()) {
-                throw GenAIException(
-                    GenAIErrorCode::INVALID_REQUEST,
-                    memory_turn.message.empty()
-                        ? "Conversation turn could not be started"
-                        : memory_turn.message,
-                    409);
-            }
-            context.memory_turn = memory_turn.token;
-            context.memory_state = std::move(memory_turn.memory);
-        }
+        // Conversation-memory turn management (beginTurn/abortTurn/publish)
+        // is owned by OrchestratorAdapter::createJob(), which reads
+        // context.caller.conversation directly.
         return context;
     }
 
@@ -696,8 +651,8 @@ private:
         scheduler::GenerativeCallbacks callbacks) {
         const std::string model_id = context.model_id;
         const std::string tool_chain_id = context.tool_chain_id;
-        const std::optional<scheduler::MemoryTurnCommitToken> memory_turn =
-            context.memory_turn;
+        // OrchestratorAdapter::createJob() owns beginning the
+        // conversation-memory turn and aborting it if prepare() throws.
         try {
             scheduler::GenerativeJobPtr job =
                 BackendFactory::createGenerativeOrchestratorForModel(
@@ -707,12 +662,7 @@ private:
             wrapCallbacks(*job);
             return job;
         } catch (...) {
-            closeChainIfPresent(model_id, tool_chain_id);
-            if (memory_turn.has_value()) {
-                memory_coordinator_->abortTurn(
-                    memory_turn.value(),
-                    scheduler::MemoryTurnState::GenerationFailed);
-            }
+            tool_chains_.closeChain(model_id, tool_chain_id);
             throw;
         }
     }
@@ -736,15 +686,15 @@ private:
         };
 
         try {
-            registerActiveOperation(*job);
+            active_operations_.registerOperation(*job);
             scheduler::GenerativeRuntimeHandle handle = scheduler_.reserve(metadata);
             const scheduler::SubmitResult result = handle.submit(job);
             if (!result.accepted()) {
                 throw submitErrorToException(result);
             }
         } catch (...) {
-            closeChainIfPresent(job->model_id, job->tool_chain_id);
-            finishActiveOperation(job->response_id, job->job_id, false);
+            tool_chains_.closeChain(job->model_id, job->tool_chain_id);
+            active_operations_.finishOperation(job->response_id, job->job_id, false);
             if (job->memory_turn.has_value()) {
                 memory_coordinator_->abortTurn(
                     job->memory_turn.value(),
@@ -767,8 +717,6 @@ private:
                 ? internalMcpLeaseId(response_id)
                 : std::string();
         const std::string job_id = job.job_id;
-        const std::optional<scheduler::MemoryTurnCommitToken> memory_turn =
-            job.memory_turn;
 
         job.callbacks.on_token = original_callbacks->on_token;
         job.callbacks.on_complete =
@@ -786,18 +734,18 @@ private:
                     responseHasToolCalls(response);
                 if (kind == scheduler::JobKind::MCP_ROUND) {
                     if (awaiting_internal_tool) {
-                        scheduler_.openToolLease(
+                        tool_chains_.openLease(
                             model_id,
                             internal_mcp_lease_id,
                             config_.tool_response_timeout);
                         if (previous_chain_id != internal_mcp_lease_id) {
-                            closeChainIfPresent(
+                            tool_chains_.closeChain(
                                 model_id, previous_chain_id);
                         }
                     } else {
-                        closeChainIfPresent(model_id, previous_chain_id);
+                        tool_chains_.closeChain(model_id, previous_chain_id);
                         if (previous_chain_id != internal_mcp_lease_id) {
-                            closeChainIfPresent(
+                            tool_chains_.closeChain(
                                 model_id, internal_mcp_lease_id);
                         }
                     }
@@ -809,33 +757,30 @@ private:
                         previous_chain_id,
                         response);
                 }
-                const bool kept_for_resume = finishActiveOperation(
+                const bool kept_for_resume = active_operations_.finishOperation(
                     response_id,
                     job_id,
                     awaiting_internal_tool);
                 if (awaiting_internal_tool && !kept_for_resume) {
-                    closeChainIfPresent(
+                    tool_chains_.closeChain(
                         model_id, internal_mcp_lease_id);
                 }
                 if (original_callbacks->on_complete) {
                     original_callbacks->on_complete(response);
                 }
             };
+        // Aborting the conversation-memory turn on error/cancellation is
+        // handled by OrchestratorAdapter's own callback wrapping
+        // (underneath original_callbacks here).
         job.callbacks.on_error =
             [this,
              original_callbacks,
              response_id,
              job_id,
              model_id,
-             previous_chain_id,
-             memory_turn](const GenAIException& error) {
-                closeChainIfPresent(model_id, previous_chain_id);
-                if (memory_turn.has_value()) {
-                    memory_coordinator_->abortTurn(
-                        memory_turn.value(),
-                        scheduler::MemoryTurnState::GenerationFailed);
-                }
-                finishActiveOperation(response_id, job_id, false);
+             previous_chain_id](const GenAIException& error) {
+                tool_chains_.closeChain(model_id, previous_chain_id);
+                active_operations_.finishOperation(response_id, job_id, false);
                 if (original_callbacks->on_error) {
                     original_callbacks->on_error(error);
                 }
@@ -846,76 +791,13 @@ private:
              response_id,
              job_id,
              model_id,
-             previous_chain_id,
-             memory_turn]() {
-                closeChainIfPresent(model_id, previous_chain_id);
-                if (memory_turn.has_value()) {
-                    memory_coordinator_->abortTurn(
-                        memory_turn.value(),
-                        scheduler::MemoryTurnState::Cancelled);
-                }
-                finishActiveOperation(response_id, job_id, false);
+             previous_chain_id]() {
+                tool_chains_.closeChain(model_id, previous_chain_id);
+                active_operations_.finishOperation(response_id, job_id, false);
                 if (original_callbacks->on_cancelled) {
                     original_callbacks->on_cancelled();
                 }
             };
-    }
-
-    void registerActiveOperation(const scheduler::GenerativeJob& job) {
-        if (job.response_id.empty()) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(active_operations_mutex_);
-        auto found = active_operations_.find(job.response_id);
-        if (found != active_operations_.end()) {
-            if (found->second.cancelled) {
-                throw GenAIException(
-                    GenAIErrorCode::INVALID_REQUEST,
-                    "Request was cancelled and cannot be resumed",
-                    409);
-            }
-            if (!found->second.job_id.empty() &&
-                found->second.job_id != job.job_id) {
-                throw GenAIException(
-                    GenAIErrorCode::INVALID_REQUEST,
-                    "Another scheduler job is already active for this request",
-                    409);
-            }
-        }
-        ActiveOperation& operation = active_operations_[job.response_id];
-        operation.job_id = job.job_id;
-        operation.lease_model_id =
-            job.kind == scheduler::JobKind::MCP_ROUND
-                ? job.model_id
-                : std::string();
-        operation.lease_id =
-            job.kind == scheduler::JobKind::MCP_ROUND
-                ? internalMcpLeaseId(job.response_id)
-                : std::string();
-        operation.memory_turn = job.memory_turn;
-        operation.cancelled = false;
-        operation.last_activity = std::chrono::steady_clock::now();
-    }
-
-    bool finishActiveOperation(const std::string& response_id,
-                               const std::string& job_id,
-                               bool keep_for_resume) {
-        if (response_id.empty()) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(active_operations_mutex_);
-        auto found = active_operations_.find(response_id);
-        if (found == active_operations_.end() ||
-            found->second.job_id != job_id) {
-            return false;
-        }
-        if (keep_for_resume && !found->second.cancelled) {
-            found->second.job_id.clear();
-            found->second.last_activity = std::chrono::steady_clock::now();
-            return true;
-        }
-        active_operations_.erase(found);
-        return false;
     }
 
     void handleCompletion(const std::string& response_id,
@@ -924,7 +806,7 @@ private:
                           const std::string& previous_chain_id,
                           const StandardResponse& response) {
         if (!responseHasToolCalls(response)) {
-            closeChainIfPresent(model_id, previous_chain_id);
+            tool_chains_.closeChain(model_id, previous_chain_id);
             return;
         }
 
@@ -934,20 +816,16 @@ private:
         const std::string new_model_id = response.model.empty()
             ? model_id
             : response.model;
-        const scheduler::ToolChainEntry chain = tool_chains_.open(
+        // Install the replacement lease before releasing the previous chain.
+        // ToolChainLeaseManager::openAndLease() opens the new lease before
+        // returning, so the old chain can be closed afterward without
+        // exposing an eviction-visible lease gap.
+        const scheduler::ToolChainEntry chain = tool_chains_.openAndLease(
             new_response_id,
             new_model_id,
             session_id,
             config_.tool_response_timeout);
-
-        // Install the replacement lease before releasing the previous chain.
-        // WarmModelPool swaps its chain id under one mutex, so closing the old
-        // id afterward cannot expose an eviction-visible lease gap.
-        scheduler_.openToolLease(
-            chain.model_id,
-            chain.chain_id,
-            config_.tool_response_timeout);
-        closeChainIfPresent(model_id, previous_chain_id);
+        tool_chains_.closeChain(model_id, previous_chain_id);
 
         LOG_INFO("[QaiForge] Opened tool chain: chain=" << chain.chain_id
                  << " response=" << chain.response_id
@@ -956,43 +834,11 @@ private:
     }
 
     void expireIdleActiveOperations() {
-        const auto cutoff = std::chrono::steady_clock::now() -
-            config_.conversation_memory_ttl;
-        std::vector<std::pair<std::string, std::string>> expired_leases;
-        {
-            std::lock_guard<std::mutex> lock(active_operations_mutex_);
-            for (auto it = active_operations_.begin();
-                 it != active_operations_.end();) {
-                if (it->second.job_id.empty() &&
-                    it->second.last_activity <= cutoff) {
-                    expired_leases.emplace_back(
-                        it->second.lease_model_id,
-                        it->second.lease_id);
-                    it = active_operations_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
+        const std::vector<std::pair<std::string, std::string>>
+            expired_leases =
+                active_operations_.expireIdle(config_.conversation_memory_ttl);
         for (const auto& lease : expired_leases) {
-            closeChainIfPresent(lease.first, lease.second);
-        }
-    }
-
-    void closeChainIfPresent(const std::string& model_id,
-                             const std::string& chain_id) {
-        if (chain_id.empty()) {
-            return;
-        }
-        tool_chains_.close(chain_id);
-        scheduler_.closeToolLease(model_id, chain_id);
-    }
-
-    void expireStaleToolChains() {
-        const std::vector<scheduler::ToolChainEntry> expired =
-            tool_chains_.expireStale();
-        for (const scheduler::ToolChainEntry& chain : expired) {
-            scheduler_.closeToolLease(chain.model_id, chain.chain_id);
+            tool_chains_.closeChain(lease.first, lease.second);
         }
     }
 
@@ -1006,7 +852,7 @@ private:
                 break;
             }
             lock.unlock();
-            expireStaleToolChains();
+            tool_chains_.expireStale();
             memory_coordinator_->expireIdle(
                 config_.conversation_memory_ttl);
             expireIdleActiveOperations();
@@ -1018,10 +864,8 @@ private:
     scheduler::InferenceScheduler& scheduler_;
     std::shared_ptr<scheduler::ConversationMemoryCoordinator>
         memory_coordinator_;
-    scheduler::ToolChainTable tool_chains_;
-
-    std::mutex active_operations_mutex_;
-    std::unordered_map<std::string, ActiveOperation> active_operations_;
+    scheduler::ToolChainLeaseManager tool_chains_;
+    scheduler::ActiveOperationRegistry active_operations_;
 
     std::mutex maintenance_mutex_;
     std::condition_variable maintenance_cv_;

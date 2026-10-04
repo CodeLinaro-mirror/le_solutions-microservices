@@ -8,7 +8,7 @@
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/ModelLoadCoordinator.h"
 #include "qai_forge/scheduler/ModelRuntime.h"
-#include "qai_forge/scheduler/PlacementContext.h"
+#include "qai_forge/scheduler/PlacementAdmissionGateway.h"
 #include "qai_forge/scheduler/PredictiveJob.h"
 
 #include <chrono>
@@ -33,7 +33,7 @@ public:
         std::shared_ptr<PredictiveOrchestrator> orchestrator,
         std::shared_ptr<ModelLoadCoordinator> load_coordinator,
         long model_memory_mb,
-        std::shared_ptr<PlacementContext> placement,
+        std::shared_ptr<PlacementAdmissionGateway> placement,
         ModelRuntimeEvents events = {});
     ~PredictiveModelRuntime();
 
@@ -79,7 +79,7 @@ private:
     std::unique_ptr<PredictiveBackendAdapter> backend_;
     std::shared_ptr<PredictiveOrchestrator> orchestrator_;
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
-    std::shared_ptr<PlacementContext> placement_;
+    std::shared_ptr<PlacementAdmissionGateway> placement_;
     PlacementReservation placement_reservation_;
     ModelRuntimeEvents events_;
     long model_memory_mb_ = 512;

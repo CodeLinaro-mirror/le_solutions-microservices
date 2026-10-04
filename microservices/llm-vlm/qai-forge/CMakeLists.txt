@@ -294,12 +294,14 @@ set(QAI_FORGE_SOURCES
     src/scheduler/ConversationMemoryCoordinator.cpp
     src/scheduler/ModelLoadCoordinator.cpp
     src/scheduler/ToolChainTable.cpp
+    src/scheduler/ToolChainLeaseManager.cpp
+    src/scheduler/ActiveOperationRegistry.cpp
     src/scheduler/EvictionPolicy.cpp
     src/scheduler/ModelRuntime.cpp
     src/scheduler/PostTurnWorker.cpp
     src/scheduler/WarmModelPool.cpp
     src/scheduler/InferenceScheduler.cpp
-    src/scheduler/PlacementContext.cpp
+    src/scheduler/PlacementAdmissionGateway.cpp
 
     # Predictive AI scheduler (Phase 4 — pool + runtime for tensor inference)
     src/scheduler/PredictiveModelRuntime.cpp

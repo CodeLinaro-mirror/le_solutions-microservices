@@ -7,35 +7,17 @@
 #include "qai_forge/orchestration/OrchestratorAdapter.h"
 #include "qai_forge/utils/Logger.h"
 
-#include <optional>
 #include <utility>
 
 namespace scheduler {
 
-namespace {
-
-bool memoryChanged(const GenieMemoryState& before,
-                   const GenieMemoryState& after) {
-    return before.summary_content != after.summary_content ||
-           before.summary_token_count != after.summary_token_count ||
-           before.facts != after.facts ||
-           before.canonical_boundary != after.canonical_boundary ||
-           before.transcript_digest != after.transcript_digest;
-}
-
-} // namespace
-
 PostTurnWorker::PostTurnWorker(
     std::string model_id,
     BackendAdapter& backend,
-    std::shared_ptr<OrchestratorAdapter> orchestrator,
-    std::shared_ptr<ConversationMemoryCoordinator> coordinator,
     std::function<void(const std::string& session_id)> finish_post_turn,
     size_t max_queue_depth)
     : model_id_(std::move(model_id)),
       backend_(backend),
-      orchestrator_(std::move(orchestrator)),
-      coordinator_(std::move(coordinator)),
       finish_post_turn_(std::move(finish_post_turn)),
       max_queue_depth_(max_queue_depth) {}
 
@@ -54,14 +36,14 @@ void PostTurnWorker::start() {
     started_ = true;
 }
 
-bool PostTurnWorker::enqueue(PostTurnTask task) {
+bool PostTurnWorker::enqueue(std::unique_ptr<PostTurnWork> work) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_ || stop_requested_ ||
             queue_.size() >= max_queue_depth_) {
             return false;
         }
-        queue_.push_back(std::move(task));
+        queue_.push_back(std::move(work));
     }
     cv_.notify_one();
     return true;
@@ -73,7 +55,7 @@ void PostTurnWorker::setMaxQueueDepth(size_t max_queue_depth) {
 }
 
 void PostTurnWorker::stop(bool force) {
-    std::deque<PostTurnTask> cancelled;
+    std::deque<std::unique_ptr<PostTurnWork>> cancelled;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_) {
@@ -86,8 +68,11 @@ void PostTurnWorker::stop(bool force) {
         }
     }
 
-    for (PostTurnTask& task : cancelled) {
-        cancelTask(task);
+    for (auto& work : cancelled) {
+        work->cancel();
+        if (finish_post_turn_) {
+            finish_post_turn_(work->sessionId());
+        }
     }
     cv_.notify_all();
     if (worker_thread_.joinable()) {
@@ -100,7 +85,7 @@ void PostTurnWorker::stop(bool force) {
 
 void PostTurnWorker::workerLoop() {
     while (true) {
-        PostTurnTask task;
+        std::unique_ptr<PostTurnWork> work;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this]() {
@@ -112,66 +97,24 @@ void PostTurnWorker::workerLoop() {
                 }
                 continue;
             }
-            task = std::move(queue_.front());
+            work = std::move(queue_.front());
             queue_.pop_front();
         }
 
-        try {
-            const GenieMemoryState before = task.input.before_memory;
-            GenieMemoryState updated = orchestrator_->executePostTurn(
-                task, backend_);
-            if (forceRequested()) {
-                coordinator_->abortTurn(
-                    task.input.memory_turn,
-                    MemoryTurnState::Cancelled);
-            } else {
-                const MemoryOutcome outcome = memoryChanged(before, updated)
-                    ? MemoryOutcome::Updated
-                    : MemoryOutcome::Unchanged;
-                coordinator_->publish(
-                    task.input.memory_turn,
-                    outcome,
-                    outcome == MemoryOutcome::Updated
-                        ? std::optional<GenieMemoryState>(std::move(updated))
-                        : std::nullopt);
-            }
-        } catch (const std::exception& error) {
-            LOG_WARN("[PostTurnWorker] Post-turn failed: model=" << model_id_
-                     << " session=" << task.input.session_id
-                     << " message=\"" << error.what() << "\"");
-            if (forceRequested()) {
-                coordinator_->abortTurn(
-                    task.input.memory_turn,
-                    MemoryTurnState::Cancelled);
-            } else {
-                coordinator_->publish(
-                    task.input.memory_turn, MemoryOutcome::Failed);
-            }
-        } catch (...) {
-            LOG_WARN("[PostTurnWorker] Post-turn failed: model=" << model_id_
-                     << " session=" << task.input.session_id
-                     << " message=<unknown>");
-            if (forceRequested()) {
-                coordinator_->abortTurn(
-                    task.input.memory_turn,
-                    MemoryTurnState::Cancelled);
-            } else {
-                coordinator_->publish(
-                    task.input.memory_turn, MemoryOutcome::Failed);
-            }
+        // PostTurnWork::run() never throws — any orchestrator-specific
+        // failure handling (e.g. publishing a Failed outcome to a memory
+        // coordinator) is the concrete implementation's responsibility.
+        // If a force-stop was requested after this item was popped (but
+        // before it started running), prefer cancel() over run().
+        if (forceRequested()) {
+            work->cancel();
+        } else {
+            work->run(backend_);
         }
 
         if (finish_post_turn_) {
-            finish_post_turn_(task.input.session_id);
+            finish_post_turn_(work->sessionId());
         }
-    }
-}
-
-void PostTurnWorker::cancelTask(PostTurnTask& task) {
-    coordinator_->abortTurn(
-        task.input.memory_turn, MemoryTurnState::Cancelled);
-    if (finish_post_turn_) {
-        finish_post_turn_(task.input.session_id);
     }
 }
 

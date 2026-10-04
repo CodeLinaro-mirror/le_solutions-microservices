@@ -25,11 +25,9 @@ std::string generateEventId() {
 }
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
 // LlamaCppOrchestrator::PreparedState — concrete opaque prepared-state
-// subclass. Holds everything that used to live on
-// scheduler::LlamaCppPreparedRequest.
-// ─────────────────────────────────────────────────────────────────────────────
+// subclass. Holds the merged messages/tools, vision buffers, and
+// generation parameters needed by execute().
 struct LlamaCppOrchestrator::PreparedState : qai_forge::PreparedGenerationState {
     json messages = json::array();
     json tools = json::array();
@@ -43,13 +41,8 @@ struct LlamaCppOrchestrator::PreparedState : qai_forge::PreparedGenerationState 
     float frequency_penalty = 0.0f;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// prepare()
-//
-// Ports the body of the old createJob() — merges inline images extracted
-// from message content, applies front eviction, and stashes generation
-// parameters into a PreparedState.
-// ─────────────────────────────────────────────────────────────────────────────
+// prepare() merges inline images extracted from message content, applies
+// front eviction, and stashes generation parameters into a PreparedState.
 std::unique_ptr<qai_forge::PreparedGenerationState> LlamaCppOrchestrator::prepare(
     const CreateChatCompletionRequest& request_in,
     const qai_forge::ConversationMemorySnapshot& /*memory*/,
@@ -93,12 +86,8 @@ std::unique_ptr<qai_forge::PreparedGenerationState> LlamaCppOrchestrator::prepar
     return prepared;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// execute()
-//
-// Ports the body of the old execute() nearly verbatim — job.*/callbacks.on_token
-// references become info.*/on_token parameter references.
-// ─────────────────────────────────────────────────────────────────────────────
+// execute() drives one generation call against the backend and parses any
+// tool-call payload out of the accumulated response text.
 StandardResponse LlamaCppOrchestrator::execute(
     const qai_forge::GenerationJobInfo& info,
     qai_forge::PreparedGenerationState& prepared_base,

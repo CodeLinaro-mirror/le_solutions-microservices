@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <functional>
+#include <vector>
 
 namespace scheduler {
 
@@ -40,6 +41,22 @@ public:
     GenerativeJobPtr pop();
     GenerativeJobPtr popIf(const std::function<bool(const GenerativeJobPtr&)>& predicate);
     GenerativeJobPtr cancel(const std::string& job_id);
+
+    // Removes and returns every queued job (across all priority lanes)
+    // whose enqueue_deadline is <= now. Used to enforce a bounded maximum
+    // queue-wait time (see WarmModelPoolConfig::queue_admission_timeout) —
+    // a job that has waited too long is proactively failed instead of
+    // eventually running with a stale/abandoned caller. No-op (returns an
+    // empty vector) for jobs whose enqueue_deadline is still
+    // time_point::max() (i.e. the feature is disabled for that job).
+    std::vector<GenerativeJobPtr> expireOlderThan(
+        std::chrono::steady_clock::time_point now);
+
+    // Earliest enqueue_deadline across all currently-queued jobs, or
+    // time_point::max() if none are queued or none have a deadline set.
+    // Lets WarmModelPool's event loop wake up exactly when the next
+    // expiration is due instead of polling.
+    std::chrono::steady_clock::time_point earliestDeadline() const;
 
     bool empty() const;
     size_t size() const;
