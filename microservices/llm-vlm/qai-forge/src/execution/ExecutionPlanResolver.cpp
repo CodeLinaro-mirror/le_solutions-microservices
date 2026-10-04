@@ -101,7 +101,7 @@ bool componentLess(
 
 ExecutionPlanResolver::ExecutionPlanResolver(
     std::shared_ptr<const resources::TopologyRegistry> topology,
-    ProviderRegistry providers)
+    ExecutionProviderRegistry providers)
     : topology_(std::move(topology)),
       providers_(std::move(providers)) {}
 

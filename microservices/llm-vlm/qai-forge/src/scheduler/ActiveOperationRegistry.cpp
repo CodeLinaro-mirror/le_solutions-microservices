@@ -35,6 +35,7 @@ void ActiveOperationRegistry::registerOperation(const GenerativeJob& job) {
     operation.lease_model_id = is_mcp_round ? job.model_id : std::string();
     operation.lease_id =
         is_mcp_round ? ("internal_mcp_" + job.response_id) : std::string();
+    operation.session_id = job.session_id;
     operation.memory_turn = job.memory_turn;
     operation.cancelled = false;
     operation.last_activity = std::chrono::steady_clock::now();
@@ -77,6 +78,7 @@ ActiveOperationRegistry::CancelInfo ActiveOperationRegistry::markCancelled(
     info.job_id = found->second.job_id;
     info.lease_model_id = found->second.lease_model_id;
     info.lease_id = found->second.lease_id;
+    info.session_id = found->second.session_id;
     info.memory_turn = found->second.memory_turn;
     return info;
 }

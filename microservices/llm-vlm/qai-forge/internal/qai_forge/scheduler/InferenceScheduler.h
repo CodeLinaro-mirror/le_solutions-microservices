@@ -23,6 +23,7 @@ namespace scheduler {
 struct GenerativeScheduleMetadata {
     std::string job_id;
     std::string model_id;
+    std::string session_id;
     JobPriority priority = JobPriority::ANY_REQUEST;
 };
 
@@ -121,17 +122,22 @@ public:
     std::shared_ptr<ConversationMemoryCoordinator> memoryCoordinator() const;
     CancelResult cancel(const std::string& job_id);
 
-    // Scoped to model_id — see QaiForge::clearSession() for rationale.
+    // Affinity-targeted when session_id has a live mapping; otherwise
+    // broadcasts to every resident replica of model_id — see
+    // WarmModelPool::clearSession() for the full rationale.
     void clearSession(const std::string& model_id, const std::string& session_id);
 
     bool openToolLease(const std::string& model_id,
                        const std::string& chain_id,
-                       std::chrono::milliseconds ttl);
+                       std::chrono::milliseconds ttl,
+                       const std::string& session_id = std::string());
     bool renewToolLease(const std::string& model_id,
                         const std::string& chain_id,
-                        std::chrono::milliseconds ttl);
+                        std::chrono::milliseconds ttl,
+                        const std::string& session_id = std::string());
     bool closeToolLease(const std::string& model_id,
-                        const std::string& chain_id);
+                        const std::string& chain_id,
+                        const std::string& session_id = std::string());
 
     void shutdown(bool force = false);
     void stop(bool force = false);

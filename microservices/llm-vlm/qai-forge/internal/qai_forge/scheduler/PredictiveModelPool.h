@@ -7,6 +7,7 @@
 #include "qai_forge/scheduler/PredictiveJob.h"
 #include "qai_forge/scheduler/PlacementAdmissionGateway.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
+#include "qai_forge/scheduler/IRequestRoutingPolicy.h"
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/dto/TensorDTOs.h"
 #include <chrono>
@@ -28,19 +29,22 @@ namespace scheduler {
 //   - Simpler lifecycle — no activation/drain coordination
 //
 // The pool manages:
-//   - Multiple PredictiveModelRuntime instances (one per loaded model)
+//   - Multiple PredictiveModelRuntime instances (one per loaded replica)
 //   - LRU eviction when max_active_models is exceeded
 //   - Idle-timeout eviction for unused models
 //   - Memory headroom enforcement
 //
-// Concurrency model:
-//   - Different models run concurrently (each in its own PredictiveModelRuntime)
-//   - Same-model requests are serialized by that runtime's executor thread
+// Replica model: mirrors WarmModelPool — one model_id may have
+// 1..max_replicas_per_model concurrently-resident PredictiveModelRuntime
+// instances, each identified by a distinct
+// qai_forge::execution::RuntimeId{model_id, replica_id}. With the default
+// max_replicas_per_model == 1 this class behaves identically to the
+// single-runtime-per-model design.
 //
-// Example:
-//   Request A: mobilenet-v3 (QNN)  → PredictiveModelRuntime A → runs concurrently
-//   Request B: resnet-50 (QNN)     → PredictiveModelRuntime B → runs concurrently
-//   Request C: mobilenet-v3 (QNN)  → PredictiveModelRuntime A → serialized
+// Concurrency model:
+//   - Different models (or replicas) run concurrently (each in its own
+//     PredictiveModelRuntime)
+//   - Same-replica requests are serialized by that runtime's executor thread
 //
 // Thread safety: All public methods are thread-safe.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,7 +63,9 @@ public:
                                  std::shared_ptr<ModelLoadCoordinator>
                                      load_coordinator = {},
                                  std::shared_ptr<PlacementAdmissionGateway>
-                                     placement = {});
+                                     placement = {},
+                                 std::shared_ptr<IRequestRoutingPolicy>
+                                     routing_policy = {});
 
     ~PredictiveModelPool();
 
@@ -99,7 +105,12 @@ private:
 
     void evictIfNeeded(const std::string& model_id_to_load);
     void evictIdleModels();
-    RuntimeRecord& createRuntimeLocked(const std::string& model_id);
+    RuntimeRecord& routeOrCreateRuntimeLocked(const std::string& model_id);
+    RuntimeRecord& createRuntimeLocked(
+        const qai_forge::execution::RuntimeId& runtime_id);
+    RuntimeRecord* firstReplicaRecordLocked(const std::string& model_id);
+    const std::vector<qai_forge::execution::RuntimeId>* replicasForModelLocked(
+        const std::string& model_id) const;
     size_t activeModelCount() const;
     long availableMemoryMb() const;
     long modelMemoryMb(const std::string& model_id) const;
@@ -110,9 +121,14 @@ private:
     std::shared_ptr<ModelLoadCoordinator> load_coordinator_;
     bool owns_load_coordinator_ = false;
     std::shared_ptr<PlacementAdmissionGateway> placement_;
+    std::shared_ptr<IRequestRoutingPolicy> routing_policy_;
     mutable std::mutex mutex_;
     bool shutdown_requested_ = false;
-    std::unordered_map<std::string, RuntimeRecord> runtimes_;
+    std::unordered_map<qai_forge::execution::RuntimeId, RuntimeRecord,
+                       qai_forge::execution::RuntimeIdHash> runtimes_;
+    // Mirrors WarmModelPool::replicas_by_model_ — see its doc comment.
+    std::unordered_map<std::string, std::vector<qai_forge::execution::RuntimeId>>
+        replicas_by_model_;
 };
 
 } // namespace scheduler

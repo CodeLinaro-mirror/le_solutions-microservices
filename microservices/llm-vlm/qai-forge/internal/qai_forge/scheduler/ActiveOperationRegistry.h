@@ -27,6 +27,10 @@ public:
         std::string job_id;
         std::string lease_model_id;
         std::string lease_id;
+        // Captured from GenerativeJob::session_id in registerOperation() so
+        // markCancelled()/expireIdle() can target affinity-aware
+        // closeChain() calls instead of falling back to a broadcast.
+        std::string session_id;
         std::optional<MemoryTurnCommitToken> memory_turn;
         bool cancelled = false;
         std::chrono::steady_clock::time_point last_activity =
@@ -41,6 +45,7 @@ public:
         std::string job_id;
         std::string lease_model_id;
         std::string lease_id;
+        std::string session_id;
         std::optional<MemoryTurnCommitToken> memory_turn;
     };
 

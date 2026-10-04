@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/scheduler/WarmModelPool.h"
 
 #include <chrono>
@@ -36,7 +37,10 @@ struct EvictionPolicyInput {
 
 struct EvictionPolicyAction {
     EvictionPolicyActionType type = EvictionPolicyActionType::Activate;
-    std::string model_id;
+    // Per-replica identity (model_id + replica_id). Each resident replica
+    // is independently evaluated/evicted — see ModelPoolRuntimeSnapshot::
+    // runtime_id.
+    qai_forge::execution::RuntimeId runtime_id;
 };
 
 struct EvictionPolicyPlan {

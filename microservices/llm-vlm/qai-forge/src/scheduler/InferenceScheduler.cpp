@@ -94,6 +94,18 @@ InferenceSchedulerConfig configFromEnvironment() {
         "QUEUE_ADMISSION_TIMEOUT_SECONDS",
         config.generative_pool_config.queue_admission_timeout);
 
+    // Maximum concurrently-resident replicas per model_id, shared across
+    // both pools (see WarmModelPoolConfig::max_replicas_per_model doc
+    // comment). 1 (default) preserves single-replica-per-model behavior
+    // for both generative and predictive pools.
+    const size_t max_replicas_per_model = parseSizeEnv(
+        "MAX_REPLICAS_PER_MODEL",
+        config.generative_pool_config.max_replicas_per_model);
+    config.generative_pool_config.max_replicas_per_model =
+        max_replicas_per_model;
+    config.predictive_pool_config.max_replicas_per_model =
+        max_replicas_per_model;
+
     return config;
 }
 
@@ -325,7 +337,8 @@ GenerativeRuntimeHandle InferenceScheduler::reserve(
     const GenerativeScheduleMetadata& metadata) {
     validateMetadata(metadata.job_id, metadata.model_id);
     GenerativeScheduleMetadata stored_metadata = metadata;
-    ModelRuntime* runtime = generative_pool_.reserve(metadata.model_id);
+    ModelRuntime* runtime = generative_pool_.reserve(
+        metadata.model_id, metadata.session_id);
     return GenerativeRuntimeHandle(
         &generative_pool_,
         runtime,
@@ -360,20 +373,23 @@ void InferenceScheduler::clearSession(const std::string& model_id,
 bool InferenceScheduler::openToolLease(
     const std::string& model_id,
     const std::string& chain_id,
-    std::chrono::milliseconds ttl) {
-    return generative_pool_.openToolLease(model_id, chain_id, ttl);
+    std::chrono::milliseconds ttl,
+    const std::string& session_id) {
+    return generative_pool_.openToolLease(model_id, chain_id, ttl, session_id);
 }
 
 bool InferenceScheduler::renewToolLease(
     const std::string& model_id,
     const std::string& chain_id,
-    std::chrono::milliseconds ttl) {
-    return generative_pool_.renewToolLease(model_id, chain_id, ttl);
+    std::chrono::milliseconds ttl,
+    const std::string& session_id) {
+    return generative_pool_.renewToolLease(model_id, chain_id, ttl, session_id);
 }
 
 bool InferenceScheduler::closeToolLease(const std::string& model_id,
-                                        const std::string& chain_id) {
-    return generative_pool_.closeToolLease(model_id, chain_id);
+                                        const std::string& chain_id,
+                                        const std::string& session_id) {
+    return generative_pool_.closeToolLease(model_id, chain_id, session_id);
 }
 
 void InferenceScheduler::shutdown(bool force) {

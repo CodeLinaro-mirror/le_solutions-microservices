@@ -87,7 +87,8 @@ public:
                  std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                  long model_memory_mb,
                  std::shared_ptr<PlacementAdmissionGateway> placement,
-                 ModelRuntimeEvents events = {});
+                 ModelRuntimeEvents events = {},
+                 uint64_t replica_id = 0);
     ~ModelRuntime();
 
     ModelRuntime(const ModelRuntime&) = delete;
@@ -122,6 +123,9 @@ public:
     ModelRuntimeAdmissionSnapshot admissionSnapshot() const;
     std::string modelId() const;
     ModelRuntimeState state() const;
+    const qai_forge::execution::RuntimeId& runtimeId() const noexcept {
+        return runtime_id_;
+    }
 
     /**
      * Forward clearSession(session_id) to the backend.

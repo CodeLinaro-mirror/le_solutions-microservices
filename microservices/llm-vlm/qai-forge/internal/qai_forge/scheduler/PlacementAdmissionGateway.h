@@ -5,7 +5,7 @@
 
 #include "qai_forge/execution/ExecutionPlan.h"
 #include "qai_forge/execution/ExecutionPlanResolver.h"
-#include "qai_forge/execution/ProviderRegistry.h"
+#include "qai_forge/execution/ExecutionProviderRegistry.h"
 #include "qai_forge/resources/ResourceManager.h"
 #include "qai_forge/resources/TopologyRegistry.h"
 
@@ -69,13 +69,18 @@ struct PlacementAdmissionResult {
 // The granted reservation is transferred to one ModelRuntime or
 // PredictiveModelRuntime, which passes the execution plan to its owned
 // backend adapter.
+//
+// Per-provider plan construction (defaultPlan/candidatePlans) is delegated
+// to the polymorphic qai_forge::execution::IExecutionProvider implementation
+// resolved from providers_ — this class no longer embeds a branchy
+// per-provider if/else chain (see qai_forge::execution::providers::*).
 class PlacementAdmissionGateway {
 public:
     static std::shared_ptr<PlacementAdmissionGateway> createDefault();
 
     PlacementAdmissionGateway(
         std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology,
-        qai_forge::execution::ProviderRegistry providers);
+        qai_forge::execution::ExecutionProviderRegistry providers);
 
     PlacementAdmissionResult tryAcquire(
         const qai_forge::execution::RuntimeId& runtime_id,
@@ -97,19 +102,8 @@ public:
     }
 
 private:
-    qai_forge::execution::ExecutionPlan defaultPlan(
+    std::shared_ptr<qai_forge::execution::IExecutionProvider> providerFor(
         const std::string& model_id) const;
-
-    PlacementAdmissionResult tryAcquireQnnDevice(
-        const qai_forge::execution::RuntimeId& runtime_id,
-        const std::string& model_id,
-        uint32_t qnn_device_id) const;
-
-    qai_forge::execution::ExecutionPlan qnnExactPlan(
-        uint32_t qnn_device_id) const;
-
-    qai_forge::execution::ExecutionPlan geniePreferredPlan(
-        uint32_t genie_device_id) const;
 
     PlacementAdmissionResult tryAcquirePlan(
         const qai_forge::execution::RuntimeId& runtime_id,
@@ -117,7 +111,7 @@ private:
         const qai_forge::execution::ExecutionPlan& plan) const;
 
     std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology_;
-    qai_forge::execution::ProviderRegistry providers_;
+    qai_forge::execution::ExecutionProviderRegistry providers_;
     std::shared_ptr<qai_forge::resources::ResourceManager> resource_manager_;
     qai_forge::execution::ExecutionPlanResolver resolver_;
 };

@@ -22,6 +22,11 @@ class InferenceScheduler;
 // (there is no externally-visible previous_response_id to resolve later) —
 // renewLease()/openLease() exist for that lease-only path, where the caller
 // manages the chain_id string itself.
+//
+// session_id params (added for session-affinity routing — see
+// WarmModelPool::SessionAffinity) are forwarded 1:1 into
+// InferenceScheduler::{open,renew,close}ToolLease(); an empty session_id
+// falls back to the pre-affinity broadcast-to-all-replicas behavior there.
 class ToolChainLeaseManager {
 public:
     explicit ToolChainLeaseManager(InferenceScheduler& scheduler);
@@ -38,13 +43,15 @@ public:
     bool markContinuationQueuedAndRenew(const std::string& chain_id,
                                         const std::string& job_id,
                                         const std::string& model_id,
-                                        std::chrono::milliseconds ttl);
+                                        std::chrono::milliseconds ttl,
+                                        const std::string& session_id = std::string());
 
     // Renews an existing scheduler lease without touching the
     // ToolChainTable. Used for internal-MCP-round leases.
     void renewLease(const std::string& model_id,
                     const std::string& chain_id,
-                    std::chrono::milliseconds ttl);
+                    std::chrono::milliseconds ttl,
+                    const std::string& session_id = std::string());
 
     // Opens a brand-new tool chain for a response that just produced
     // tool_calls, and opens its matching scheduler lease.
@@ -57,12 +64,14 @@ public:
     // internal-MCP-round leases.
     void openLease(const std::string& model_id,
                    const std::string& chain_id,
-                   std::chrono::milliseconds ttl);
+                   std::chrono::milliseconds ttl,
+                   const std::string& session_id = std::string());
 
     // Closes a chain: closes both the ToolChainTable entry (if any) and the
     // scheduler lease. No-op if chain_id is empty.
     void closeChain(const std::string& model_id,
-                    const std::string& chain_id);
+                    const std::string& chain_id,
+                    const std::string& session_id = std::string());
 
     // Sweeps expired ToolChainTable entries and closes their scheduler
     // leases.

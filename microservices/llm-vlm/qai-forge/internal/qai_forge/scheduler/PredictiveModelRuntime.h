@@ -34,7 +34,8 @@ public:
         std::shared_ptr<ModelLoadCoordinator> load_coordinator,
         long model_memory_mb,
         std::shared_ptr<PlacementAdmissionGateway> placement,
-        ModelRuntimeEvents events = {});
+        ModelRuntimeEvents events = {},
+        uint64_t replica_id = 0);
     ~PredictiveModelRuntime();
 
     PredictiveModelRuntime(const PredictiveModelRuntime&) = delete;
@@ -52,6 +53,9 @@ public:
     ModelRuntimeSnapshot snapshot() const;
     ModelRuntimeState state() const;
     std::string modelId() const;
+    const qai_forge::execution::RuntimeId& runtimeId() const noexcept {
+        return runtime_id_;
+    }
     std::chrono::steady_clock::time_point lastUsedAt() const;
 
 private:

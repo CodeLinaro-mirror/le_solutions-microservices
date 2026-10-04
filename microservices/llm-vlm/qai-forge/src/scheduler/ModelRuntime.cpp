@@ -93,9 +93,10 @@ ModelRuntime::ModelRuntime(std::string model_id,
                      std::shared_ptr<ModelLoadCoordinator> load_coordinator,
                      long model_memory_mb,
                      std::shared_ptr<PlacementAdmissionGateway> placement,
-                     ModelRuntimeEvents events)
+                     ModelRuntimeEvents events,
+                     uint64_t replica_id)
     : model_id_(model_id),
-      runtime_id_{model_id, 0},
+      runtime_id_{model_id, replica_id},
       backend_(std::move(backend)),
       orchestrator_(std::move(orchestrator)),
       load_coordinator_(std::move(load_coordinator)),

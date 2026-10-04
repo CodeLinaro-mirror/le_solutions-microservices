@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -83,32 +82,6 @@ std::string providerForModel(const std::string& model_id) {
     return "genie";
 }
 
-bool usesAcceleratorDomain(const std::string& provider) {
-    return provider == "qnn" || provider == "genie" ||
-           provider == "llamacpp" || provider == "snpe" ||
-           provider == "litert" || provider == "litert_lm";
-}
-
-std::string snpeRuntimeOrderFromEnvironment() {
-    const char* delegate = std::getenv("SNPE_DELEGATE");
-    const std::string requested = delegate ? delegate : "dsp";
-
-    if (requested == "dsp") {
-        return "DSP,CPU";
-    }
-    if (requested == "aip") {
-        return "AIP_FIXED8_TF,CPU";
-    }
-    if (requested == "gpu") {
-        return "GPU,CPU";
-    }
-    if (requested == "none" || requested == "cpu") {
-        return "CPU";
-    }
-
-    return "DSP,CPU";
-}
-
 uint32_t sharedUsersFor(
     const qai_forge::resources::ResourceSnapshot& snapshot,
     const qai_forge::resources::ResourceId& resource) {
@@ -127,22 +100,36 @@ PlacementAdmissionGateway::createDefault() {
     auto topology = topologyFromEnvironment();
     return std::make_shared<PlacementAdmissionGateway>(
         std::move(topology),
-        qai_forge::execution::ProviderRegistry::createDefault());
+        qai_forge::execution::ExecutionProviderRegistry::createDefault());
 }
 
 PlacementAdmissionGateway::PlacementAdmissionGateway(
     std::shared_ptr<const qai_forge::resources::TopologyRegistry> topology,
-    qai_forge::execution::ProviderRegistry providers)
+    qai_forge::execution::ExecutionProviderRegistry providers)
     : topology_(requireTopology(std::move(topology))),
-      providers_(std::move(providers)),
+      providers_(providers),
       resource_manager_(
           std::make_shared<qai_forge::resources::ResourceManager>(topology_)),
-      resolver_(topology_, providers_) {}
+      resolver_(topology_, std::move(providers)) {}
+
+std::shared_ptr<qai_forge::execution::IExecutionProvider>
+PlacementAdmissionGateway::providerFor(const std::string& model_id) const {
+    return providers_.get(providerForModel(model_id));
+}
 
 PlacementAdmissionResult PlacementAdmissionGateway::tryAcquire(
     const qai_forge::execution::RuntimeId& runtime_id,
     const std::string& model_id) const {
-    return tryAcquirePlan(runtime_id, model_id, defaultPlan(model_id));
+    const auto provider = providerFor(model_id);
+    if (!provider) {
+        PlacementAdmissionResult result;
+        result.denial_reason =
+            "No execution provider registered for model '" + model_id + "'";
+        return result;
+    }
+    return tryAcquirePlan(
+        runtime_id, model_id,
+        provider->defaultPlan(model_id, *topology_));
 }
 
 PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireAutomatic(
@@ -156,95 +143,56 @@ PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireAutomatic(
         return result;
     }
 
-    const std::string provider = providerForModel(model_id);
-    if (provider != "qnn" && provider != "genie") {
-        return tryAcquirePlan(runtime_id, model_id, defaultPlan(model_id));
-    }
-
-    struct Candidate {
-        uint32_t device_id = 0;
-        uint32_t shared_users = 0;
-        std::string resource_id;
-    };
-    std::vector<Candidate> candidates;
-    const auto snapshot = resource_manager_->snapshot();
-
-    for (const auto* node :
-         topology_->byKind(qai_forge::resources::ResourceKind::Htp)) {
-        if (!node) {
-            continue;
-        }
-
-        const auto native_id = node->native_ids.find(provider);
-        if (native_id == node->native_ids.end()) {
-            continue;
-        }
-
-        try {
-            size_t consumed = 0;
-            const unsigned long long parsed =
-                std::stoull(native_id->second, &consumed, 10);
-            if (consumed != native_id->second.size() ||
-                parsed > std::numeric_limits<uint32_t>::max()) {
-                continue;
-            }
-
-            const qai_forge::resources::ResourceId resource = node->id;
-            const bool resource_unavailable = std::any_of(
-                snapshot.resources.begin(), snapshot.resources.end(),
-                [&resource](const auto& entry) {
-                    return entry.resource == resource && entry.unavailable;
-                });
-            const bool parent_unavailable =
-                node->parent.has_value() &&
-                std::any_of(
-                    snapshot.resources.begin(),
-                    snapshot.resources.end(),
-                    [&parent = node->parent.value()](const auto& entry) {
-                        return entry.resource == parent && entry.unavailable;
-                    });
-            if (resource_unavailable || parent_unavailable) {
-                continue;
-            }
-
-            candidates.push_back(
-                {static_cast<uint32_t>(parsed),
-                 sharedUsersFor(snapshot, resource),
-                 resource.value});
-        } catch (...) {
-        }
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& lhs, const Candidate& rhs) {
-                  if (lhs.shared_users != rhs.shared_users) {
-                      return lhs.shared_users < rhs.shared_users;
-                  }
-                  if (lhs.device_id != rhs.device_id) {
-                      return lhs.device_id < rhs.device_id;
-                  }
-                  return lhs.resource_id < rhs.resource_id;
-              });
-
-    if (candidates.empty()) {
+    const auto provider = providerFor(model_id);
+    if (!provider) {
         result.denial_reason =
-            "Automatic " + provider +
-            " placement found no healthy mapped HTP candidates";
+            "No execution provider registered for model '" + model_id + "'";
         return result;
     }
 
+    // Providers without physical-target enumeration (snpe/litert/litert_lm)
+    // return their single defaultPlan() from candidatePlans() — handled
+    // uniformly below rather than requiring a special case here.
+    std::vector<qai_forge::execution::ExecutionPlan> candidates =
+        provider->candidatePlans(model_id, *topology_);
+
+    if (candidates.empty()) {
+        result.denial_reason =
+            "Automatic " + provider->id() +
+            " placement produced no candidates";
+        return result;
+    }
+
+    // Rank candidates by current shared load (fewest shared_users first),
+    // then by resource id for determinism. Candidates with no physical
+    // resource claim (automatic/backend-managed plans) sort last since
+    // they carry no load signal to rank by — in practice this only
+    // matters when candidates.size() > 1, which today only happens for
+    // qnn/genie (physical-target enumeration).
+    const auto snapshot = resource_manager_->snapshot();
+    auto loadScore = [&](const qai_forge::execution::ExecutionPlan& plan) {
+        uint32_t total = 0;
+        bool have_resource = false;
+        for (const auto& component : plan.components) {
+            for (const auto& claim : component.claims) {
+                have_resource = true;
+                total += sharedUsersFor(snapshot, claim.resource);
+            }
+        }
+        return std::make_pair(have_resource ? 0 : 1, total);
+    };
+
+    std::stable_sort(
+        candidates.begin(), candidates.end(),
+        [&](const qai_forge::execution::ExecutionPlan& lhs,
+            const qai_forge::execution::ExecutionPlan& rhs) {
+            return loadScore(lhs) < loadScore(rhs);
+        });
+
     std::string last_denial;
     for (const auto& candidate : candidates) {
-        PlacementAdmissionResult candidate_result;
-        if (provider == "qnn") {
-            candidate_result = tryAcquireQnnDevice(
-                runtime_id, model_id, candidate.device_id);
-        } else {
-            candidate_result = tryAcquirePlan(
-                runtime_id,
-                model_id,
-                geniePreferredPlan(candidate.device_id));
-        }
+        PlacementAdmissionResult candidate_result =
+            tryAcquirePlan(runtime_id, model_id, candidate);
         if (candidate_result.granted) {
             return candidate_result;
         }
@@ -252,26 +200,11 @@ PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireAutomatic(
     }
 
     result.denial_reason =
-        "Automatic " + provider + " placement could not acquire a candidate";
+        "Automatic " + provider->id() + " placement could not acquire a candidate";
     if (!last_denial.empty()) {
         result.denial_reason += ": " + last_denial;
     }
     return result;
-}
-
-PlacementAdmissionResult PlacementAdmissionGateway::tryAcquireQnnDevice(
-    const qai_forge::execution::RuntimeId& runtime_id,
-    const std::string& model_id,
-    uint32_t qnn_device_id) const {
-    if (providerForModel(model_id) != "qnn") {
-        PlacementAdmissionResult result;
-        result.denial_reason =
-            "QNN placement requested for non-QNN model '" + model_id + "'";
-        return result;
-    }
-
-    return tryAcquirePlan(
-        runtime_id, model_id, qnnExactPlan(qnn_device_id));
 }
 
 PlacementAdmissionResult PlacementAdmissionGateway::tryAcquirePlan(
@@ -304,167 +237,6 @@ PlacementAdmissionResult PlacementAdmissionGateway::tryAcquirePlan(
     result.reservation = PlacementReservation(
         validation.normalized_plan, std::move(lease_result.lease));
     return result;
-}
-
-qai_forge::execution::ExecutionPlan
-PlacementAdmissionGateway::geniePreferredPlan(uint32_t genie_device_id) const {
-    qai_forge::execution::ExecutionPlan plan;
-    plan.provider = "genie";
-
-    qai_forge::execution::ComponentPlacement component;
-    component.role = qai_forge::execution::ComponentRole::MainGraph;
-    component.target.provider = "genie";
-    component.target.target_id =
-        "device_id=" + std::to_string(genie_device_id);
-    component.target.semantics =
-        qai_forge::execution::TargetSemantics::PhysicalInstance;
-    component.target.discovery_mode =
-        qai_forge::execution::DiscoveryMode::Configured;
-    component.target.binding_strength =
-        qai_forge::execution::BindingStrength::Preferred;
-
-    const qai_forge::resources::ResourceNode* selected_node = nullptr;
-    for (const auto* node :
-         topology_->byKind(qai_forge::resources::ResourceKind::Htp)) {
-        if (!node) {
-            continue;
-        }
-        const auto native_id = node->native_ids.find("genie");
-        if (native_id != node->native_ids.end() &&
-            native_id->second == std::to_string(genie_device_id)) {
-            selected_node = node;
-            break;
-        }
-    }
-
-    const qai_forge::resources::ResourceId selected_resource =
-        selected_node
-            ? selected_node->id
-            : qai_forge::resources::ResourceId(
-                  "htp:" + std::to_string(genie_device_id));
-
-    component.claims.push_back({
-        selected_resource,
-        1,
-        qai_forge::execution::ClaimRequirement::Required,
-        qai_forge::execution::ResourceClaimMode::Shared});
-
-    if (selected_node && selected_node->parent.has_value()) {
-        component.claims.push_back({
-            selected_node->parent.value(),
-            1,
-            qai_forge::execution::ClaimRequirement::Required,
-            qai_forge::execution::ResourceClaimMode::Shared});
-    }
-
-    plan.components.push_back(std::move(component));
-    return plan;
-}
-
-qai_forge::execution::ExecutionPlan
-PlacementAdmissionGateway::qnnExactPlan(uint32_t qnn_device_id) const {
-    qai_forge::execution::ExecutionPlan plan;
-    plan.provider = "qnn";
-
-    qai_forge::execution::ComponentPlacement component;
-    component.role = qai_forge::execution::ComponentRole::MainGraph;
-    component.target.provider = "qnn";
-    component.target.target_id =
-        "device_id=" + std::to_string(qnn_device_id);
-    component.target.semantics =
-        qai_forge::execution::TargetSemantics::PhysicalInstance;
-    component.target.discovery_mode =
-        qai_forge::execution::DiscoveryMode::Enumerated;
-    component.target.binding_strength =
-        qai_forge::execution::BindingStrength::Exact;
-
-    const qai_forge::resources::ResourceNode* selected_node = nullptr;
-    for (const auto* node :
-         topology_->byKind(qai_forge::resources::ResourceKind::Htp)) {
-        if (!node) {
-            continue;
-        }
-
-        const auto native_id = node->native_ids.find("qnn");
-        if (native_id != node->native_ids.end() &&
-            native_id->second == std::to_string(qnn_device_id)) {
-            selected_node = node;
-            break;
-        }
-    }
-
-    const qai_forge::resources::ResourceId selected_resource =
-        selected_node
-            ? selected_node->id
-            : qai_forge::resources::ResourceId(
-                  "htp:" + std::to_string(qnn_device_id));
-
-    component.claims.push_back({
-        selected_resource,
-        1,
-        qai_forge::execution::ClaimRequirement::Required,
-        qai_forge::execution::ResourceClaimMode::Shared});
-
-    if (selected_node && selected_node->parent.has_value()) {
-        component.claims.push_back({
-            selected_node->parent.value(),
-            1,
-            qai_forge::execution::ClaimRequirement::Required,
-            qai_forge::execution::ResourceClaimMode::Shared});
-    }
-
-    plan.components.push_back(std::move(component));
-    return plan;
-}
-
-qai_forge::execution::ExecutionPlan PlacementAdmissionGateway::defaultPlan(
-    const std::string& model_id) const {
-    qai_forge::execution::ExecutionPlan plan;
-    plan.provider = providerForModel(model_id);
-
-    qai_forge::execution::ComponentPlacement component;
-    component.role = qai_forge::execution::ComponentRole::MainGraph;
-    component.target.provider = plan.provider;
-    component.target.semantics =
-        plan.provider == "snpe"
-            ? qai_forge::execution::TargetSemantics::RuntimePreference
-            : qai_forge::execution::TargetSemantics::BackendAutomatic;
-    component.target.discovery_mode =
-        plan.provider == "snpe"
-            ? qai_forge::execution::DiscoveryMode::Configured
-            : qai_forge::execution::DiscoveryMode::BackendManaged;
-    component.target.binding_strength =
-        plan.provider == "snpe"
-            ? qai_forge::execution::BindingStrength::Preferred
-            : qai_forge::execution::BindingStrength::Automatic;
-
-    if (plan.provider == "snpe") {
-        component.target.target_id =
-            "runtime_order=" + snpeRuntimeOrderFromEnvironment();
-    } else if (plan.provider == "litert_lm") {
-        const char* env = std::getenv("LITERT_LM_BACKEND");
-        const std::string backend = (env && env[0] != '\0') ? env : "npu";
-        component.target.semantics =
-            qai_forge::execution::TargetSemantics::BackendAutomatic;
-        component.target.discovery_mode =
-            qai_forge::execution::DiscoveryMode::Configured;
-        component.target.binding_strength =
-            qai_forge::execution::BindingStrength::Preferred;
-        component.target.target_id = "backend=" + backend;
-    }
-
-    if (usesAcceleratorDomain(plan.provider) &&
-        topology_->find(qai_forge::resources::ResourceId("cdsp:0")) !=
-            nullptr) {
-        component.claims.push_back({
-            qai_forge::resources::ResourceId("cdsp:0"),
-            1,
-            qai_forge::execution::ClaimRequirement::Required,
-            qai_forge::execution::ResourceClaimMode::Shared});
-    }
-
-    plan.components.push_back(std::move(component));
-    return plan;
 }
 
 }  // namespace scheduler

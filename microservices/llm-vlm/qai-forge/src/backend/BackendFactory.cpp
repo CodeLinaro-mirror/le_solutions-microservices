@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 std::unique_ptr<BackendAdapter>
@@ -97,6 +98,7 @@ RuntimePair BackendFactory::createRuntimePair(const std::string& model_id) {
     RuntimePair pair;
     pair.backend = createGenerativeBackend(model_config->runtime);
     pair.orchestrator = createGenerativeOrchestrator(model_config->runtime);
+
     return pair;
 }
 

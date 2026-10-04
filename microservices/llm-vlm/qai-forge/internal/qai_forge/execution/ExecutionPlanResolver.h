@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "qai_forge/execution/ExecutionPlan.h"
-#include "qai_forge/execution/ProviderRegistry.h"
+#include "qai_forge/execution/ExecutionProviderRegistry.h"
 #include "qai_forge/resources/TopologyRegistry.h"
 
 namespace qai_forge {
@@ -45,7 +45,7 @@ class ExecutionPlanResolver {
 public:
     ExecutionPlanResolver(
         std::shared_ptr<const resources::TopologyRegistry> topology,
-        ProviderRegistry providers);
+        ExecutionProviderRegistry providers);
 
     // Validates and normalizes one plan. The input plan is never modified.
     PlanValidationResult resolve(const ExecutionPlan& plan) const;
@@ -60,7 +60,7 @@ private:
         const ResourceClaim& claim) const;
 
     std::shared_ptr<const resources::TopologyRegistry> topology_;
-    ProviderRegistry providers_;
+    ExecutionProviderRegistry providers_;
 };
 
 }  // namespace execution

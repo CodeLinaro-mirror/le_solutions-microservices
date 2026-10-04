@@ -297,13 +297,19 @@ set(QAI_FORGE_SOURCES
     src/scheduler/ToolChainLeaseManager.cpp
     src/scheduler/ActiveOperationRegistry.cpp
     src/scheduler/EvictionPolicy.cpp
+    # IRequestRoutingPolicy — extracts the least-queue-depth replica-
+    # selection logic into a named, independently unit-testable policy
+    # type instead of a private, non-reusable branch inside WarmModelPool/
+    # PredictiveModelPool. See internal/qai_forge/scheduler/
+    # IRequestRoutingPolicy.h.
+    src/scheduler/IRequestRoutingPolicy.cpp
     src/scheduler/ModelRuntime.cpp
     src/scheduler/PostTurnWorker.cpp
     src/scheduler/WarmModelPool.cpp
     src/scheduler/InferenceScheduler.cpp
     src/scheduler/PlacementAdmissionGateway.cpp
 
-    # Predictive AI scheduler (Phase 4 — pool + runtime for tensor inference)
+    # Predictive AI scheduler (pool + runtime for tensor inference)
     src/scheduler/PredictiveModelRuntime.cpp
     src/scheduler/PredictiveModelPool.cpp
 
@@ -316,7 +322,6 @@ set(QAI_FORGE_SOURCES
 
     # Execution/placement layer (device placement)
     src/execution/ExecutionPlan.cpp
-    src/execution/ProviderRegistry.cpp
     src/execution/ExecutionPlanResolver.cpp
     src/execution/RuntimeArtifacts.cpp
     src/execution/QnnLaunchOptions.cpp
@@ -324,6 +329,18 @@ set(QAI_FORGE_SOURCES
     src/execution/LiteRtLaunchOptions.cpp
     src/execution/LiteRtLmLaunchOptions.cpp
     src/execution/LlamaCppLaunchOptions.cpp
+
+    # Polymorphic per-provider placement abstraction: replaces the branchy
+    # per-provider if/else chain previously inlined in
+    # PlacementAdmissionGateway with one IExecutionProvider implementation
+    # per provider — see internal/qai_forge/execution/IExecutionProvider.h.
+    src/execution/ExecutionProviderRegistry.cpp
+    src/execution/providers/QnnExecutionProvider.cpp
+    src/execution/providers/GenieExecutionProvider.cpp
+    src/execution/providers/LlamaCppExecutionProvider.cpp
+    src/execution/providers/SnpeExecutionProvider.cpp
+    src/execution/providers/LiteRtExecutionProvider.cpp
+    src/execution/providers/LiteRtLmExecutionProvider.cpp
 
     # Orchestration (Layer 2)
     src/orchestration/PredictiveOrchestrator.cpp

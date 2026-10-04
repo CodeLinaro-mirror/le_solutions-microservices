@@ -14,25 +14,27 @@ EvictionPolicyPlan EvictionPolicy::plan(
     plan.available_memory_mb = input.available_memory_mb;
     plan.memory_headroom_mb = input.config.memory_headroom_mb;
 
-    std::unordered_set<std::string> planned_model_ids;
+    std::unordered_set<qai_forge::execution::RuntimeId,
+                       qai_forge::execution::RuntimeIdHash> planned_runtime_ids;
 
     auto add_action =
-        [&plan, &planned_model_ids](EvictionPolicyActionType type,
-                                    const std::string& model_id) {
-            if (model_id.empty() ||
-                planned_model_ids.count(model_id) > 0) {
+        [&plan, &planned_runtime_ids](
+            EvictionPolicyActionType type,
+            const qai_forge::execution::RuntimeId& runtime_id) {
+            if (runtime_id.model_id.empty() ||
+                planned_runtime_ids.count(runtime_id) > 0) {
                 return;
             }
-            plan.actions.push_back(EvictionPolicyAction{type, model_id});
-            planned_model_ids.insert(model_id);
+            plan.actions.push_back(EvictionPolicyAction{type, runtime_id});
+            planned_runtime_ids.insert(runtime_id);
         };
 
     for (const auto& runtime : input.snapshot.runtimes) {
-        if (planned_model_ids.count(runtime.model_id) > 0) {
+        if (planned_runtime_ids.count(runtime.runtime_id) > 0) {
             continue;
         }
         if (isIdleTimeoutExpired(runtime, input.config, input.now)) {
-            add_action(EvictionPolicyActionType::Drain, runtime.model_id);
+            add_action(EvictionPolicyActionType::Drain, runtime.runtime_id);
         }
     }
 
@@ -58,10 +60,10 @@ EvictionPolicyPlan EvictionPolicy::plan(
             });
         }
 
-        if (planned_model_ids.count(runtime.model_id) == 0 &&
+        if (planned_runtime_ids.count(runtime.runtime_id) == 0 &&
             isEvictableIdleRuntime(runtime)) {
             evictable.push_back(EvictionCandidate{&runtime, model_memory_mb});
-        } else if (planned_model_ids.count(runtime.model_id) == 0 &&
+        } else if (planned_runtime_ids.count(runtime.runtime_id) == 0 &&
                    isFairnessDrainCandidate(runtime)) {
             fairness_evictable.push_back(
                 EvictionCandidate{&runtime, model_memory_mb});
@@ -77,7 +79,7 @@ EvictionPolicyPlan EvictionPolicy::plan(
     if (input.config.max_active_models == 0) {
         for (const WaitingCandidate& candidate : waiting) {
             add_action(EvictionPolicyActionType::Reject,
-                       candidate.runtime->model_id);
+                       candidate.runtime->runtime_id);
         }
         return plan;
     }
@@ -95,14 +97,14 @@ EvictionPolicyPlan EvictionPolicy::plan(
         if (input.available_memory_mb + eventual_reclaimable_mb <
             candidate.required_memory_mb) {
             add_action(EvictionPolicyActionType::Reject,
-                       candidate.runtime->model_id);
+                       candidate.runtime->runtime_id);
             continue;
         }
 
         if (active_reserved_count + 1 <= input.config.max_active_models &&
             remaining_available_mb >= candidate.required_memory_mb) {
             add_action(EvictionPolicyActionType::Activate,
-                       candidate.runtime->model_id);
+                       candidate.runtime->runtime_id);
             remaining_available_mb -= candidate.required_memory_mb;
             ++active_reserved_count;
             activated_candidate = true;
@@ -135,15 +137,15 @@ EvictionPolicyPlan EvictionPolicy::plan(
 
     size_t planned_eviction_count = 0;
     long planned_freed_mb = 0;
-    std::vector<std::string> victims_for_candidate;
+    std::vector<qai_forge::execution::RuntimeId> victims_for_candidate;
 
     for (const EvictionCandidate& victim : evictable) {
         if (!victim.runtime ||
-            planned_model_ids.count(victim.runtime->model_id) > 0) {
+            planned_runtime_ids.count(victim.runtime->runtime_id) > 0) {
             continue;
         }
 
-        victims_for_candidate.push_back(victim.runtime->model_id);
+        victims_for_candidate.push_back(victim.runtime->runtime_id);
         planned_freed_mb += victim.model_memory_mb;
         ++planned_eviction_count;
 
@@ -161,11 +163,11 @@ EvictionPolicyPlan EvictionPolicy::plan(
             input.config.cold_model_fairness_wait)) {
         for (const EvictionCandidate& victim : fairness_evictable) {
             if (!victim.runtime ||
-                planned_model_ids.count(victim.runtime->model_id) > 0) {
+                planned_runtime_ids.count(victim.runtime->runtime_id) > 0) {
                 continue;
             }
 
-            victims_for_candidate.push_back(victim.runtime->model_id);
+            victims_for_candidate.push_back(victim.runtime->runtime_id);
             planned_freed_mb += victim.model_memory_mb;
             ++planned_eviction_count;
 
@@ -178,8 +180,9 @@ EvictionPolicyPlan EvictionPolicy::plan(
 
     if (planned_eviction_count >= count_evictions_needed &&
         planned_freed_mb >= memory_needed_mb) {
-        for (const std::string& victim_model_id : victims_for_candidate) {
-            add_action(EvictionPolicyActionType::Drain, victim_model_id);
+        for (const qai_forge::execution::RuntimeId& victim_runtime_id :
+             victims_for_candidate) {
+            add_action(EvictionPolicyActionType::Drain, victim_runtime_id);
         }
     }
 
@@ -270,7 +273,7 @@ bool EvictionPolicy::waitingLess(
     if (queueCandidateLess(rhs.runtime->candidate, lhs.runtime->candidate)) {
         return false;
     }
-    return lhs.runtime->model_id < rhs.runtime->model_id;
+    return lhs.runtime->runtime_id.key() < rhs.runtime->runtime_id.key();
 }
 
 bool EvictionPolicy::victimLess(
@@ -286,7 +289,7 @@ bool EvictionPolicy::victimLess(
     if (lhs.runtime->last_used_at != rhs.runtime->last_used_at) {
         return lhs.runtime->last_used_at < rhs.runtime->last_used_at;
     }
-    return lhs.runtime->model_id < rhs.runtime->model_id;
+    return lhs.runtime->runtime_id.key() < rhs.runtime->runtime_id.key();
 }
 
 bool EvictionPolicy::queueCandidateLess(

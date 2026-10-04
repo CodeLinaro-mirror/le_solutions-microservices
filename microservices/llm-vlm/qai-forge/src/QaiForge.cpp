@@ -502,7 +502,7 @@ struct QaiForge::Impl {
             active_operations_.markCancelled(response_id);
         std::string job_id = info.found ? info.job_id : response_id;
 
-        tool_chains_.closeChain(info.lease_model_id, info.lease_id);
+        tool_chains_.closeChain(info.lease_model_id, info.lease_id, info.session_id);
         if (info.memory_turn.has_value()) {
             memory_coordinator_->abortTurn(
                 info.memory_turn.value(), scheduler::MemoryTurnState::Cancelled);
@@ -572,7 +572,8 @@ private:
             tool_chains_.renewLease(
                 context.model_id,
                 context.tool_chain_id,
-                config_.tool_response_timeout);
+                config_.tool_response_timeout,
+                session_id);
         }
 
         bool tool_output = options.tool_output_submission ||
@@ -616,7 +617,8 @@ private:
                         chain.chain_id,
                         context.job_id,
                         chain.model_id,
-                        config_.tool_response_timeout)) {
+                        config_.tool_response_timeout,
+                        chain.session_id)) {
                     if (!options.allow_tool_chain_fallback) {
                         throw submitErrorToException(rejected(
                             scheduler::SubmitStatus::
@@ -682,6 +684,7 @@ private:
         scheduler::GenerativeScheduleMetadata metadata{
             job->job_id,
             job->model_id,
+            job->session_id,
             job->priority,
         };
 
@@ -737,16 +740,17 @@ private:
                         tool_chains_.openLease(
                             model_id,
                             internal_mcp_lease_id,
-                            config_.tool_response_timeout);
+                            config_.tool_response_timeout,
+                            session_id);
                         if (previous_chain_id != internal_mcp_lease_id) {
                             tool_chains_.closeChain(
-                                model_id, previous_chain_id);
+                                model_id, previous_chain_id, session_id);
                         }
                     } else {
-                        tool_chains_.closeChain(model_id, previous_chain_id);
+                        tool_chains_.closeChain(model_id, previous_chain_id, session_id);
                         if (previous_chain_id != internal_mcp_lease_id) {
                             tool_chains_.closeChain(
-                                model_id, internal_mcp_lease_id);
+                                model_id, internal_mcp_lease_id, session_id);
                         }
                     }
                 } else {
@@ -763,7 +767,7 @@ private:
                     awaiting_internal_tool);
                 if (awaiting_internal_tool && !kept_for_resume) {
                     tool_chains_.closeChain(
-                        model_id, internal_mcp_lease_id);
+                        model_id, internal_mcp_lease_id, session_id);
                 }
                 if (original_callbacks->on_complete) {
                     original_callbacks->on_complete(response);
@@ -778,8 +782,9 @@ private:
              response_id,
              job_id,
              model_id,
+             session_id,
              previous_chain_id](const GenAIException& error) {
-                tool_chains_.closeChain(model_id, previous_chain_id);
+                tool_chains_.closeChain(model_id, previous_chain_id, session_id);
                 active_operations_.finishOperation(response_id, job_id, false);
                 if (original_callbacks->on_error) {
                     original_callbacks->on_error(error);
@@ -791,8 +796,9 @@ private:
              response_id,
              job_id,
              model_id,
+             session_id,
              previous_chain_id]() {
-                tool_chains_.closeChain(model_id, previous_chain_id);
+                tool_chains_.closeChain(model_id, previous_chain_id, session_id);
                 active_operations_.finishOperation(response_id, job_id, false);
                 if (original_callbacks->on_cancelled) {
                     original_callbacks->on_cancelled();
@@ -806,7 +812,7 @@ private:
                           const std::string& previous_chain_id,
                           const StandardResponse& response) {
         if (!responseHasToolCalls(response)) {
-            tool_chains_.closeChain(model_id, previous_chain_id);
+            tool_chains_.closeChain(model_id, previous_chain_id, session_id);
             return;
         }
 
@@ -825,7 +831,7 @@ private:
             new_model_id,
             session_id,
             config_.tool_response_timeout);
-        tool_chains_.closeChain(model_id, previous_chain_id);
+        tool_chains_.closeChain(model_id, previous_chain_id, session_id);
 
         LOG_INFO("[QaiForge] Opened tool chain: chain=" << chain.chain_id
                  << " response=" << chain.response_id
