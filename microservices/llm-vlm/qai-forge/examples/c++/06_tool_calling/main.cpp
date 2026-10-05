@@ -12,15 +12,19 @@
 //
 // Key concepts:
 //   - tools array in CreateChatCompletionRequest
-//   - StandardResponse.tool_calls — parsed by ModelAdapter::parseToolCalls()
+//   - StandardResponse.tool_calls — parsed by the model's ModelAdapter
 //   - Tool result message (role: "tool") in the follow-up request
-//   - ModelAdapterFactory resolves the correct tool format per model family
+//   - QaiForge::generate() / generateStream() facade (same API as 01-05)
 //
 // Note: Tool calling requires a model that supports it (e.g. Qwen2.5-7B-Instruct).
-//       Check ModelConfig::supports_tool_calling (set in metadata.json).
+//
+// Model selection (checked in order):
+//   1. argv[1]              e.g. ./06_tool_calling qwen2.5-7b
+//   2. QAI_FORGE_MODEL env var
+//   3. Fallback default: "qwen2.5-7b"
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/InternalDTOs.h"
 #include <iostream>
@@ -28,10 +32,25 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <condition_variable>
+#include <mutex>
+#include <cstdlib>
+
+namespace {
+
+std::string resolveModelId(int argc, char* argv[], const std::string& fallback) {
+    if (argc > 1 && argv[1][0] != '\0') {
+        return argv[1];
+    }
+    if (const char* env = std::getenv("QAI_FORGE_MODEL")) {
+        if (env[0] != '\0') return env;
+    }
+    return fallback;
+}
 
 // ── Simulated tool implementations ────────────────────────────────────────────
 
-static std::string get_weather(const std::string& location, const std::string& unit) {
+std::string get_weather(const std::string& location, const std::string& unit) {
     // Simulated weather data — in production, call a real weather API
     std::ostringstream oss;
     oss << "{\"location\":\"" << location << "\","
@@ -42,7 +61,7 @@ static std::string get_weather(const std::string& location, const std::string& u
     return oss.str();
 }
 
-static std::string calculate(const std::string& expression) {
+std::string calculate(const std::string& expression) {
     // Very simple calculator — only handles basic arithmetic for demo purposes
     // In production, use a proper expression parser
     std::ostringstream oss;
@@ -53,7 +72,7 @@ static std::string calculate(const std::string& expression) {
 }
 
 // Dispatch a tool call to the appropriate implementation
-static std::string execute_tool(const std::string& tool_name, const json& arguments) {
+std::string execute_tool(const std::string& tool_name, const json& arguments) {
     if (tool_name == "get_weather") {
         std::string location = arguments.value("location", "Unknown");
         std::string unit     = arguments.value("unit", "celsius");
@@ -66,23 +85,29 @@ static std::string execute_tool(const std::string& tool_name, const json& argume
     return "{\"error\":\"Unknown tool: " + tool_name + "\"}";
 }
 
+} // namespace
+
 int main(int argc, char* argv[]) {
-    const std::string model_id = (argc > 1) ? argv[1] : "qwen2.5-7b";
+    const std::string model_id = resolveModelId(argc, argv, "qwen2.5-7b");
 
     std::cout << "=== qai-forge Example 06: Tool Calling ===\n\n";
-    std::cout << "Model: " << model_id << "\n\n";
+    std::cout << "Model: " << model_id
+               << " (override with argv[1] or QAI_FORGE_MODEL env var)\n\n";
+
+    qai_forge::QaiForge::getInstance().start();
 
     // Initialize model registry
     ModelConfigManager::getInstance().scanModelBundles();
     if (!ModelConfigManager::getInstance().validateModel(model_id)) {
         std::cerr << "ERROR: Model '" << model_id << "' not found.\n";
+        qai_forge::QaiForge::getInstance().shutdown();
         return 1;
     }
 
     // ── Define tools ───────────────────────────────────────────────────────────
     // Tools are defined in the OpenAI function calling format.
-    // The ModelAdapter (Qwen25Adapter / Qwen3Adapter) formats these into
-    // the model-specific system prompt injection.
+    // The model's adapter formats these into the model-specific system
+    // prompt injection.
     json tools = json::array({
         {
             {"type", "function"},
@@ -142,8 +167,10 @@ int main(int argc, char* argv[]) {
     turn1_request.max_completion_tokens = 512;
     turn1_request.temperature = 0.1f;  // Low temperature for deterministic tool calls
 
+    int exit_code = 0;
     try {
-        StandardResponse turn1_response = ChatOrchestrator::getInstance().handleBlocking(turn1_request);
+        StandardResponse turn1_response =
+            qai_forge::QaiForge::getInstance().generate(turn1_request);
 
         // Check if the model wants to call tools
         if (turn1_response.finish_reason == "tool_calls" && turn1_response.tool_calls.has_value()) {
@@ -209,16 +236,50 @@ int main(int argc, char* argv[]) {
 
             std::cout << "─── Final Answer ───────────────────────────────────────\n";
 
-            ChatOrchestrator::getInstance().handleStreaming(turn2_request,
-                [](const StreamChunk& chunk) {
-                    if (chunk.content_delta.has_value()) {
-                        std::cout << chunk.content_delta.value();
-                        std::cout.flush();
-                    }
+            std::mutex done_mutex;
+            std::condition_variable done_cv;
+            bool done = false;
+            bool had_error = false;
+            std::string error_message;
+
+            qai_forge::StreamCallbacks callbacks;
+            callbacks.onToken = [&](const StreamChunk& chunk) {
+                if (chunk.content_delta.has_value()) {
+                    std::cout << chunk.content_delta.value();
+                    std::cout.flush();
                 }
-            );
+            };
+            callbacks.onComplete = [&](const StandardResponse&) {
+                std::lock_guard<std::mutex> lock(done_mutex);
+                done = true;
+                done_cv.notify_one();
+            };
+            callbacks.onError = [&](const GenAIException& e) {
+                std::lock_guard<std::mutex> lock(done_mutex);
+                had_error = true;
+                error_message = e.message;
+                done = true;
+                done_cv.notify_one();
+            };
+            callbacks.onCancelled = [&]() {
+                std::lock_guard<std::mutex> lock(done_mutex);
+                had_error = true;
+                error_message = "Request cancelled";
+                done = true;
+                done_cv.notify_one();
+            };
+
+            qai_forge::QaiForge::getInstance().generateStream(turn2_request, callbacks);
+            {
+                std::unique_lock<std::mutex> lock(done_mutex);
+                done_cv.wait(lock, [&] { return done; });
+            }
 
             std::cout << "\n────────────────────────────────────────────────────────\n";
+            if (had_error) {
+                std::cerr << "GenAI error: " << error_message << "\n";
+                exit_code = 1;
+            }
 
         } else {
             // Model responded directly without tool calls
@@ -231,11 +292,12 @@ int main(int argc, char* argv[]) {
 
     } catch (const GenAIException& e) {
         std::cerr << "GenAI error (HTTP " << e.http_status << "): " << e.message << "\n";
-        return 1;
+        exit_code = 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
-        return 1;
+        exit_code = 1;
     }
 
-    return 0;
+    qai_forge::QaiForge::getInstance().shutdown();
+    return exit_code;
 }

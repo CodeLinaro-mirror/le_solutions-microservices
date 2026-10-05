@@ -17,6 +17,7 @@
 #include "qai_forge/c_api/qai_forge_c_api.h"
 #include "qai_forge/QaiForge.h"
 #include "qai_forge/InternalDTOs.h"
+#include "qai_forge/managers/ModelConfigManager.h"
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <condition_variable>
@@ -311,6 +312,10 @@ int qai_forge_infer(const char*  request_json,
 
 void qai_forge_start(void) {
     qai_forge::QaiForge::getInstance().start();
+}
+
+void qai_forge_scan_models(void) {
+    ModelConfigManager::getInstance().scanModelBundles();
 }
 
 void qai_forge_shutdown(int force) {

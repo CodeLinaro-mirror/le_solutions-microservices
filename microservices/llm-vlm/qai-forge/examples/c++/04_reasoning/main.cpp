@@ -8,36 +8,62 @@
 // QwQ) that generate <think>...</think> blocks before their final answer.
 //
 // Key concepts:
-//   - bypass_think_filter: enabled automatically for models with
-//     supports_thinking=true in metadata.json
-//   - ReasoningRouter: routes <think> tokens to reasoning_content field
-//   - StreamChunk.reasoning_content vs StreamChunk.content_delta
-//   - Non-streaming: StandardResponse.reasoning_content
-//   - Thinking budget: limits the number of thinking token fragments
+//   - ReasoningRouter: routes <think> tokens to reasoning_content, enabled
+//     automatically for models with supports_thinking=true in metadata.json
+//   - StreamChunk.reasoning_content vs StreamChunk.content_delta (streaming)
+//   - StandardResponse.reasoning_content (non-streaming)
+//   - QaiForge::generate() / generateStream() facade (same API as 01/02/03)
+//
+// Model selection (checked in order):
+//   1. argv[1]              e.g. ./04_reasoning qwen3-8b
+//   2. QAI_FORGE_MODEL env var
+//   3. Fallback default: "qwen3-8b"
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "qai_forge/orchestration/ChatOrchestrator.h"
+#include "qai_forge/QaiForge.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/InternalDTOs.h"
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <cstdlib>
+#include <algorithm>
+
+namespace {
+
+std::string resolveModelId(int argc, char* argv[], const std::string& fallback) {
+    if (argc > 1 && argv[1][0] != '\0') {
+        return argv[1];
+    }
+    if (const char* env = std::getenv("QAI_FORGE_MODEL")) {
+        if (env[0] != '\0') return env;
+    }
+    return fallback;
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     // Default to a reasoning model — change to your deployed model ID
-    const std::string model_id = (argc > 1) ? argv[1] : "qwen3-8b";
+    const std::string model_id = resolveModelId(argc, argv, "qwen3-8b");
     const std::string problem  = (argc > 2) ? argv[2]
         : "A train travels 120 km in 2 hours. Another train travels 180 km in 3 hours. "
           "Which train is faster, and by how much?";
 
     std::cout << "=== qai-forge Example 04: Reasoning Model ===\n\n";
-    std::cout << "Model:   " << model_id << "\n";
+    std::cout << "Model:   " << model_id
+               << " (override with argv[1] or QAI_FORGE_MODEL env var)\n";
     std::cout << "Problem: " << problem << "\n\n";
+
+    qai_forge::QaiForge::getInstance().start();
 
     // Initialize model registry
     ModelConfigManager::getInstance().scanModelBundles();
     if (!ModelConfigManager::getInstance().validateModel(model_id)) {
         std::cerr << "ERROR: Model '" << model_id << "' not found.\n";
+        qai_forge::QaiForge::getInstance().shutdown();
         return 1;
     }
 
@@ -63,36 +89,67 @@ int main(int argc, char* argv[]) {
     bool in_thinking = false;
     auto start = std::chrono::steady_clock::now();
 
-    try {
-        ChatOrchestrator::getInstance().handleStreaming(stream_request,
-            [&](const StreamChunk& chunk) {
-                if (chunk.reasoning_content.has_value()) {
-                    // Thinking token — print in dim/italic style
-                    if (!in_thinking) {
-                        std::cout << "\033[2m[Thinking]\n";
-                        in_thinking = true;
-                    }
-                    std::cout << chunk.reasoning_content.value();
-                    std::cout.flush();
-                    thinking_tokens++;
-                }
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
+    bool done = false;
+    bool had_error = false;
+    std::string error_message;
 
-                if (chunk.content_delta.has_value()) {
-                    // Answer token — print normally
-                    if (in_thinking) {
-                        std::cout << "\033[0m\n[Answer]\n";
-                        in_thinking = false;
-                    }
-                    std::cout << chunk.content_delta.value();
-                    std::cout.flush();
-                    answer_tokens++;
-                }
+    qai_forge::StreamCallbacks callbacks;
+    callbacks.onToken = [&](const StreamChunk& chunk) {
+        if (chunk.reasoning_content.has_value()) {
+            if (!in_thinking) {
+                std::cout << "\033[2m[Thinking]\n";
+                in_thinking = true;
             }
-        );
-        if (in_thinking) std::cout << "\033[0m";
+            std::cout << chunk.reasoning_content.value();
+            std::cout.flush();
+            thinking_tokens++;
+        }
 
+        if (chunk.content_delta.has_value()) {
+            if (in_thinking) {
+                std::cout << "\033[0m\n[Answer]\n";
+                in_thinking = false;
+            }
+            std::cout << chunk.content_delta.value();
+            std::cout.flush();
+            answer_tokens++;
+        }
+    };
+    callbacks.onComplete = [&](const StandardResponse&) {
+        std::lock_guard<std::mutex> lock(done_mutex);
+        done = true;
+        done_cv.notify_one();
+    };
+    callbacks.onError = [&](const GenAIException& e) {
+        std::lock_guard<std::mutex> lock(done_mutex);
+        had_error = true;
+        error_message = e.message;
+        done = true;
+        done_cv.notify_one();
+    };
+    callbacks.onCancelled = [&]() {
+        std::lock_guard<std::mutex> lock(done_mutex);
+        had_error = true;
+        error_message = "Request cancelled";
+        done = true;
+        done_cv.notify_one();
+    };
+
+    try {
+        qai_forge::QaiForge::getInstance().generateStream(stream_request, callbacks);
+        std::unique_lock<std::mutex> lock(done_mutex);
+        done_cv.wait(lock, [&] { return done; });
+        if (in_thinking) std::cout << "\033[0m";
+        if (had_error) {
+            std::cerr << "\nGenAI error: " << error_message << "\n";
+            qai_forge::QaiForge::getInstance().shutdown();
+            return 1;
+        }
     } catch (const GenAIException& e) {
         std::cerr << "\nGenAI error: " << e.message << "\n";
+        qai_forge::QaiForge::getInstance().shutdown();
         return 1;
     }
 
@@ -117,8 +174,10 @@ int main(int argc, char* argv[]) {
     block_request.max_completion_tokens = 2048;
     block_request.temperature = 0.6f;
 
+    int exit_code = 0;
     try {
-        StandardResponse response = ChatOrchestrator::getInstance().handleBlocking(block_request);
+        StandardResponse response =
+            qai_forge::QaiForge::getInstance().generate(block_request);
 
         if (response.reasoning_content.has_value() && !response.reasoning_content.value().empty()) {
             std::cout << "\n[Thinking]\n";
@@ -138,8 +197,9 @@ int main(int argc, char* argv[]) {
 
     } catch (const GenAIException& e) {
         std::cerr << "GenAI error: " << e.message << "\n";
-        return 1;
+        exit_code = 1;
     }
 
-    return 0;
+    qai_forge::QaiForge::getInstance().shutdown();
+    return exit_code;
 }

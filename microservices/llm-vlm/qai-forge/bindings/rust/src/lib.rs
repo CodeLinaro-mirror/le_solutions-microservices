@@ -54,6 +54,11 @@ extern "C" {
     fn qai_forge_release_conversation(user: *const c_char) -> c_int;
     fn qai_forge_free_string(s: *mut c_char);
     fn qai_forge_version() -> *const c_char;
+    fn qai_forge_start();
+    fn qai_forge_scan_models();
+    fn qai_forge_shutdown(force: c_int);
+    fn qai_forge_cancel(response_id: *const c_char) -> c_int;
+    fn qai_forge_supported_runtimes() -> *const c_char;
 }
 
 // ── Public types ───────────────────────────────────────────────────────────────
@@ -145,6 +150,53 @@ pub enum QaiForgeError {
     NullPointer,
 }
 
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+/// Starts the internal scheduler (loads backend plugins).
+///
+/// Must be called once before any [`generate`]/[`generate_stream`] call.
+/// Safe to call multiple times — subsequent calls are no-ops.
+pub fn start() {
+    unsafe { qai_forge_start() }
+}
+
+/// Scans the models directory (`GENAI_MODELS_DIR` env var, or the built-in
+/// default) and (re)populates the model registry used by
+/// [`generate`]/[`generate_stream`] for model-id validation and
+/// backend/runtime routing.
+///
+/// MUST be called at least once after [`start`] and before any
+/// generate/generate_stream call — otherwise every request fails with a 404
+/// "Model not found" error, since the registry starts empty. Safe to call
+/// again later to hot-reload if models are added/removed on disk.
+pub fn scan_models() {
+    unsafe { qai_forge_scan_models() }
+}
+
+/// Shuts down the internal scheduler.
+///
+/// `force = false` drains in-flight requests gracefully; `force = true`
+/// aborts them immediately.
+pub fn shutdown(force: bool) {
+    unsafe { qai_forge_shutdown(if force { 1 } else { 0 }) }
+}
+
+/// Cancels an in-flight generative request by `response_id`.
+/// Returns `true` if the request was found and cancelled.
+pub fn cancel(response_id: &str) -> Result<bool, QaiForgeError> {
+    let response_id = CString::new(response_id)?;
+    Ok(unsafe { qai_forge_cancel(response_id.as_ptr()) } != 0)
+}
+
+/// Returns a JSON string describing which generative and predictive
+/// runtimes this build of `libqai_forge.so` supports, e.g.
+/// `{"generative":["genie","litert_lm"],"predictive":["qnn","snpe"]}`.
+pub fn supported_runtimes() -> &'static str {
+    unsafe { CStr::from_ptr(qai_forge_supported_runtimes()) }
+        .to_str()
+        .unwrap_or("{}")
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /// Returns the library version string (e.g. `"1.0.0"`).
@@ -168,7 +220,7 @@ pub fn release_conversation(user: &str) -> Result<bool, QaiForgeError> {
 ///
 /// Returns [`QaiForgeError`] if the C API returns a non-zero error code,
 /// if JSON serialization fails, or if the response cannot be deserialized.
-pub fn chat(req: &ChatRequest) -> Result<ChatResponse, QaiForgeError> {
+pub fn generate(req: &ChatRequest) -> Result<ChatResponse, QaiForgeError> {
     let req_json = CString::new(serde_json::to_string(req)?)?;
 
     let mut resp_ptr: *mut c_char = std::ptr::null_mut();
@@ -214,7 +266,7 @@ pub fn chat(req: &ChatRequest) -> Result<ChatResponse, QaiForgeError> {
 /// # Errors
 ///
 /// Returns [`QaiForgeError`] if the C API returns a non-zero error code.
-pub fn chat_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError> {
+pub fn generate_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError> {
     let req_json = CString::new(serde_json::to_string(req)?)?;
 
     // Collect chunks via the C callback into a shared Vec
@@ -268,4 +320,22 @@ pub fn chat_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError>
         })?;
 
     Ok(result)
+}
+
+// ── Deprecated aliases (kept for one release cycle) ─────────────────────────
+//
+// These names were used before generate()/generate_stream() were introduced
+// to match the QaiForge facade and C API naming (qai_forge_generate /
+// qai_forge_generate_stream). Prefer the new names.
+
+/// Deprecated alias for [`generate`].
+#[deprecated(since = "1.1.0", note = "use `generate` instead")]
+pub fn chat(req: &ChatRequest) -> Result<ChatResponse, QaiForgeError> {
+    generate(req)
+}
+
+/// Deprecated alias for [`generate_stream`].
+#[deprecated(since = "1.1.0", note = "use `generate_stream` instead")]
+pub fn chat_stream(req: &ChatRequest) -> Result<Vec<StreamChunk>, QaiForgeError> {
+    generate_stream(req)
 }

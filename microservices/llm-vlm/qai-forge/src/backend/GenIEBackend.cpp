@@ -55,7 +55,10 @@ int selectedGenieDeviceId(const qai_forge::execution::ExecutionPlan& plan) {
             component.target.target_id.rfind("device_id=", 0) != 0) {
             throw std::invalid_argument(
                 "GenIEBackend: placement plan must resolve to a physical "
-                "device_id target");
+                "device_id target (no physical HTP target was found in the "
+                "resolved topology — set QAI_FORGE_PLATFORM=ventunoq|iq9 to "
+                "use a built-in hardware preset, or QNN_BACKEND_LIB=<path to "
+                "libQnnHtp.so> to auto-probe the topology at startup)");
         }
 
         const std::string value =

@@ -4,6 +4,11 @@ version = "1.0.0"
 edition = "2021"
 description = "Rust bindings for the qai-forge inference facade"
 license = "BSD-3-Clause-Clear"
+# Explicit [[example]] entries below list every runnable example binary.
+# Disabled so Cargo doesn't also try to build examples/common.rs (a shared
+# helper module with no `fn main()`, included via `include!()`) as its own
+# example target.
+autoexamples = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -14,5 +19,21 @@ thiserror = "1"
 # build.rs links libqai_forge.so
 
 [[example]]
-name = "chat"
-path = "examples/main.rs"
+name = "01_simple_chat"
+path = "examples/01_simple_chat.rs"
+
+[[example]]
+name = "02_streaming_chat"
+path = "examples/02_streaming_chat.rs"
+
+[[example]]
+name = "03_reasoning"
+path = "examples/03_reasoning.rs"
+
+[[example]]
+name = "04_multi_turn"
+path = "examples/04_multi_turn.rs"
+
+[[example]]
+name = "05_sampling_params"
+path = "examples/05_sampling_params.rs"

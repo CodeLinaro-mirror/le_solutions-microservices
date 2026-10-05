@@ -10,6 +10,11 @@
 //   - Sending the complete transcript on every request
 //   - Passing explicit conversation and turn identifiers
 //   - Releasing private runtime memory when the conversation ends
+//
+// Model selection (checked in order):
+//   1. argv[1]              e.g. ./03_multi_turn qwen2.5-7b
+//   2. QAI_FORGE_MODEL env var
+//   3. Fallback default: "qwen2.5-7b"
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "qai_forge/QaiForge.h"
@@ -18,6 +23,22 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdlib>
+
+namespace {
+
+// Resolve the model id to use: CLI arg > QAI_FORGE_MODEL env var > fallback.
+std::string resolveModelId(int argc, char* argv[], const std::string& fallback) {
+    if (argc > 1 && argv[1][0] != '\0') {
+        return argv[1];
+    }
+    if (const char* env = std::getenv("QAI_FORGE_MODEL")) {
+        if (env[0] != '\0') return env;
+    }
+    return fallback;
+}
+
+} // namespace
 
 // Helper: send one turn and print the response
 static std::string send_turn(const std::string& model_id,
@@ -54,20 +75,25 @@ static std::string send_turn(const std::string& model_id,
 }
 
 int main(int argc, char* argv[]) {
-    const std::string model_id = (argc > 1) ? argv[1] : "qwen2.5-7b";
+    const std::string model_id = resolveModelId(argc, argv, "qwen2.5-7b");
 
     std::cout << "=== qai-forge Example 03: Multi-Turn Conversation ===\n\n";
-    std::cout << "Model: " << model_id << "\n\n";
+    std::cout << "Model: " << model_id
+               << " (override with argv[1] or QAI_FORGE_MODEL env var)\n\n";
+
+    qai_forge::QaiForge::getInstance().start();
 
     // Initialize model registry
     ModelConfigManager::getInstance().scanModelBundles();
     if (!ModelConfigManager::getInstance().validateModel(model_id)) {
         std::cerr << "ERROR: Model '" << model_id << "' not found.\n";
+        qai_forge::QaiForge::getInstance().shutdown();
         return 1;
     }
 
     const std::string conversation_id = "example-03-session";
-    qai_forge::QaiForge::getInstance().start();
+
+    int exit_code = 0;
 
     // ── Turn 1: Introduce a topic ──────────────────────────────────────────────
     std::cout << "Turn 1\n";
@@ -122,12 +148,12 @@ int main(int argc, char* argv[]) {
 
     } catch (const GenAIException& e) {
         std::cerr << "GenAI error (HTTP " << e.http_status << "): " << e.message << "\n";
-        return 1;
+        exit_code = 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
-        return 1;
+        exit_code = 1;
     }
 
     qai_forge::QaiForge::getInstance().shutdown();
-    return 0;
+    return exit_code;
 }

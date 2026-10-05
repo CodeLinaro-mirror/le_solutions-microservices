@@ -216,11 +216,12 @@ void ModelConfigManager::scanModelBundles() {
                              << " (already loaded from a previous bundle)");
                     continue;
                 }
+                const std::string full_model_id = config.id;  // capture BEFORE move
                 config.bundle_path = bundle_path;
-                new_models[config.id] = std::move(config);
+                new_models[full_model_id] = std::move(config);
 
-                if (new_default.empty()) new_default = config.id;
-                LOG_INFO("[ModelConfigManager] Loaded model: " << config.id
+                if (new_default.empty()) new_default = full_model_id;
+                LOG_INFO("[ModelConfigManager] Loaded model: " << full_model_id
                          << " from " << bundle_name);
 
             } catch (const std::exception& e) {

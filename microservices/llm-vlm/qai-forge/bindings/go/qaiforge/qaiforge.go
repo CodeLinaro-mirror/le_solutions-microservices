@@ -86,11 +86,62 @@ type StreamChunk struct {
 	Role           string `json:"role,omitempty"`
 }
 
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+// Start starts the internal scheduler (loads backend plugins).
+// Must be called once before any Generate/GenerateStream call. Safe to call
+// multiple times — subsequent calls are no-ops.
+func Start() {
+	C.qai_forge_start()
+}
+
+// ScanModels scans the models directory (GENAI_MODELS_DIR env var, or the
+// built-in default) and (re)populates the model registry used by
+// Generate()/GenerateStream() for model-id validation and backend/runtime
+// routing.
+//
+// MUST be called at least once after Start() and before any
+// Generate/GenerateStream call — otherwise every request fails with a 404
+// "Model not found" error, since the registry starts empty. Safe to call
+// again later to hot-reload if models are added/removed on disk.
+func ScanModels() {
+	C.qai_forge_scan_models()
+}
+
+// Shutdown shuts down the internal scheduler.
+// force=false drains in-flight requests gracefully; force=true aborts them
+// immediately.
+func Shutdown(force bool) {
+	if force {
+		C.qai_forge_shutdown(1)
+	} else {
+		C.qai_forge_shutdown(0)
+	}
+}
+
+// Cancel cancels an in-flight generative request by response_id.
+// Returns true if the request was found and cancelled.
+func Cancel(responseID string) bool {
+	if responseID == "" {
+		return false
+	}
+	cID := C.CString(responseID)
+	defer C.free(unsafe.Pointer(cID))
+	return C.qai_forge_cancel(cID) != 0
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 // Version returns the library version string.
 func Version() string {
 	return C.GoString(C.qai_forge_version())
+}
+
+// SupportedRuntimes returns a JSON string describing which generative and
+// predictive runtimes this build of libqai_forge.so supports, e.g.
+// `{"generative":["genie","litert_lm"],"predictive":["qnn","snpe"]}`.
+func SupportedRuntimes() string {
+	return C.GoString(C.qai_forge_supported_runtimes())
 }
 
 // ReleaseConversation releases private runtime memory associated with user.
@@ -103,9 +154,9 @@ func ReleaseConversation(user string) bool {
 	return C.qai_forge_release_conversation(cUser) != 0
 }
 
-// Chat runs a blocking chat completion.
+// Generate runs a blocking chat completion.
 // It blocks until generation is complete and returns the full response.
-func Chat(req ChatRequest) (*ChatResponse, error) {
+func Generate(req ChatRequest) (*ChatResponse, error) {
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("QaiForge: marshal request: %w", err)
@@ -135,7 +186,7 @@ func Chat(req ChatRequest) (*ChatResponse, error) {
 	return &resp, nil
 }
 
-// ChatStream runs a streaming chat completion.
+// GenerateStream runs a streaming chat completion.
 //
 // Returns two channels:
 //   - chunks: receives StreamChunk values as tokens arrive; closed when done.
@@ -146,14 +197,14 @@ func Chat(req ChatRequest) (*ChatResponse, error) {
 //
 // Example:
 //
-//	chunks, errs := qaiforge.ChatStream(req)
+//	chunks, errs := qaiforge.GenerateStream(req)
 //	for chunk := range chunks {
 //	    fmt.Print(chunk.ContentDelta)
 //	}
 //	if err := <-errs; err != nil {
 //	    log.Fatal(err)
 //	}
-func ChatStream(req ChatRequest) (<-chan StreamChunk, <-chan error) {
+func GenerateStream(req ChatRequest) (<-chan StreamChunk, <-chan error) {
 	chunks := make(chan StreamChunk, 64)
 	errs := make(chan error, 1)
 
@@ -188,9 +239,25 @@ func ChatStream(req ChatRequest) (<-chan StreamChunk, <-chan error) {
 				errMsg = C.GoString(cErr)
 				C.qai_forge_free_string(cErr)
 			}
-			errs <- fmt.Errorf("QaiForge: ChatStream failed [%d]: %s", rc, errMsg)
+			errs <- fmt.Errorf("QaiForge: GenerateStream failed [%d]: %s", rc, errMsg)
 		}
 	}()
 
 	return chunks, errs
+}
+
+// ── Deprecated aliases (kept for one release cycle) ─────────────────────────
+//
+// These names were used before Generate()/GenerateStream() were introduced
+// to match the QaiForge facade and C API naming (qai_forge_generate /
+// qai_forge_generate_stream). Prefer the new names.
+
+// Chat is a deprecated alias for Generate.
+func Chat(req ChatRequest) (*ChatResponse, error) {
+	return Generate(req)
+}
+
+// ChatStream is a deprecated alias for GenerateStream.
+func ChatStream(req ChatRequest) (<-chan StreamChunk, <-chan error) {
+	return GenerateStream(req)
 }

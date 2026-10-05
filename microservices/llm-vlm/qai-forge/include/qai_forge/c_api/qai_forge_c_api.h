@@ -126,6 +126,17 @@ int qai_forge_infer(const char*  request_json,
 // Safe to call multiple times — subsequent calls are no-ops.
 void qai_forge_start(void);
 
+// Scan the models directory (GENAI_MODELS_DIR env var, or the built-in
+// default) and (re)populate the model registry used by qai_forge_generate()/
+// qai_forge_generate_stream()/qai_forge_infer() for model-id validation and
+// backend/runtime routing.
+//
+// MUST be called at least once after qai_forge_start() and before any
+// generate/infer call — otherwise every request fails with a 404 "Model not
+// found" error, since the registry starts empty. Safe to call again later
+// to hot-reload if models are added/removed on disk.
+void qai_forge_scan_models(void);
+
 // Shut down the internal scheduler.
 // force=0: drain in-flight requests gracefully.
 // force=1: abort in-flight requests immediately.

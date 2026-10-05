@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 # ─────────────────────────────────────────────────────────────────────────────
-# qai_forge.py — Python bindings for qai-forge Layer 2
+# qai_forge.py — Python bindings for qai-forge
 #
 # Uses the built-in ctypes module — zero build dependencies.
 # Loads libqai_forge.so at import time.
@@ -12,8 +12,10 @@
 #   from qai_forge import QaiForge
 #
 #   llm = QaiForge()
-#   resp = llm.chat("Qwen3-1.7B", [{"role": "user", "content": "Hello"}])
+#   llm.start()
+#   resp = llm.generate("Qwen3-1.7B", [{"role": "user", "content": "Hello"}])
 #   print(resp["content"])
+#   llm.shutdown()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import ctypes
@@ -61,6 +63,21 @@ _lib.qai_forge_free_string.restype = None
 _lib.qai_forge_version.argtypes = []
 _lib.qai_forge_version.restype = ctypes.c_char_p
 
+_lib.qai_forge_start.argtypes = []
+_lib.qai_forge_start.restype = None
+
+_lib.qai_forge_scan_models.argtypes = []
+_lib.qai_forge_scan_models.restype = None
+
+_lib.qai_forge_shutdown.argtypes = [ctypes.c_int]
+_lib.qai_forge_shutdown.restype = None
+
+_lib.qai_forge_cancel.argtypes = [ctypes.c_char_p]
+_lib.qai_forge_cancel.restype = ctypes.c_int
+
+_lib.qai_forge_supported_runtimes.argtypes = []
+_lib.qai_forge_supported_runtimes.restype = ctypes.c_char_p
+
 
 # ── Public exceptions ──────────────────────────────────────────────────────────
 class QaiForgeError(Exception):
@@ -71,43 +88,106 @@ class QaiForgeError(Exception):
 # ── Public API ─────────────────────────────────────────────────────────────────
 class QaiForge:
     """
-    Pythonic wrapper around the qai-forge Layer 2 C API.
+    Pythonic wrapper around the qai-forge C API.
 
     Calls QaiForge directly in-process — no HTTP/gRPC/D-Bus server needed.
+
+    IMPORTANT: :meth:`start` must be called once before any
+    :meth:`generate`/:meth:`generate_stream` call, and :meth:`shutdown`
+    should be called when done to drain in-flight requests and release
+    scheduler resources.
 
     Examples
     --------
     Blocking completion::
 
         llm = QaiForge()
-        resp = llm.chat("Qwen3-1.7B", [{"role": "user", "content": "Hello"}])
+        llm.start()
+        resp = llm.generate("Qwen3-1.7B", [{"role": "user", "content": "Hello"}])
         print(resp["content"])
+        llm.shutdown()
 
     Streaming completion::
 
-        for chunk in llm.chat_stream("Qwen3-1.7B", [{"role": "user", "content": "Hello"}]):
+        for chunk in llm.generate_stream("Qwen3-1.7B", [{"role": "user", "content": "Hello"}]):
             print(chunk.get("content_delta", ""), end="", flush=True)
 
     Multi-turn session (send the complete transcript on every turn)::
 
-        resp1 = llm.chat("Qwen3-1.7B",
-                          [{"role": "user", "content": "My name is Alice"}],
-                          user="session-alice")
-        resp2 = llm.chat("Qwen3-1.7B",
-                          [{"role": "user", "content": "My name is Alice"},
-                           {"role": "assistant", "content": resp1["content"]},
-                           {"role": "user", "content": "What is my name?"}],
-                          user="session-alice")
+        resp1 = llm.generate("Qwen3-1.7B",
+                              [{"role": "user", "content": "My name is Alice"}],
+                              user="session-alice")
+        resp2 = llm.generate("Qwen3-1.7B",
+                              [{"role": "user", "content": "My name is Alice"},
+                               {"role": "assistant", "content": resp1["content"]},
+                               {"role": "user", "content": "What is my name?"}],
+                              user="session-alice")
         print(resp2["content"])
         llm.release_conversation("session-alice")
     """
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def start() -> None:
+        """
+        Start the internal scheduler (loads backend plugins).
+
+        Must be called once before any :meth:`generate`/:meth:`generate_stream`
+        call. Safe to call multiple times — subsequent calls are no-ops.
+        """
+        _lib.qai_forge_start()
+
+    @staticmethod
+    def scan_models() -> None:
+        """
+        Scan the models directory (GENAI_MODELS_DIR env var, or the built-in
+        default) and (re)populate the model registry.
+
+        MUST be called at least once after :meth:`start` and before any
+        :meth:`generate`/:meth:`generate_stream` call — otherwise every
+        request fails with a 404 "Model not found" error, since the
+        registry starts empty. Safe to call again later to hot-reload if
+        models are added/removed on disk.
+        """
+        _lib.qai_forge_scan_models()
+
+    @staticmethod
+    def shutdown(force: bool = False) -> None:
+        """
+        Shut down the internal scheduler gracefully.
+
+        Parameters
+        ----------
+        force : bool
+            If True, abort in-flight requests immediately instead of
+            draining them.
+        """
+        _lib.qai_forge_shutdown(1 if force else 0)
+
+    @staticmethod
+    def cancel(response_id: str) -> bool:
+        """Cancel an in-flight generative request by response_id."""
+        if not response_id:
+            return False
+        return bool(_lib.qai_forge_cancel(response_id.encode("utf-8")))
 
     @staticmethod
     def version() -> str:
         """Return the library version string."""
         return _lib.qai_forge_version().decode("utf-8")
 
-    def chat(
+    @staticmethod
+    def supported_runtimes() -> Dict[str, Any]:
+        """
+        Return which generative/predictive runtimes this build supports, e.g.
+        ``{"generative": ["genie", "litert_lm"], "predictive": ["qnn", "snpe"]}``.
+        """
+        return json.loads(_lib.qai_forge_supported_runtimes().decode("utf-8"))
+
+    # ── Generative AI ─────────────────────────────────────────────────────────
+
+    def generate(
         self,
         model: str,
         messages: List[Dict[str, str]],
@@ -173,7 +253,7 @@ class QaiForge:
         _lib.qai_forge_free_string(resp_ptr)
         return result
 
-    def chat_stream(
+    def generate_stream(
         self,
         model: str,
         messages: List[Dict[str, str]],
@@ -199,7 +279,7 @@ class QaiForge:
         Parameters
         ----------
         model, messages, max_tokens, temperature, top_p, top_k, user
-            Same as :meth:`chat`.
+            Same as :meth:`generate`.
 
         Yields
         ------
@@ -257,6 +337,20 @@ class QaiForge:
         return bool(
             _lib.qai_forge_release_conversation(user.encode("utf-8"))
         )
+
+    # ── Deprecated aliases (kept for one release cycle) ─────────────────────────
+    #
+    # These names were used before generate()/generate_stream() were
+    # introduced to match the QaiForge facade and C API naming
+    # (qai_forge_generate / qai_forge_generate_stream). Prefer the new names.
+
+    def chat(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Deprecated alias for :meth:`generate`."""
+        return self.generate(*args, **kwargs)
+
+    def chat_stream(self, *args: Any, **kwargs: Any) -> Iterator[Dict[str, Any]]:
+        """Deprecated alias for :meth:`generate_stream`."""
+        return self.generate_stream(*args, **kwargs)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
