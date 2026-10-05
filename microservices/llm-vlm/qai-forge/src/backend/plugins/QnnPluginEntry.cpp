@@ -11,6 +11,10 @@
 
 #include <memory>
 
+extern "C" const char* qai_forge_plugin_abi_version() {
+    return QAI_FORGE_PLUGIN_ABI_VERSION;
+}
+
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::PredictiveEntry entry;
     entry.create_backend = []() -> std::unique_ptr<qai_forge::IInferenceBackend> {

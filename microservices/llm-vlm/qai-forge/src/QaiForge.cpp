@@ -5,6 +5,7 @@
 
 #include "qai_forge/backend/BackendFactory.h"
 #include "qai_forge/plugin/PluginLoader.h"
+#include "qai_forge/plugin/PluginRegistry.h"
 #include "qai_forge/managers/ModelConfigManager.h"
 #include "qai_forge/orchestration/PredictiveOrchestrator.h"
 #include "qai_forge/scheduler/ActiveOperationRegistry.h"
@@ -461,6 +462,14 @@ struct QaiForge::Impl {
         // before anything else runs, so BackendFactory/PluginRegistry
         // are fully populated before the scheduler starts accepting jobs.
         PluginLoader::loadAll();
+
+        // Fail-fast diagnostic: catch backend/orchestrator registration
+        // mismatches (e.g. a plugin that registers a backend but forgets
+        // its orchestrator) at startup via a logged warning, instead of
+        // silently deferring to the first request that happens to hit the
+        // misconfigured runtime (see PluginRegistry::validateRegistrations()).
+        PluginRegistry::instance().validateRegistrations();
+
         LOG_INFO("[QaiForge] Available runtimes: "
                  << BackendFactory::supportedRuntimes().dump());
 

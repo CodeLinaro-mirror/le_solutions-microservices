@@ -168,7 +168,10 @@ scheduler::GenerativeJobPtr OrchestratorAdapter::createJob(
     // out of both the request-admission layer and the scheduler.
     std::optional<scheduler::MemoryTurnCommitToken> memory_turn;
     scheduler::GenieMemoryState initial_memory;
-    if (context.caller.conversation.has_value() && coordinator_) {
+    const bool wants_memory = context.caller.conversation.has_value() &&
+        coordinator_ &&
+        impl_->capabilities().requires_conversation_memory;
+    if (wants_memory) {
         scheduler::MemoryTurnStartResult turn_result =
             coordinator_->beginTurn(context.caller.conversation.value());
         if (!turn_result.accepted()) {
@@ -276,7 +279,8 @@ std::unique_ptr<PostTurnWork> OrchestratorAdapter::createPostTurnTask(
     const StandardResponse& response) const {
     if (!job.memory_turn.has_value() ||
         job.skip_post_turn_summarization ||
-        !job.prepared_state) {
+        !job.prepared_state ||
+        !impl_->capabilities().supports_post_turn) {
         if (job.memory_turn.has_value() && coordinator_) {
             const bool has_tool_calls = response.finish_reason == "tool_calls" &&
                 response.tool_calls.has_value() &&

@@ -29,6 +29,11 @@ namespace qai_forge {
 // internal mixin, with a graceful fallback to initialize(model_id, {}) for
 // backends (including out-of-tree third-party ones) that don't implement it.
 //
+// This is a deliberate, currently-permanent boundary of this public ABI,
+// not an oversight — see IPlacementAwarePredictiveBackend.h for the full
+// rationale and the path forward if/when placement is eventually promoted
+// to a public ABI.
+//
 // Implemented internally (see internal/qai_forge/backend/) by:
 //   LiteRTBackend — wraps TFLite C++ API (TfLiteInterpreter)
 //   QNNBackend    — wraps QNN SDK C++ API

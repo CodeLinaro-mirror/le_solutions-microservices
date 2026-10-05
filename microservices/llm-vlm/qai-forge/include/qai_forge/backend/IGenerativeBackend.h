@@ -35,6 +35,14 @@ namespace qai_forge {
 // graceful fallback to loadModel(model_id) for backends (including
 // out-of-tree third-party ones) that don't implement it.
 //
+// This is a deliberate, currently-permanent boundary of this public ABI,
+// not an oversight: a third-party backend implementing ONLY this public
+// interface can never participate in device placement, because the
+// placement subsystem's own types (ExecutionPlan/RuntimeId/ResourceClaim)
+// are still evolving and are not frozen into a public contract. See
+// IPlacementAwareGenerativeBackend.h for the full rationale and the path
+// forward if/when placement is eventually promoted to a public ABI.
+//
 // Current implementations (all internal, see internal/qai_forge/backend/):
 //   GenIEBackend     — wraps InferenceWorkerManager (LLM) +
 //                      VlmInferenceWorkerManager (VLM)

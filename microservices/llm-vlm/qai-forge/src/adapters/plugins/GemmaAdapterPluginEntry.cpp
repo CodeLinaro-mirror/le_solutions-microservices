@@ -28,6 +28,10 @@ bool matchesGemma(const std::string& model_id) {
 
 } // namespace
 
+extern "C" const char* qai_forge_plugin_abi_version() {
+    return QAI_FORGE_PLUGIN_ABI_VERSION;
+}
+
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::ModelAdapterEntry entry;
     entry.matches = matchesGemma;

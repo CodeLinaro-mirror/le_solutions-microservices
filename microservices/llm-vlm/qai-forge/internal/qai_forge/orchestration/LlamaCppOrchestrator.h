@@ -31,6 +31,10 @@ public:
     LlamaCppOrchestrator() = default;
     ~LlamaCppOrchestrator() override = default;
 
+    qai_forge::OrchestratorCapabilities capabilities() const override {
+        return {false, false};
+    }
+
     std::unique_ptr<qai_forge::PreparedGenerationState> prepare(
         const CreateChatCompletionRequest& request,
         const qai_forge::ConversationMemorySnapshot& memory,

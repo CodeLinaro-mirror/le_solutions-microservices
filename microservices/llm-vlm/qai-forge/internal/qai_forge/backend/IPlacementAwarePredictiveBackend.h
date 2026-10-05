@@ -19,6 +19,13 @@
 // this interface to opportunistically route placement-aware initialization;
 // a bare third-party backend that only implements the public interface
 // degrades gracefully to initialize(model_id, {}).
+//
+// DELIBERATE DESIGN BOUNDARY (not an oversight) — see
+// IPlacementAwareGenerativeBackend.h's matching note for the full
+// rationale. This mixin's internal-only visibility is intentional and
+// permanent until/unless the placement subsystem (ExecutionPlan/RuntimeId/
+// ResourceClaim) is deliberately promoted to a stable public ABI via a new
+// public interface — not by relaxing this header's visibility.
 // ─────────────────────────────────────────────────────────────────────────────
 class IPlacementAwarePredictiveBackend {
 public:

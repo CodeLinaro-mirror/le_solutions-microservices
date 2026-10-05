@@ -22,6 +22,7 @@ namespace {
 #endif
 
 using RegisterPluginFn = void (*)(PluginRegistry&);
+using AbiVersionFn = const char* (*)();
 
 // Keeps every successfully dlopen()'d handle alive for the lifetime of the
 // process — plugin vtables/static state must stay valid for as long as any
@@ -52,6 +53,35 @@ bool loadOnePlugin(const std::string& path) {
         const char* error = dlerror();
         LOG_WARN("[PluginLoader] Failed to dlopen plugin: " << path
                  << " error=\"" << (error ? error : "unknown") << "\"");
+        return false;
+    }
+
+    // ABI version check — see QAI_FORGE_PLUGIN_ABI_VERSION's doc comment in
+    // PluginRegistry.h. A plugin built against an older/newer PluginRegistry
+    // layout is rejected here rather than risking a struct-layout mismatch
+    // inside qai_forge_register_plugin().
+    dlerror(); // clear any stale error state before dlsym
+    void* version_symbol = dlsym(handle, "qai_forge_plugin_abi_version");
+    const char* version_symbol_error = dlerror();
+    if (!version_symbol || version_symbol_error) {
+        LOG_WARN("[PluginLoader] Plugin missing qai_forge_plugin_abi_version "
+                 "entry point (built against a pre-versioning qai-forge?): "
+                 << path << " error=\""
+                 << (version_symbol_error ? version_symbol_error : "not found")
+                 << "\"");
+        dlclose(handle);
+        return false;
+    }
+    auto abi_version_fn = reinterpret_cast<AbiVersionFn>(version_symbol);
+    const char* plugin_abi_version = abi_version_fn();
+    const std::string plugin_abi_version_str =
+        plugin_abi_version ? plugin_abi_version : "";
+    if (plugin_abi_version_str != QAI_FORGE_PLUGIN_ABI_VERSION) {
+        LOG_WARN("[PluginLoader] Plugin ABI version mismatch, skipping: "
+                 << path << " plugin_version=\"" << plugin_abi_version_str
+                 << "\" expected_version=\"" << QAI_FORGE_PLUGIN_ABI_VERSION
+                 << "\"");
+        dlclose(handle);
         return false;
     }
 

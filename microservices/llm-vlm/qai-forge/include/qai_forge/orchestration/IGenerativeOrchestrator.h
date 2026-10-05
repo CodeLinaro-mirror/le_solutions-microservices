@@ -85,6 +85,51 @@ struct PreparedGenerationState {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OrchestratorCapabilities — declared by each qai_forge::IGenerativeOrchestrator
+// implementation.
+//
+// Mirrors qai_forge::BackendCapabilities' role on the backend side: a
+// declarative, queryable set of flags rather than ad-hoc virtual methods,
+// so callers (and future scheduler logic) can branch on capability instead
+// of concrete orchestrator type. All three in-tree orchestrators
+// (GenieOrchestrator, LiteRTLMOrchestrator, LlamaCppOrchestrator) are
+// conversation-memory-aware and support postTurn(), so the defaults below
+// match their behavior exactly — no orchestrator currently needs to
+// override capabilities().
+//
+// These flags are load-bearing, not purely advisory: internal/qai_forge/
+// orchestration/OrchestratorAdapter.{h,cpp} — the one piece of code that
+// wraps every registered orchestrator before the scheduler ever touches
+// it — reads capabilities() to decide whether to begin a conversation-
+// memory turn in createJob() (requires_conversation_memory) and whether
+// to dispatch postTurn() work at all in createPostTurnTask()
+// (supports_post_turn). An orchestrator that overrides either flag to
+// false will see the corresponding behavior actually skipped, not merely
+// documented as skippable.
+// ─────────────────────────────────────────────────────────────────────────────
+struct OrchestratorCapabilities {
+    // true  → this orchestrator may return a non-nullopt
+    //          ConversationMemorySnapshot from postTurn() (summarization,
+    //          fact extraction, context eviction, etc.) and the scheduler
+    //          should schedule post-turn work for it.
+    // false → postTurn() always returns std::nullopt; OrchestratorAdapter::
+    //          createPostTurnTask() short-circuits to its no-op path
+    //          (completeStructural/markAwaitingTool) and never calls
+    //          postTurn() or dispatches work to PostTurnWorker for this
+    //          orchestrator.
+    bool supports_post_turn = true;
+
+    // true  → prepare() meaningfully consumes the ConversationMemorySnapshot
+    //          argument (i.e. this orchestrator participates in
+    //          QaiForge-owned conversation memory). false → OrchestratorAdapter::
+    //          createJob() never calls ConversationMemoryCoordinator::beginTurn()
+    //          for this orchestrator, even if the caller supplied a
+    //          ConversationReference — prepare() always receives a
+    //          default-constructed (empty) ConversationMemorySnapshot.
+    bool requires_conversation_memory = true;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GenerationJobInfo — identity/context fields an orchestrator needs during
 // execute()/postTurn(), without exposing the internal scheduler's
 // GenerativeJob type (which carries MemoryTurnCommitToken, JobKind/
@@ -105,6 +150,17 @@ struct GenerationJobInfo {
 class IGenerativeOrchestrator {
 public:
     virtual ~IGenerativeOrchestrator() = default;
+
+    /**
+     * Declare this orchestrator's capabilities. Default matches every
+     * in-tree orchestrator's actual behavior (post-turn-capable,
+     * conversation-memory-aware) — override only if a new orchestrator
+     * genuinely differs (e.g. a stateless orchestrator with no private
+     * per-turn memory at all).
+     */
+    virtual OrchestratorCapabilities capabilities() const {
+        return {};
+    }
 
     /**
      * Build the backend-specific prepared request from the raw caller

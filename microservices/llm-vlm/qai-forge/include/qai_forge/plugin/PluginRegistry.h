@@ -15,6 +15,24 @@
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Plugin ABI version — see docs/PLUGIN_DEVELOPMENT.md.
+//
+// Every plugin .so must export a matching
+//   extern "C" const char* qai_forge_plugin_abi_version();
+// returning exactly this string. PluginLoader checks this before calling
+// qai_forge_register_plugin() and skips (with a logged warning) any plugin
+// whose reported version does not match, instead of risking a layout
+// mismatch against this process's PluginRegistry/GenerativeEntry/
+// PredictiveEntry/ModelAdapterEntry/VisionAdapterEntry struct definitions.
+//
+// Bump this value whenever a change to PluginRegistry (or any struct it
+// exposes to plugins — GenerativeEntry, PredictiveEntry, ModelAdapterEntry,
+// VisionAdapterEntry) could break binary compatibility with a plugin .so
+// built against an older header.
+// ─────────────────────────────────────────────────────────────────────────────
+inline constexpr const char* QAI_FORGE_PLUGIN_ABI_VERSION = "1.0.0";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PluginRegistry — central registry for qai-forge pluggable capabilities.
 //
 // Renamed/relocated from the old backend-only RuntimePluginRegistry — this
@@ -28,14 +46,14 @@
 // build their own .so, and drop it into the plugin directory — no access to
 // qai-forge's source or build system required.
 //
-// Backend registration (registerGenerative/registerPredictive) remains
-// internal-only for now — only the orchestrator half of a generative
-// runtime plugin has a public ABI today (qai_forge::IGenerativeOrchestrator,
-// wrapped internally by OrchestratorAdapter before being handed to the
-// scheduler). Promoting registerGenerative/registerPredictive themselves to
-// a public ABI — so a third party can register an entirely new backend
-// without any access to qai-forge's internal headers at all — is an
-// explicit follow-up phase.
+// Backend/orchestrator registration (registerGenerative/registerPredictive)
+// is likewise callable from any plugin's qai_forge_register_plugin() entry
+// point using only public headers (qai_forge::IGenerativeBackend,
+// qai_forge::IGenerativeOrchestrator, qai_forge::IInferenceBackend) — see
+// docs/PLUGIN_DEVELOPMENT.md for the full contract and a worked example.
+// Device-placement-aware loading (IPlacementAwareGenerativeBackend /
+// IPlacementAwarePredictiveBackend) remains an internal-only mixin on top
+// of this — see the "Device placement" section of that doc for why.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class BackendAdapter;
@@ -104,6 +122,17 @@ public:
 
     std::vector<std::string> registeredGenerativeRuntimes() const;
     std::vector<std::string> registeredPredictiveRuntimes() const;
+
+    // Logs a warning (via Logger) for every registered generative runtime
+    // that has a backend factory but no orchestrator factory, or vice
+    // versa — a registration mistake that would otherwise only surface as
+    // a late, confusing failure the first time that runtime is actually
+    // requested (see BackendFactory::createRuntimePair()). Intended to be
+    // called once at startup, immediately after PluginLoader::loadAll(),
+    // so misconfigured plugins are caught at process-startup time instead
+    // of at first-request time. Does not throw — this is a diagnostic
+    // check, not an admission gate.
+    void validateRegistrations() const;
 
     // ── Model / vision adapters (public ABI) ───────────────────────────────
     void registerModelAdapter(ModelAdapterEntry entry);

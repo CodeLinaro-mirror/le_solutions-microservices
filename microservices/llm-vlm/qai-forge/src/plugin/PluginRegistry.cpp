@@ -13,6 +13,7 @@
 #include "qai_forge/backend/PredictiveBackendAdapter.h"
 #include "qai_forge/orchestration/IGenerativeOrchestrator.h"
 #include "qai_forge/orchestration/OrchestratorAdapter.h"
+#include "qai_forge/utils/Logger.h"
 
 #include <algorithm>
 
@@ -112,6 +113,41 @@ std::vector<std::string> PluginRegistry::registeredPredictiveRuntimes() const {
         runtimes.push_back(runtime);
     }
     return runtimes;
+}
+
+void PluginRegistry::validateRegistrations() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [runtime, entry] : generative_) {
+        const bool has_backend = static_cast<bool>(entry.create_backend);
+        const bool has_orchestrator = static_cast<bool>(entry.create_orchestrator);
+        if (has_backend && !has_orchestrator) {
+            LOG_WARN("[PluginRegistry] Generative runtime '" << runtime
+                     << "' registered a backend factory but no orchestrator "
+                        "factory — requests for this runtime will fail at "
+                        "first use (see BackendFactory::createGenerativeOrchestrator). "
+                        "Check the plugin's qai_forge_register_plugin() entry point.");
+        } else if (!has_backend && has_orchestrator) {
+            LOG_WARN("[PluginRegistry] Generative runtime '" << runtime
+                     << "' registered an orchestrator factory but no backend "
+                        "factory — requests for this runtime will fail at "
+                        "first use (see BackendFactory::createGenerativeBackend). "
+                        "Check the plugin's qai_forge_register_plugin() entry point.");
+        } else if (!has_backend && !has_orchestrator) {
+            LOG_WARN("[PluginRegistry] Generative runtime '" << runtime
+                     << "' is registered with neither a backend nor an "
+                        "orchestrator factory — this entry is a no-op. Check "
+                        "the plugin's qai_forge_register_plugin() entry point.");
+        }
+    }
+
+    for (const auto& [runtime, entry] : predictive_) {
+        if (!entry.create_backend) {
+            LOG_WARN("[PluginRegistry] Predictive runtime '" << runtime
+                     << "' is registered with no backend factory — this "
+                        "entry is a no-op. Check the plugin's "
+                        "qai_forge_register_plugin() entry point.");
+        }
+    }
 }
 
 // ── Model / vision adapters ─────────────────────────────────────────────────
