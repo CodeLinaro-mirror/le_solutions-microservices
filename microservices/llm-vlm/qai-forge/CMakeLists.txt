@@ -504,11 +504,13 @@ if(QAI_FORGE_BUILD_LLAMACPP)
             "  Example: -DLLAMACPP_INCLUDE_PATH=/install/include")
     endif()
 
+    # Only ggml/include (gguf.h) is needed here — ${LLAMACPP_INCLUDE_PATH}
+    # itself also contains llama.cpp's vendored nlohmann/json.hpp, which
+    # would shadow the project's pinned nlohmann version for this target.
     target_include_directories(qai_forge PRIVATE
-            ${LLAMACPP_INCLUDE_PATH}
-	    ${LLAMACPP_INCLUDE_PATH}/ggml/include
+            ${LLAMACPP_INCLUDE_PATH}/ggml/include
     )
-    message(STATUS "[qai-forge] Added llama.cpp include path: ${LLAMACPP_INCLUDE_PATH}")
+    message(STATUS "[qai-forge] Added llama.cpp ggml include path: ${LLAMACPP_INCLUDE_PATH}/ggml/include")
 
     # Locate libllama, libggml, and its modular dependencies (base, cpu, common)
     find_library(LLAMACPP_LLAMA_LIB
@@ -679,6 +681,24 @@ set_target_properties(qai_forge PROPERTIES
 
 set(QAI_FORGE_PLUGIN_INSTALL_SUBDIR "lib/qai-forge/plugins" CACHE STRING
     "Relative install destination for runtime plugin shared libraries")
+
+# Wipe the plugin install directory before any qaiforge_plugin_* target is
+# copied in below. Without this, a plugin target that gets renamed, split,
+# or removed from this CMakeLists.txt leaves its old .so sitting in
+# QAI_FORGE_PLUGIN_INSTALL_SUBDIR indefinitely across incremental installs
+# that don't start from a clean DESTDIR — PluginLoader::loadAll() will
+# still dlopen() that stale artifact on every subsequent process start,
+# relying entirely on the ABI version check (if someone remembered to bump
+# it) to catch the mismatch. install(CODE ...) runs at `make install` time,
+# ordered here — before every individual plugin's install(TARGETS ...)
+# below, regardless of which QAI_FORGE_BUILD_* block declared it, since
+# CMake executes install() rules in the order they appear in this script.
+if(QAI_FORGE_INSTALL)
+    install(CODE "
+        file(REMOVE_RECURSE \"\${CMAKE_INSTALL_PREFIX}/${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}\")
+        file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${QAI_FORGE_PLUGIN_INSTALL_SUBDIR}\")
+    ")
+endif()
 
 # ── qaiforge_plugin_genie ─────────────────────────────────────────────────────
 if(QAI_FORGE_BUILD_GENIE)

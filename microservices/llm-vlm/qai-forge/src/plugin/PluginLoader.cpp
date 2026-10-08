@@ -84,6 +84,12 @@ bool loadOnePlugin(const std::string& path) {
         dlclose(handle);
         return false;
     }
+    // Logged even on a successful match (not just on mismatch) — cheap
+    // diagnostic that lets a build-refresh debugging session grep logs to
+    // confirm exactly which ABI version every loaded plugin reported,
+    // rather than only ever seeing a line when something was already wrong.
+    LOG_DEBUG("[PluginLoader] Plugin ABI version matched: " << path
+              << " version=\"" << plugin_abi_version_str << "\"");
 
     dlerror(); // clear any stale error state before dlsym
     void* symbol = dlsym(handle, "qai_forge_register_plugin");

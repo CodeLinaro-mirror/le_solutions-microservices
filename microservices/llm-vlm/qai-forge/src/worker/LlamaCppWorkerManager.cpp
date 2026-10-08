@@ -5,12 +5,8 @@
 
 #include "qai_forge/worker/LlamaCppWorkerManager.h"
 
-namespace qai_forge {
-
 LlamaCppWorkerManager::LlamaCppWorkerManager()
     : InferenceWorkerManager("llamacpp") {
 }
-
-} // namespace qai_forge
 
 #endif // QAI_FORGE_BUILD_LLAMACPP

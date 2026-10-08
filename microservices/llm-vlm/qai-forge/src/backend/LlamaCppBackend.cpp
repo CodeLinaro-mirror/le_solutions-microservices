@@ -17,8 +17,6 @@
 #include <filesystem>
 #include <fstream>
 
-namespace qai_forge {
-
 namespace fs = std::filesystem;
 
 // -----------------------------------------------------------------------------
@@ -300,7 +298,5 @@ bool LlamaCppBackend::forceKillActiveWorker() {
 bool LlamaCppBackend::isHealthy() const {
     return worker_ && worker_->isWorkerRunning();
 }
-
-} // namespace qai_forge
 
 #endif // QAI_FORGE_BUILD_LLAMACPP

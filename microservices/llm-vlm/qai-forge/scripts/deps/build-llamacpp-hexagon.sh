@@ -54,11 +54,13 @@ echo "=== Building llama.cpp with Hexagon NPU support ==="
 BUILD_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 if [ "${BUILD_ARCH}" = "arm64" ]; then
     FASTRPC_CC=gcc
+    FASTRPC_CXX=g++
     FASTRPC_CONFIGURE_ARGS=""
     LLAMACPP_CROSS_CMAKE_ARGS=""
     STRIP_BIN=strip
 else
     FASTRPC_CC=aarch64-linux-gnu-gcc
+    FASTRPC_CXX=aarch64-linux-gnu-g++
     FASTRPC_CONFIGURE_ARGS="--host=aarch64-linux-gnu"
     # CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR required: ggml probes
     # CMAKE_SYSTEM_PROCESSOR for codegen flags, defaulting to x86_64 and

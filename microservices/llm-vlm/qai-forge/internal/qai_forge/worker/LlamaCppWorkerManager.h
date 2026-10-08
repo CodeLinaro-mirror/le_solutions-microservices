@@ -18,8 +18,6 @@
 // the base class's standard READY → INIT → READY sequence is sufficient.
 // ─────────────────────────────────────────────────────────────────────────────
 
-namespace qai_forge {
-
 class LlamaCppWorkerManager : public InferenceWorkerManager {
 public:
     /**
@@ -30,7 +28,5 @@ public:
      */
     LlamaCppWorkerManager();
 };
-
-} // namespace qai_forge
 
 #endif // QAI_FORGE_BUILD_LLAMACPP

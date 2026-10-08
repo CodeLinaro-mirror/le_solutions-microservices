@@ -25,10 +25,51 @@
 // mismatch against this process's PluginRegistry/GenerativeEntry/
 // PredictiveEntry/ModelAdapterEntry/VisionAdapterEntry struct definitions.
 //
-// Bump this value whenever a change to PluginRegistry (or any struct it
-// exposes to plugins — GenerativeEntry, PredictiveEntry, ModelAdapterEntry,
-// VisionAdapterEntry) could break binary compatibility with a plugin .so
-// built against an older header.
+// Bump this value whenever a binary-compatibility-affecting change is made
+// to ANY header that forms the plugin ABI surface — not just PluginRegistry
+// itself. This includes (but is not limited to):
+//   - qai_forge/plugin/PluginRegistry.h          (this file — GenerativeEntry,
+//                                                  PredictiveEntry, ModelAdapterEntry,
+//                                                  VisionAdapterEntry)
+//   - qai_forge/backend/IGenerativeBackend.h      (vtable layout, method
+//                                                  signatures a plugin backend
+//                                                  overrides)
+//   - qai_forge/backend/IInferenceBackend.h       (same, for predictive backends)
+//   - qai_forge/backend/BackendCapabilities.h     (struct layout returned by
+//                                                  capabilities())
+//   - qai_forge/orchestration/IGenerativeOrchestrator.h
+//                                                  (vtable layout, prepare/execute/
+//                                                  postTurn signatures, plus
+//                                                  ConversationMemorySnapshot /
+//                                                  PreparedGenerationState /
+//                                                  OrchestratorCapabilities /
+//                                                  GenerationJobInfo struct layouts)
+//   - qai_forge/worker/InferenceEvents.h           (IPCTokenEvent/IPCDoneEvent/
+//                                                  IPCErrorEvent/IPCReadyEvent
+//                                                  struct layouts)
+//   - qai_forge/InternalDTOs.h                     (StreamChunk/StandardResponse/
+//                                                  CreateChatCompletionRequest/
+//                                                  GenAIException struct layouts)
+//   - qai_forge/adapters/ModelAdapter.h             (vtable layout, method
+//                                                  signatures a plugin model
+//                                                  adapter overrides — backs
+//                                                  PluginRegistry::ModelAdapterEntry,
+//                                                  exercised by e.g.
+//                                                  qaiforge_plugin_adapter_qwen/_gemma)
+//   - qai_forge/adapters/VisionPreprocessAdapter.h  (vtable layout — backs
+//                                                  PluginRegistry::VisionAdapterEntry)
+//
+// A struct layout or vtable change in any of the headers above is just as
+// ABI-breaking as a change to PluginRegistry's own structs: a stale plugin
+// .so built against an older layout will dlopen() "successfully" if the
+// version check is skipped or forgotten, then crash or corrupt memory on
+// the first virtual call or field access — a failure mode strictly worse
+// than the clean, logged skip this version check is meant to produce.
+//
+// There is currently no automated enforcement that this value was bumped
+// when it needed to be — this is a code-review requirement, not a build-
+// time guarantee. Treat any PR touching the headers listed above as
+// incomplete unless it also bumps this string.
 // ─────────────────────────────────────────────────────────────────────────────
 inline constexpr const char* QAI_FORGE_PLUGIN_ABI_VERSION = "1.0.0";
 

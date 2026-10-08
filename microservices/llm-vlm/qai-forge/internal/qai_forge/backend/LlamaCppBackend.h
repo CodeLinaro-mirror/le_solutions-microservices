@@ -18,8 +18,6 @@
 
 using json = nlohmann::ordered_json;
 
-namespace qai_forge {
-
 // -----------------------------------------------------------------------------
 // LlamaCppBackend — qai_forge::IGenerativeBackend for llama.cpp (direct libllama worker)
 //
@@ -28,7 +26,7 @@ namespace qai_forge {
 //
 // Key design decisions:
 //   - loadModel() writes a small JSON sidecar file {model_path, context_size,
-//     n_gpu_layers, mmproj_path} to /tmp/configs � ModelConfigManager's GGUF
+//     n_gpu_layers, mmproj_path} to /tmp/configs — ModelConfigManager's GGUF
 //     auto-discovery sets ModelConfig::config_file to the raw .gguf path
 //     directly (there is no processed-bundle step for bare .gguf files the
 //     way there is for GenIE bundles), so the sidecar has to be synthesized
@@ -36,7 +34,7 @@ namespace qai_forge {
 //   - unloadModel() always uses SIGKILL (force=true), matching GenIEBackend/
 //     LiteRTLMBackend's rationale for clean resource reclamation.
 //   - forceKillActiveWorker() delegates to the worker manager's native
-//     support � fixes the old HTTP-based backend's inability to cancel a
+//     support — fixes the old HTTP-based backend's inability to cancel a
 //     single in-flight request without killing the whole worker.
 //   - generateVlm() is left as the qai_forge::IGenerativeBackend default no-op — vision
 //     support is reached through generateStructured()'s images parameter
@@ -45,12 +43,12 @@ namespace qai_forge {
 //     always structured, never plain-text prompts.
 //
 // Environment variable overrides:
-//   LLAMACPP_WORKER_BINARY � path to llamacpp-inference-worker binary
+//   LLAMACPP_WORKER_BINARY — path to llamacpp-inference-worker binary
 //                            (default /usr/local/bin/llamacpp-inference-worker)
 // -----------------------------------------------------------------------------
 
-class LlamaCppBackend : public IGenerativeBackend,
-                         public ::IPlacementAwareGenerativeBackend {
+class LlamaCppBackend : public qai_forge::IGenerativeBackend,
+                         public IPlacementAwareGenerativeBackend {
 public:
     LlamaCppBackend();
     ~LlamaCppBackend() override = default;
@@ -103,7 +101,7 @@ public:
      * @param images  Raw image bytes (e.g. PNG/JPEG), forwarded unmodified
      *                to the worker via the shared-memory image_refs
      *                mechanism. Empty for text-only requests or when the
-     *                loaded model has no mmproj projector � the worker
+     *                loaded model has no mmproj projector — the worker
      *                degrades gracefully to text-only in the latter case.
      */
     void generateStructured(
@@ -125,7 +123,7 @@ public:
 
     /**
      * Called after context compaction. FULL_RECOMPUTE already clears the KV
-     * cache on every EXECUTE, so this is a no-op � kept for interface parity.
+     * cache on every EXECUTE, so this is a no-op — kept for interface parity.
      */
     void onContextCompacted() override {}
 
@@ -161,7 +159,5 @@ private:
     std::string current_model_id_;
     std::unique_ptr<LlamaCppWorkerManager> worker_;
 };
-
-} // namespace qai_forge
 
 #endif // QAI_FORGE_BUILD_LLAMACPP

@@ -19,7 +19,7 @@ extern "C" const char* qai_forge_plugin_abi_version() {
 extern "C" void qai_forge_register_plugin(PluginRegistry& registry) {
     PluginRegistry::GenerativeEntry entry;
     entry.create_backend = []() -> std::unique_ptr<qai_forge::IGenerativeBackend> {
-        return std::make_unique<qai_forge::LlamaCppBackend>();
+        return std::make_unique<LlamaCppBackend>();
     };
     entry.create_orchestrator = []() -> std::shared_ptr<qai_forge::IGenerativeOrchestrator> {
         return std::make_shared<LlamaCppOrchestrator>();
