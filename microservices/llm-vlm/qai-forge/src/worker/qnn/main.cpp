@@ -218,17 +218,30 @@ static void modelExecutorLoop(ModelSlot* slot) {
         const std::string event_id = msg.value("event_id", "");
         try {
             const auto& inputs_json = msg.at("inputs");
-            std::vector<const uint8_t*> input_ptrs;
-            std::vector<size_t> input_sizes;
+            const auto& in_specs = slot->engine->inputSpecs();
+            std::vector<const uint8_t*> input_ptrs(in_specs.size(), nullptr);
+            std::vector<size_t> input_sizes(in_specs.size(), 0);
 
             for (const auto& t : inputs_json) {
+                const std::string name = t.at("name").get<std::string>();
+                size_t idx = in_specs.size();
+                for (size_t i = 0; i < in_specs.size(); ++i) {
+                    if (in_specs[i].name == name) { idx = i; break; }
+                }
+                if (idx == in_specs.size())
+                    throw std::runtime_error("EXECUTE: unknown input tensor '" + name + "'");
+
                 const auto& ref = t.at("data_ref");
                 size_t offset = ref.value("offset", (size_t)0);
                 size_t len = ref.value("len", (size_t)0);
                 if (offset + len > slot->shm_dir_bytes)
                     throw std::runtime_error("input data_ref out of bounds");
-                input_ptrs.push_back(slot->shm_ptr + offset);
-                input_sizes.push_back(len);
+                input_ptrs[idx] = slot->shm_ptr + offset;
+                input_sizes[idx] = len;
+            }
+            for (size_t i = 0; i < in_specs.size(); ++i) {
+                if (!input_ptrs[i])
+                    throw std::runtime_error("EXECUTE: missing input tensor '" + in_specs[i].name + "'");
             }
 
             const auto& out_specs = slot->engine->outputSpecs();

@@ -24,6 +24,39 @@ std::string labelFor(int class_idx, const std::map<int, std::string>& labels) {
     return (it != labels.end()) ? it->second : "unknown";
 }
 
+// The decode* functions below index straight into OutputTensor::shape at
+// fixed positions (e.g. shape[2]) based on the rank matchLayout() validated
+// against the model's *declared* config shape. That declared shape can
+// diverge from the tensor's *actual* runtime rank (e.g. a compiled .dlc
+// dropping a leading batch dim during graph optimization) — an unchecked
+// shape[N] on a shorter vector is UB, silently reading garbage heap bytes as
+// a huge index. Guard with an explicit rank check so a mismatch surfaces as
+// a clean thrown error instead.
+void requireRank(const OutputTensor& t, size_t min_rank) {
+    if (t.shape.size() < min_rank) {
+        throw std::out_of_range(
+            "yolov8 postprocess: tensor '" + t.name + "' has rank " +
+            std::to_string(t.shape.size()) + ", expected >= " + std::to_string(min_rank));
+    }
+}
+
+// cfg.output_specs travels in the model's *declared* config order, but the
+// inference backend's actual raw tensor order isn't guaranteed to match it
+// (see postprocess-qpd.cpp's identical note about SNPE/QNN compiled graphs
+// reordering outputs) -- reading cfg.output_specs[N] positionally can pair a
+// tensor with another tensor's quant_scale/quant_zero_point, dequantizing
+// garbage that silently reads as low-confidence and gets filtered out below
+// conf_threshold. Resolve by name instead, exactly like this module's
+// client-side Python port (yolov8_postprocess's spec_for) already does
+// against the same /infer_postprocess response.
+const postproc_abi::TensorSpec& specFor(const OutputTensor& t, const RequestConfig& cfg) {
+    for (const auto& spec : cfg.output_specs) {
+        if (spec.name == t.name) return spec;
+    }
+    static const postproc_abi::TensorSpec kDefault{};
+    return kDefault;
+}
+
 const float kDefaultThreshold        = 0.70f;
 const float kNMSIntersectionTreshold = 0.5f;
 
@@ -55,10 +88,17 @@ std::vector<Detection> decodeMonoblock(
     float conf_threshold, float iou_threshold,
     int64_t input_w, int64_t input_h) {
 
-    const float scale   = cfg.output_specs[0].quant_scale;
-    const int32_t zp     = cfg.output_specs[0].quant_zero_point;
-    const int64_t n_paxels  = tensor.shape[2];
-    const int64_t n_classes = tensor.shape[1] - 4;
+    // A leading batch dim is only ever dropped from the FRONT of the shape
+    // vector by the compiled graph, never the back — so index from the end
+    // (size-1, size-2) rather than fixed front positions (1, 2). This keeps
+    // n_paxels/n_classes correct whether this tensor's batch dim survived
+    // (rank 3) or was dropped (rank 2) by this specific compiled graph.
+    requireRank(tensor, 2);
+    const auto& spec = specFor(tensor, cfg);
+    const float scale   = spec.quant_scale;
+    const int32_t zp     = spec.quant_zero_point;
+    const int64_t n_paxels  = tensor.shape[tensor.shape.size() - 1];
+    const int64_t n_classes = tensor.shape[tensor.shape.size() - 2] - 4;
     const int64_t score_base = 4 * n_paxels;
 
     std::vector<Detection> accepted;
@@ -102,12 +142,16 @@ std::vector<Detection> decodeDualblock(
     float conf_threshold, float iou_threshold,
     int64_t input_w, int64_t input_h) {
 
-    const float boxes_scale  = cfg.output_specs[0].quant_scale;
-    const int32_t boxes_zp    = cfg.output_specs[0].quant_zero_point;
-    const float scores_scale = cfg.output_specs[1].quant_scale;
-    const int32_t scores_zp   = cfg.output_specs[1].quant_zero_point;
-    const int64_t n_paxels  = boxes_t.shape[2];
-    const int64_t n_classes = scores_t.shape[1];
+    requireRank(boxes_t, 2);
+    requireRank(scores_t, 2);
+    const auto& boxes_spec  = specFor(boxes_t, cfg);
+    const auto& scores_spec = specFor(scores_t, cfg);
+    const float boxes_scale  = boxes_spec.quant_scale;
+    const int32_t boxes_zp    = boxes_spec.quant_zero_point;
+    const float scores_scale = scores_spec.quant_scale;
+    const int32_t scores_zp   = scores_spec.quant_zero_point;
+    const int64_t n_paxels  = boxes_t.shape[boxes_t.shape.size() - 1];
+    const int64_t n_classes = scores_t.shape[scores_t.shape.size() - 2];
 
     std::vector<Detection> accepted;
     for (int64_t idx = 0; idx < n_paxels; ++idx) {
@@ -157,13 +201,17 @@ std::vector<Detection> decodeTripleblock(
     float conf_threshold, float iou_threshold,
     int64_t input_w, int64_t input_h) {
 
-    const float boxes_scale   = cfg.output_specs[0].quant_scale;
-    const int32_t boxes_zp     = cfg.output_specs[0].quant_zero_point;
-    const float scores_scale  = cfg.output_specs[1].quant_scale;
-    const int32_t scores_zp    = cfg.output_specs[1].quant_zero_point;
-    const float classes_scale = cfg.output_specs[2].quant_scale;
-    const int32_t classes_zp   = cfg.output_specs[2].quant_zero_point;
-    const int64_t n_paxels = boxes_t.shape[1];
+    requireRank(boxes_t, 2);
+    const auto& boxes_spec   = specFor(boxes_t, cfg);
+    const auto& scores_spec  = specFor(scores_t, cfg);
+    const auto& classes_spec = specFor(classes_t, cfg);
+    const float boxes_scale   = boxes_spec.quant_scale;
+    const int32_t boxes_zp     = boxes_spec.quant_zero_point;
+    const float scores_scale  = scores_spec.quant_scale;
+    const int32_t scores_zp    = scores_spec.quant_zero_point;
+    const float classes_scale = classes_spec.quant_scale;
+    const int32_t classes_zp   = classes_spec.quant_zero_point;
+    const int64_t n_paxels = boxes_t.shape[boxes_t.shape.size() - 2];
 
     std::vector<Detection> accepted;
     for (int64_t idx = 0; idx < n_paxels; ++idx) {

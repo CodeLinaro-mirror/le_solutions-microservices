@@ -94,12 +94,29 @@ std::string LlamaCppBackend::writeWorkerConfigFile(const std::string& model_id,
 
     const fs::path sidecar_path = dir / (model_id + ".llamacpp.json");
 
+    // Default matches the old llama-server invocation's "--n-gpu-layers 999"
+    // (offload as many layers as the backend will accept). Overridable per
+    // deployment via GENAI_LLAMACPP_NGL - some MoE GGUFs (e.g. 32-expert
+    // models) pack enough weight into the layers assigned to a single HTP
+    // device that llama.cpp's HTP*-REPACK buffer allocation exceeds the
+    // Hexagon FastRPC/ION single-mapping limit (~1GiB) and fails to load;
+    // lowering n_gpu_layers shrinks that per-device buffer by leaving some
+    // layers on CPU.
+    int n_gpu_layers = 999;
+    const char* ngl_env = std::getenv("GENAI_LLAMACPP_NGL");
+    if (ngl_env) {
+        try {
+            n_gpu_layers = std::stoi(ngl_env);
+        } catch (...) {}
+    }
+    LOG_INFO("[LlamaCppBackend] writeWorkerConfigFile: model=" << model_id
+             << " n_gpu_layers=" << n_gpu_layers
+             << " (GENAI_LLAMACPP_NGL=" << (ngl_env ? ngl_env : "<unset>") << ")");
+
     json cfg = {
         {"model_path", gguf_path},
         {"context_size", context_size},
-        // Matches the old llama-server invocation's "--n-gpu-layers 999"
-        // (offload as many layers as the backend will accept).
-        {"n_gpu_layers", 999},
+        {"n_gpu_layers", n_gpu_layers},
     };
     if (!mmproj_path.empty()) {
         cfg["mmproj_path"] = mmproj_path;
@@ -150,18 +167,30 @@ void LlamaCppBackend::loadModel(const std::string& model_id) {
 // -----------------------------------------------------------------------------
 // unloadModel()
 //
-// Always uses SIGKILL (force=true) — same rationale as GenIEBackend/
-// LiteRTLMBackend: keeping shutdown uniform across all backends is simpler
-// than special-casing llama.cpp's CPU/GPU paths, which could also shut down
-// gracefully.
+// force=false (normal drain/eviction): graceful shutdown() sends the
+// SHUTDOWN IPC command first. The worker's own exit path then calls
+// llama_free()/llama_model_free(), tearing down the ggml-hex HTP0/HTP1
+// sessions and releasing their FastRPC/ION REPACK buffers. Skipping this
+// (plain SIGKILL) was observed to leak Hexagon DSP memory across reload
+// cycles for LFM2.5-8B-A1B's MoE GGUF: a later load with a SMALLER buffer
+// request failed where an earlier larger one had succeeded. shutdown()
+// still falls back to SIGKILL if the worker does not exit within its
+// grace period.
+//
+// force=true (e.g. cancelSession()'s emergency teardown): keep immediate
+// SIGKILL for a guaranteed-fast teardown.
 // -----------------------------------------------------------------------------
 
-void LlamaCppBackend::unloadModel(bool /*force*/) {
+void LlamaCppBackend::unloadModel(bool force) {
     LOG_INFO("[LlamaCppBackend] unloadModel: model=" << current_model_id_
-             << " (always SIGKILL for clean resource reclamation)");
+             << " force=" << (force ? "true" : "false"));
 
     if (worker_) {
-        worker_->terminateWorker(true); // Always SIGKILL
+        if (force) {
+            worker_->terminateWorker(true);
+        } else {
+            worker_->shutdown();
+        }
         worker_.reset();
     }
 

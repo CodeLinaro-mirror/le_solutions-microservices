@@ -33,6 +33,7 @@ enum class TensorDataType {
     FLOAT16,   // "FP16"
     INT32,     // "INT32"
     INT16,     // "INT16"
+    UINT16,    // "UINT16"
     INT8,      // "INT8"
     UINT8,     // "UINT8"
     BOOL,      // "BOOL"
@@ -48,6 +49,7 @@ inline std::string tensorDataTypeToString(TensorDataType dt) {
         case TensorDataType::FLOAT16: return "FP16";
         case TensorDataType::INT32:   return "INT32";
         case TensorDataType::INT16:   return "INT16";
+        case TensorDataType::UINT16:  return "UINT16";
         case TensorDataType::INT8:    return "INT8";
         case TensorDataType::UINT8:   return "UINT8";
         case TensorDataType::BOOL:    return "BOOL";
@@ -74,7 +76,8 @@ inline TensorDataType tensorDataTypeFromString(const std::string& s) {
     if (upper == "FP32"  || upper == "FLOAT32" || upper == "FLOAT")  return TensorDataType::FLOAT32;
     if (upper == "FP16"  || upper == "FLOAT16")                      return TensorDataType::FLOAT16;
     if (upper == "INT32" || upper == "UINT32")                       return TensorDataType::INT32;
-    if (upper == "INT16" || upper == "UINT16")                       return TensorDataType::INT16;
+    if (upper == "INT16")                                            return TensorDataType::INT16;
+    if (upper == "UINT16")                                           return TensorDataType::UINT16;
     if (upper == "INT8")                                             return TensorDataType::INT8;
     if (upper == "UINT8")                                            return TensorDataType::UINT8;
     if (upper == "BOOL")                                             return TensorDataType::BOOL;

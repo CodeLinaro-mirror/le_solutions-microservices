@@ -24,6 +24,7 @@ size_t elementWidth(TensorDataType dtype) {
             return 4;
         case TensorDataType::FLOAT16:
         case TensorDataType::INT16:
+        case TensorDataType::UINT16:
             return 2;
         case TensorDataType::INT8:
         case TensorDataType::UINT8:

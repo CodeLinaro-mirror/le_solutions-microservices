@@ -1170,6 +1170,22 @@ std::vector<ModelConfig> ModelConfigManager::parseGenieXJson(const json& manifes
                 }
                 cfg.config_file = gguf_path.string();
                 cfg.mmproj_path = mmproj_resolved;
+
+                // geniex.json carries no context-length field of its own — read it
+                // straight from the GGUF header, same as the bare-.gguf auto-discovery
+                // path (above), instead of silently inheriting ModelConfig's 4096 default.
+                auto meta = GgufMetadataReader::readMetadata(gguf_path.string());
+                cfg.context_size = meta.isValid ? meta.contextLength : 4096;
+                const char* cap_env_genie = std::getenv("GENAI_CONTEXT_CAPPING");
+                if (cap_env_genie) {
+                    try {
+                        int cap = std::stoi(cap_env_genie);
+                        if (cap != -1) {
+                            cfg.context_size = std::min(cfg.context_size, cap);
+                        }
+                    } catch (...) {}
+                }
+
                 results.push_back(std::move(cfg));
             }
             if (!results.empty()) return results;

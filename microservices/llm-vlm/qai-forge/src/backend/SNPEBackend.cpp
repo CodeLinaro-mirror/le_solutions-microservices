@@ -99,11 +99,22 @@ void SNPEBackend::initialize(
         delegate = delegate_env ? delegate_env : "dsp";
     }
 
+    // Output tensor names to force-expose via SNPEBuilderSetOutputTensors --
+    // without this, SNPEEngine falls back to SNPE_GetOutputTensorNames()'s
+    // own default output set once the interpreter is built, which for some
+    // compiled .dlc graphs is a strict subset of what the model's config
+    // declares (empty output_tensors is the "let SNPE decide" branch in
+    // snpe-engine.cpp). Passing every declared name here forces the builder
+    // to expose all of them, as long as they still exist by name in the
+    // compiled graph.
+    nlohmann::ordered_json output_tensors = nlohmann::ordered_json::array();
+    for (const auto& spec : mc->output_specs) output_tensors.push_back(spec.name);
+
     // Build LOAD_MODEL params
     nlohmann::ordered_json init_params = {
         {"model_file",     model_file},
         {"delegate",       delegate},
-        {"output_tensors", nlohmann::ordered_json::array()}  // empty = all outputs
+        {"output_tensors", output_tensors}
     };
 
     const auto launch_options =

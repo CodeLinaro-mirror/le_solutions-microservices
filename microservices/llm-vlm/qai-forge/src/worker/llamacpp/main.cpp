@@ -92,12 +92,44 @@ static uint8_t* g_image_shm_ptr   = nullptr;
 static size_t   g_image_shm_bytes = 0;
 
 static void sendMessage(const json& msg) {
-    std::string line = msg.dump() + "\n";
+    // error_handler_t::replace: defense-in-depth against malformed UTF-8
+    // slipping into a text field (see validateUtf8PrefixLen() below for the
+    // primary fix) — degrade to a replacement character instead of
+    // nlohmann::json throwing type_error and crashing this process.
+    std::string line = msg.dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
     ssize_t written = ::write(g_sock_fd, line.c_str(), line.size());
     if (written < 0) {
         // Fatal — parent closed socket
         ::_exit(1);
     }
+}
+
+// Returns the length of the longest prefix of `text` that is complete,
+// well-formed UTF-8. A detokenized piece can legitimately end mid-codepoint
+// — some vocabularies split a multi-byte UTF-8 character across adjacent
+// tokens — so the caller holds back any trailing incomplete sequence and
+// prepends it to the next piece rather than emitting it immediately.
+static size_t validateUtf8PrefixLen(const std::string& text) {
+    size_t len = text.size();
+    if (len == 0) return 0;
+
+    for (size_t i = 1; i <= 4 && i <= len; ++i) {
+        unsigned char c = static_cast<unsigned char>(text[len - i]);
+        if ((c & 0xE0) == 0xC0) {        // 2-byte sequence lead
+            if (i < 2) return len - i;
+            break;
+        } else if ((c & 0xF0) == 0xE0) { // 3-byte sequence lead
+            if (i < 3) return len - i;
+            break;
+        } else if ((c & 0xF8) == 0xF0) { // 4-byte sequence lead
+            if (i < 4) return len - i;
+            break;
+        } else if ((c & 0xC0) != 0x80) {
+            // Not a continuation byte: the sequence (if any) already ended.
+            break;
+        }
+    }
+    return len;
 }
 
 static json readMessage() {
@@ -467,6 +499,7 @@ static void handleExecute(LlamaCppSession& sess, const json& cmd) {
 
     std::string finish_reason = "stop";
     int n_generated = 0;
+    std::string pending_utf8;
 
     while (true) {
         int n_ctx_used = (int)llama_memory_seq_pos_max(llama_get_memory(sess.ctx), 0) + 1;
@@ -504,12 +537,17 @@ static void handleExecute(LlamaCppSession& sess, const json& cmd) {
             return;
         }
 
-        json token_msg = {
-            {"type", "TOKEN"},
-            {"event_id", event_id},
-            {"content", std::string(piece_buf, piece_len)}
-        };
-        sendMessage(token_msg);
+        pending_utf8.append(piece_buf, piece_len);
+        size_t safe_len = validateUtf8PrefixLen(pending_utf8);
+        if (safe_len > 0) {
+            json token_msg = {
+                {"type", "TOKEN"},
+                {"event_id", event_id},
+                {"content", pending_utf8.substr(0, safe_len)}
+            };
+            sendMessage(token_msg);
+            pending_utf8.erase(0, safe_len);
+        }
 
         ++n_generated;
         if (n_generated >= max_tokens) {
@@ -522,6 +560,19 @@ static void handleExecute(LlamaCppSession& sess, const json& cmd) {
     }
 
     common_sampler_free(sampler);
+
+    // Generation stopped with no further tokens to complete a pending
+    // multi-byte sequence (shouldn't normally happen) — flush it anyway via
+    // the hardened sendMessage() rather than silently dropping it.
+    if (!pending_utf8.empty()) {
+        json token_msg = {
+            {"type", "TOKEN"},
+            {"event_id", event_id},
+            {"content", pending_utf8}
+        };
+        sendMessage(token_msg);
+        pending_utf8.clear();
+    }
 
     json done_msg = {
         {"type", "DONE"},
