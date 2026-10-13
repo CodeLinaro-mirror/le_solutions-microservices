@@ -132,6 +132,11 @@ done
 [ -d "${LITERT_SRC_DIR}/.git" ] || { echo "ERROR: LiteRT clone failed after 8 attempts"; exit 1; }
 
 cd "${LITERT_SRC_DIR}"
+# Export Qualcomm option C APIs (Lrt*) from libLiteRt.so.
+LITERT_RUNTIME_EXPORTS="${LITERT_SRC_DIR}/litert/build_common/export_litert_runtime_only_linux.lds"
+if [ -f "${LITERT_RUNTIME_EXPORTS}" ] && ! grep -q '^    Lrt\*;' "${LITERT_RUNTIME_EXPORTS}"; then
+    sed -i '/^    LiteRt\*;/a\    Lrt*;' "${LITERT_RUNTIME_EXPORTS}"
+fi
 
 # Clone submodules with retry logic
 i=1
@@ -372,6 +377,7 @@ sed \
 echo "Staged LiteRT libraries and tools:"
 ls -lah "${LITERT_DEPLOY_DIR}/lib"
 ls -lah "${LITERT_DEPLOY_DIR}/bin"
+
 
 # Verification checks
 test "$(find "${LITERT_DEPLOY_DIR}/lib" -maxdepth 1 -type f | wc -l)" -gt 0

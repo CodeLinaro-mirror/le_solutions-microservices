@@ -32,7 +32,9 @@
 #include "litert/c/litert_layout.h"
 #include "litert/c/litert_model.h"
 #include "litert/c/litert_model_types.h"
+#include "litert/c/litert_opaque_options.h"
 #include "litert/c/litert_options.h"
+#include "litert/c/options/litert_qualcomm_options.h"
 #include "litert/c/litert_tensor_buffer.h"
 #include "litert/c/litert_tensor_buffer_requirements.h"
 
@@ -110,10 +112,16 @@ struct LiteRTEngine::Impl {
     // Cached ranked tensor types for buffer creation (signature 0)
     std::vector<LiteRtRankedTensorType> input_types;
     std::vector<LiteRtRankedTensorType> output_types;
+    std::vector<LiteRtTensorBuffer> input_buffers;
+    std::vector<LiteRtTensorBuffer> output_buffers;
 
     ~Impl() { cleanup(); }
 
     void cleanup() {
+        for (auto buffer : input_buffers) { if (buffer) LiteRtDestroyTensorBuffer(buffer); }
+        for (auto buffer : output_buffers) { if (buffer) LiteRtDestroyTensorBuffer(buffer); }
+        input_buffers.clear();
+        output_buffers.clear();
         if (compiled_model) { LiteRtDestroyCompiledModel(compiled_model); compiled_model = nullptr; }
         if (options)        { LiteRtDestroyOptions(options);               options        = nullptr; }
         if (model)          { LiteRtDestroyModel(model);                   model          = nullptr; }
@@ -160,6 +168,30 @@ LiteRTEngine::LiteRTEngine(const std::string& model_file,
                     m.options,
                     static_cast<LiteRtHwAcceleratorSet>(hw_accelerators)),
                 "LiteRtSetOptionsHardwareAccelerators");
+
+    if ((hw_accelerators & kLiteRtHwAcceleratorNpu) != 0) {
+        LrtQualcommOptions qcom_options = nullptr;
+        checkStatus(LrtCreateQualcommOptions(&qcom_options),
+                    "LrtCreateQualcommOptions");
+        checkStatus(LrtQualcommOptionsSetHtpPerformanceMode(
+                        qcom_options,
+                        kLiteRtQualcommHtpPerformanceModeBurst),
+                    "LrtQualcommOptionsSetHtpPerformanceMode");
+
+        const char* identifier = nullptr;
+        void* payload = nullptr;
+        void (*payload_deleter)(void*) = nullptr;
+        checkStatus(LrtGetOpaqueQualcommOptionsData(
+                        qcom_options, &identifier, &payload, &payload_deleter),
+                    "LrtGetOpaqueQualcommOptionsData");
+
+        LiteRtOpaqueOptions opaque_options = nullptr;
+        checkStatus(LiteRtCreateOpaqueOptions(
+                        identifier, payload, payload_deleter, &opaque_options),
+                    "LiteRtCreateOpaqueOptions (Qualcomm)");
+        checkStatus(LiteRtAddOpaqueOptions(m.options, opaque_options),
+                    "LiteRtAddOpaqueOptions (Qualcomm)");
+    }
 
     // ── 4. Compile model ──────────────────────────────────────────────────────
     checkStatus(LiteRtCreateCompiledModel(m.env, m.model, m.options, &m.compiled_model),
@@ -266,8 +298,9 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
     if (output_ptrs.size() != n_out)
         throw std::runtime_error("LiteRTEngine::infer: wrong number of outputs");
 
-    // ── Allocate input tensor buffers ─────────────────────────────────────────
-    std::vector<LiteRtTensorBuffer> in_bufs(n_in, nullptr);
+    // ── Allocate input tensor buffers and copy input data ─────────────────────
+    auto& in_bufs = m.input_buffers;
+    if (in_bufs.empty()) in_bufs.resize(n_in, nullptr);
     for (size_t i = 0; i < n_in; ++i) {
         LiteRtTensorBufferRequirements req = nullptr;
         checkStatus(LiteRtGetCompiledModelInputBufferRequirements(
@@ -275,7 +308,7 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
                         static_cast<LiteRtParamIndex>(i), &req),
                     "LiteRtGetCompiledModelInputBufferRequirements");
 
-        checkStatus(LiteRtCreateManagedTensorBufferFromRequirements(
+        if (!in_bufs[i]) checkStatus(LiteRtCreateManagedTensorBufferFromRequirements(
                         m.env, &m.input_types[i], req, &in_bufs[i]),
                     "LiteRtCreateManagedTensorBufferFromRequirements (input)");
 
@@ -295,7 +328,8 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
     }
 
     // ── Allocate output tensor buffers ────────────────────────────────────────
-    std::vector<LiteRtTensorBuffer> out_bufs(n_out, nullptr);
+    auto& out_bufs = m.output_buffers;
+    if (out_bufs.empty()) out_bufs.resize(n_out, nullptr);
     for (size_t i = 0; i < n_out; ++i) {
         LiteRtTensorBufferRequirements req = nullptr;
         checkStatus(LiteRtGetCompiledModelOutputBufferRequirements(
@@ -303,7 +337,7 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
                         static_cast<LiteRtParamIndex>(i), &req),
                     "LiteRtGetCompiledModelOutputBufferRequirements");
 
-        checkStatus(LiteRtCreateManagedTensorBufferFromRequirements(
+        if (!out_bufs[i]) checkStatus(LiteRtCreateManagedTensorBufferFromRequirements(
                         m.env, &m.output_types[i], req, &out_bufs[i]),
                     "LiteRtCreateManagedTensorBufferFromRequirements (output)");
     }
@@ -314,7 +348,7 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
         static_cast<size_t>(n_in),  in_bufs.data(),
         static_cast<size_t>(n_out), out_bufs.data());
 
-    // ── Copy output data out before destroying buffers ────────────────────────
+    // ── Copy output data out from persistent buffers ────────────────────────
     for (size_t i = 0; i < n_out; ++i) {
         void* host_ptr = nullptr;
         LiteRtStatus lock_st = LiteRtLockTensorBuffer(out_bufs[i], &host_ptr,
@@ -326,10 +360,7 @@ void LiteRTEngine::infer(const std::vector<const uint8_t*>& input_ptrs,
             std::memcpy(output_ptrs[i], host_ptr, copy_bytes);
             LiteRtUnlockTensorBuffer(out_bufs[i]);
         }
-        LiteRtDestroyTensorBuffer(out_bufs[i]);
     }
-    for (size_t i = 0; i < n_in; ++i)
-        LiteRtDestroyTensorBuffer(in_bufs[i]);
 
     // Check run status after cleanup so buffers are always freed
     checkStatus(run_status, "LiteRtRunCompiledModel");
