@@ -357,14 +357,19 @@ void PredictiveWorkerChannel::loadModel(
     PredictiveChannelReadyValidator ready_validator)
 {
     auto call = std::make_shared<PendingCall>();
-    {
-        std::lock_guard<std::mutex> lock(calls_mutex_);
-        model_calls_[model_id] = call;
-    }
 
     try {
-        std::lock_guard<std::mutex> process_lock(process_mutex_);
-        ensureProcessRunningLocked();
+        // Recover the worker before registering the call.
+        // Cleanup clears pending calls when the worker dies.
+        {
+            std::lock_guard<std::mutex> process_lock(process_mutex_);
+            ensureProcessRunningLocked();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(calls_mutex_);
+            model_calls_[model_id] = call;
+        }
 
         json load_cmd = init_params;
         load_cmd["type"] = "LOAD_MODEL";
@@ -372,6 +377,7 @@ void PredictiveWorkerChannel::loadModel(
         load_cmd["shm_dir_bytes"] = shm_dir_bytes;
 
         std::lock_guard<std::mutex> write_lock(write_mutex_);
+        std::lock_guard<std::mutex> process_lock(process_mutex_);
         sendMessageWithFdLocked(load_cmd, shm_fd);
     } catch (const std::exception&) {
         std::lock_guard<std::mutex> lock(calls_mutex_);
