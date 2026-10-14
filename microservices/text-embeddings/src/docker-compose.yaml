@@ -23,4 +23,4 @@ services:
       - /sys/firmware/devicetree/base/model:/run/device-model
       - ${QCOM:-/usr/share/qcom}:${HOST_QCOM:-/run/host-qcom}:ro
       - ${T2E_MODEL_DIR:-/opt/embed_gen}:/mnt/work/models/
-    command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2E_PORT} --reload"
+    command: sh -c "hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_T2E_PORT:-9090} --reload"

@@ -17,5 +17,5 @@ services:
     volumes:
       - /sys/firmware/devicetree/base/model:/run/device-model
       - ${QCOM:-/usr/share/qcom}:${HOST_QCOM:-/run/host-qcom}:ro
-      - ${T2I_MODEL_DIR:-/opt/image_gen}:/mnt/work/models/
-    command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:9090"]
+      - ${T2I_MODEL_DIR:-/home/ubuntu/Downloads/image_gen}:/mnt/work/models/
+    command: ["hypercorn", "openapi_server.main:app", "--bind", "0.0.0.0:${GENAI_T2I_PORT:-9090}"]
