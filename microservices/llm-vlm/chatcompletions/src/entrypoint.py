@@ -9,10 +9,11 @@
 #   3. Add target user to those supplementary groups dynamically
 #   4. Merge the read-only host qcom config into a private, writable qcom
 #      directory (without ever writing back to the host)
-#   5. Drop privileges to the target user and exec the container command
+#   5. Drop privileges to the target user and supervise the container command
 
 import glob
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -90,6 +91,44 @@ def setup_qcom_conf():
         except OSError as e:
             print(f"[entrypoint] WARNING: Could not deploy fastrpc config: {e}", flush=True)
 
+def run_application(cmd):
+    """Run the service command and forward container stop signals to it."""
+    child = None
+    pending_signal = None
+
+    def forward_signal(signum, _frame):
+        nonlocal pending_signal
+        pending_signal = signum
+
+        if child is None or child.poll() is not None:
+            return
+
+        signal_name = signal.Signals(signum).name
+        print(
+            f"[entrypoint] Received {signal_name}; forwarding to application",
+            flush=True,
+        )
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGTERM, forward_signal)
+    signal.signal(signal.SIGINT, forward_signal)
+
+    try:
+        child = subprocess.Popen(cmd, shell=False)
+    except OSError as e:
+        print(f"[entrypoint] FATAL: Failed to execute application: {e}", flush=True)
+        return 127
+
+    # A signal can arrive between installing the handlers and creating the child.
+    if pending_signal is not None:
+        forward_signal(pending_signal, None)
+
+    return_code = child.wait()
+    return 128 + abs(return_code) if return_code < 0 else return_code
+
 def main():
     print("[entrypoint] Starting Python-based group ID configuration...", flush=True)
 
@@ -160,8 +199,7 @@ def main():
     if len(sys.argv) > 1:
         cmd = sys.argv[1:]
         print(f"[entrypoint] Executing application: {' '.join(cmd)}", flush=True)
-        result = subprocess.run(cmd, shell=False)
-        sys.exit(result.returncode)
+        sys.exit(run_application(cmd))
     else:
         print("[entrypoint] No application command provided.", flush=True)
 
